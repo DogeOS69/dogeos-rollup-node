@@ -42,6 +42,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Extract version from Cargo.toml
         run: |
@@ -82,7 +84,6 @@ jobs:
               TAGS="${TAGS},${IMAGE_NAME}:${VERSION_MAJOR}.${VERSION_MINOR}"
               TAGS="${TAGS},${IMAGE_NAME}:${VERSION_MAJOR}"
               TAGS="${TAGS},${IMAGE_NAME}:latest-testnet"
-              TAGS="${TAGS},${IMAGE_NAME}:latest-devnet"
             fi
           elif [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
             ENVIRONMENT="testnet"
@@ -116,21 +117,23 @@ jobs:
 
       - name: Set up QEMU
         if: ${{ github.ref_type == 'tag' || (github.event_name == 'workflow_dispatch' && github.event.inputs.build_arm64 == 'true') }}
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+        with:
+          cache-binary: false
 
       - name: Login to Docker Hub
         if: ${{ github.event_name != 'pull_request' }}
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Build Docker image
         if: ${{ github.event_name == 'pull_request' }}
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           file: Dockerfile
@@ -153,7 +156,7 @@ jobs:
 
       - name: Build and push Docker image
         if: ${{ github.event_name != 'pull_request' }}
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           file: Dockerfile

@@ -168,6 +168,8 @@ where
             .set_dev(is_dev)
             .with_txpool(TxPoolArgs {
                 no_local_transactions_propagation,
+                // Raise the per-account slot limit far above the reth default (16) so tests can
+                // queue many transactions from a single wallet without hitting the pool cap.
                 max_account_slots: 16_384,
                 ..Default::default()
             });
@@ -216,7 +218,12 @@ where
 
         let span = span!(Level::INFO, "node", node_index);
         let _enter = span.enter();
-        let task_executor = TaskExecutor::default();
+        // Use the lightweight test runtime (2-thread tokio/rayon pools) rather than
+        // TaskExecutor::default(), which builds full CPU-sized pools per node. setup_engine
+        // creates one executor per node and the integration suite runs several multi-node
+        // fixtures in parallel, so default pools would allocate hundreds of threads on
+        // high-core CI runners.
+        let task_executor = TaskExecutor::test();
         let testing_node = NodeBuilder::new(node_config.clone())
             .with_database(db.clone())
             .with_launch_context(task_executor.clone());

@@ -454,9 +454,10 @@ async fn can_forward_tx_to_sequencer() -> eyre::Result<()> {
         // Tolerate the tx already being in the follower pool (it can arrive via gossip from the
         // sequencer peer); re-raise anything else.
         let msg = format!("{e:?}");
-        if !msg.contains("already known") && !msg.contains("AlreadyImported") {
-            panic!("failed to inject tx into follower pool: {msg}");
-        }
+        assert!(
+            msg.contains("already known") || msg.contains("AlreadyImported"),
+            "failed to inject tx into follower pool: {msg}"
+        );
     }
 
     tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;

@@ -450,7 +450,14 @@ async fn can_forward_tx_to_sequencer() -> eyre::Result<()> {
 
     // inject a transaction into the pool of the follower node
     let tx = generate_tx(wallet).await;
-    follower_node[0].rpc.inject_tx(tx).await.unwrap();
+    if let Err(e) = follower_node[0].rpc.inject_tx(tx).await {
+        // Tolerate the tx already being in the follower pool (it can arrive via gossip from the
+        // sequencer peer); re-raise anything else.
+        let msg = format!("{e:?}");
+        if !msg.contains("already known") && !msg.contains("AlreadyImported") {
+            panic!("failed to inject tx into follower pool: {msg}");
+        }
+    }
 
     tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
 
@@ -616,7 +623,7 @@ async fn can_bridge_blocks() -> eyre::Result<()> {
     let mut network_events = network_handle.event_listener();
 
     // Spawn the standard NetworkManager.
-    bridge_node.task_manager.executor().spawn(network);
+    bridge_node.task_executor.spawn_task(network);
 
     // Connect the standard NetworkManager to the bridge node.
     bridge_node.network.add_peer(network_handle.local_node_record()).await;
@@ -1736,8 +1743,9 @@ async fn can_rpc_enable_disable_sequencing() -> eyre::Result<()> {
     fixture.l1().sync().await?;
 
     // Test that sequencing is initially enabled (blocks produced automatically)
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert_ne!(fixture.get_sequencer_block().await?.header.number, 0, "Should produce blocks");
+    fixture.expect_event().block_sequenced(1).await?;
+    let block_num = fixture.get_sequencer_block().await?.header.number;
+    assert_ne!(block_num, 0, "Should produce blocks");
 
     // Disable automatic sequencing via RPC
     let client = fixture.sequencer().node.rpc_client().expect("Should have rpc client");

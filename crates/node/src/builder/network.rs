@@ -354,5 +354,7 @@ fn header_to_alloy<H: BlockHeader>(header: &H) -> Header {
         excess_blob_gas: header.excess_blob_gas(),
         parent_beacon_block_root: header.parent_beacon_block_root(),
         requests_hash: header.requests_hash(),
+        block_access_list_hash: header.block_access_list_hash(),
+        slot_number: header.slot_number(),
     }
 }

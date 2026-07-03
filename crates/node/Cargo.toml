@@ -32,9 +32,10 @@ alloy-primitives.workspace = true
 alloy-provider.workspace = true
 alloy-rpc-client.workspace = true
 alloy-rpc-types-engine.workspace = true
+alloy-node-bindings = { workspace = true, optional = true }
 alloy-signer-local.workspace = true
-alloy-signer-aws = "1.0.30"
-alloy-signer = "1.0.30"
+alloy-signer-aws.workspace = true
+alloy-signer.workspace = true
 alloy-transport.workspace = true
 
 scroll-alloy-consensus.workspace = true
@@ -68,6 +69,7 @@ reth-network-p2p.workspace = true
 reth-network-peers.workspace = true
 reth-provider.workspace = true
 reth-revm.workspace = true
+revm.workspace = true
 reth-rpc-api.workspace = true
 reth-rpc-eth-api.workspace = true
 reth-rpc-eth-types.workspace = true
@@ -90,7 +92,6 @@ aws-config = "1.8.0"
 aws-sdk-kms = "1.76.0"
 
 # test-utils
-anvil = { git = "https://github.com/foundry-rs/foundry.git", rev = "2c84e1c970d11ef5023a77d8002a1cb70b143888", default-features = false, optional = true }
 alloy-rpc-types-eth = { workspace = true, optional = true }
 alloy-rpc-types-anvil = { workspace = true, optional = true }
 reth-db = { workspace = true, optional = true, features = ["test-utils"] }
@@ -198,7 +199,7 @@ test-utils = [
     "reth-network-p2p/test-utils",
     "rollup-node-chain-orchestrator/test-utils",
     "scroll-network/test-utils",
-    "anvil",
+    "alloy-node-bindings",
     "reth-storage-api",
     "alloy-rpc-types-eth",
     "alloy-rpc-types-anvil",

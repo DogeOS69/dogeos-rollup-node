@@ -1211,6 +1211,7 @@ mod tests {
             inner: recovered,
             block_hash: None,
             block_number: None,
+            block_timestamp: None,
             transaction_index: None,
             effective_gas_price: None,
         };

@@ -371,6 +371,8 @@ pub async fn derive<L1P: L1Provider + Sync + Send>(
                     prev_randao: B256::ZERO,
                     withdrawals: None,
                     parent_beacon_block_root: None,
+                    slot_number: None,
+                    target_gas_limit: None,
                 },
                 transactions: Some(txs),
                 no_tx_pool: true,

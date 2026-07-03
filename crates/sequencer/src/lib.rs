@@ -113,6 +113,8 @@ where
             parent_beacon_block_root: None,
             prev_randao: Default::default(),
             withdrawals: None,
+            slot_number: None,
+            target_gas_limit: None,
         };
 
         let mut l1_messages = vec![];

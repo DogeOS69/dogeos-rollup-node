@@ -15,7 +15,7 @@ use reth_node_builder::{
     FullNodeComponents,
 };
 use reth_node_types::NodeTypes;
-use reth_revm::context::{BlockEnv, TxEnv};
+use reth_revm::context::BlockEnv;
 use reth_rpc_eth_types::error::FromEvmError;
 use reth_scroll_chainspec::ScrollChainSpec;
 use reth_scroll_engine_primitives::ScrollEngineTypes;
@@ -25,6 +25,7 @@ use reth_scroll_node::{
 };
 use reth_scroll_primitives::ScrollPrimitives;
 use reth_scroll_rpc::{eth::ScrollEthApiBuilder, ScrollEthApiError};
+use revm::context::TxEnv;
 use scroll_alloy_evm::ScrollTransactionIntoTxEnv;
 use scroll_wire::ScrollWireEvent;
 use std::sync::Arc;

@@ -12,6 +12,7 @@ use crate::{
 
 use alloy_eips::BlockNumberOrTag;
 use alloy_network::Ethereum;
+use alloy_node_bindings::{Anvil, AnvilInstance};
 use alloy_primitives::Address;
 use alloy_provider::{ext::AnvilApi, layers::CacheLayer, Provider, ProviderBuilder};
 use alloy_rpc_client::RpcClient;
@@ -68,7 +69,7 @@ pub struct TestFixture {
     /// L1 provider for making L1 RPC calls (if connected to real L1).
     pub l1_provider: Option<L1Provider>,
     /// Optional Anvil instance for L1 simulation.
-    pub anvil: Option<anvil::NodeHandle>,
+    pub anvil: Option<AnvilInstance>,
     /// The configuration for the nodes.
     pub config: ScrollRollupNodeConfig,
     /// Whether this fixture has a remote source node (always the last node).
@@ -354,7 +355,7 @@ impl TestFixture {
             );
             let client = RpcClient::builder()
                 .layer(retry_layer)
-                .http(anvil.http_endpoint().parse().expect("failed to parse anvil http endpoint"));
+                .http(anvil.endpoint().parse().expect("failed to parse anvil http endpoint"));
             let cache_layer = CacheLayer::new(constants::L1_PROVIDER_CACHE_MAX_ITEMS);
             ProviderBuilder::new().layer(cache_layer).connect_client(client)
         })
@@ -749,7 +750,7 @@ impl TestFixtureBuilder {
 
             // Parse endpoint URL once and reuse
             let endpoint_url = handle
-                .http_endpoint()
+                .endpoint()
                 .parse::<reqwest::Url>()
                 .map_err(|e| eyre::eyre!("Failed to parse Anvil endpoint URL: {}", e))?;
 
@@ -837,31 +838,27 @@ impl TestFixtureBuilder {
         chain_id: Option<u64>,
         block_time: Option<u64>,
         slots_in_an_epoch: u64,
-    ) -> eyre::Result<anvil::NodeHandle> {
-        let mut config = anvil::NodeConfig { port: 0, ..Default::default() };
+    ) -> eyre::Result<AnvilInstance> {
+        let mut anvil = Anvil::new().port(0u16);
 
         if let Some(id) = chain_id {
-            config.chain_id = Some(id);
+            anvil = anvil.chain_id(id);
         }
 
-        // Configure block time
         if let Some(time) = block_time {
-            config.block_time = Some(std::time::Duration::from_secs(time));
+            anvil = anvil.block_time(time);
         }
 
-        // Load state from file if provided
         if let Some(path) = state_path {
-            let state = anvil::eth::backend::db::SerializableState::load(path).map_err(|e| {
-                eyre::eyre!("Failed to load Anvil state from {}: {:?}", path.display(), e)
-            })?;
-            tracing::info!("Loaded Anvil state from: {}", path.display());
-            config.init_state = Some(state);
+            if !path.exists() {
+                return Err(eyre::eyre!("Anvil state file does not exist: {}", path.display()));
+            }
+            tracing::info!("Loading Anvil state from: {}", path.display());
+            anvil = anvil.arg("--load-state").arg(path);
         }
 
-        config.slots_in_an_epoch = slots_in_an_epoch;
+        anvil = anvil.arg("--slots-in-an-epoch").arg(slots_in_an_epoch.to_string());
 
-        // Spawn Anvil and return the NodeHandle
-        let (_api, handle) = anvil::spawn(config).await;
-        Ok(handle)
+        anvil.try_spawn().map_err(|e| eyre::eyre!("Failed to spawn Anvil: {}", e))
     }
 }

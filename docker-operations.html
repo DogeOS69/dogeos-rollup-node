@@ -1,0 +1,684 @@
+<!DOCTYPE HTML>
+<html lang="en" class="light sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Running with Docker Compose - Rollup node</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="favicon-de23e50b.svg">
+        <link rel="shortcut icon" href="favicon-8114d1fc.png">
+        <link rel="stylesheet" href="css/variables-8adf115d.css">
+        <link rel="stylesheet" href="css/general-e96d0476.css">
+        <link rel="stylesheet" href="css/chrome-d279d366.css">
+        <link rel="stylesheet" href="css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "";
+            const default_light_theme = "light";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "searchindex-98ceb75a.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="toc-e2c7dee6.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('light')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">Rollup node</h1>
+
+                    <div class="right-buttons">
+                        <a href="print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="running-with-docker-compose"><a class="header" href="#running-with-docker-compose">Running with Docker Compose</a></h1>
+<p>This guide covers how to run the Scroll rollup node using Docker Compose. The Docker setup provides a complete
+environment including the rollup node, monitoring infrastructure, and optional L1 devnet for shadow-fork testing.</p>
+<h2 id="overview"><a class="header" href="#overview">Overview</a></h2>
+<p>The Docker Compose stack includes the following services:</p>
+<ul>
+<li><strong>rollup-node</strong>: The main Scroll rollup node</li>
+<li><strong>prometheus</strong>: Metrics collection and time-series database</li>
+<li><strong>grafana</strong>: Visualization dashboard for metrics</li>
+<li><strong>l1-devnet</strong> (optional): Local L1 Ethereum node for shadow-fork mode</li>
+</ul>
+<h2 id="prerequisites"><a class="header" href="#prerequisites">Prerequisites</a></h2>
+<ul>
+<li><a href="https://docs.docker.com/get-docker/">Docker</a> installed (version 20.10 or later)</li>
+<li><a href="https://docs.docker.com/compose/install/">Docker Compose</a> installed (version 1.28 or later)</li>
+<li>At least 16 GB RAM</li>
+<li>Sufficient disk space for chain data</li>
+</ul>
+<h2 id="quick-start"><a class="header" href="#quick-start">Quick Start</a></h2>
+<h3 id="1-navigate-to-docker-compose-directory"><a class="header" href="#1-navigate-to-docker-compose-directory">1. Navigate to Docker Compose Directory</a></h3>
+<pre><code class="language-bash">cd docker-compose
+</code></pre>
+<h3 id="2-configure-environment"><a class="header" href="#2-configure-environment">2. Configure Environment</a></h3>
+<p>The docker-compose setup uses a <code>.env</code> file for configuration. You <strong>must</strong> configure your own L1 RPC and beacon node
+endpoints.</p>
+<p>Key environment variables:</p>
+<ul>
+<li><code>ENV</code>: The network to connect to (<code>sepolia</code>, <code>mainnet</code>, or <code>dev</code>)</li>
+<li><code>SHADOW_FORK</code>: Enable shadow-fork mode (<code>true</code> or <code>false</code>)</li>
+<li><code>FORK_BLOCK_NUMBER</code>: Block number to fork from (when shadow-fork is enabled)</li>
+<li><code>L1_URL</code>: Your L1 Ethereum RPC endpoint URL (e.g., Alchemy, Infura, QuickNode)</li>
+<li><code>BEACON_URL</code>: Your beacon node URL for blob data</li>
+</ul>
+<p><strong>Note</strong>: You must provide your own RPC endpoints. Configure these in your <code>.env</code> file before starting the stack.</p>
+<h3 id="3-download-snapshot-optional"><a class="header" href="#3-download-snapshot-optional">3. Download Snapshot (Optional)</a></h3>
+<p>For faster initial sync, you can optionally download a snapshot of the blockchain data before starting the stack.</p>
+<p><strong>This step is recommended but not required.</strong> Without a snapshot, the node will sync from genesis, which can take considerably longer.</p>
+<p><strong>Step 1:</strong> Create the volume directory if it doesn’t exist:</p>
+<pre><code class="language-bash">mkdir -p volumes/l2reth
+</code></pre>
+<p><strong>Step 2:</strong> Download the snapshot for your target network:</p>
+<p>For Scroll Mainnet:</p>
+<pre><code class="language-bash">wget https://scroll-geth-snapshot.s3.us-west-2.amazonaws.com/reth/latest.tar
+</code></pre>
+<p>For Scroll Sepolia:</p>
+<pre><code class="language-bash">wget https://scroll-sepolia-l2geth-snapshots.s3.us-west-2.amazonaws.com/reth/latest.tar
+</code></pre>
+<p><strong>Step 3:</strong> Extract the snapshot to the volume directory (<code>volumes/l2reth</code>):</p>
+<pre><code class="language-bash">tar -xvf latest.tar -C volumes/l2reth
+</code></pre>
+<p><strong>Step 4:</strong> Clean up the downloaded archive:</p>
+<pre><code class="language-bash">rm latest.tar
+</code></pre>
+<h3 id="4-start-the-stack"><a class="header" href="#4-start-the-stack">4. Start the Stack</a></h3>
+<p>For standard operation (following public networks):</p>
+<pre><code class="language-bash">docker compose up -d
+</code></pre>
+<p>For shadow-fork mode:</p>
+<pre><code class="language-bash">docker compose --profile shadow-fork up -d
+</code></pre>
+<h3 id="5-access-the-services"><a class="header" href="#5-access-the-services">5. Access the Services</a></h3>
+<p>Once running, the following endpoints are available:</p>
+<ul>
+<li><strong>Rollup Node JSON-RPC</strong>: <a href="http://localhost:8545">http://localhost:8545</a></li>
+<li><strong>Rollup Node WebSocket</strong>: <a href="ws://localhost:8546">ws://localhost:8546</a></li>
+<li><strong>Rollup Node Metrics</strong>: <a href="http://localhost:6060/metrics">http://localhost:6060/metrics</a></li>
+<li><strong>Prometheus UI</strong>: <a href="http://localhost:19090">http://localhost:19090</a></li>
+<li><strong>Grafana Dashboards</strong>: <a href="http://localhost:13000">http://localhost:13000</a></li>
+</ul>
+<h2 id="operating-modes"><a class="header" href="#operating-modes">Operating Modes</a></h2>
+<h3 id="standard-mode-follower-node"><a class="header" href="#standard-mode-follower-node">Standard Mode (Follower Node)</a></h3>
+<p>Standard mode connects the rollup node to public Scroll networks (Sepolia or Mainnet).</p>
+<h4 id="sepolia-testnet"><a class="header" href="#sepolia-testnet">Sepolia Testnet</a></h4>
+<p>Edit your <code>.env</code> file with your RPC endpoints:</p>
+<pre><code class="language-env">ENV=sepolia
+SHADOW_FORK=false
+L1_URL=https://eth-sepolia.g.alchemy.com/v2/YOUR_API_KEY
+BEACON_URL=https://eth-sepolia.g.alchemy.com/v2/YOUR_API_KEY
+</code></pre>
+<p>Replace <code>YOUR_API_KEY</code> with your actual API key from your RPC provider (Alchemy, Infura, QuickNode, etc.).</p>
+<p>Start the services:</p>
+<pre><code class="language-bash">docker compose up -d
+</code></pre>
+<p>The node will:</p>
+<ul>
+<li>Connect to your configured L1 RPC endpoint</li>
+<li>Connect to your configured beacon node</li>
+<li>Sync from the Scroll Sepolia network</li>
+<li>Connect to trusted peers on the network</li>
+</ul>
+<h4 id="mainnet"><a class="header" href="#mainnet">Mainnet</a></h4>
+<p>Edit your <code>.env</code> file with your RPC endpoints:</p>
+<pre><code class="language-env">ENV=mainnet
+SHADOW_FORK=false
+L1_URL=https://eth-mainnet.g.alchemy.com/v2/YOUR_API_KEY
+BEACON_URL=https://eth-mainnet.g.alchemy.com/v2/YOUR_API_KEY
+</code></pre>
+<p>Replace <code>YOUR_API_KEY</code> with your actual API key from your RPC provider (Alchemy, Infura, QuickNode, etc.).</p>
+<p>Start the services:</p>
+<pre><code class="language-bash">docker compose up -d
+</code></pre>
+<p>The node will:</p>
+<ul>
+<li>Connect to your configured L1 RPC endpoint</li>
+<li>Connect to your configured beacon node</li>
+<li>Sync from the Scroll Mainnet network</li>
+<li>Connect to trusted peers on the network</li>
+</ul>
+<h3 id="shadow-fork-mode"><a class="header" href="#shadow-fork-mode">Shadow-Fork Mode</a></h3>
+<p>Shadow-fork mode runs the rollup node against a forked L1 chain, useful for testing and development without affecting
+the live network.</p>
+<h4 id="configuration"><a class="header" href="#configuration">Configuration</a></h4>
+<p>Edit your <code>.env</code> file:</p>
+<pre><code class="language-env">ENV=sepolia  # or mainnet
+SHADOW_FORK=true
+FORK_BLOCK_NUMBER=8700000  # Adjust to your desired fork point
+</code></pre>
+<h4 id="starting-shadow-fork"><a class="header" href="#starting-shadow-fork">Starting Shadow-Fork</a></h4>
+<pre><code class="language-bash">docker compose --profile shadow-fork up -d
+</code></pre>
+<p>This will:</p>
+<ol>
+<li>Start an L1 devnet (Anvil) forked from the specified block</li>
+<li>Start the rollup node configured to use the local L1 devnet</li>
+<li>Start Prometheus and Grafana for monitoring</li>
+</ol>
+<h4 id="how-shadow-fork-works"><a class="header" href="#how-shadow-fork-works">How Shadow-Fork Works</a></h4>
+<p>The <code>l1-devnet</code> service uses Foundry’s Anvil to create a local fork:</p>
+<pre><code class="language-bash">anvil --fork-url &lt;SCROLL_L1_RPC&gt; \
+      --fork-block-number &lt;FORK_BLOCK_NUMBER&gt; \
+      --chain-id &lt;CHAIN_ID&gt; \
+      --host 0.0.0.0 \
+      --block-time 12
+</code></pre>
+<p>The rollup node then connects to this local L1 at <code>http://l1-devnet:8545</code> instead of the public L1 RPC.</p>
+<h4 id="use-cases"><a class="header" href="#use-cases">Use Cases</a></h4>
+<p>Shadow-fork mode is ideal for:</p>
+<ul>
+<li>Testing node behavior at specific block heights</li>
+<li>Debugging derivation issues</li>
+<li>Development without consuming testnet resources</li>
+<li>Simulating historical scenarios</li>
+</ul>
+<h3 id="development-mode"><a class="header" href="#development-mode">Development Mode</a></h3>
+<p>For local development with a completely isolated environment:</p>
+<pre><code class="language-env">ENV=dev
+</code></pre>
+<p>This mode:</p>
+<ul>
+<li>Uses the <code>dev</code> chain spec</li>
+<li>Enables sequencer mode</li>
+<li>Bypasses signing requirements with <code>--test</code> flag</li>
+<li>Disables peer discovery</li>
+<li>Sets fast block times (250ms)</li>
+</ul>
+<h3 id="configuring-rpc-endpoints"><a class="header" href="#configuring-rpc-endpoints">Configuring RPC Endpoints</a></h3>
+<p>You <strong>must</strong> configure your own L1 RPC and beacon node URLs using a provider of your choice:</p>
+<p><strong>Recommended Providers:</strong></p>
+<ul>
+<li><a href="https://www.alchemy.com/">Alchemy</a> - Offers free tier with generous limits</li>
+<li><a href="https://infura.io/">Infura</a> - Reliable infrastructure with free tier</li>
+<li><a href="https://www.quicknode.com/">QuickNode</a> - High-performance nodes</li>
+<li>Your own self-hosted L1 archive node</li>
+</ul>
+<p><strong>Requirements:</strong></p>
+<ul>
+<li>L1 RPC endpoint must support Ethereum mainnet or Sepolia testnet</li>
+<li>Beacon node must provide EIP-4844 blob data access</li>
+<li>Both endpoints should be reliable with good uptime</li>
+</ul>
+<h4 id="configuration-priority"><a class="header" href="#configuration-priority">Configuration Priority</a></h4>
+<p>The launch script determines which URLs to use in this order:</p>
+<ol>
+<li><strong>User-provided URLs</strong> (via <code>L1_URL</code> or <code>BEACON_URL</code>) - highest priority</li>
+<li><strong>Shadow-fork URLs</strong> (if <code>SHADOW_FORK=true</code>) - uses local L1 devnet</li>
+<li><strong>Error</strong> - If no URLs are configured and not in shadow-fork mode, the node will fail to start</li>
+</ol>
+<h4 id="example-using-alchemy-for-sepolia"><a class="header" href="#example-using-alchemy-for-sepolia">Example: Using Alchemy for Sepolia</a></h4>
+<p>Edit your <code>.env</code> file:</p>
+<pre><code class="language-env">ENV=sepolia
+SHADOW_FORK=false
+L1_URL=https://eth-sepolia.g.alchemy.com/v2/YOUR_API_KEY
+BEACON_URL=https://eth-sepolia.g.alchemy.com/v2/YOUR_API_KEY
+</code></pre>
+<p>Then start:</p>
+<pre><code class="language-bash">docker compose up -d
+</code></pre>
+<h4 id="verifying-rpc-connectivity"><a class="header" href="#verifying-rpc-connectivity">Verifying RPC Connectivity</a></h4>
+<p>After starting the node, verify connectivity to your RPC endpoints by checking the logs:</p>
+<pre><code class="language-bash">docker compose logs rollup-node | grep -i "l1\|beacon"
+</code></pre>
+<p>You should see logs indicating successful connection to your configured endpoints. If you see connection errors, verify
+your URLs and API keys are correct.</p>
+<h2 id="service-details"><a class="header" href="#service-details">Service Details</a></h2>
+<h3 id="rollup-node-service"><a class="header" href="#rollup-node-service">Rollup Node Service</a></h3>
+<p><strong>Image</strong>: <code>scrolltech/rollup-node:v1.0.5</code></p>
+<p><strong>Port Mappings</strong>:</p>
+<ul>
+<li><code>8545</code>: JSON-RPC interface</li>
+<li><code>8546</code>: WebSocket interface</li>
+<li><code>6060</code>: Metrics endpoint</li>
+</ul>
+<p><strong>Volumes</strong>:</p>
+<ul>
+<li><code>./volumes/l2reth</code>: Node data directory (chain state, database)</li>
+<li><code>./launch_rollup_node.bash</code>: Entrypoint script (read-only)</li>
+</ul>
+<p><strong>Configuration</strong>:</p>
+<p>The <code>launch_rollup_node.bash</code> script configures the node based on the <code>ENV</code> variable:</p>
+<ul>
+<li><strong>dev</strong>: Local sequencer mode with fast block times</li>
+<li><strong>sepolia</strong>: Sepolia follower with optional shadow-fork</li>
+<li><strong>mainnet</strong>: Mainnet follower with optional shadow-fork</li>
+</ul>
+<p>Key command-line flags used:</p>
+<pre><code class="language-bash">--chain &lt;CHAIN&gt;           # Chain specification
+--datadir=/l2reth         # Data directory
+--metrics=0.0.0.0:6060    # Metrics endpoint
+--disable-discovery       # P2P discovery disabled in Docker
+--http --http.addr=0.0.0.0 --http.port=8545
+--ws --ws.addr=0.0.0.0 --ws.port=8546
+--http.api admin,debug,eth,net,trace,txpool,web3,rpc,reth,ots,flashbots,miner,mev
+--l1.url &lt;URL&gt;                      # L1 RPC endpoint
+--blob.beacon_node_urls &lt;URLS&gt;      # Beacon node endpoint
+--blob.s3_url &lt;URL&gt;                 # S3 Blob URL
+--trusted-peers &lt;PEERS&gt;             # Trusted P2P peers
+</code></pre>
+<h3 id="l1-devnet-service-shadow-fork-only"><a class="header" href="#l1-devnet-service-shadow-fork-only">L1 Devnet Service (Shadow-Fork Only)</a></h3>
+<p><strong>Image</strong>: <code>ghcr.io/foundry-rs/foundry:v1.2.3</code></p>
+<p><strong>Port Mappings</strong>:</p>
+<ul>
+<li><code>8543</code>: JSON-RPC interface (mapped from internal 8545)</li>
+<li><code>8544</code>: WebSocket interface (mapped from internal 8546)</li>
+</ul>
+<p><strong>Volumes</strong>:</p>
+<ul>
+<li><code>./volumes/l1devnet</code>: Anvil state directory</li>
+<li><code>./launch_l1.bash</code>: Entrypoint script (read-only)</li>
+</ul>
+<p><strong>Profile</strong>: <code>shadow-fork</code> (only starts when this profile is active)</p>
+<h3 id="prometheus-service"><a class="header" href="#prometheus-service">Prometheus Service</a></h3>
+<p><strong>Image</strong>: <code>prom/prometheus:v3.3.1</code></p>
+<p><strong>Port Mappings</strong>:</p>
+<ul>
+<li><code>19090</code>: Prometheus web UI</li>
+</ul>
+<p><strong>Volumes</strong>:</p>
+<ul>
+<li><code>./resource/prometheus.yml</code>: Configuration file (read-only)</li>
+<li><code>./volumes/prometheus</code>: Time-series database storage</li>
+</ul>
+<p><strong>Configuration</strong>:</p>
+<p>Prometheus scrapes metrics from the rollup node every 10 seconds at <code>http://rollup-node:6060/metrics</code>. The configuration
+includes:</p>
+<ul>
+<li><strong>Scrape interval</strong>: 10 seconds</li>
+<li><strong>Retention time</strong>: 1 day</li>
+<li><strong>Retention size</strong>: 512 MB</li>
+<li><strong>WAL compression</strong>: Enabled</li>
+</ul>
+<h3 id="grafana-service"><a class="header" href="#grafana-service">Grafana Service</a></h3>
+<p><strong>Image</strong>: <code>grafana/grafana:12.0.2</code></p>
+<p><strong>Port Mappings</strong>:</p>
+<ul>
+<li><code>13000</code>: Grafana web UI (mapped from internal 3000)</li>
+</ul>
+<p><strong>Volumes</strong>:</p>
+<ul>
+<li><code>./resource/grafana-datasource.yml</code>: Prometheus datasource config (read-only)</li>
+<li><code>./resource/grafana-dashboard-providers.yml</code>: Dashboard provider config (read-only)</li>
+<li><code>./resource/dashboards/</code>: Pre-built dashboard JSON files (read-only)</li>
+<li><code>./volumes/grafana</code>: Grafana database and settings</li>
+</ul>
+<p><strong>Configuration</strong>:</p>
+<ul>
+<li><strong>Anonymous access</strong>: Enabled with Admin role (for easy local access)</li>
+<li><strong>Default home dashboard</strong>: Overview dashboard</li>
+<li><strong>Pre-provisioned dashboards</strong>:
+<ul>
+<li><code>overview.json</code>: High-level node metrics</li>
+<li><code>performance.json</code>: Performance and throughput metrics</li>
+<li><code>state_history.json</code>: State and history metrics</li>
+<li><code>transaction_pool.json</code>: Transaction pool metrics</li>
+<li><code>rollup_node.json</code>: Rollup-specific metrics</li>
+</ul>
+</li>
+</ul>
+<h2 id="monitoring-and-observability"><a class="header" href="#monitoring-and-observability">Monitoring and Observability</a></h2>
+<h3 id="accessing-grafana-dashboards"><a class="header" href="#accessing-grafana-dashboards">Accessing Grafana Dashboards</a></h3>
+<ol>
+<li>Open <a href="http://localhost:13000">http://localhost:13000</a> in your browser</li>
+<li>No login required (anonymous access enabled)</li>
+<li>Select from pre-configured dashboards in the sidebar</li>
+</ol>
+<h3 id="available-dashboards"><a class="header" href="#available-dashboards">Available Dashboards</a></h3>
+<h4 id="overview-dashboard"><a class="header" href="#overview-dashboard">Overview Dashboard</a></h4>
+<p>Provides high-level metrics including:</p>
+<ul>
+<li>Block production rate</li>
+<li>Sync status</li>
+<li>L1/L2 block heights</li>
+<li>Network peer count</li>
+</ul>
+<h4 id="performance-dashboard"><a class="header" href="#performance-dashboard">Performance Dashboard</a></h4>
+<p>Detailed performance metrics:</p>
+<ul>
+<li>CPU and memory usage</li>
+<li>Database operations per second</li>
+<li>RPC request latency</li>
+<li>Block processing time</li>
+</ul>
+<h4 id="transaction-pool-dashboard"><a class="header" href="#transaction-pool-dashboard">Transaction Pool Dashboard</a></h4>
+<p>Transaction pool monitoring:</p>
+<ul>
+<li>Pending transaction count</li>
+<li>Transaction pool size</li>
+<li>Transaction arrival rate</li>
+<li>Gas price distribution</li>
+</ul>
+<h4 id="rollup-node-dashboard"><a class="header" href="#rollup-node-dashboard">Rollup Node Dashboard</a></h4>
+<p>Rollup-specific metrics:</p>
+<ul>
+<li>L1 batch processing</li>
+<li>Derivation pipeline throughput</li>
+<li>Engine API calls</li>
+<li>Consolidation status</li>
+</ul>
+<h3 id="prometheus-queries"><a class="header" href="#prometheus-queries">Prometheus Queries</a></h3>
+<p>Access Prometheus at <a href="http://localhost:19090">http://localhost:19090</a> to run custom queries.</p>
+<p>Example queries:</p>
+<pre><code class="language-promql"># Current block height
+scroll_block_height
+
+# Block processing rate (blocks per second)
+rate(scroll_blocks_processed_total[1m])
+
+# L1 batch processing time
+histogram_quantile(0.95, scroll_l1_batch_processing_seconds_bucket)
+
+# RPC request rate by method
+rate(scroll_rpc_requests_total[5m])
+</code></pre>
+<h3 id="viewing-logs"><a class="header" href="#viewing-logs">Viewing Logs</a></h3>
+<h4 id="all-services"><a class="header" href="#all-services">All Services</a></h4>
+<pre><code class="language-bash">docker compose logs -f
+</code></pre>
+<h4 id="specific-service"><a class="header" href="#specific-service">Specific Service</a></h4>
+<pre><code class="language-bash">docker compose logs -f rollup-node
+docker compose logs -f prometheus
+docker compose logs -f grafana
+</code></pre>
+<h4 id="with-timestamps"><a class="header" href="#with-timestamps">With Timestamps</a></h4>
+<pre><code class="language-bash">docker compose logs -f -t rollup-node
+</code></pre>
+<h4 id="last-n-lines"><a class="header" href="#last-n-lines">Last N Lines</a></h4>
+<pre><code class="language-bash">docker compose logs --tail=100 rollup-node
+</code></pre>
+<h2 id="volume-management"><a class="header" href="#volume-management">Volume Management</a></h2>
+<h3 id="data-persistence"><a class="header" href="#data-persistence">Data Persistence</a></h3>
+<p>The Docker Compose setup uses local volumes in <code>./volumes/</code> to persist data:</p>
+<pre><code>volumes/
+├── l1devnet/      # L1 devnet state (shadow-fork only)
+├── l2reth/        # Rollup node data (chain state, database)
+├── prometheus/    # Prometheus time-series data
+└── grafana/       # Grafana configuration and dashboards
+</code></pre>
+<h3 id="backing-up-data"><a class="header" href="#backing-up-data">Backing Up Data</a></h3>
+<p>To backup your node data:</p>
+<pre><code class="language-bash"># Stop the services first
+docker compose down
+
+# Create a backup
+tar -czf backup-$(date +%Y%m%d).tar.gz volumes/
+
+# Restart services
+docker compose up -d
+</code></pre>
+<h3 id="resetting-node-data"><a class="header" href="#resetting-node-data">Resetting Node Data</a></h3>
+<p>To completely reset and resync:</p>
+<pre><code class="language-bash"># Stop services
+docker compose down
+
+# Remove all volumes
+rm -rf volumes/
+
+# Restart (will create fresh volumes)
+docker compose up -d
+</code></pre>
+<h3 id="resetting-specific-services"><a class="header" href="#resetting-specific-services">Resetting Specific Services</a></h3>
+<pre><code class="language-bash"># Reset only L2 node data
+docker compose down
+rm -rf volumes/l2reth/
+docker compose up -d
+
+# Reset only monitoring data
+docker compose down
+rm -rf volumes/prometheus/ volumes/grafana/
+docker compose up -d
+</code></pre>
+<h2 id="network-configuration"><a class="header" href="#network-configuration">Network Configuration</a></h2>
+<h3 id="port-usage"><a class="header" href="#port-usage">Port Usage</a></h3>
+<p>The Docker Compose stack uses the following host ports:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Service</th><th>Port</th><th>Protocol</th><th>Purpose</th></tr>
+</thead>
+<tbody>
+<tr><td>rollup-node</td><td>8545</td><td>HTTP</td><td>JSON-RPC API</td></tr>
+<tr><td>rollup-node</td><td>8546</td><td>WebSocket</td><td>WebSocket API</td></tr>
+<tr><td>rollup-node</td><td>6060</td><td>HTTP</td><td>Metrics endpoint</td></tr>
+<tr><td>l1-devnet</td><td>8543</td><td>HTTP</td><td>L1 JSON-RPC (shadow-fork)</td></tr>
+<tr><td>l1-devnet</td><td>8544</td><td>WebSocket</td><td>L1 WebSocket (shadow-fork)</td></tr>
+<tr><td>prometheus</td><td>19090</td><td>HTTP</td><td>Prometheus UI</td></tr>
+<tr><td>grafana</td><td>13000</td><td>HTTP</td><td>Grafana UI</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="troubleshooting"><a class="header" href="#troubleshooting">Troubleshooting</a></h2>
+<h3 id="rollup-node-not-syncing"><a class="header" href="#rollup-node-not-syncing">Rollup Node Not Syncing</a></h3>
+<p><strong>Check L1 connectivity:</strong></p>
+<p>For shadow-fork mode, ensure l1-devnet is running:</p>
+<pre><code class="language-bash">docker compose ps l1-devnet
+</code></pre>
+<p>For standard mode, verify L1 RPC endpoint is accessible.</p>
+<p><strong>Check logs for derivation errors:</strong></p>
+<pre><code class="language-bash">docker compose logs -f rollup-node | grep -i error
+</code></pre>
+<p><strong>Verify beacon node connectivity:</strong></p>
+<pre><code class="language-bash"># From within the container
+docker compose exec rollup-node curl http://l1reth-cl.sepolia.scroll.tech:5052/eth/v1/node/health
+</code></pre>
+<h3 id="shadow-fork-l1-devnet-issues"><a class="header" href="#shadow-fork-l1-devnet-issues">Shadow-Fork L1 Devnet Issues</a></h3>
+<p><strong>Check Anvil is forking correctly:</strong></p>
+<pre><code class="language-bash">docker compose logs l1-devnet
+</code></pre>
+<p><strong>Verify fork block number exists:</strong></p>
+<p>Ensure <code>FORK_BLOCK_NUMBER</code> is not ahead of the current L1 chain tip.</p>
+<p><strong>Test L1 devnet connectivity:</strong></p>
+<pre><code class="language-bash">curl -X POST http://localhost:8543 \
+  -H "Content-Type: application/json" \
+  -d '{
+    "jsonrpc": "2.0",
+    "method": "eth_blockNumber",
+    "params": [],
+    "id": 1
+  }'
+</code></pre>
+<h2 id="more"><a class="header" href="#more">More</a></h2>
+<p>For general node operation and configuration, see the <a href="./running-a-node.html">Running a Node</a> guide.</p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="running-a-sequencer.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="debug-toolkit.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="running-a-sequencer.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="debug-toolkit.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="elasticlunr-ef4e11c1.min.js"></script>
+        <script src="mark-09e88c2c.min.js"></script>
+        <script src="searcher-09f2665d.js"></script>
+
+        <script src="clipboard-1626706a.min.js"></script>
+        <script src="highlight-abc7f01d.js"></script>
+        <script src="book-609e4cb8.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+
+    </div>
+    </body>
+</html>

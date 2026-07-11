@@ -1,80 +1,182 @@
-name: Docker
+name: Build and Push Docker Image
 
 on:
   push:
+    branches:
+      - main
+      - develop
     tags:
-      - '*'
-  release:
-    types: [published]
+      - "v*"
+  pull_request:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/release.yml"
+      - ".cargo/**"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "Dockerfile"
+      - "crates/**"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Image tag"
+        required: true
+        default: "latest"
+        type: string
+      build_arm64:
+        description: "Build arm64 image"
+        required: true
+        type: boolean
+        default: false
+
+env:
+  IMAGE_NAME: dogeos69/rollup-node
 
 jobs:
-  build-and-push:
-    runs-on:
-        group: scroll-reth-runner-group
-    permissions: {}
+  build-and-publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
 
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v6
-      with:
-        persist-credentials: false
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
-    - name: Set up QEMU
-      uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+      - name: Extract version from Cargo.toml
+        run: |
+          VERSION=$(grep -A 3 '^\[workspace\.package\]' Cargo.toml | grep '^version = ' | sed 's/version = "\(.*\)"/\1/')
+          echo "WORKSPACE_VERSION=$VERSION" >> "$GITHUB_ENV"
 
-    - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
-      with:
-        cache-binary: false
+          MAJOR=$(echo "$VERSION" | cut -d. -f1)
+          MINOR=$(echo "$VERSION" | cut -d. -f2)
+          PATCH=$(echo "$VERSION" | cut -d. -f3)
 
-    - name: Extract docker metadata (stable)
-      id: meta-stable
-      uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
-      with:
-        images: scrolltech/rollup-node
-        tags: |
-          type=ref,event=tag,enable=${{ github.event_name == 'push' }}
-          type=raw,value=latest,enable=${{ github.event_name == 'release' }}
-        flavor: |
-          latest=false
+          echo "VERSION_MAJOR=$MAJOR" >> "$GITHUB_ENV"
+          echo "VERSION_MINOR=$MINOR" >> "$GITHUB_ENV"
+          echo "VERSION_PATCH=$PATCH" >> "$GITHUB_ENV"
 
-    - name: Extract docker metadata (nightly)
-      id: meta-nightly
-      uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
-      with:
-        images: scrolltech/rollup-node
-        tags: |
-          type=ref,event=tag,enable=${{ github.event_name == 'push' }},suffix=-nightly
-          type=raw,value=latest-nightly,enable=${{ github.event_name == 'release' }}
-        flavor: |
-          latest=false
+      - name: Set image tags and environment
+        run: |
+          echo "BUILD_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")" >> "$GITHUB_ENV"
+          echo "VCS_REF=${GITHUB_SHA:0:8}" >> "$GITHUB_ENV"
 
-    - name: Login to Docker Hub
-      uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 #v3.7.0
-      with:
-        username: ${{ secrets.DOCKERHUB_USERNAME }}
-        password: ${{ secrets.DOCKERHUB_TOKEN }}
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            MANUAL_TAG="${{ github.event.inputs.tag }}"
+            TAGS="${IMAGE_NAME}:${MANUAL_TAG}"
+            ENVIRONMENT="manual"
+          elif [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            TAG_NAME="${GITHUB_REF_NAME}"
+            VERSION="${TAG_NAME#v}"
 
-    - name: Build docker image (stable)
-      uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
-      with:
-        context: .
-        file: Dockerfile
-        push: true
-        tags: ${{ steps.meta-stable.outputs.tags }}
-        labels: ${{ steps.meta-stable.outputs.labels }}
-        cache-from: type=gha,scope=${{ github.workflow }}-stable
-        cache-to: type=gha,scope=${{ github.workflow }}-stable
+            if [[ "$VERSION" =~ -(alpha|beta|rc) ]]; then
+              ENVIRONMENT="devnet"
+              TAGS="${IMAGE_NAME}:${TAG_NAME}"
+              TAGS="${TAGS},${IMAGE_NAME}:${VERSION}"
+              TAGS="${TAGS},${IMAGE_NAME}:${VERSION}-${GITHUB_SHA:0:8}"
+            else
+              ENVIRONMENT="testnet"
+              TAGS="${IMAGE_NAME}:${TAG_NAME}"
+              TAGS="${TAGS},${IMAGE_NAME}:${WORKSPACE_VERSION}"
+              TAGS="${TAGS},${IMAGE_NAME}:${WORKSPACE_VERSION}-${GITHUB_SHA:0:8}"
+              TAGS="${TAGS},${IMAGE_NAME}:${VERSION_MAJOR}.${VERSION_MINOR}"
+              TAGS="${TAGS},${IMAGE_NAME}:${VERSION_MAJOR}"
+              TAGS="${TAGS},${IMAGE_NAME}:latest-testnet"
+            fi
+          elif [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+            ENVIRONMENT="testnet"
+            TAGS="${IMAGE_NAME}:latest-testnet"
+            TAGS="${TAGS},${IMAGE_NAME}:${GITHUB_SHA:0:8}"
+          elif [[ "${{ github.ref }}" == "refs/heads/develop" ]]; then
+            ENVIRONMENT="devnet"
+            TAGS="${IMAGE_NAME}:latest-devnet"
+            TAGS="${TAGS},${IMAGE_NAME}:${GITHUB_SHA:0:8}"
+          else
+            ENVIRONMENT="ephemeral"
+            TAGS="${IMAGE_NAME}:${GITHUB_SHA:0:8}"
+          fi
 
-    - name: Build docker image (nightly)
-      uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
-      with:
-        context: .
-        file: Dockerfile
-        push: true
-        tags: ${{ steps.meta-nightly.outputs.tags }}
-        labels: ${{ steps.meta-nightly.outputs.labels }}
-        build-args: |
-          CARGO_FEATURES=js-tracer
-        cache-from: type=gha,scope=${{ github.workflow }}-nightly
-        cache-to: type=gha,scope=${{ github.workflow }}-nightly
+          echo "ENVIRONMENT=$ENVIRONMENT" >> "$GITHUB_ENV"
+          echo "DOCKER_TAGS=$TAGS" >> "$GITHUB_ENV"
+          echo "Docker tags: $TAGS"
+
+      - name: Set platform
+        run: |
+          PLATFORM="linux/amd64"
+
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ github.event.inputs.build_arm64 }}" == "true" ]]; then
+            PLATFORM="linux/amd64,linux/arm64"
+          elif [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            PLATFORM="linux/amd64,linux/arm64"
+          fi
+
+          echo "PLATFORM=$PLATFORM" >> "$GITHUB_ENV"
+          echo "Docker platform: $PLATFORM"
+
+      - name: Set up QEMU
+        if: ${{ github.ref_type == 'tag' || (github.event_name == 'workflow_dispatch' && github.event.inputs.build_arm64 == 'true') }}
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+        with:
+          cache-binary: false
+
+      - name: Login to Docker Hub
+        if: ${{ github.event_name != 'pull_request' }}
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build Docker image
+        if: ${{ github.event_name == 'pull_request' }}
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          file: Dockerfile
+          push: false
+          platforms: ${{ env.PLATFORM }}
+          tags: ${{ env.DOCKER_TAGS }}
+          labels: |
+            org.opencontainers.image.title=rollup-node
+            org.opencontainers.image.description=DogeOS rollup-node service
+            org.opencontainers.image.version=${{ env.WORKSPACE_VERSION }}
+            org.opencontainers.image.created=${{ env.BUILD_DATE }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            dogeos.environment=${{ env.ENVIRONMENT }}
+            dogeos.version.major=${{ env.VERSION_MAJOR }}
+            dogeos.version.minor=${{ env.VERSION_MINOR }}
+            dogeos.version.patch=${{ env.VERSION_PATCH }}
+            dogeos.git.sha=${{ env.VCS_REF }}
+            dogeos.git.branch=${{ github.ref_name }}
+
+      - name: Build and push Docker image
+        if: ${{ github.event_name != 'pull_request' }}
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          platforms: ${{ env.PLATFORM }}
+          tags: ${{ env.DOCKER_TAGS }}
+          cache-from: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache
+          cache-to: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache,mode=max
+          labels: |
+            org.opencontainers.image.title=rollup-node
+            org.opencontainers.image.description=DogeOS rollup-node service
+            org.opencontainers.image.version=${{ env.WORKSPACE_VERSION }}
+            org.opencontainers.image.created=${{ env.BUILD_DATE }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            dogeos.environment=${{ env.ENVIRONMENT }}
+            dogeos.version.major=${{ env.VERSION_MAJOR }}
+            dogeos.version.minor=${{ env.VERSION_MINOR }}
+            dogeos.version.patch=${{ env.VERSION_PATCH }}
+            dogeos.git.sha=${{ env.VCS_REF }}
+            dogeos.git.branch=${{ github.ref_name }}
+        env:
+          DOCKER_BUILDKIT: 1

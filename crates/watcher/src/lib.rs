@@ -387,8 +387,9 @@ where
         let latest = self.latest_block().await?;
         self.handle_latest_block(&finalized.header, &latest.header).await?;
 
-        // Refresh after structural head handling so a retry does not duplicate `NewBlock`, but
-        // before log progress so `Processed` means the head's consensus update was queued.
+        // Refresh after structural head handling so a signer-read retry does not duplicate
+        // `NewBlock`, but before log progress so `Processed` means the head's consensus update was
+        // queued.
         self.handle_system_contract_update(&latest).await?;
 
         if latest.header.number != self.current_block_number {
@@ -761,9 +762,10 @@ where
 
     /// Refreshes the authorized signer once per distinct L1 head identity.
     ///
-    /// This method deduplicates by block number and hash, queues the consensus notification
-    /// internally, and leaves the refresh cursor unchanged when the storage read or send fails so
-    /// the same head remains retryable.
+    /// This method deduplicates by block number and hash and queues the consensus notification
+    /// internally. It leaves the refresh cursor unchanged on storage-read or send failure.
+    /// Storage-read failures remain retryable on the next step; send failures propagate and stop
+    /// the watcher.
     ///
     /// TODO(greg): replace polling with event-driven refresh when the system contract emits a
     /// suitable signer-update event.

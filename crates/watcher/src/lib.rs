@@ -995,23 +995,29 @@ mod tests {
         )
     }
 
-    fn step_watcher(
+    struct StepWatcherBlocks {
         unfinalized_blocks: Vec<Header>,
         provider_blocks: Vec<Header>,
         finalized_blocks: Vec<Header>,
         latest_blocks: Vec<Header>,
+    }
+
+    fn step_watcher(
+        blocks: StepWatcherBlocks,
         l1_state: L1State,
         current_block_number: u64,
         log_query_block_range: u64,
         storage_responses: Vec<TransportResult<StorageValue>>,
     ) -> (L1Watcher<MockProvider>, L1WatcherHandle) {
         let provider_blocks =
-            provider_blocks.into_iter().map(|header| Block { header, ..Default::default() });
-        let finalized_blocks = finalized_blocks
+            blocks.provider_blocks.into_iter().map(|header| Block { header, ..Default::default() });
+        let finalized_blocks = blocks
+            .finalized_blocks
             .into_iter()
             .map(|header| Block { header, ..Default::default() })
             .collect();
-        let latest_blocks = latest_blocks
+        let latest_blocks = blocks
+            .latest_blocks
             .into_iter()
             .map(|header| Block { header, ..Default::default() })
             .collect();
@@ -1030,7 +1036,7 @@ mod tests {
         (
             L1Watcher {
                 execution_provider: provider,
-                unfinalized_blocks: unfinalized_blocks.into(),
+                unfinalized_blocks: blocks.unfinalized_blocks.into(),
                 l1_state,
                 current_block_number,
                 last_authorized_signer_refresh_head: None,
@@ -1066,10 +1072,12 @@ mod tests {
         let (finalized, latest, chain) = chain(3);
         let signer = address!("1111111111111111111111111111111111111111");
         let (mut watcher, mut handle) = step_watcher(
-            chain[1..].to_vec(),
-            vec![finalized.clone()],
-            vec![finalized.clone(), finalized.clone()],
-            vec![latest.clone(), latest.clone()],
+            StepWatcherBlocks {
+                unfinalized_blocks: chain[1..].to_vec(),
+                provider_blocks: vec![finalized.clone()],
+                finalized_blocks: vec![finalized.clone(), finalized.clone()],
+                latest_blocks: vec![latest.clone(), latest.clone()],
+            },
             L1State { head: latest.number, finalized: finalized.number },
             latest.number,
             LOG_QUERY_BLOCK_RANGE,
@@ -1096,10 +1104,12 @@ mod tests {
         let previous_head = chain[1].clone();
         let signer = address!("2222222222222222222222222222222222222222");
         let (mut watcher, mut handle) = step_watcher(
-            vec![previous_head.clone()],
-            vec![finalized.clone()],
-            vec![finalized.clone()],
-            vec![latest.clone()],
+            StepWatcherBlocks {
+                unfinalized_blocks: vec![previous_head.clone()],
+                provider_blocks: vec![finalized.clone()],
+                finalized_blocks: vec![finalized.clone()],
+                latest_blocks: vec![latest.clone()],
+            },
             L1State { head: previous_head.number, finalized: finalized.number },
             previous_head.number,
             LOG_QUERY_BLOCK_RANGE,
@@ -1129,10 +1139,12 @@ mod tests {
         let old_signer = address!("8888888888888888888888888888888888888888");
         let new_signer = address!("9999999999999999999999999999999999999999");
         let (mut watcher, mut handle) = step_watcher(
-            vec![initial_head.clone()],
-            vec![finalized.clone()],
-            vec![finalized.clone(), finalized.clone()],
-            vec![first_forward_head.clone(), latest.clone()],
+            StepWatcherBlocks {
+                unfinalized_blocks: vec![initial_head.clone()],
+                provider_blocks: vec![finalized.clone()],
+                finalized_blocks: vec![finalized.clone(), finalized.clone()],
+                latest_blocks: vec![first_forward_head.clone(), latest.clone()],
+            },
             L1State { head: initial_head.number, finalized: finalized.number },
             initial_head.number,
             LOG_QUERY_BLOCK_RANGE,
@@ -1170,10 +1182,12 @@ mod tests {
         latest.number = 105;
         let signer = address!("3333333333333333333333333333333333333333");
         let (mut watcher, mut handle) = step_watcher(
-            vec![latest.clone()],
-            vec![finalized.clone()],
-            vec![finalized.clone(), finalized.clone()],
-            vec![latest.clone(), latest.clone()],
+            StepWatcherBlocks {
+                unfinalized_blocks: vec![latest.clone()],
+                provider_blocks: vec![finalized.clone()],
+                finalized_blocks: vec![finalized.clone(), finalized.clone()],
+                latest_blocks: vec![latest.clone(), latest.clone()],
+            },
             L1State { head: latest.number, finalized: finalized.number },
             100,
             2,
@@ -1204,10 +1218,12 @@ mod tests {
         let old_signer = address!("4444444444444444444444444444444444444444");
         let new_signer = address!("5555555555555555555555555555555555555555");
         let (mut watcher, mut handle) = step_watcher(
-            old_chain[1..].to_vec(),
-            vec![finalized.clone(), replacement_chain[1].clone()],
-            vec![finalized.clone(), finalized.clone()],
-            vec![old_latest.clone(), replacement_latest.clone()],
+            StepWatcherBlocks {
+                unfinalized_blocks: old_chain[1..].to_vec(),
+                provider_blocks: vec![finalized.clone(), replacement_chain[1].clone()],
+                finalized_blocks: vec![finalized.clone(), finalized.clone()],
+                latest_blocks: vec![old_latest.clone(), replacement_latest.clone()],
+            },
             L1State { head: old_latest.number, finalized: finalized.number },
             old_latest.number,
             LOG_QUERY_BLOCK_RANGE,
@@ -1242,10 +1258,12 @@ mod tests {
         let previous_head = chain[1].clone();
         let signer = address!("6666666666666666666666666666666666666666");
         let (mut watcher, mut handle) = step_watcher(
-            vec![previous_head.clone()],
-            vec![finalized.clone()],
-            vec![finalized.clone(), finalized.clone()],
-            vec![latest.clone(), latest.clone()],
+            StepWatcherBlocks {
+                unfinalized_blocks: vec![previous_head.clone()],
+                provider_blocks: vec![finalized.clone()],
+                finalized_blocks: vec![finalized.clone(), finalized.clone()],
+                latest_blocks: vec![latest.clone(), latest.clone()],
+            },
             L1State { head: previous_head.number, finalized: finalized.number },
             previous_head.number,
             LOG_QUERY_BLOCK_RANGE,
@@ -1279,10 +1297,12 @@ mod tests {
         let (finalized, latest, chain) = chain(3);
         let signer = address!("7777777777777777777777777777777777777777");
         let (mut watcher, mut handle) = step_watcher(
-            chain[1..].to_vec(),
-            vec![finalized.clone()],
-            vec![finalized.clone(), finalized.clone()],
-            vec![latest.clone(), latest.clone()],
+            StepWatcherBlocks {
+                unfinalized_blocks: chain[1..].to_vec(),
+                provider_blocks: vec![finalized.clone()],
+                finalized_blocks: vec![finalized.clone(), finalized.clone()],
+                latest_blocks: vec![latest.clone(), latest.clone()],
+            },
             L1State { head: latest.number, finalized: finalized.number },
             latest.number,
             LOG_QUERY_BLOCK_RANGE,

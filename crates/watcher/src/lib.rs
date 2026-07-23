@@ -88,7 +88,7 @@ pub struct L1Watcher<EP> {
     l1_state: L1State,
     /// The latest indexed block.
     current_block_number: BlockNumber,
-    /// The L1 head for which an authorized signer refresh was successfully delivered.
+    /// The L1 head for which an authorized signer refresh was successfully queued.
     last_authorized_signer_refresh_head: Option<BlockInfo>,
     /// The command receiver for the L1 watcher.
     command_rx: mpsc::UnboundedReceiver<L1WatcherCommand>,
@@ -386,6 +386,9 @@ where
         // handle the latest block.
         let latest = self.latest_block().await?;
         self.handle_latest_block(&finalized.header, &latest.header).await?;
+
+        // Refresh after structural head handling so a retry does not duplicate `NewBlock`, but
+        // before log progress so `Processed` means the head's consensus update was queued.
         self.handle_system_contract_update(&latest).await?;
 
         if latest.header.number != self.current_block_number {
@@ -756,8 +759,14 @@ where
         Ok(notifications)
     }
 
-    /// Handles the system contract update events.
-    /// TODO(greg): update with logs once system contract emits logs.
+    /// Refreshes the authorized signer once per distinct L1 head identity.
+    ///
+    /// This method deduplicates by block number and hash, queues the consensus notification
+    /// internally, and leaves the refresh cursor unchanged when the storage read or send fails so
+    /// the same head remains retryable.
+    ///
+    /// TODO(greg): replace polling with event-driven refresh when the system contract emits a
+    /// suitable signer-update event.
     async fn handle_system_contract_update(&mut self, latest_block: &Block) -> L1WatcherResult<()> {
         let latest_head = BlockInfo::from(&latest_block.header);
         if self.last_authorized_signer_refresh_head == Some(latest_head) {
@@ -1105,6 +1114,48 @@ mod tests {
             vec![
                 L1Notification::NewBlock((&latest).into()),
                 L1Notification::Consensus(ConsensusUpdate::AuthorizedSigner(signer)),
+                L1Notification::Processed(latest.number),
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn forward_head_signer_rotation_refreshes_each_head() -> eyre::Result<()> {
+        let (finalized, latest, chain) = chain(4);
+        let initial_head = chain[1].clone();
+        let first_forward_head = chain[2].clone();
+        let old_signer = address!("8888888888888888888888888888888888888888");
+        let new_signer = address!("9999999999999999999999999999999999999999");
+        let (mut watcher, mut handle) = step_watcher(
+            vec![initial_head.clone()],
+            vec![finalized.clone()],
+            vec![finalized.clone(), finalized.clone()],
+            vec![first_forward_head.clone(), latest.clone()],
+            L1State { head: initial_head.number, finalized: finalized.number },
+            initial_head.number,
+            LOG_QUERY_BLOCK_RANGE,
+            vec![Ok(storage_value(old_signer)), Ok(storage_value(new_signer))],
+        );
+
+        watcher.step().await?;
+        assert_eq!(
+            received_notifications(&mut handle),
+            vec![
+                L1Notification::NewBlock((&first_forward_head).into()),
+                L1Notification::Consensus(ConsensusUpdate::AuthorizedSigner(old_signer)),
+                L1Notification::Processed(first_forward_head.number),
+            ]
+        );
+
+        watcher.step().await?;
+        assert_eq!(watcher.execution_provider.storage_read_count(), 2);
+        assert_eq!(
+            received_notifications(&mut handle),
+            vec![
+                L1Notification::NewBlock((&latest).into()),
+                L1Notification::Consensus(ConsensusUpdate::AuthorizedSigner(new_signer)),
                 L1Notification::Processed(latest.number),
             ]
         );

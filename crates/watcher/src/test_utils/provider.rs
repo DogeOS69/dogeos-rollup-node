@@ -1,7 +1,10 @@
 use crate::Block;
 use std::{
     collections::{HashMap, VecDeque},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
 };
 
 use alloy_eips::BlockNumberOrTag;
@@ -20,6 +23,8 @@ pub struct MockProvider {
     logs: Arc<Mutex<VecDeque<Log>>>,
     finalized_blocks: Arc<Mutex<Vec<Block>>>,
     latest_blocks: Arc<Mutex<Vec<Block>>>,
+    storage_responses: Arc<Mutex<VecDeque<TransportResult<StorageValue>>>>,
+    storage_read_count: Arc<AtomicUsize>,
 }
 
 impl MockProvider {
@@ -42,7 +47,23 @@ impl MockProvider {
             logs: Arc::new(Mutex::new(logs.collect())),
             finalized_blocks: Arc::new(Mutex::new(finalized_blocks)),
             latest_blocks: Arc::new(Mutex::new(latest_blocks)),
+            storage_responses: Arc::new(Mutex::new(VecDeque::new())),
+            storage_read_count: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// Sets the scripted storage responses returned by [`Provider::get_storage_at`].
+    pub fn with_storage_responses(
+        mut self,
+        responses: impl IntoIterator<Item = TransportResult<StorageValue>>,
+    ) -> Self {
+        self.storage_responses = Arc::new(Mutex::new(responses.into_iter().collect()));
+        self
+    }
+
+    /// Returns the number of storage requests made through this provider.
+    pub fn storage_read_count(&self) -> usize {
+        self.storage_read_count.load(Ordering::Relaxed)
     }
 }
 
@@ -108,7 +129,14 @@ impl Provider for MockProvider {
         _address: Address,
         _key: U256,
     ) -> RpcWithBlock<(Address, U256), StorageValue> {
-        RpcWithBlock::new_provider(|_| ProviderCall::Ready(Some(Ok(StorageValue::ZERO))))
+        let storage_responses = Arc::clone(&self.storage_responses);
+        let storage_read_count = Arc::clone(&self.storage_read_count);
+        RpcWithBlock::new_provider(move |_| {
+            storage_read_count.fetch_add(1, Ordering::Relaxed);
+            let response =
+                storage_responses.lock().unwrap().pop_front().unwrap_or(Ok(StorageValue::ZERO));
+            ProviderCall::Ready(Some(response))
+        })
     }
 
     fn get_transaction_by_hash(

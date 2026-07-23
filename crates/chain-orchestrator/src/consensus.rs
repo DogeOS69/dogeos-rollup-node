@@ -117,9 +117,10 @@ mod tests {
     use std::{str::FromStr, sync::OnceLock};
 
     #[test]
-    fn test_should_validate_block() {
-        let consensus =
-            SystemContractConsensus::new(address!("d83c4892bb5aa241b63d8c4c134920111e142a20"));
+    fn authorized_signer_update_changes_sequencing_and_validation() {
+        let old_signer = address!("1111111111111111111111111111111111111111");
+        let new_signer = address!("d83c4892bb5aa241b63d8c4c134920111e142a20");
+        let mut consensus = SystemContractConsensus::new(old_signer);
         let signature = Signature::from_raw(&bytes!("6d2b8ef87f0956ea4dd10fb0725fa7196ad80c6d567a161f6b4367f95b5de6ec279142b540d3b248f08ed337bb962fa3fd83d21de622f7d6c8207272558fd15a00")).unwrap();
 
         let tx_hash = OnceLock::new();
@@ -168,6 +169,15 @@ mod tests {
                 withdrawals: None,
             },
         };
-        consensus.validate_new_block(&block, &signature).unwrap()
+
+        assert!(consensus.should_sequence_block(&old_signer));
+        assert!(!consensus.should_sequence_block(&new_signer));
+        assert!(consensus.validate_new_block(&block, &signature).is_err());
+
+        consensus.update_config(&ConsensusUpdate::AuthorizedSigner(new_signer));
+
+        assert!(!consensus.should_sequence_block(&old_signer));
+        assert!(consensus.should_sequence_block(&new_signer));
+        consensus.validate_new_block(&block, &signature).unwrap();
     }
 }

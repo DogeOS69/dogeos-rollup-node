@@ -1,7 +1,20 @@
 //! Scroll binary
 
+use reth_node_builder::TreeConfig;
+
+const DEFAULT_PERSISTENCE_THRESHOLD: u64 = 0;
+const DEFAULT_PERSISTENCE_BACKPRESSURE_THRESHOLD: u64 = 16;
+
 #[global_allocator]
 static ALLOC: reth_cli_util::allocator::Allocator = reth_cli_util::allocator::new_allocator();
+
+fn with_rollup_tree_overrides(tree_config: TreeConfig) -> TreeConfig {
+    tree_config
+        .with_always_process_payload_attributes_on_canonical_head(true)
+        .with_unwind_canonical_header(true)
+        // Use the legacy processor due to performance issues with Reth's state root task.
+        .with_legacy_state_root(true)
+}
 
 fn main() {
     use clap::Parser;
@@ -9,9 +22,16 @@ fn main() {
     use dogeos_reth_evm::ScrollEvmConfig;
     use reth_ethereum_cli::Cli;
     use reth_node_builder::EngineNodeLauncher;
+    use reth_node_core::args::DefaultEngineValues;
     use rollup_node::{DogeosChainSpecParser, ScrollRollupNode, ScrollRollupNodeConfig};
     use std::sync::Arc;
     use tracing::info;
+
+    DefaultEngineValues::default()
+        .with_persistence_threshold(DEFAULT_PERSISTENCE_THRESHOLD)
+        .with_persistence_backpressure_threshold(DEFAULT_PERSISTENCE_BACKPRESSURE_THRESHOLD)
+        .try_init()
+        .expect("engine defaults must be initialized before parsing CLI arguments");
 
     // set default log level to info if RUST_LOG is not set
     if std::env::var("RUST_LOG").is_err() {
@@ -56,15 +76,16 @@ fn main() {
                     // on top of heads part of the canonical state. Not
                     // providing this argument leads the `EngineTree` to ignore
                     // the payload building attributes: <https://github.com/scroll-tech/reth/blob/4271872fdcbe7ff96520825e38f5e36ef923fcca/crates/engine/tree/src/tree/mod.rs#L898>
-                    let tree_config = builder
-                        .config()
-                        .engine
-                        .tree_config()
-                        .with_always_process_payload_attributes_on_canonical_head(true)
-                        .with_persistence_threshold(0)
-                        .with_unwind_canonical_header(true)
-                        // Use legacy state root processor due to performance issues with the new state root processor in reth.
-                        .with_legacy_state_root(true);
+                    let tree_config =
+                        with_rollup_tree_overrides(builder.config().engine.tree_config());
+                    info!(
+                        target: "reth::cli",
+                        persistence_threshold = tree_config.persistence_threshold(),
+                        persistence_backpressure_threshold =
+                            tree_config.persistence_backpressure_threshold(),
+                        memory_block_buffer_target = tree_config.memory_block_buffer_target(),
+                        "Engine persistence configured"
+                    );
                     let launcher = EngineNodeLauncher::new(
                         builder.task_executor().clone(),
                         builder.config().datadir(),
@@ -78,5 +99,27 @@ fn main() {
     ) {
         eprintln!("Error: {err:?}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rollup_tree_overrides_preserve_persistence_settings() {
+        let tree_config = TreeConfig::default()
+            .with_persistence_backpressure_threshold(24)
+            .with_persistence_threshold(8)
+            .with_memory_block_buffer_target(0);
+
+        let tree_config = with_rollup_tree_overrides(tree_config);
+
+        assert_eq!(tree_config.persistence_threshold(), 8);
+        assert_eq!(tree_config.persistence_backpressure_threshold(), 24);
+        assert_eq!(tree_config.memory_block_buffer_target(), 0);
+        assert!(tree_config.always_process_payload_attributes_on_canonical_head());
+        assert!(tree_config.unwind_canonical_header());
+        assert!(tree_config.legacy_state_root());
     }
 }

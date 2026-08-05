@@ -6,7 +6,7 @@ static ALLOC: reth_cli_util::allocator::Allocator = reth_cli_util::allocator::ne
 fn main() {
     use clap::Parser;
     use reth_node_builder::EngineNodeLauncher;
-    use reth_scroll_cli::{Cli, ScrollChainSpecParser};
+    use reth_scroll_cli::{Cli, DogeosChainSpecParser};
     use rollup_node::{ScrollRollupNode, ScrollRollupNodeConfig};
     use tracing::info;
 
@@ -27,7 +27,7 @@ fn main() {
         std::env::set_var("RUST_BACKTRACE", "1");
     }
 
-    if let Err(err) = Cli::<ScrollChainSpecParser, ScrollRollupNodeConfig>::parse().run(
+    if let Err(err) = Cli::<DogeosChainSpecParser, ScrollRollupNodeConfig>::parse().run(
         |builder, args| async move {
             info!(target: "reth::cli", "Launching node");
 

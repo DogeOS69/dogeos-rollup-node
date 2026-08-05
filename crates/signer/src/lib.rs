@@ -134,7 +134,7 @@ impl std::fmt::Debug for Signer {
 mod tests {
     use super::*;
     use alloy_signer_local::PrivateKeySigner;
-    use reth_scroll_primitives::ScrollBlock;
+    use dogeos_reth_primitives::DogeosBlock;
     use rollup_node_primitives::sig_encode_hash;
 
     #[tokio::test]
@@ -144,7 +144,7 @@ mod tests {
         let mut handle = Signer::spawn(Box::new(signer.clone()));
 
         // Test sending a request
-        let block = ScrollBlock::default();
+        let block = DogeosBlock::default();
         handle.sign_block(block.clone()).unwrap();
 
         // Test receiving an event
@@ -214,7 +214,7 @@ mod tests {
         let task = tokio::spawn(signer.run());
 
         // Send a signing request through the handle
-        let block = ScrollBlock::default();
+        let block = DogeosBlock::default();
         handle.sign_block(block.clone()).unwrap();
 
         // Drop the handle to simulate shutdown

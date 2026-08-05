@@ -2,9 +2,10 @@
 
 use alloy_consensus::{transaction::TxHashRef, BlockHeader};
 use alloy_primitives::{hex, Address, U256};
+use dogeos_chainspec::DOGEOS_DEV;
+use dogeos_protocol_types::{ScrollTransaction, TxL1Message};
 use futures::stream::StreamExt;
 use reth_e2e_test_utils::transaction::TransactionTestContext;
-use reth_scroll_chainspec::SCROLL_DEV;
 use reth_scroll_node::test_utils::setup;
 use rollup_node::{
     constants::SCROLL_GAS_LIMIT,
@@ -19,10 +20,8 @@ use rollup_node_sequencer::{
     L1MessageInclusionMode, PayloadBuildingConfig, Sequencer, SequencerConfig, SequencerEvent,
 };
 use rollup_node_watcher::L1Notification;
-use scroll_alloy_consensus::{ScrollTransaction, TxL1Message};
-use scroll_alloy_provider::ScrollAuthApiEngineClient;
 use scroll_db::{test_utils::setup_test_db, DatabaseWriteOperations};
-use scroll_engine::{Engine, ForkchoiceState};
+use scroll_engine::{Engine, ForkchoiceState, ScrollAuthApiEngineClient};
 use std::{io::Write, path::PathBuf, sync::Arc};
 use tempfile::NamedTempFile;
 use tokio::{
@@ -207,7 +206,7 @@ async fn can_build_blocks() {
 async fn can_build_blocks_with_delayed_l1_messages() {
     reth_tracing::init_test_tracing();
 
-    let chain_spec = SCROLL_DEV.clone();
+    let chain_spec = DOGEOS_DEV.clone();
     const L1_MESSAGE_DELAY: u64 = 2;
 
     // setup a test node
@@ -341,7 +340,7 @@ async fn can_build_blocks_with_delayed_l1_messages() {
 async fn can_build_blocks_with_finalized_l1_messages() {
     reth_tracing::init_test_tracing();
 
-    let chain_spec = SCROLL_DEV.clone();
+    let chain_spec = DOGEOS_DEV.clone();
     // setup a test node
     let (mut nodes, _dbs, wallet) = setup_engine(
         default_test_scroll_rollup_node_config(),
@@ -493,7 +492,7 @@ async fn can_sequence_blocks_with_private_key_file() -> eyre::Result<()> {
     let expected_signer = alloy_signer_local::PrivateKeySigner::from_slice(&expected_key_bytes)?;
     let expected_address = expected_signer.address();
 
-    let chain_spec = (*SCROLL_DEV).clone();
+    let chain_spec = (*DOGEOS_DEV).clone();
     let rollup_manager_args = ScrollRollupNodeConfig {
         test_args: TestArgs {
             test: false, // disable test mode to enable real signing
@@ -600,7 +599,7 @@ async fn can_sequence_blocks_with_hex_key_file_without_prefix() -> eyre::Result<
         alloy_signer_local::PrivateKeySigner::from_slice(&expected_key_bytes).unwrap();
     let expected_address = expected_signer.address();
 
-    let chain_spec = (*SCROLL_DEV).clone();
+    let chain_spec = (*DOGEOS_DEV).clone();
     let rollup_manager_args = ScrollRollupNodeConfig {
         test_args: TestArgs {
             test: false, // disable test mode to enable real signing
@@ -693,7 +692,7 @@ async fn can_sequence_blocks_with_hex_key_file_without_prefix() -> eyre::Result<
 async fn can_build_blocks_and_exit_at_gas_limit() {
     reth_tracing::init_test_tracing();
 
-    let chain_spec = SCROLL_DEV.clone();
+    let chain_spec = DOGEOS_DEV.clone();
     const MIN_TRANSACTION_GAS_COST: u64 = 21_000;
     const TRANSACTIONS_COUNT: usize = 2000;
 
@@ -780,7 +779,7 @@ async fn can_build_blocks_and_exit_at_gas_limit() {
 async fn can_build_blocks_and_exit_at_time_limit() {
     reth_tracing::init_test_tracing();
 
-    let chain_spec = SCROLL_DEV.clone();
+    let chain_spec = DOGEOS_DEV.clone();
     const MIN_TRANSACTION_GAS_COST: u64 = 21_000;
     const BLOCK_BUILDING_DURATION: Duration = Duration::from_secs(1);
     const TRANSACTIONS_COUNT: usize = 2000;
@@ -876,7 +875,7 @@ async fn should_limit_l1_message_cumulative_gas() {
     reth_tracing::init_test_tracing();
 
     // setup a test node
-    let chain_spec = SCROLL_DEV.clone();
+    let chain_spec = DOGEOS_DEV.clone();
     let (mut nodes, _dbs, wallet) = setup_engine(
         default_test_scroll_rollup_node_config(),
         1,
@@ -1000,7 +999,7 @@ async fn should_not_add_skipped_messages() {
     reth_tracing::init_test_tracing();
 
     // setup a test node
-    let chain_spec = SCROLL_DEV.clone();
+    let chain_spec = DOGEOS_DEV.clone();
     let (mut nodes, _dbs, wallet) = setup_engine(
         default_test_scroll_rollup_node_config(),
         1,

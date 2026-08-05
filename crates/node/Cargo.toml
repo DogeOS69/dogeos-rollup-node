@@ -22,6 +22,18 @@ workspace = true
 # async trait support
 async-trait.workspace = true
 
+# DogeOS Reth 2 execution component family
+dogeos-chainspec = { workspace = true, features = ["std"] }
+dogeos-hardforks = { workspace = true, features = ["std"] }
+dogeos-protocol-types = { workspace = true, features = ["std"] }
+dogeos-reth-engine = { workspace = true, features = ["std"] }
+dogeos-reth-evm = { workspace = true, features = ["std"] }
+dogeos-reth-consensus.workspace = true
+dogeos-reth-node.workspace = true
+dogeos-reth-primitives = { workspace = true, features = ["std", "serde", "reth-codec"] }
+dogeos-reth-rpc = { workspace = true, features = ["std"] }
+dogeos-rpc-types = { workspace = true, features = ["std", "reth"] }
+
 # alloy
 alloy-chains.workspace = true
 alloy-consensus.workspace = true
@@ -37,21 +49,7 @@ alloy-signer-aws = "1.0.30"
 alloy-signer = "1.0.30"
 alloy-transport.workspace = true
 
-scroll-alloy-consensus.workspace = true
-scroll-alloy-evm.workspace = true
-scroll-alloy-hardforks.workspace = true
-scroll-alloy-network.workspace = true
-scroll-alloy-provider.workspace = true
-
 reth-primitives-traits.workspace = true
-reth-scroll-engine-primitives.workspace = true
-reth-scroll-evm.workspace = true
-reth-scroll-cli.workspace = true
-reth-scroll-consensus.workspace = true
-reth-scroll-primitives.workspace = true
-reth-scroll-chainspec.workspace = true
-reth-scroll-node.workspace = true
-reth-scroll-rpc.workspace = true
 
 reth-chainspec.workspace = true
 reth-cli.workspace = true
@@ -69,6 +67,7 @@ reth-network-peers.workspace = true
 reth-provider.workspace = true
 reth-revm.workspace = true
 reth-rpc-api.workspace = true
+reth-rpc-builder.workspace = true
 reth-rpc-eth-api.workspace = true
 reth-rpc-eth-types.workspace = true
 reth-tasks.workspace = true
@@ -100,8 +99,6 @@ reth-fs-util = { workspace = true, optional = true }
 reth-rpc-layer = { workspace = true, optional = true }
 reth-rpc-server-types = { workspace = true, optional = true }
 reth-storage-api = { workspace = true, optional = true }
-scroll-alloy-rpc-types-engine = { workspace = true, optional = true }
-scroll-alloy-rpc-types.workspace = true
 
 # debug-toolkit dependencies
 alloy-sol-types = { workspace = true, optional = true }
@@ -126,6 +123,7 @@ serde_json.workspace = true
 jsonrpsee = { version = "0.26.0", features = ["server", "client", "macros"] }
 rayon.workspace = true
 reqwest.workspace = true
+reqwest-13 = { package = "reqwest", version = "0.13", default-features = false, features = ["rustls"] }
 tokio.workspace = true
 tracing.workspace = true
 console-subscriber = "0.5.0"
@@ -149,19 +147,17 @@ reth-provider.workspace = true
 reth-primitives-traits.workspace = true
 reth-rpc-layer.workspace = true
 reth-rpc-server-types.workspace = true
-reth-scroll-node = { workspace = true, features = ["test-utils"] }
 reth-storage-api.workspace = true
 reth-tasks.workspace = true
 reth-tokio-util.workspace = true
 reth-tracing.workspace = true
 rollup-node = { workspace = true, features = ["test-utils"] }
-scroll-alloy-rpc-types-engine.workspace = true
 serde_json = { workspace = true, features = ["alloc"] }
 color-eyre = "0.6"
 alloy-rpc-types-eth = { workspace = true }
 
 [features]
-js-tracer = ["reth-scroll-node/js-tracer", "reth-scroll-rpc/js-tracer"]
+js-tracer = []
 debug-toolkit = [
     "test-utils",
     "dep:alloy-sol-types",
@@ -183,7 +179,6 @@ test-utils = [
     "reth-node-builder/test-utils",
     "reth-provider/test-utils",
     "reth-revm/test-utils",
-    "reth-scroll-node/test-utils",
     "reth-transaction-pool/test-utils",
     "rollup-node-providers/test-utils",
     "rollup-node-watcher/test-utils",
@@ -193,7 +188,6 @@ test-utils = [
     "reth-e2e-test-utils",
     "reth-rpc-server-types",
     "reth-rpc-layer",
-    "scroll-alloy-rpc-types-engine",
     "reth-primitives-traits/test-utils",
     "reth-network-p2p/test-utils",
     "rollup-node-chain-orchestrator/test-utils",

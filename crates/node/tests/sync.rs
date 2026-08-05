@@ -1,11 +1,12 @@
 //! Contains tests related to RN and EN sync.
 
 use alloy_primitives::{b256, Address, B256, U256};
+use dogeos_chainspec::{DOGEOS_CHIKYU, DOGEOS_DEV};
+use dogeos_protocol_types::TxL1Message;
 use futures::StreamExt;
 use reqwest::Url;
 use reth_provider::{BlockIdReader, BlockReader};
 use reth_rpc_eth_api::helpers::EthTransactions;
-use reth_scroll_chainspec::{SCROLL_DEV, SCROLL_SEPOLIA};
 use reth_tokio_util::EventStream;
 use rollup_node::{
     test_utils::{
@@ -20,7 +21,6 @@ use rollup_node_chain_orchestrator::ChainOrchestratorEvent;
 use rollup_node_primitives::BlockInfo;
 use rollup_node_sequencer::L1MessageInclusionMode;
 use rollup_node_watcher::L1Notification;
-use scroll_alloy_consensus::TxL1Message;
 use std::{path::PathBuf, sync::Arc};
 
 #[tokio::test]
@@ -82,7 +82,7 @@ async fn test_should_consolidate_to_block_15k() -> eyre::Result<()> {
         require_l1_data_fee_buffer: false,
     };
 
-    let chain_spec = (*SCROLL_SEPOLIA).clone();
+    let chain_spec = (*DOGEOS_CHIKYU).clone();
     let (mut nodes, _dbs, _wallet) =
         setup_engine(node_config, 1, chain_spec.clone(), false, false, None, None).await?;
     let node = nodes.pop().unwrap();
@@ -555,7 +555,7 @@ async fn test_chain_orchestrator_l1_reorg() -> eyre::Result<()> {
     };
 
     // Create the chain spec for scroll dev with Feynman activated and a test genesis.
-    let chain_spec = (*SCROLL_DEV).clone();
+    let chain_spec = (*DOGEOS_DEV).clone();
 
     // Create a sequencer node and an unsynced node.
     let (mut nodes, _dbs, _wallet) = setup_engine(

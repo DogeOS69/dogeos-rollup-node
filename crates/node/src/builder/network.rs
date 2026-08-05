@@ -1,24 +1,25 @@
+use alloy_consensus::BlockHeader as _;
 use alloy_primitives::{Address, Signature, B256};
+use dogeos_chainspec::DogeosChainSpec;
+use dogeos_reth_primitives::DogeosPrimitives;
 use reth_chainspec::EthChainSpec;
-use reth_eth_wire_types::BasicNetworkPrimitives;
 use reth_network::{
     config::NetworkMode,
+    primitives::BasicNetworkPrimitives,
     protocol::{RlpxSubProtocol, RlpxSubProtocols},
     transform::header::{HeaderResponseTransform, HeaderTransform},
     NetworkConfig, NetworkHandle, NetworkManager, PeersInfo,
 };
-use reth_node_api::TxTy;
+use reth_node_api::{NodeTypes, TxTy};
 use reth_node_builder::{components::NetworkBuilder, BuilderContext, FullNodeTypes};
-use reth_node_types::NodeTypes;
 use reth_primitives_traits::{BlockHeader, Header};
-use reth_scroll_chainspec::ScrollChainSpec;
-use reth_scroll_primitives::ScrollPrimitives;
 use reth_transaction_pool::{PoolTransaction, TransactionPool};
 use rollup_node_primitives::sig_encode_hash;
 use rollup_node_signer::SignatureAsBytes;
-use scroll_alloy_hardforks::ScrollHardforks;
 use scroll_db::{Database, DatabaseReadOperations, DatabaseWriteOperations};
+use scroll_network::{EthWireBlockImport, EthWireBlockWithPeer};
 use std::{fmt, fmt::Debug, sync::Arc};
+use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, info, trace, warn};
 
 use crate::args::RollupNodeNetworkArgs;
@@ -32,12 +33,22 @@ pub struct ScrollNetworkBuilder {
     rollup_node_db: Arc<Database>,
     /// The address for which we should persist and serve signatures for.
     signer: Option<Address>,
+    /// Sender used to bridge Reth's `eth` block-import callback into the rollup network manager.
+    eth_wire_block_tx: UnboundedSender<EthWireBlockWithPeer>,
 }
 
 impl ScrollNetworkBuilder {
     /// Create a new [`ScrollNetworkBuilder`] with provided rollup node database.
-    pub fn new(rollup_node_db: Arc<Database>) -> Self {
-        Self { scroll_sub_protocols: RlpxSubProtocols::default(), rollup_node_db, signer: None }
+    pub fn new(
+        rollup_node_db: Arc<Database>,
+        eth_wire_block_tx: UnboundedSender<EthWireBlockWithPeer>,
+    ) -> Self {
+        Self {
+            scroll_sub_protocols: RlpxSubProtocols::default(),
+            rollup_node_db,
+            signer: None,
+            eth_wire_block_tx,
+        }
     }
 
     /// Add a scroll sub-protocol to the network builder.
@@ -57,16 +68,16 @@ impl ScrollNetworkBuilder {
 impl<Node, Pool> NetworkBuilder<Node, Pool> for ScrollNetworkBuilder
 where
     Node:
-        FullNodeTypes<Types: NodeTypes<ChainSpec = ScrollChainSpec, Primitives = ScrollPrimitives>>,
+        FullNodeTypes<Types: NodeTypes<ChainSpec = DogeosChainSpec, Primitives = DogeosPrimitives>>,
     Pool: TransactionPool<
             Transaction: PoolTransaction<
                 Consensus = TxTy<Node::Types>,
-                Pooled = scroll_alloy_consensus::ScrollPooledTransaction,
+                Pooled = dogeos_protocol_types::ScrollPooledTransaction,
             >,
         > + Unpin
         + 'static,
 {
-    type Network = NetworkHandle<ScrollNetworkPrimitives>;
+    type Network = NetworkHandle<DogeosNetworkPrimitives>;
 
     async fn build_network(
         self,
@@ -80,21 +91,15 @@ where
         } else {
             self.signer
         };
-        let transform = ScrollHeaderTransform::new(
-            chain_spec.clone(),
-            self.rollup_node_db.clone(),
-            authorized_signer,
-        );
-        let request_transform = ScrollRequestHeaderTransform::new(
-            chain_spec,
-            self.rollup_node_db.clone(),
-            authorized_signer,
-        );
+        let transform = ScrollHeaderTransform::new(self.rollup_node_db.clone(), authorized_signer);
+        let request_transform =
+            ScrollRequestHeaderTransform::new(self.rollup_node_db.clone(), authorized_signer);
 
         // set the network mode to work.
         let config = ctx.network_config()?;
         let config = NetworkConfig {
             network_mode: NetworkMode::Work,
+            block_import: Box::new(EthWireBlockImport::new(self.eth_wire_block_tx)),
             header_transform: Arc::new(transform),
             extra_protocols: self.scroll_sub_protocols,
             ..config
@@ -108,8 +113,8 @@ where
 }
 
 /// Network primitive types used by Scroll networks.
-type ScrollNetworkPrimitives =
-    BasicNetworkPrimitives<ScrollPrimitives, scroll_alloy_consensus::ScrollPooledTransaction>;
+type DogeosNetworkPrimitives =
+    BasicNetworkPrimitives<DogeosPrimitives, dogeos_protocol_types::ScrollPooledTransaction>;
 
 /// Errors that can occur during signature validation
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,44 +145,29 @@ impl std::error::Error for HeaderTransformError {}
 /// An implementation of a [`HeaderTransform`] for downloaded headers for Scroll.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
-pub(crate) struct ScrollHeaderTransform<ChainSpec> {
-    chain_spec: Arc<ChainSpec>,
+pub(crate) struct ScrollHeaderTransform {
     db: Arc<Database>,
     signer: Option<Address>,
 }
 
-impl<ChainSpec: EthChainSpec + ScrollHardforks + Debug + Send + Sync + 'static>
-    ScrollHeaderTransform<ChainSpec>
-{
-    /// Returns a new instance of the [`ScrollHeaderTransform`] from the provider chain spec.
-    pub(crate) const fn new(
-        chain_spec: Arc<ChainSpec>,
-        db: Arc<Database>,
-        signer: Option<Address>,
-    ) -> Self {
-        Self { chain_spec, db, signer }
+impl ScrollHeaderTransform {
+    /// Returns a new [`ScrollHeaderTransform`].
+    pub(crate) const fn new(db: Arc<Database>, signer: Option<Address>) -> Self {
+        Self { db, signer }
     }
 }
 
 #[async_trait::async_trait]
-impl<H: BlockHeader, ChainSpec: EthChainSpec + ScrollHardforks + Debug + Send + Sync + 'static>
-    HeaderTransform<H> for ScrollHeaderTransform<ChainSpec>
-{
-    async fn map(&self, mut headers: Vec<H>) -> Vec<H> {
+impl HeaderTransform<Header> for ScrollHeaderTransform {
+    async fn map(&self, mut headers: Vec<Header>) -> Vec<Header> {
         // TODO: remove this once we deprecated l2geth
         let signer = self.signer;
-        let chain_spec = self.chain_spec.clone();
-
         // Process headers in a blocking task to avoid blocking the async runtime
         let (headers, signatures) = tokio::task::spawn_blocking(move || {
             use rayon::prelude::*;
 
             let signatures: Vec<(B256, Signature)> = headers.par_iter_mut().filter_map(|header| {
-                if !chain_spec.is_euclid_v2_active_at_timestamp(header.timestamp()) {
-                    return None
-                }
-
-                let signature_bytes = std::mem::take(header.extra_data_mut());
+                let signature_bytes = std::mem::take(&mut header.extra_data);
                 let signature = if let Ok(sig) = parse_65b_signature(&signature_bytes) {
                     sig
                 } else {
@@ -227,34 +217,21 @@ impl<H: BlockHeader, ChainSpec: EthChainSpec + ScrollHardforks + Debug + Send + 
 /// An implementation of a [`HeaderTransform`] for header request responses for Scroll.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
-pub(crate) struct ScrollRequestHeaderTransform<ChainSpec> {
-    chain_spec: ChainSpec,
+pub(crate) struct ScrollRequestHeaderTransform {
     db: Arc<Database>,
     signer: Option<Address>,
 }
 
-impl<ChainSpec: EthChainSpec + ScrollHardforks + Debug + Send + Sync + 'static>
-    ScrollRequestHeaderTransform<ChainSpec>
-{
-    /// Returns a new instance of the [`ScrollHeaderTransform`] from the provider chain spec.
-    pub(crate) const fn new(
-        chain_spec: ChainSpec,
-        db: Arc<Database>,
-        signer: Option<Address>,
-    ) -> Self {
-        Self { chain_spec, db, signer }
+impl ScrollRequestHeaderTransform {
+    /// Returns a new [`ScrollRequestHeaderTransform`].
+    pub(crate) const fn new(db: Arc<Database>, signer: Option<Address>) -> Self {
+        Self { db, signer }
     }
 }
 
 #[async_trait::async_trait]
-impl<H: BlockHeader, ChainSpec: EthChainSpec + ScrollHardforks + Debug + Send + Sync>
-    HeaderResponseTransform<H> for ScrollRequestHeaderTransform<ChainSpec>
-{
-    async fn map(&self, mut header: H) -> H {
-        if !self.chain_spec.is_euclid_v2_active_at_timestamp(header.timestamp()) {
-            return header;
-        }
-
+impl HeaderResponseTransform<Header> for ScrollRequestHeaderTransform {
+    async fn map(&self, mut header: Header) -> Header {
         // read the signature from the rollup node.
         let hash = header.hash_slow();
 
@@ -283,7 +260,7 @@ impl<H: BlockHeader, ChainSpec: EthChainSpec + ScrollHardforks + Debug + Send + 
                     err
                 );
             } else {
-                *header.extra_data_mut() = sig.sig_as_bytes().into();
+                header.extra_data = sig.sig_as_bytes().into();
             }
         } else {
             debug!(

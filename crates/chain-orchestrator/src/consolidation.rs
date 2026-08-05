@@ -1,10 +1,10 @@
 use super::ChainOrchestratorError;
 use alloy_provider::Provider;
+use dogeos_rpc_types::Scroll;
 use futures::{stream::FuturesOrdered, TryStreamExt};
 use rollup_node_primitives::{
     BatchConsolidationOutcome, BatchInfo, BatchStatus, L2BlockInfoWithL1Messages,
 };
-use scroll_alloy_network::Scroll;
 use scroll_derivation_pipeline::{BatchDerivationResult, DerivedAttributes};
 use scroll_engine::{block_matches_attributes, ForkchoiceState};
 

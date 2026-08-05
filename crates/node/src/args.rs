@@ -15,16 +15,15 @@ use alloy_signer_local::PrivateKeySigner;
 use alloy_transport::layers::RetryBackoffLayer;
 use aws_sdk_kms::config::BehaviorVersion;
 use clap::ArgAction;
+use dogeos_chainspec::{ChainConfig, DogeosChainSpec, ScrollChainConfig, SCROLL_FEE_VAULT_ADDRESS};
+use dogeos_hardforks::DogeosHardforks;
+use dogeos_reth_consensus::DogeosConsensus;
+use dogeos_rpc_types::Scroll;
 use reth_chainspec::EthChainSpec;
 use reth_network::NetworkProtocols;
 use reth_network_api::FullNetwork;
 use reth_network_p2p::FullBlockClient;
 use reth_node_builder::{rpc::RethRpcServerHandles, NodeConfig as RethNodeConfig};
-use reth_scroll_chainspec::{
-    ChainConfig, ScrollChainConfig, ScrollChainSpec, SCROLL_FEE_VAULT_ADDRESS,
-};
-use reth_scroll_consensus::ScrollBeaconConsensus;
-use reth_scroll_node::ScrollNetworkPrimitives;
 use rollup_node_chain_orchestrator::{
     ChainOrchestrator, ChainOrchestratorConfig, ChainOrchestratorHandle, Consensus, NoopConsensus,
     SystemContractConsensus,
@@ -37,17 +36,14 @@ use rollup_node_sequencer::{
     L1MessageInclusionMode, PayloadBuildingConfig, Sequencer, SequencerConfig,
 };
 use rollup_node_watcher::{L1Watcher, L1WatcherCommand};
-use scroll_alloy_hardforks::ScrollHardforks;
-use scroll_alloy_network::Scroll;
-use scroll_alloy_provider::{ScrollAuthApiEngineClient, ScrollEngineApi};
 use scroll_db::{
     Database, DatabaseConnectionProvider, DatabaseError, DatabaseMaintenance,
     DatabaseReadOperations, DatabaseWriteOperations,
 };
 use scroll_derivation_pipeline::DerivationPipeline;
-use scroll_engine::{Engine, ForkchoiceState};
+use scroll_engine::{Engine, ForkchoiceState, ScrollAuthApiEngineClient, ScrollEngineApi};
 use scroll_migration::{traits::ScrollMigrator, MigratorTrait};
-use scroll_network::ScrollNetworkManager;
+use scroll_network::{DogeosNetworkPrimitives, EthWireBlockWithPeer, ScrollNetworkManager};
 use scroll_wire::ScrollWireEvent;
 use std::{fs, path::PathBuf, sync::Arc};
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -159,7 +155,7 @@ impl ScrollRollupNodeConfig {
     /// Hydrate the config by initializing the database connection.
     pub async fn hydrate(
         &mut self,
-        node_config: RethNodeConfig<ScrollChainSpec>,
+        node_config: RethNodeConfig<DogeosChainSpec>,
     ) -> eyre::Result<()> {
         // Instantiate the database
         let db_path = node_config.datadir().db();
@@ -184,11 +180,12 @@ impl ScrollRollupNodeConfig {
         self,
         ctx: RollupNodeContext<N, CS>,
         events: UnboundedReceiver<ScrollWireEvent>,
+        eth_wire_events: UnboundedReceiver<EthWireBlockWithPeer>,
         rpc_server_handles: RethRpcServerHandles,
     ) -> eyre::Result<(
         ChainOrchestrator<
             N,
-            impl ScrollHardforks + EthChainSpec<Header: BlockHeader> + IsDevChain + Clone + 'static,
+            impl DogeosHardforks + EthChainSpec<Header: BlockHeader> + IsDevChain + Clone + 'static,
             impl L1MessageProvider + Clone,
             impl Provider<Scroll> + Clone,
             impl ScrollEngineApi,
@@ -196,10 +193,12 @@ impl ScrollRollupNodeConfig {
         ChainOrchestratorHandle<N>,
     )>
     where
-        N: FullNetwork<Primitives = ScrollNetworkPrimitives> + NetworkProtocols,
+        N: FullNetwork<Primitives = DogeosNetworkPrimitives>
+            + NetworkProtocols
+            + scroll_network::EthWirePeerSender,
         CS: EthChainSpec<Header: BlockHeader>
             + ChainConfig<Config = ScrollChainConfig>
-            + ScrollHardforks
+            + DogeosHardforks
             + IsDevChain
             + 'static,
     {
@@ -367,10 +366,8 @@ impl ScrollRollupNodeConfig {
         let chain_spec = Arc::new(chain_spec.clone());
 
         // Instantiate the network manager
-        let eth_wire_listener = self
-            .network_args
-            .enable_eth_scroll_wire_bridge
-            .then_some(ctx.network.eth_wire_block_listener().await?);
+        let eth_wire_listener =
+            self.network_args.enable_eth_scroll_wire_bridge.then_some(eth_wire_events);
 
         // TODO: remove this once we deprecate l2geth.
         let authorized_signer = self.network_args.effective_signer(chain_spec.chain().named());
@@ -493,7 +490,7 @@ impl ScrollRollupNodeConfig {
                 .fetch_client()
                 .await
                 .expect("failed to fetch block client"),
-            Arc::new(ScrollBeaconConsensus::new(chain_spec.clone())),
+            Arc::new(DogeosConsensus),
         );
         let l1_v2_message_queue_start_index =
             l1_v2_message_queue_start_index(chain_spec.chain().named());
@@ -683,8 +680,8 @@ impl RollupNodeNetworkArgs {
     /// Get the default authorized signer address for the given chain.
     pub const fn default_authorized_signer(chain: Option<NamedChain>) -> Option<Address> {
         match chain {
-            Some(NamedChain::Scroll) => Some(constants::SCROLL_MAINNET_SIGNER),
-            Some(NamedChain::ScrollSepolia) => Some(constants::SCROLL_SEPOLIA_SIGNER),
+            Some(NamedChain::Scroll) => Some(constants::DOGEOS_MAINNET_SIGNER),
+            Some(NamedChain::ScrollSepolia) => Some(constants::DOGEOS_CHIKYU_SIGNER),
             _ => None,
         }
     }
@@ -985,8 +982,8 @@ pub struct RemoteBlockSourceArgs {
 /// Returns the total difficulty constant for the given chain.
 const fn td_constant(chain: Option<NamedChain>) -> U128 {
     match chain {
-        Some(NamedChain::Scroll) => constants::SCROLL_MAINNET_TD_CONSTANT,
-        Some(NamedChain::ScrollSepolia) => constants::SCROLL_SEPOLIA_TD_CONSTANT,
+        Some(NamedChain::Scroll) => constants::DOGEOS_MAINNET_TD_CONSTANT,
+        Some(NamedChain::ScrollSepolia) => constants::DOGEOS_CHIKYU_TD_CONSTANT,
         _ => U128::ZERO, // Default to zero for other chains
     }
 }
@@ -994,8 +991,8 @@ const fn td_constant(chain: Option<NamedChain>) -> U128 {
 /// The L1 message queue index at which queue hashes should be computed .
 const fn l1_v2_message_queue_start_index(chain: Option<NamedChain>) -> u64 {
     match chain {
-        Some(NamedChain::Scroll) => constants::SCROLL_MAINNET_V2_MESSAGE_QUEUE_START_INDEX,
-        Some(NamedChain::ScrollSepolia) => constants::SCROLL_SEPOLIA_V2_MESSAGE_QUEUE_START_INDEX,
+        Some(NamedChain::Scroll) => constants::DOGEOS_MAINNET_V2_MESSAGE_QUEUE_START_INDEX,
+        Some(NamedChain::ScrollSepolia) => constants::DOGEOS_CHIKYU_V2_MESSAGE_QUEUE_START_INDEX,
         _ => 0,
     }
 }
@@ -1010,12 +1007,12 @@ mod tests {
         // Test Scroll mainnet
         let mainnet_signer =
             RollupNodeNetworkArgs::default_authorized_signer(Some(NamedChain::Scroll));
-        assert_eq!(mainnet_signer, Some(constants::SCROLL_MAINNET_SIGNER));
+        assert_eq!(mainnet_signer, Some(constants::DOGEOS_MAINNET_SIGNER));
 
         // Test Scroll Sepolia
         let sepolia_signer =
             RollupNodeNetworkArgs::default_authorized_signer(Some(NamedChain::ScrollSepolia));
-        assert_eq!(sepolia_signer, Some(constants::SCROLL_SEPOLIA_SIGNER));
+        assert_eq!(sepolia_signer, Some(constants::DOGEOS_CHIKYU_SIGNER));
 
         // Test other chains
         let other_signer =
@@ -1040,11 +1037,11 @@ mod tests {
         let network_args_default = RollupNodeNetworkArgs::default();
         assert_eq!(
             network_args_default.effective_signer(Some(NamedChain::Scroll)),
-            Some(constants::SCROLL_MAINNET_SIGNER)
+            Some(constants::DOGEOS_MAINNET_SIGNER)
         );
         assert_eq!(
             network_args_default.effective_signer(Some(NamedChain::ScrollSepolia)),
-            Some(constants::SCROLL_SEPOLIA_SIGNER)
+            Some(constants::DOGEOS_CHIKYU_SIGNER)
         );
         assert_eq!(network_args_default.effective_signer(Some(NamedChain::Mainnet)), None);
     }

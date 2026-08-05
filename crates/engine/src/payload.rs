@@ -1,6 +1,6 @@
 use alloy_primitives::B64;
+use dogeos_reth_engine::ScrollPayloadAttributes;
 use reth_primitives_traits::{AlloyBlockHeader, Block, BlockBody};
-use scroll_alloy_rpc_types_engine::ScrollPayloadAttributes;
 
 use tracing::debug;
 
@@ -75,7 +75,7 @@ pub fn block_matches_attributes<B: Block>(attributes: &ScrollPayloadAttributes, 
         return false;
     }
 
-    // nonce defaults to `Some(0x0000000000000000)` for `ScrollBlock`.
+    // nonce defaults to `Some(0x0000000000000000)` for `DogeosBlock`.
     if B64::from(block_data.nonce.unwrap_or_default()) != header.nonce().unwrap_or_default() {
         debug!(
             target: "scroll::engine::driver",
@@ -97,10 +97,10 @@ mod tests {
     use alloy_eips::Encodable2718;
     use alloy_primitives::{Bytes, B256, U256};
     use arbitrary::{Arbitrary, Unstructured};
-    use reth_scroll_primitives::ScrollBlock;
+    use dogeos_protocol_types::ScrollTxEnvelope;
+    use dogeos_reth_engine::BlockDataHint;
+    use dogeos_reth_primitives::DogeosBlock;
     use reth_testing_utils::{generators, generators::Rng};
-    use scroll_alloy_consensus::ScrollTxEnvelope;
-    use scroll_alloy_rpc_types_engine::BlockDataHint;
 
     #[test]
     fn test_matching_payloads() -> eyre::Result<()> {
@@ -125,7 +125,7 @@ mod tests {
         attributes.payload_attributes.prev_randao = prev_randao;
         attributes.block_data_hint = block_data_hint.clone();
 
-        let block = ScrollBlock {
+        let block = DogeosBlock {
             header: Header {
                 parent_hash,
                 timestamp,
@@ -159,7 +159,7 @@ mod tests {
         let extra_data = Bytes::arbitrary(&mut unstructured)?;
 
         let attributes = ScrollPayloadAttributes::arbitrary(&mut unstructured)?;
-        let block = ScrollBlock {
+        let block = DogeosBlock {
             header: Header {
                 parent_hash,
                 timestamp,

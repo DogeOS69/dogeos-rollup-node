@@ -19,14 +19,14 @@ alloy-rpc-types-engine.workspace = true
 alloy-rpc-types-eth.workspace = true
 
 # scroll
-scroll-alloy-consensus.workspace = true
-scroll-alloy-rpc-types-engine.workspace = true
-reth-scroll-chainspec.workspace = true
+dogeos-protocol-types.workspace = true
+dogeos-reth-engine.workspace = true
+dogeos-chainspec.workspace = true
 
 # reth
 reth-network-peers.workspace = true
 reth-primitives-traits.workspace = true
-reth-scroll-primitives.workspace = true
+dogeos-reth-primitives.workspace = true
 reth-chainspec.workspace = true
 reth-node-core.workspace = true
 
@@ -41,16 +41,16 @@ default = ["std"]
 std = [
     "alloy-primitives/std",
     "alloy-rpc-types-engine/std",
-    "scroll-alloy-consensus/std",
+    "dogeos-protocol-types/std",
     "derive_more/std",
-    "scroll-alloy-rpc-types-engine/std",
+    "dogeos-reth-engine/std",
     "alloy-eips/std",
-    "reth-scroll-primitives/std",
+    "dogeos-reth-primitives/std",
     "reth-primitives-traits/std",
     "alloy-consensus/std",
     "alloy-chains/std",
     "reth-chainspec/std",
-    "reth-scroll-chainspec/std",
+    "dogeos-chainspec/std",
     "reth-network-peers/std",
     "alloy-rpc-types-eth/std",
 ]
@@ -58,11 +58,9 @@ arbitrary = [
     "std",
     "dep:arbitrary",
     "alloy-primitives/arbitrary",
-    "scroll-alloy-consensus/arbitrary",
+    "dogeos-protocol-types/arbitrary",
     "alloy-eips/arbitrary",
-    "scroll-alloy-rpc-types-engine/arbitrary",
-    "reth-scroll-primitives/arbitrary",
-    "reth-scroll-primitives/std",
+    "dogeos-reth-primitives/std",
     "reth-primitives-traits/arbitrary",
     "alloy-consensus/arbitrary",
     "alloy-rpc-types-engine/arbitrary",
@@ -77,8 +75,7 @@ serde = [
     "alloy-primitives/serde",
     "alloy-rpc-types-engine/serde",
     "reth-primitives-traits/serde",
-    "reth-scroll-primitives/serde",
-    "scroll-alloy-consensus/serde",
-    "scroll-alloy-rpc-types-engine/serde",
+    "dogeos-reth-primitives/serde",
+    "dogeos-protocol-types/serde",
     "alloy-rpc-types-eth/serde",
 ]

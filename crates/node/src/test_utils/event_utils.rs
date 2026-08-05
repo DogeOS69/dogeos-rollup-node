@@ -3,8 +3,8 @@
 use super::fixture::TestFixture;
 use std::time::Duration;
 
+use dogeos_reth_primitives::DogeosBlock;
 use futures::{FutureExt, StreamExt};
-use reth_scroll_primitives::ScrollBlock;
 use rollup_node_chain_orchestrator::ChainOrchestratorEvent;
 use rollup_node_primitives::ChainImport;
 use tokio::time::timeout;
@@ -33,7 +33,7 @@ impl<'a> EventWaiter<'a> {
     }
 
     /// Wait for block sequenced event on all specified nodes.
-    pub async fn block_sequenced(self, target: u64) -> eyre::Result<ScrollBlock> {
+    pub async fn block_sequenced(self, target: u64) -> eyre::Result<DogeosBlock> {
         self.wait_for_event_on_all(|e| {
             if let ChainOrchestratorEvent::BlockSequenced(block) = e {
                 (block.header.number == target).then(|| block.clone())
@@ -196,7 +196,7 @@ impl<'a> EventWaiter<'a> {
     }
 
     /// Wait for new block received event on all specified nodes.
-    pub async fn new_block_received(self) -> eyre::Result<ScrollBlock> {
+    pub async fn new_block_received(self) -> eyre::Result<DogeosBlock> {
         self.wait_for_event_on_all(|e| {
             if let ChainOrchestratorEvent::NewBlockReceived(block_with_peer) = e {
                 Some(block_with_peer.block.clone())

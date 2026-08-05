@@ -6,15 +6,13 @@ use alloy_primitives::Signature;
 use alloy_provider::{Provider, ProviderBuilder, RootProvider};
 use alloy_rpc_client::RpcClient;
 use alloy_transport::layers::RetryBackoffLayer;
+use dogeos_rpc_types::Scroll;
 use futures::StreamExt;
 use reth_network_api::{FullNetwork, PeerId};
 use reth_provider::BlockReader;
-use reth_scroll_node::ScrollNetworkPrimitives;
-use reth_tasks::shutdown::Shutdown;
 use reth_tokio_util::EventStream;
 use rollup_node_chain_orchestrator::{ChainOrchestratorEvent, ChainOrchestratorHandle};
-use scroll_alloy_network::Scroll;
-use scroll_network::NewBlockWithPeer;
+use scroll_network::{DogeosNetworkPrimitives, NewBlockWithPeer};
 use tokio::time::{interval, Duration};
 
 /// Remote block source add-on that imports blocks from a trusted remote L2 node
@@ -22,7 +20,7 @@ use tokio::time::{interval, Duration};
 #[derive(Debug)]
 pub struct RemoteBlockSourceAddOn<N>
 where
-    N: FullNetwork<Primitives = ScrollNetworkPrimitives>,
+    N: FullNetwork<Primitives = DogeosNetworkPrimitives>,
 {
     /// Configuration for the remote block source.
     config: RemoteBlockSourceArgs,
@@ -40,7 +38,7 @@ where
 
 impl<N> RemoteBlockSourceAddOn<N>
 where
-    N: FullNetwork<Primitives = ScrollNetworkPrimitives> + Send + Sync + 'static,
+    N: FullNetwork<Primitives = DogeosNetworkPrimitives> + Send + Sync + 'static,
 {
     /// Creates a new remote block source add-on.
     pub async fn new(
@@ -103,7 +101,10 @@ where
     }
 
     /// Runs the remote block source until shutdown.
-    pub async fn run_until_shutdown(mut self, mut shutdown: Shutdown) -> eyre::Result<()> {
+    pub async fn run_until_shutdown(
+        mut self,
+        mut shutdown: impl std::future::Future<Output = ()> + Unpin,
+    ) -> eyre::Result<()> {
         let mut poll_interval = interval(Duration::from_millis(self.config.poll_interval_ms));
 
         loop {

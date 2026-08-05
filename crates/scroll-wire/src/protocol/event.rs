@@ -21,7 +21,7 @@ pub enum ScrollWireEvent {
         /// The peer id the block was received from.
         peer_id: PeerId,
         /// The block that was received.
-        block: reth_scroll_primitives::ScrollBlock,
+        block: dogeos_reth_primitives::DogeosBlock,
         /// The signature of the block.
         signature: Signature,
     },
@@ -40,7 +40,7 @@ impl ScrollWireEvent {
     /// Creates a new [`ScrollWireEvent::NewBlock`] event.
     pub const fn new_block(
         peer_id: PeerId,
-        block: reth_scroll_primitives::ScrollBlock,
+        block: dogeos_reth_primitives::DogeosBlock,
         signature: Signature,
     ) -> Self {
         Self::NewBlock { peer_id, block, signature }

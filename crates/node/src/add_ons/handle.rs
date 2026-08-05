@@ -2,13 +2,13 @@ use reth_network_api::FullNetwork;
 use reth_node_api::FullNodeComponents;
 use reth_node_builder::rpc::{RpcHandle, RpcHandleProvider};
 use reth_rpc_eth_api::EthApiTypes;
-use reth_scroll_node::ScrollNetworkPrimitives;
 use rollup_node_chain_orchestrator::ChainOrchestratorHandle;
+use scroll_network::DogeosNetworkPrimitives;
 
 /// A handle for scroll addons, which includes handles for the rollup manager and RPC server.
 #[derive(Debug, Clone)]
 pub struct ScrollAddOnsHandle<
-    Node: FullNodeComponents<Network: FullNetwork<Primitives = ScrollNetworkPrimitives>>,
+    Node: FullNodeComponents<Network: FullNetwork<Primitives = DogeosNetworkPrimitives>>,
     EthApi: EthApiTypes,
 > {
     /// The handle used to send commands to the rollup manager.
@@ -17,10 +17,10 @@ pub struct ScrollAddOnsHandle<
     pub rpc_handle: RpcHandle<Node, EthApi>,
 }
 
-impl<
-        Node: FullNodeComponents<Network: FullNetwork<Primitives = ScrollNetworkPrimitives>>,
-        EthApi: EthApiTypes,
-    > RpcHandleProvider<Node, EthApi> for ScrollAddOnsHandle<Node, EthApi>
+impl<Node, EthApi> RpcHandleProvider<Node, EthApi> for ScrollAddOnsHandle<Node, EthApi>
+where
+    Node: FullNodeComponents<Network: FullNetwork<Primitives = DogeosNetworkPrimitives>>,
+    EthApi: EthApiTypes,
 {
     fn rpc_handle(&self) -> &RpcHandle<Node, EthApi> {
         &self.rpc_handle

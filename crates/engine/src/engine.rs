@@ -1,9 +1,9 @@
 use super::{EngineError, ForkchoiceState};
+use crate::ScrollEngineApi;
 use alloy_rpc_types_engine::{
     ExecutionPayloadV1, ForkchoiceUpdated, PayloadStatus, PayloadStatusEnum,
 };
 use rollup_node_primitives::BlockInfo;
-use scroll_alloy_provider::ScrollEngineApi;
 use std::sync::Arc;
 
 /// The engine that communicates with the execution layer.
@@ -128,7 +128,7 @@ where
     pub async fn build_payload(
         &self,
         head: Option<BlockInfo>,
-        attributes: scroll_alloy_rpc_types_engine::ScrollPayloadAttributes,
+        attributes: dogeos_reth_engine::ScrollPayloadAttributes,
     ) -> Result<ForkchoiceUpdated, EngineError> {
         tracing::trace!(target: "scroll::engine", ?attributes, "Building new payload with attributes");
 

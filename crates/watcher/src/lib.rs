@@ -21,13 +21,13 @@ use alloy_primitives::{ruint::UintTryTo, BlockNumber, B256};
 use alloy_provider::{Network, Provider};
 use alloy_rpc_types_eth::{BlockNumberOrTag, Filter, Log, TransactionTrait};
 use alloy_sol_types::SolEvent;
+use dogeos_protocol_types::TxL1Message;
 use error::L1WatcherResult;
 use rollup_node_primitives::{
     BatchCommitData, BatchInfo, BlockInfo, BoundedVec, ConsensusUpdate, L1BlockStartupInfo,
     NodeConfig,
 };
 use rollup_node_providers::SystemContractProvider;
-use scroll_alloy_consensus::TxL1Message;
 use scroll_l1::abi::logs::{
     CommitBatch, FinalizeBatch, QueueTransaction, RevertBatch_0, RevertBatch_1,
 };

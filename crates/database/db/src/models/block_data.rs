@@ -1,5 +1,5 @@
 use alloy_primitives::{Address, B256, U256};
-use scroll_alloy_rpc_types_engine::BlockDataHint;
+use dogeos_reth_engine::BlockDataHint;
 use sea_orm::entity::prelude::*;
 
 /// A database model that represents extra data for the block.

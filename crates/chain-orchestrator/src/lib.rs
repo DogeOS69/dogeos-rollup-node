@@ -5,13 +5,14 @@ use alloy_eips::Encodable2718;
 use alloy_primitives::{b256, bytes::Bytes, keccak256, B256};
 use alloy_provider::Provider;
 use alloy_rpc_types_engine::ExecutionPayloadV1;
+use dogeos_hardforks::DogeosHardforks;
+use dogeos_protocol_types::{ScrollTxEnvelope, TxL1Message};
+use dogeos_reth_primitives::DogeosBlock;
+use dogeos_rpc_types::Scroll;
 use futures::{stream, StreamExt, TryStreamExt};
 use reth_chainspec::EthChainSpec;
 use reth_network_api::{BlockDownloaderProvider, FullNetwork};
 use reth_network_p2p::{sync::SyncState as RethSyncState, FullBlockClient};
-use reth_scroll_node::ScrollNetworkPrimitives;
-use reth_scroll_primitives::ScrollBlock;
-use reth_tasks::shutdown::Shutdown;
 use reth_tokio_util::{EventSender, EventStream};
 use rollup_node_primitives::{
     BatchCommitData, BatchInfo, BatchStatus, BlockConsolidationOutcome, BlockInfo, ChainImport,
@@ -21,18 +22,15 @@ use rollup_node_providers::L1MessageProvider;
 use rollup_node_sequencer::{Sequencer, SequencerEvent};
 use rollup_node_signer::{SignatureAsBytes, SignerEvent, SignerHandle};
 use rollup_node_watcher::{L1Notification, L1WatcherHandle};
-use scroll_alloy_consensus::{ScrollTxEnvelope, TxL1Message};
-use scroll_alloy_hardforks::ScrollHardforks;
-use scroll_alloy_network::Scroll;
-use scroll_alloy_provider::ScrollEngineApi;
 use scroll_db::{
     Database, DatabaseError, DatabaseReadOperations, DatabaseWriteOperations, L1MessageKey,
     UnwindResult,
 };
 use scroll_derivation_pipeline::{BatchDerivationResult, DerivationPipeline};
-use scroll_engine::Engine;
+use scroll_engine::{Engine, ScrollEngineApi};
 use scroll_network::{
-    BlockImportOutcome, NewBlockWithPeer, ScrollNetwork, ScrollNetworkManagerEvent,
+    BlockImportOutcome, DogeosNetworkPrimitives, NewBlockWithPeer, ScrollNetwork,
+    ScrollNetworkManagerEvent,
 };
 use std::{collections::VecDeque, sync::Arc, time::Instant, vec};
 use tokio::sync::mpsc::{self, UnboundedReceiver};
@@ -97,7 +95,7 @@ const BATCH_SIZE: usize = 1;
 /// based on data consolidated from L1 and the data received over the p2p network.
 #[derive(Debug)]
 pub struct ChainOrchestrator<
-    N: FullNetwork<Primitives = ScrollNetworkPrimitives>,
+    N: FullNetwork<Primitives = DogeosNetworkPrimitives>,
     ChainSpec,
     L1MP,
     L2P,
@@ -136,8 +134,8 @@ pub struct ChainOrchestrator<
 }
 
 impl<
-        N: FullNetwork<Primitives = ScrollNetworkPrimitives> + Send + Sync + 'static,
-        ChainSpec: ScrollHardforks + EthChainSpec + Send + Sync + 'static,
+        N: FullNetwork<Primitives = DogeosNetworkPrimitives> + Send + Sync + 'static,
+        ChainSpec: DogeosHardforks + EthChainSpec + Send + Sync + 'static,
         L1MP: L1MessageProvider + Unpin + Clone + Send + Sync + 'static,
         L2P: Provider<Scroll> + 'static,
         EC: ScrollEngineApi + Sync + Send + 'static,
@@ -182,8 +180,11 @@ impl<
         ))
     }
 
-    /// Drives the [`ChainOrchestrator`] future until a [`Shutdown`] signal is received.
-    pub async fn run_until_shutdown(mut self, mut shutdown: Shutdown) {
+    /// Drives the [`ChainOrchestrator`] future until a shutdown signal is received.
+    pub async fn run_until_shutdown(
+        mut self,
+        mut shutdown: impl std::future::Future<Output = ()> + Unpin,
+    ) {
         loop {
             tokio::select! {
                 biased;
@@ -1113,7 +1114,7 @@ impl<
             let parent_number = new_headers.front().expect("at least one header exists").number - 1;
             let fetch_count = HEADER_FETCH_COUNT.min(parent_number - current_safe_block_number);
             tracing::trace!(target: "scroll::chain_orchestrator", ?received_block_hash, ?received_block_number, ?parent_hash, ?parent_number, %current_safe_block_number, fetch_count, "Fetching headers to find common ancestor for fork");
-            let headers: Vec<ScrollBlock> = self
+            let headers: Vec<DogeosBlock> = self
                 .block_client
                 .get_full_block_range(parent_hash, fetch_count)
                 .await
@@ -1160,7 +1161,7 @@ impl<
     /// Imports a chain of headers into the L2 chain.
     async fn import_chain(
         &mut self,
-        chain: Vec<ScrollBlock>,
+        chain: Vec<DogeosBlock>,
         block_with_peer: NewBlockWithPeer,
     ) -> Result<ChainImport, ChainOrchestratorError> {
         let chain_head_hash = chain.last().expect("at least one header exists").hash_slow();
@@ -1322,7 +1323,7 @@ impl<
     /// from L1.
     async fn validate_l1_messages(
         &self,
-        blocks: &[ScrollBlock],
+        blocks: &[DogeosBlock],
     ) -> Result<(), ChainOrchestratorError> {
         let l1_message_hashes = blocks
             .iter()

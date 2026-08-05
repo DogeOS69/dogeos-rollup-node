@@ -1,9 +1,10 @@
 use crate::{BlockImportError, BlockValidationError};
 
 use super::{
-    BlockImportOutcome, BlockValidation, NetworkHandleMessage, NewBlockWithPeer,
-    ScrollNetworkHandle, ScrollNetworkManagerEvent,
+    BlockImportOutcome, BlockValidation, EthWireBlockWithPeer, EthWirePeerSender,
+    NetworkHandleMessage, NewBlockWithPeer, ScrollNetworkHandle, ScrollNetworkManagerEvent,
 };
+use crate::DogeosNetworkPrimitives;
 use alloy_primitives::{Address, Signature, B256, U128};
 use futures::StreamExt;
 use reth_chainspec::EthChainSpec;
@@ -12,13 +13,10 @@ use reth_network::{
     cache::LruCache, NetworkConfig as RethNetworkConfig, NetworkHandle as RethNetworkHandle,
     NetworkManager as RethNetworkManager,
 };
-use reth_network_api::{block::NewBlockWithPeer as RethNewBlockWithPeer, FullNetwork, PeerId};
-use reth_scroll_node::ScrollNetworkPrimitives;
-use reth_scroll_primitives::ScrollBlock;
+use reth_network_api::{FullNetwork, PeerId};
 use reth_storage_api::BlockNumReader as BlockNumReaderT;
-use reth_tokio_util::{EventSender, EventStream};
+use reth_tokio_util::EventSender;
 use rollup_node_primitives::{sig_encode_hash, BlockInfo};
-use scroll_alloy_hardforks::ScrollHardforks;
 use scroll_wire::{
     NewBlock, ScrollWireConfig, ScrollWireEvent, ScrollWireManager, ScrollWireProtocolHandler,
     LRU_CACHE_SIZE,
@@ -44,14 +42,14 @@ const EVENT_CHANNEL_SIZE: usize = 5000;
 #[derive(Debug)]
 pub struct ScrollNetworkManager<N, CS> {
     /// The chain spec used by the rollup node.
-    chain_spec: Arc<CS>,
+    _chain_spec: Arc<CS>,
     /// The inner network handle which is used to communicate with the inner network.
     inner_network_handle: N,
     /// Receiver half of the channel set up between this type and the [`FullNetwork`], receives
     /// [`NetworkHandleMessage`]s.
     from_handle_rx: UnboundedReceiverStream<NetworkHandleMessage>,
     /// The receiver for new blocks received from the network (used to bridge from eth-wire).
-    eth_wire_listener: Option<EventStream<RethNewBlockWithPeer<ScrollBlock>>>,
+    eth_wire_listener: Option<UnboundedReceiverStream<EthWireBlockWithPeer>>,
     /// The scroll wire protocol manager.
     pub scroll_wire: ScrollWireManager,
     /// The LRU cache used to track already seen (block,signature) pair.
@@ -69,19 +67,19 @@ pub struct ScrollNetworkManager<N, CS> {
     event_sender: EventSender<ScrollNetworkManagerEvent>,
 }
 
-impl<CS: ScrollHardforks + EthChainSpec + Send + Sync + 'static>
-    ScrollNetworkManager<RethNetworkHandle<ScrollNetworkPrimitives>, CS>
+impl<CS: EthChainSpec + Send + Sync + 'static>
+    ScrollNetworkManager<RethNetworkHandle<DogeosNetworkPrimitives>, CS>
 {
     /// Creates a new [`ScrollNetworkManager`] instance from the provided configuration and block
     /// import.
     pub async fn new<C: BlockNumReaderT + 'static>(
         chain_spec: Arc<CS>,
-        mut network_config: RethNetworkConfig<C, ScrollNetworkPrimitives>,
+        mut network_config: RethNetworkConfig<C, DogeosNetworkPrimitives>,
         scroll_wire_config: ScrollWireConfig,
-        eth_wire_listener: Option<EventStream<RethNewBlockWithPeer<ScrollBlock>>>,
+        eth_wire_listener: Option<UnboundedReceiver<EthWireBlockWithPeer>>,
         td_constant: U128,
         authorized_signer: Option<Address>,
-    ) -> (Self, ScrollNetworkHandle<RethNetworkHandle<ScrollNetworkPrimitives>>) {
+    ) -> (Self, ScrollNetworkHandle<RethNetworkHandle<DogeosNetworkPrimitives>>) {
         // Create the scroll-wire protocol handler.
         let (scroll_wire_handler, events) = ScrollWireProtocolHandler::new(scroll_wire_config);
 
@@ -90,7 +88,7 @@ impl<CS: ScrollHardforks + EthChainSpec + Send + Sync + 'static>
 
         // Create the inner network manager.
         let inner_network_manager =
-            RethNetworkManager::<ScrollNetworkPrimitives>::new(network_config).await.unwrap();
+            RethNetworkManager::<DogeosNetworkPrimitives>::new(network_config).await.unwrap();
         let inner_network_handle = inner_network_manager.handle().clone();
 
         // Create the channel for sending messages to the network manager.
@@ -110,13 +108,13 @@ impl<CS: ScrollHardforks + EthChainSpec + Send + Sync + 'static>
 
         (
             Self {
-                chain_spec,
+                _chain_spec: chain_spec,
                 inner_network_handle,
                 from_handle_rx: from_handle_rx.into(),
                 scroll_wire,
                 blocks_seen,
                 peer_state,
-                eth_wire_listener,
+                eth_wire_listener: eth_wire_listener.map(Into::into),
                 td_constant,
                 authorized_signer,
                 event_sender,
@@ -129,8 +127,8 @@ impl<CS: ScrollHardforks + EthChainSpec + Send + Sync + 'static>
 }
 
 impl<
-        N: FullNetwork<Primitives = ScrollNetworkPrimitives>,
-        CS: ScrollHardforks + EthChainSpec + Send + Sync + 'static,
+        N: FullNetwork<Primitives = DogeosNetworkPrimitives> + EthWirePeerSender,
+        CS: EthChainSpec + Send + Sync + 'static,
     > ScrollNetworkManager<N, CS>
 {
     /// Creates a new [`ScrollNetworkManager`] instance from the provided parts.
@@ -141,7 +139,7 @@ impl<
         chain_spec: Arc<CS>,
         inner_network_handle: N,
         events: UnboundedReceiver<ScrollWireEvent>,
-        eth_wire_listener: Option<EventStream<RethNewBlockWithPeer<ScrollBlock>>>,
+        eth_wire_listener: Option<UnboundedReceiver<EthWireBlockWithPeer>>,
         td_constant: U128,
         authorized_signer: Option<Address>,
     ) -> (Self, ScrollNetworkHandle<N>) {
@@ -159,13 +157,13 @@ impl<
 
         (
             Self {
-                chain_spec,
+                _chain_spec: chain_spec,
                 inner_network_handle,
                 from_handle_rx: from_handle_rx.into(),
                 scroll_wire,
                 blocks_seen,
                 peer_state,
-                eth_wire_listener,
+                eth_wire_listener: eth_wire_listener.map(Into::into),
                 td_constant,
                 authorized_signer,
                 event_sender,
@@ -229,10 +227,8 @@ impl<
     }
 
     async fn next_eth_wire_block(
-        eth_wire_listener: &mut Option<
-            EventStream<reth_network_api::block::NewBlockWithPeer<ScrollBlock>>,
-        >,
-    ) -> Option<reth_network_api::block::NewBlockWithPeer<ScrollBlock>> {
+        eth_wire_listener: &mut Option<UnboundedReceiverStream<EthWireBlockWithPeer>>,
+    ) -> Option<EthWireBlockWithPeer> {
         match eth_wire_listener.as_mut() {
             Some(listener) => listener.next().await,
             None => std::future::pending().await,
@@ -410,18 +406,14 @@ impl<
     /// Handles a new block received from the eth-wire protocol.
     fn handle_eth_wire_block(
         &mut self,
-        block: reth_network_api::block::NewBlockWithPeer<ScrollBlock>,
+        block: EthWireBlockWithPeer,
     ) -> Option<ScrollNetworkManagerEvent> {
-        let reth_network_api::block::NewBlockWithPeer { peer_id, mut block } = block;
+        let EthWireBlockWithPeer { peer_id, mut block } = block;
 
-        // We purge the extra data field post euclid v2 to align with protocol specification.
-        let extra_data = if self.chain_spec.is_euclid_v2_active_at_timestamp(block.timestamp) {
-            let extra_data = block.extra_data.clone();
-            block.header.extra_data = Default::default();
-            extra_data
-        } else {
-            block.extra_data.clone()
-        };
+        // DogeOS history begins at Feynman, so signed-header handling is always active: retain the
+        // signature bytes separately and hash/import the cleared header.
+        let extra_data = block.extra_data.clone();
+        block.header.extra_data = Default::default();
 
         // If we can extract a signature from the extra data we validate consensus and then attempt
         // import via the EngineAPI in the `handle_new_block` method. The signature is extracted

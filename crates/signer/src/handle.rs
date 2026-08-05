@@ -29,7 +29,7 @@ impl SignerHandle {
     /// Sends a request to sign a block.
     pub fn sign_block(
         &self,
-        block: reth_scroll_primitives::ScrollBlock,
+        block: dogeos_reth_primitives::DogeosBlock,
     ) -> Result<(), SignerError> {
         self.request_tx
             .send(SignerRequest::SignBlock(block))

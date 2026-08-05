@@ -1,6 +1,6 @@
 use alloy_provider::{Provider, ProviderBuilder};
+use dogeos_rpc_types::Scroll;
 use eyre::Result;
-use scroll_alloy_network::Scroll;
 use std::{fs, ops::Deref, process::Command, time::Duration};
 use tokio::{
     io::{AsyncBufReadExt, BufReader},

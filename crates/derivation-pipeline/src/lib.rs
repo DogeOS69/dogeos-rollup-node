@@ -6,10 +6,10 @@
 use alloy_primitives::{Address, B256};
 use alloy_rpc_types_engine::PayloadAttributes;
 use core::{fmt::Debug, future::Future, pin::Pin, task::Poll};
+use dogeos_reth_engine::ScrollPayloadAttributes;
 use futures::{stream::FuturesOrdered, Stream, StreamExt};
 use rollup_node_primitives::{BatchCommitData, BatchInfo, BatchStatus, L1MessageEnvelope};
 use rollup_node_providers::L1Provider;
-use scroll_alloy_rpc_types_engine::{BlockDataHint, ScrollPayloadAttributes};
 use scroll_codec::{decoding::payload::PayloadData, Codec, CodecError, DecodingError};
 use scroll_db::{Database, DatabaseReadOperations, L1MessageKey};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -374,10 +374,7 @@ pub async fn derive<L1P: L1Provider + Sync + Send>(
                 },
                 transactions: Some(txs),
                 no_tx_pool: true,
-                block_data_hint: cache
-                    .get(block.context.number)
-                    .await?
-                    .unwrap_or_else(BlockDataHint::none),
+                block_data_hint: cache.get(block.context.number).await?.unwrap_or_default(),
                 gas_limit: Some(block.context.gas_limit),
             },
         };
@@ -458,11 +455,11 @@ mod tests {
 
     use alloy_eips::Decodable2718;
     use alloy_primitives::{address, b256, bytes, U256};
+    use dogeos_protocol_types::TxL1Message;
+    use dogeos_reth_engine::BlockDataHint;
     use futures::StreamExt;
     use rollup_node_primitives::L1MessageEnvelope;
     use rollup_node_providers::{test_utils::MockL1Provider, L1ProviderError};
-    use scroll_alloy_consensus::TxL1Message;
-    use scroll_alloy_rpc_types_engine::BlockDataHint;
     use scroll_codec::decoding::test_utils::read_to_bytes;
     use scroll_db::{test_utils::setup_test_db, DatabaseWriteOperations};
     use std::{collections::HashMap, path::PathBuf};

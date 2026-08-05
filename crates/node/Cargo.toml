@@ -54,6 +54,7 @@ reth-primitives-traits.workspace = true
 reth-chainspec.workspace = true
 reth-cli.workspace = true
 reth-cli-util.workspace = true
+reth-ethereum-cli.workspace = true
 reth-eth-wire-types.workspace = true
 reth-evm.workspace = true
 reth-node-builder.workspace = true
@@ -121,7 +122,6 @@ eyre.workspace = true
 futures.workspace = true
 serde_json.workspace = true
 jsonrpsee = { version = "0.26.0", features = ["server", "client", "macros"] }
-rayon.workspace = true
 reqwest.workspace = true
 reqwest-13 = { package = "reqwest", version = "0.13", default-features = false, features = ["rustls"] }
 tokio.workspace = true

@@ -5,7 +5,7 @@ use super::{
 };
 use crate::{
     constants, BlobProviderArgs, ChainOrchestratorArgs, ConsensusAlgorithm, ConsensusArgs,
-    EngineDriverArgs, L1ProviderArgs, PprofArgs, RollupNodeDatabaseArgs,
+    DogeosChainSpecParser, EngineDriverArgs, L1ProviderArgs, PprofArgs, RollupNodeDatabaseArgs,
     RollupNodeGasPriceOracleArgs, RollupNodeNetworkArgs, RpcArgs, ScrollRollupNode,
     ScrollRollupNodeConfig, SequencerArgs, SignerArgs, TestArgs,
 };
@@ -34,7 +34,6 @@ use reth_node_builder::NodeTypes;
 use reth_node_core::exit::NodeExitFuture;
 use reth_node_types::NodeTypesWithDBAdapter;
 use reth_provider::providers::BlockchainProvider;
-use reth_scroll_cli::DogeosChainSpecParser;
 use reth_tasks::TaskExecutor;
 use reth_tokio_util::EventStream;
 use rollup_node_chain_orchestrator::{ChainOrchestratorEvent, ChainOrchestratorHandle};
@@ -133,6 +132,8 @@ pub struct ScrollNodeTestComponents {
     pub task_executor: TaskExecutor,
     /// The exit future for the test node.
     pub exit_future: NodeExitFuture,
+    /// Handle to the rollup manager launched alongside the Reth node.
+    pub rollup_manager_handle: ChainOrchestratorHandle<ScrollNetworkHandle>,
 }
 
 impl ScrollNodeTestComponents {
@@ -141,8 +142,9 @@ impl ScrollNodeTestComponents {
         node: ScrollTestNode,
         task_executor: TaskExecutor,
         exit_future: NodeExitFuture,
+        rollup_manager_handle: ChainOrchestratorHandle<ScrollNetworkHandle>,
     ) -> Self {
-        Self { node, task_executor, exit_future }
+        Self { node, task_executor, exit_future, rollup_manager_handle }
     }
 }
 
@@ -195,9 +197,8 @@ impl NodeHandle {
         );
         let engine = Engine::new(Arc::new(engine_client), fcs);
 
-        let rollup_manager_handle = node.inner.add_ons_handle.rollup_manager_handle.clone();
-        let chain_orchestrator_rx =
-            node.inner.add_ons_handle.rollup_manager_handle.get_event_listener().await?;
+        let rollup_manager_handle = node.rollup_manager_handle.clone();
+        let chain_orchestrator_rx = rollup_manager_handle.get_event_listener().await?;
 
         Ok(Self { node, engine, chain_orchestrator_rx, rollup_manager_handle, typ })
     }

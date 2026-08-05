@@ -5,9 +5,12 @@ static ALLOC: reth_cli_util::allocator::Allocator = reth_cli_util::allocator::ne
 
 fn main() {
     use clap::Parser;
+    use dogeos_reth_consensus::DogeosConsensus;
+    use dogeos_reth_evm::ScrollEvmConfig;
+    use reth_ethereum_cli::Cli;
     use reth_node_builder::EngineNodeLauncher;
-    use reth_scroll_cli::{Cli, DogeosChainSpecParser};
-    use rollup_node::{ScrollRollupNode, ScrollRollupNodeConfig};
+    use rollup_node::{DogeosChainSpecParser, ScrollRollupNode, ScrollRollupNodeConfig};
+    use std::sync::Arc;
     use tracing::info;
 
     // set default log level to info if RUST_LOG is not set
@@ -27,8 +30,13 @@ fn main() {
         std::env::set_var("RUST_BACKTRACE", "1");
     }
 
-    if let Err(err) = Cli::<DogeosChainSpecParser, ScrollRollupNodeConfig>::parse().run(
-        |builder, args| async move {
+    if let Err(err) = Cli::<DogeosChainSpecParser, ScrollRollupNodeConfig>::parse()
+        .run_with_components::<ScrollRollupNode>(
+        |chain_spec| (
+            ScrollEvmConfig::dogeos(chain_spec),
+            Arc::new(DogeosConsensus),
+        ),
+        async move |builder, args| {
             info!(target: "reth::cli", "Launching node");
 
             // Modify the chain spec based on the CLI args.

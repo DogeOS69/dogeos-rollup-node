@@ -3,7 +3,7 @@
 use crate::{args::ScrollRollupNodeConfig, builder::network::ScrollNetworkBuilder, constants};
 use std::time::Duration;
 
-use super::add_ons::ScrollRollupNodeAddOns;
+use super::add_ons::{RollupManagerHandle, ScrollRollupNodeAddOns};
 use dogeos_chainspec::DogeosChainSpec;
 use dogeos_reth_node::{
     DogeosConsensusBuilder, DogeosExecutorBuilder, DogeosNodeTypes, DogeosPayloadBuilderBuilder,
@@ -17,7 +17,7 @@ use reth_node_builder::{
 };
 use scroll_network::EthWireBlockWithPeer;
 use scroll_wire::{ScrollWireConfig, ScrollWireEvent, ScrollWireProtocolHandler};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::sync::{mpsc::UnboundedReceiver, Mutex};
 
 /// The Scroll node implementation.
@@ -26,6 +26,7 @@ pub struct ScrollRollupNode {
     config: ScrollRollupNodeConfig,
     scroll_wire_events: Arc<Mutex<Option<UnboundedReceiver<ScrollWireEvent>>>>,
     eth_wire_events: Arc<Mutex<Option<UnboundedReceiver<EthWireBlockWithPeer>>>>,
+    rollup_manager_handle: Arc<OnceLock<RollupManagerHandle>>,
 }
 
 impl ScrollRollupNode {
@@ -48,7 +49,14 @@ impl ScrollRollupNode {
             config,
             scroll_wire_events: Arc::new(Mutex::new(None)),
             eth_wire_events: Arc::new(Mutex::new(None)),
+            rollup_manager_handle: Arc::new(OnceLock::new()),
         }
+    }
+
+    /// Returns the rollup manager handle after the node add-ons have launched.
+    #[cfg(feature = "test-utils")]
+    pub(crate) fn rollup_manager_handle(&self) -> Option<&RollupManagerHandle> {
+        self.rollup_manager_handle.get()
     }
 }
 
@@ -77,11 +85,7 @@ where
         let (eth_wire_block_tx, eth_wire_events) = tokio::sync::mpsc::unbounded_channel();
         *self.eth_wire_events.try_lock().unwrap() = Some(eth_wire_events);
 
-        let mut network_builder = ScrollNetworkBuilder::new(
-            self.config.database.clone().expect("database is set via hydration"),
-            eth_wire_block_tx,
-        )
-        .with_signer(self.config.network_args.signer_address);
+        let mut network_builder = ScrollNetworkBuilder::new(eth_wire_block_tx);
 
         // Only add scroll-wire sub-protocol if enabled
         if self.config.network_args.enable_scroll_wire {
@@ -108,6 +112,7 @@ where
             self.config.clone(),
             self.scroll_wire_events.try_lock().unwrap().take().unwrap(),
             self.eth_wire_events.try_lock().unwrap().take().unwrap(),
+            self.rollup_manager_handle.clone(),
         )
     }
 }

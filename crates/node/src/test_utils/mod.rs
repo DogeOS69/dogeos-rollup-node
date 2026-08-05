@@ -90,13 +90,12 @@ use alloy_primitives::Bytes;
 use reth_chainspec::EthChainSpec;
 use reth_db::test_utils::create_test_rw_db_with_path;
 use reth_e2e_test_utils::{
-    node::NodeTestContext, transaction::TransactionTestContext, wallet::Wallet, Adapter,
-    TmpNodeAddOnsHandle, TmpNodeEthApi,
+    node::NodeTestContext, transaction::TransactionTestContext, wallet::Wallet,
 };
 use reth_engine_local::LocalPayloadAttributesBuilder;
 use reth_node_builder::{
-    rpc::RpcHandleProvider, EngineNodeLauncher, Node, NodeBuilder, NodeConfig,
-    NodeHandle as RethNodeHandle, NodeTypes, PayloadAttributesBuilder, PayloadTypes, TreeConfig,
+    EngineNodeLauncher, Node, NodeBuilder, NodeConfig, NodeHandle as RethNodeHandle, NodeTypes,
+    PayloadAttributesBuilder, PayloadTypes, TreeConfig,
 };
 use reth_node_core::args::{
     DiscoveryArgs, NetworkArgs, PayloadBuilderArgs, RpcServerArgs, TxPoolArgs,
@@ -131,8 +130,6 @@ where
         PayloadAttributesBuilder<
             <<ScrollRollupNode as NodeTypes>::Payload as PayloadTypes>::PayloadAttributes,
         >,
-    TmpNodeAddOnsHandle<ScrollRollupNode>:
-        RpcHandleProvider<Adapter<ScrollRollupNode>, TmpNodeEthApi<ScrollRollupNode>>,
 {
     let network_config = NetworkArgs {
         discovery: DiscoveryArgs { disable_discovery: true, ..DiscoveryArgs::default() },
@@ -228,11 +225,11 @@ where
             .with_database(db.clone())
             .with_launch_context(task_executor.clone());
         let testing_config = testing_node.config().clone();
-        let node = ScrollRollupNode::new(scroll_node_config.clone(), testing_config).await;
+        let rollup_node = ScrollRollupNode::new(scroll_node_config.clone(), testing_config).await;
         let RethNodeHandle { node, node_exit_future } = testing_node
             .with_types_and_provider::<ScrollRollupNode, BlockchainProvider<_>>()
-            .with_components(node.components_builder())
-            .with_add_ons(node.add_ons())
+            .with_components(rollup_node.components_builder())
+            .with_add_ons(rollup_node.add_ons())
             .launch_with_fn(|builder| {
                 let tree_config = TreeConfig::default()
                     .with_always_process_payload_attributes_on_canonical_head(true)
@@ -246,6 +243,10 @@ where
                 builder.launch_with(launcher)
             })
             .await?;
+        let rollup_manager_handle = rollup_node
+            .rollup_manager_handle()
+            .cloned()
+            .ok_or_else(|| eyre::eyre!("rollup manager handle was not initialized"))?;
 
         let mut node =
             NodeTestContext::new(node, |_| panic!("should not build payloads using this method"))
@@ -263,7 +264,13 @@ where
             }
         }
 
-        let node = ScrollNodeTestComponents::new(node, task_executor, node_exit_future).await;
+        let node = ScrollNodeTestComponents::new(
+            node,
+            task_executor,
+            node_exit_future,
+            rollup_manager_handle,
+        )
+        .await;
 
         nodes.push(node);
     }

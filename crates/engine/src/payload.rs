@@ -117,9 +117,9 @@ mod tests {
             .collect::<Vec<Bytes>>();
         let prev_randao = B256::arbitrary(&mut unstructured)?;
         let timestamp = u64::arbitrary(&mut unstructured)?;
-        let block_data_hint = BlockDataHint::arbitrary(&mut unstructured)?;
+        let block_data_hint = BlockDataHint::default();
 
-        let mut attributes = ScrollPayloadAttributes::arbitrary(&mut unstructured)?;
+        let mut attributes = ScrollPayloadAttributes::default();
         attributes.transactions = Some(encoded_transactions);
         attributes.payload_attributes.timestamp = timestamp;
         attributes.payload_attributes.prev_randao = prev_randao;
@@ -158,7 +158,7 @@ mod tests {
         let difficulty = U256::arbitrary(&mut unstructured)?;
         let extra_data = Bytes::arbitrary(&mut unstructured)?;
 
-        let attributes = ScrollPayloadAttributes::arbitrary(&mut unstructured)?;
+        let attributes = ScrollPayloadAttributes::default();
         let block = DogeosBlock {
             header: Header {
                 parent_hash,

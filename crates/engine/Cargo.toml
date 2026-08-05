@@ -52,7 +52,7 @@ alloy-consensus.workspace = true
 arbitrary.workspace = true
 async-trait.workspace = true
 reth-testing-utils.workspace = true
-dogeos-protocol-types.workspace = true
+dogeos-protocol-types = { workspace = true, features = ["arbitrary"] }
 dogeos-reth-engine.workspace = true
 
 [features]

@@ -13,6 +13,22 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  dependency-sources:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: dcarbone/install-jq-action@v3
+      - name: Configure private dependency access
+        env:
+          GITHUB_TOKEN: ${{ secrets.DOGEOS_RETH2_TOKEN || github.token }}
+        run: git config --global url."https://x-access-token:${GITHUB_TOKEN}@github.com/".insteadOf "https://github.com/"
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked
+      - name: Verify Reth dependency sources
+        run: .github/assets/verify_reth_sources.sh
+
   clippy:
     runs-on: ubuntu-latest
     timeout-minutes: 30

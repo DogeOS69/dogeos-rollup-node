@@ -1,10 +1,8 @@
 use dogeos_chainspec::DogeosChainSpec;
 use dogeos_reth_primitives::DogeosPrimitives;
 use reth_network::{
-    config::NetworkMode,
-    primitives::BasicNetworkPrimitives,
-    protocol::{RlpxSubProtocol, RlpxSubProtocols},
-    NetworkConfig, NetworkHandle, NetworkManager, PeersInfo,
+    config::NetworkMode, primitives::BasicNetworkPrimitives, protocol::RlpxSubProtocol,
+    NetworkHandle, NetworkManager, PeersInfo,
 };
 use reth_node_api::{NodeTypes, TxTy};
 use reth_node_builder::{components::NetworkBuilder, BuilderContext, FullNodeTypes};
@@ -18,7 +16,7 @@ use tracing::info;
 #[derive(Debug)]
 pub struct ScrollNetworkBuilder {
     /// Additional `RLPx` sub-protocols to be added to the network.
-    scroll_sub_protocols: RlpxSubProtocols,
+    scroll_sub_protocols: Vec<RlpxSubProtocol>,
     /// Sender used to bridge Reth's `eth` block-import callback into the rollup network manager.
     eth_wire_block_tx: UnboundedSender<EthWireBlockWithPeer>,
 }
@@ -26,7 +24,7 @@ pub struct ScrollNetworkBuilder {
 impl ScrollNetworkBuilder {
     /// Create a new [`ScrollNetworkBuilder`].
     pub fn new(eth_wire_block_tx: UnboundedSender<EthWireBlockWithPeer>) -> Self {
-        Self { scroll_sub_protocols: RlpxSubProtocols::default(), eth_wire_block_tx }
+        Self { scroll_sub_protocols: Vec::new(), eth_wire_block_tx }
     }
 
     /// Add a scroll sub-protocol to the network builder.
@@ -55,17 +53,16 @@ where
         ctx: &BuilderContext<Node>,
         pool: Pool,
     ) -> eyre::Result<Self::Network> {
-        // set the network mode to work.
-        let config = ctx.network_config()?;
-        let config = NetworkConfig {
-            network_mode: NetworkMode::Work,
-            block_import: Box::new(EthWireBlockImport::new(self.eth_wire_block_tx)),
-            extra_protocols: self.scroll_sub_protocols,
-            ..config
-        };
+        let mut config = ctx
+            .network_config_builder::<DogeosNetworkPrimitives>()?
+            .network_mode(NetworkMode::Work)
+            .block_import(Box::new(EthWireBlockImport::new(self.eth_wire_block_tx)));
+        for protocol in self.scroll_sub_protocols {
+            config = config.add_rlpx_sub_protocol(protocol);
+        }
 
-        let network = NetworkManager::builder(config).await?;
-        let handle = ctx.start_network(network, pool, None);
+        let network = NetworkManager::builder(ctx.build_network_config(config)).await?;
+        let handle = ctx.start_network(network, pool);
         info!(target: "reth::cli", enode=%handle.local_node_record(), "P2P networking initialized");
         Ok(handle)
     }

@@ -6,7 +6,7 @@ trap 'rm -f "$metadata_file"' EXIT
 
 cargo metadata --locked --offline --format-version 1 > "$metadata_file"
 
-components_source="git+https://github.com/DogeOS69/dogeos-reth.git?rev=cd92aada272e0c083d9a68794a46f94665d53a29#cd92aada272e0c083d9a68794a46f94665d53a29"
+components_source="git+https://github.com/DogeOS69/dogeos-reth.git?rev=fdf28d7070da3bb62bb26521d4bf22347fc9e49f#fdf28d7070da3bb62bb26521d4bf22347fc9e49f"
 reth_source="git+https://github.com/DogeOS69/reth.git?rev=ae160090003d9b04be0521e9e4760558798cdf40#ae160090003d9b04be0521e9e4760558798cdf40"
 official_reth_pattern='^git\+https://github\.com/paradigmxyz/reth(\.git)?[?#]'
 

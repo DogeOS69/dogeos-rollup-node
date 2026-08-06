@@ -13247,7 +13247,6 @@ dependencies = [
  "hyper-util",
  "jsonrpsee",
  "pprof",
- "rayon",
  "regex-lite",
  "reqwest 0.12.28",
  "reqwest 0.13.4",

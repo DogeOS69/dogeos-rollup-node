@@ -160,6 +160,7 @@ alloy-transport = { version = "=1.8.3", default-features = false }
 reth-chainspec = { git = "https://github.com/DogeOS69/reth.git", rev = "ae160090003d9b04be0521e9e4760558798cdf40", default-features = false }
 reth-db = { git = "https://github.com/DogeOS69/reth.git", rev = "ae160090003d9b04be0521e9e4760558798cdf40", default-features = false }
 reth-e2e-test-utils = { git = "https://github.com/DogeOS69/reth.git", rev = "ae160090003d9b04be0521e9e4760558798cdf40" }
+reth-ethereum-cli = { git = "https://github.com/DogeOS69/reth.git", rev = "ae160090003d9b04be0521e9e4760558798cdf40", default-features = false }
 reth-eth-wire = { git = "https://github.com/DogeOS69/reth.git", rev = "ae160090003d9b04be0521e9e4760558798cdf40", default-features = false }
 reth-eth-wire-types = { git = "https://github.com/DogeOS69/reth.git", rev = "ae160090003d9b04be0521e9e4760558798cdf40", default-features = false }
 reth-fs-util = { git = "https://github.com/DogeOS69/reth.git", rev = "ae160090003d9b04be0521e9e4760558798cdf40", default-features = false }

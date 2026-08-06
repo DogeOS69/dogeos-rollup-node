@@ -1,2 +1,5 @@
 [alias]
 docs = "doc --workspace --all-features --no-deps"
+
+[net]
+git-fetch-with-cli = true

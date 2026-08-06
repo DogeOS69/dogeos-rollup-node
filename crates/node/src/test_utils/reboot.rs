@@ -41,7 +41,8 @@ impl TestFixture {
             .get_mut(node_index)
             .and_then(|opt| opt.take())
             .expect("Node existence checked above");
-        let ScrollNodeTestComponents { node, task_executor, exit_future } = node;
+        let ScrollNodeTestComponents { node, task_executor, exit_future, rollup_manager_handle: _ } =
+            node;
 
         tokio::task::spawn_blocking(move || {
             if !task_executor.graceful_shutdown_with_timeout(Duration::from_secs(10)) {

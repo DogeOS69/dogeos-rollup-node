@@ -133,6 +133,8 @@ pub struct ScrollNodeTestComponents {
     pub task_executor: TaskExecutor,
     /// The exit future for the test node.
     pub exit_future: NodeExitFuture,
+    /// Handle to the rollup manager launched alongside the Reth node.
+    pub rollup_manager_handle: ChainOrchestratorHandle<ScrollNetworkHandle>,
 }
 
 impl ScrollNodeTestComponents {
@@ -141,8 +143,9 @@ impl ScrollNodeTestComponents {
         node: ScrollTestNode,
         task_executor: TaskExecutor,
         exit_future: NodeExitFuture,
+        rollup_manager_handle: ChainOrchestratorHandle<ScrollNetworkHandle>,
     ) -> Self {
-        Self { node, task_executor, exit_future }
+        Self { node, task_executor, exit_future, rollup_manager_handle }
     }
 }
 
@@ -195,9 +198,8 @@ impl NodeHandle {
         );
         let engine = Engine::new(Arc::new(engine_client), fcs);
 
-        let rollup_manager_handle = node.inner.add_ons_handle.rollup_manager_handle.clone();
-        let chain_orchestrator_rx =
-            node.inner.add_ons_handle.rollup_manager_handle.get_event_listener().await?;
+        let rollup_manager_handle = node.rollup_manager_handle.clone();
+        let chain_orchestrator_rx = rollup_manager_handle.get_event_listener().await?;
 
         Ok(Self { node, engine, chain_orchestrator_rx, rollup_manager_handle, typ })
     }

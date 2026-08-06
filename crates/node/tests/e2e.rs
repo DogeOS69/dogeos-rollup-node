@@ -407,7 +407,7 @@ async fn can_forward_tx_to_sequencer() -> eyre::Result<()> {
     sequencer_node[0].network.next_session_established().await;
 
     // generate rollup node manager event streams for each node
-    let sequencer_rnm_handle = sequencer_node[0].inner.add_ons_handle.rollup_manager_handle.clone();
+    let sequencer_rnm_handle = sequencer_node[0].rollup_manager_handle.clone();
     let mut sequencer_events = sequencer_rnm_handle.get_event_listener().await.unwrap();
     let mut follower_events = follower_node[0]
         .inner
@@ -580,7 +580,7 @@ async fn can_bridge_blocks() -> eyre::Result<()> {
     let mut bridge_node = nodes.pop().unwrap();
     let bridge_peer_id = bridge_node.network.record().id;
     let bridge_node_l1_watcher_tx =
-        bridge_node.inner.add_ons_handle.rollup_manager_handle.l1_watcher_mock.clone().unwrap();
+        bridge_node.rollup_manager_handle.l1_watcher_mock.clone().unwrap();
 
     // Send a notification to set the L1 to synced
     bridge_node_l1_watcher_tx.notification_tx.send(Arc::new(L1Notification::Synced)).await.unwrap();
@@ -708,7 +708,7 @@ async fn shutdown_consolidates_most_recent_batch_on_startup() -> eyre::Result<()
                 node.inner.task_executor.clone(),
             ),
             events,
-            node.inner.add_ons_handle.rpc_handle.rpc_server_handles.clone(),
+            node.inner.add_ons_handle.rpc_server_handles.clone(),
         )
         .await?;
 
@@ -868,7 +868,7 @@ async fn shutdown_consolidates_most_recent_batch_on_startup() -> eyre::Result<()
                 node.inner.task_executor.clone(),
             ),
             events,
-            node.inner.add_ons_handle.rpc_handle.rpc_server_handles.clone(),
+            node.inner.add_ons_handle.rpc_server_handles.clone(),
         )
         .await?;
     let l1_notification_tx = handle.l1_watcher_mock.clone().unwrap();
@@ -986,7 +986,7 @@ async fn graceful_shutdown_sets_fcs_to_latest_signed_block_in_db_on_start_up() -
                 node.inner.task_executor.clone(),
             ),
             events,
-            node.inner.add_ons_handle.rpc_handle.rpc_server_handles.clone(),
+            node.inner.add_ons_handle.rpc_server_handles.clone(),
         )
         .await?;
     let (_signal, shutdown) = shutdown_signal();
@@ -1060,7 +1060,7 @@ async fn graceful_shutdown_sets_fcs_to_latest_signed_block_in_db_on_start_up() -
                 node.inner.task_executor.clone(),
             ),
             events,
-            node.inner.add_ons_handle.rpc_handle.rpc_server_handles.clone(),
+            node.inner.add_ons_handle.rpc_server_handles.clone(),
         )
         .await?;
 

@@ -8,13 +8,12 @@ use dogeos_reth_evm::{ScrollEvmConfig, ScrollTransactionIntoTxEnv};
 use dogeos_reth_node::{DogeosEngineValidatorBuilder, DogeosEthApiBuilder, DogeosStorage};
 use dogeos_reth_primitives::DogeosPrimitives;
 use reth_evm::{EvmFactory, EvmFactoryFor};
-use reth_network::NetworkProtocols;
-use reth_network_api::FullNetwork;
+use reth_network::NetworkHandle;
 use reth_node_api::{AddOnsContext, NodeAddOns};
 use reth_node_builder::{
     rpc::{
         BasicEngineApiBuilder, BasicEngineValidatorBuilder, EngineValidatorAddOn, EthApiBuilder,
-        Identity, RethRpcAddOns, RethRpcMiddleware, RpcAddOns,
+        Identity, RethRpcAddOns, RethRpcMiddleware, RpcAddOns, RpcHandle,
     },
     FullNodeComponents,
 };
@@ -23,10 +22,7 @@ use reth_revm::context::{BlockEnv, TxEnv};
 use reth_rpc_builder::RethRpcModule;
 use reth_rpc_eth_types::{error::FromEvmError, EthApiError};
 use scroll_wire::ScrollWireEvent;
-use std::sync::Arc;
-
-mod handle;
-pub use handle::ScrollAddOnsHandle;
+use std::sync::{Arc, OnceLock};
 
 mod remote_block_source;
 pub use remote_block_source::RemoteBlockSourceAddOn;
@@ -43,11 +39,15 @@ use rollup::RollupManagerAddOn;
 use scroll_network::{DogeosNetworkPrimitives, EthWireBlockWithPeer};
 use tokio::sync::mpsc::UnboundedReceiver;
 
+pub(crate) type RollupManagerHandle = rollup_node_chain_orchestrator::ChainOrchestratorHandle<
+    reth_network::NetworkHandle<DogeosNetworkPrimitives>,
+>;
+
 /// Add-ons for the Scroll follower node.
 #[derive(Debug)]
 pub struct ScrollRollupNodeAddOns<N, RpcMiddleware = Identity>
 where
-    N: FullNodeComponents,
+    N: FullNodeComponents<Network = NetworkHandle<DogeosNetworkPrimitives>>,
     DogeosEthApiBuilder: EthApiBuilder<N>,
 {
     /// Rpc add-ons responsible for launching the RPC servers and instantiating the RPC handlers
@@ -63,11 +63,14 @@ where
 
     /// Rollup manager addon responsible for managing the components of the rollup node.
     pub rollup_manager_addon: RollupManagerAddOn,
+
+    /// Shared handle populated after the rollup manager launches.
+    rollup_manager_handle: Arc<OnceLock<RollupManagerHandle>>,
 }
 
 impl<N> ScrollRollupNodeAddOns<N>
 where
-    N: FullNodeComponents,
+    N: FullNodeComponents<Network = NetworkHandle<DogeosNetworkPrimitives>>,
     DogeosEthApiBuilder: EthApiBuilder<N>,
 {
     /// Create a new instance of [`ScrollRollupNodeAddOns`].
@@ -75,6 +78,7 @@ where
         config: ScrollRollupNodeConfig,
         scroll_wire_event: UnboundedReceiver<ScrollWireEvent>,
         eth_wire_event: UnboundedReceiver<EthWireBlockWithPeer>,
+        rollup_manager_handle: Arc<OnceLock<RollupManagerHandle>>,
     ) -> Self {
         let rpc_add_ons = RpcAddOns::new(
             DogeosEthApiBuilder::without_scroll_wire(),
@@ -85,19 +89,23 @@ where
         );
         let rollup_manager_addon =
             RollupManagerAddOn::new(config, scroll_wire_event, eth_wire_event);
-        Self { rpc_add_ons, rollup_manager_addon }
+        Self { rpc_add_ons, rollup_manager_addon, rollup_manager_handle }
     }
 }
 
 impl<N, RpcMiddleware> ScrollRollupNodeAddOns<N, RpcMiddleware>
 where
-    N: FullNodeComponents,
+    N: FullNodeComponents<Network = NetworkHandle<DogeosNetworkPrimitives>>,
     DogeosEthApiBuilder: EthApiBuilder<N>,
 {
     /// Sets the provided middleware for the rollup node addons.
     pub fn with_middleware<T>(self, middleware: T) -> ScrollRollupNodeAddOns<N, T> {
         let rpc_add_ons = self.rpc_add_ons.with_rpc_middleware(middleware);
-        ScrollRollupNodeAddOns { rpc_add_ons, rollup_manager_addon: self.rollup_manager_addon }
+        ScrollRollupNodeAddOns {
+            rpc_add_ons,
+            rollup_manager_addon: self.rollup_manager_addon,
+            rollup_manager_handle: self.rollup_manager_handle,
+        }
     }
 }
 
@@ -111,18 +119,20 @@ where
             Payload = DogeosEngineTypes,
         >,
         Evm = ScrollEvmConfig,
-        Network: FullNetwork<Primitives = DogeosNetworkPrimitives>
-                     + NetworkProtocols
-                     + scroll_network::EthWirePeerSender,
+        Network = NetworkHandle<DogeosNetworkPrimitives>,
     >,
     EthApiError: FromEvmError<N::Evm>,
     EvmFactoryFor<N::Evm>: EvmFactory<Tx = ScrollTransactionIntoTxEnv<TxEnv>, BlockEnv = BlockEnv>,
     RpcMiddleware: RethRpcMiddleware,
 {
-    type Handle = ScrollAddOnsHandle<N, <DogeosEthApiBuilder as EthApiBuilder<N>>::EthApi>;
+    type Handle = RpcHandle<N, <DogeosEthApiBuilder as EthApiBuilder<N>>::EthApi>;
 
     async fn launch_add_ons(self, ctx: AddOnsContext<'_, N>) -> eyre::Result<Self::Handle> {
-        let Self { mut rpc_add_ons, rollup_manager_addon: rollup_node_manager_addon } = self;
+        let Self {
+            mut rpc_add_ons,
+            rollup_manager_addon: rollup_node_manager_addon,
+            rollup_manager_handle: shared_rollup_manager_handle,
+        } = self;
         let (tx, rx) = tokio::sync::oneshot::channel();
         let rpc_config = rollup_node_manager_addon.config().rpc_args.clone();
         let min_suggested_priority_fee =
@@ -190,6 +200,9 @@ where
         let rpc_handle = rpc_add_ons.launch_add_ons_with(ctx.clone(), |_| Ok(())).await?;
         let rollup_manager_handle =
             rollup_node_manager_addon.launch(ctx.clone(), rpc_handle.clone()).await?;
+        shared_rollup_manager_handle
+            .set(rollup_manager_handle.clone())
+            .map_err(|_| eyre::eyre!("rollup manager handle was already initialized"))?;
 
         // Only send handle if RPC is enabled
         if rpc_config.basic_enabled || rpc_config.admin_enabled {
@@ -214,7 +227,7 @@ where
                 });
         }
 
-        Ok(ScrollAddOnsHandle { rollup_manager_handle, rpc_handle })
+        Ok(rpc_handle)
     }
 }
 
@@ -228,9 +241,7 @@ where
             Payload = DogeosEngineTypes,
         >,
         Evm = ScrollEvmConfig,
-        Network: FullNetwork<Primitives = DogeosNetworkPrimitives>
-                     + NetworkProtocols
-                     + scroll_network::EthWirePeerSender,
+        Network = NetworkHandle<DogeosNetworkPrimitives>,
     >,
     EthApiError: FromEvmError<N::Evm>,
     EvmFactoryFor<N::Evm>: EvmFactory<Tx = ScrollTransactionIntoTxEnv<TxEnv>, BlockEnv = BlockEnv>,
@@ -252,7 +263,7 @@ where
             Payload = DogeosEngineTypes,
         >,
         Evm = ScrollEvmConfig,
-        Network: FullNetwork<Primitives = DogeosNetworkPrimitives> + NetworkProtocols,
+        Network = NetworkHandle<DogeosNetworkPrimitives>,
     >,
     DogeosEthApiBuilder: EthApiBuilder<N>,
 {

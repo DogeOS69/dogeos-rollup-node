@@ -56,27 +56,32 @@ impl BlockImport<EthWireNewBlock<DogeosBlock>> for EthWireBlockImport {
         incoming_block: NewBlockEvent<EthWireNewBlock<DogeosBlock>>,
     ) {
         if let NewBlockEvent::Block(message) = incoming_block {
-            match self
-                .sender
-                .try_send(EthWireBlockWithPeer { peer_id, block: message.block.block.clone() })
-            {
-                Ok(()) => {}
-                Err(TrySendError::Full(_)) => {
+            // Reserve a slot before cloning: on a full queue the announcement is dropped anyway,
+            // so this avoids paying for a block clone that would be discarded immediately.
+            match self.sender.try_reserve() {
+                Ok(permit) => {
+                    permit
+                        .send(EthWireBlockWithPeer { peer_id, block: message.block.block.clone() });
+                }
+                Err(TrySendError::Full(())) => {
                     // The serial consumer is behind; drop the announcement instead of buffering
                     // unboundedly. The block is recovered later through re-announcements or sync.
                     self.dropped_since_log += 1;
                     if self.last_drop_log.is_none_or(|last| last.elapsed() >= DROP_LOG_INTERVAL) {
                         warn!(
                             target: "scroll::network::eth_wire",
+                            // `dropped` aggregates announcements from every peer since the last
+                            // warning; `latest_peer` is only the most recent sender, not the sole
+                            // source of the drops.
                             dropped = self.dropped_since_log,
-                            %peer_id,
+                            latest_peer = %peer_id,
                             "eth-wire block queue is full, dropping announcements"
                         );
                         self.dropped_since_log = 0;
                         self.last_drop_log = Some(Instant::now());
                     }
                 }
-                Err(TrySendError::Closed(_)) => {
+                Err(TrySendError::Closed(())) => {
                     trace!(
                         target: "scroll::network::eth_wire",
                         %peer_id,

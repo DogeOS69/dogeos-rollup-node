@@ -1149,7 +1149,12 @@ async fn can_revert_to_l1_block() -> eyre::Result<()> {
     assert_eq!(status.l2.fcs.safe_block_info().number, 57);
 
     // Now send a revert to L1 block 18318210
-    fixture.follower(0).rollup_manager_handle.revert_to_l1_block(18318210).await?;
+    fixture
+        .follower(0)
+        .rollup_manager_handle
+        .revert_to_l1_block(18318210)
+        .await?
+        .expect("revert to L1 block should succeed");
 
     // Wait for the chain to be unwound
     fixture.expect_event().revert_to_l1_block().await?;
@@ -1954,9 +1959,19 @@ async fn can_gossip_over_eth_wire() -> eyre::Result<()> {
     Ok(())
 }
 
+/// Verifies that the chain orchestrator *applies* a head-qualified authorized-signer rotation:
+/// after the rotation, sequencing and block validation follow the new signer.
+///
+/// This exercises the consumer path only. The rotation is injected via `L1Helper::signer_update`,
+/// which drives the head-qualified two-phase protocol across both transports — phase one
+/// (`AuthorizationPending`) on the priority control channel and phase two (`AuthorizedSigner`) on
+/// the ordinary FIFO notification channel — but does not drive the L1 watcher, so it does not prove
+/// watcher-driven refresh. The producer side — that dynamic mode refreshes, and that
+/// explicit-static and no-op modes neither read nor emit — is covered by the watcher unit tests and
+/// the `authorized_signer_source` policy.
 #[allow(clippy::large_stack_frames)]
 #[tokio::test]
-async fn signer_rotation() -> eyre::Result<()> {
+async fn signer_rotation_applied_via_authorization_barrier() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
     // Create the chain spec for scroll dev with Feynman activated and a test genesis.

@@ -74,6 +74,11 @@ pub enum ConsensusError {
     /// Failed to recover signer.
     #[error(transparent)]
     Recovery(#[from] RecoveryError),
+    /// Authorization is pending an L1 head signer confirmation, so the block cannot yet be
+    /// validated. This is a transient, fail-closed state and must not be treated as an invalid
+    /// block or used to penalize the sending peer.
+    #[error("authorization pending L1 head signer confirmation")]
+    AuthorizationPending,
 }
 
 /// An error that can occur during block validation.

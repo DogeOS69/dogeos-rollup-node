@@ -82,12 +82,12 @@ impl Signer {
             tokio::select! {
                 Some(request) = self.requests.next() => {
                     match request {
-                        SignerRequest::SignBlock(block) => {
+                        SignerRequest::SignBlock { block, generation } => {
                             let signer = self.signer.clone();
                             let metric = self.metrics.clone();
                             let future = Box::pin(async move {
                                 let now = Instant::now();
-                                let res = sign_block(block, signer).await;
+                                let res = sign_block(block, generation, signer).await;
                                 metric.signing_duration.record(now.elapsed().as_secs_f64());
                                 res
                             });
@@ -145,13 +145,17 @@ mod tests {
 
         // Test sending a request
         let block = DogeosBlock::default();
-        handle.sign_block(block.clone()).unwrap();
+        handle.sign_block(block.clone(), 7).unwrap();
 
         // Test receiving an event
         let event = handle.next().await.unwrap();
-        let (event_block, signature) = match event {
-            SignerEvent::SignedBlock { block, signature } => (block, signature),
+        let (event_block, signature, generation) = match event {
+            SignerEvent::SignedBlock { block, signature, generation } => {
+                (block, signature, generation)
+            }
         };
+        // The generation tag is echoed back unchanged.
+        assert_eq!(generation, 7);
         let hash = sig_encode_hash(&event_block);
         let recovered_address = signature.recover_address_from_prehash(&hash).unwrap();
 
@@ -215,7 +219,7 @@ mod tests {
 
         // Send a signing request through the handle
         let block = DogeosBlock::default();
-        handle.sign_block(block.clone()).unwrap();
+        handle.sign_block(block.clone(), 0).unwrap();
 
         // Drop the handle to simulate shutdown
         drop(handle);

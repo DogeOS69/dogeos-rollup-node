@@ -1,4 +1,5 @@
 use crate::L1Notification;
+use rollup_node_primitives::ConsensusUpdate;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -11,5 +12,9 @@ pub enum L1WatcherCommand {
         block: u64,
         /// New sender to replace the current notification channel.
         tx: mpsc::Sender<Arc<L1Notification>>,
+        /// New sender to replace the current authorization-control channel. Replacing it on reset
+        /// discards any control messages queued for the receiver that is being torn down, so a
+        /// stale [`ConsensusUpdate`] cannot be applied after the reset.
+        consensus_control_tx: mpsc::UnboundedSender<ConsensusUpdate>,
     },
 }

@@ -965,11 +965,17 @@ impl DebugRepl {
             }
             AdminCommand::RevertToL1Block(block_number) => {
                 crate::debug_toolkit::shared::output::print_admin_revert_start(block_number);
-                let result = handle.revert_to_l1_block(block_number).await?;
-                crate::debug_toolkit::shared::output::print_admin_revert_result(
-                    block_number,
-                    result,
-                );
+                match handle.revert_to_l1_block(block_number).await? {
+                    Ok(result) => {
+                        crate::debug_toolkit::shared::output::print_admin_revert_result(
+                            block_number,
+                            result,
+                        );
+                    }
+                    Err(e) => {
+                        println!("Revert to L1 block {} failed: {}", block_number, e);
+                    }
+                }
             }
         }
         Ok(())

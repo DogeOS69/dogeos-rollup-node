@@ -9,18 +9,26 @@ use rand::Rng;
 use rollup_node_primitives::{L1BlockStartupInfo, NodeConfig};
 use rollup_node_watcher::{
     random, test_utils::provider::MockProvider, Block, L1Notification, L1Watcher, L1WatcherHandle,
+    SignerRefreshPolicy,
 };
 const LOGS_QUERY_BLOCK_RANGE: u64 = 500;
 const L1_LIVENESS_THRESHOLD: u64 = 60;
 const L1_LIVENESS_CHECK_INTERVAL: u64 = 12;
 
+/// Bounded wait for the next structural notification, skipping the `Processed` and `Synced`
+/// progress markers. Head-qualified `Consensus` updates travel on the separate
+/// authorization-control channel and never appear here. A bounded timeout keeps a missing
+/// notification from hanging the test.
 async fn next_structural_notification(l1_watcher: &mut L1WatcherHandle) -> Arc<L1Notification> {
     loop {
-        let notification = l1_watcher.l1_notification_receiver().recv().await.unwrap();
-        if !matches!(
-            notification.as_ref(),
-            L1Notification::Consensus(_) | L1Notification::Processed(_) | L1Notification::Synced
-        ) {
+        let notification = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            l1_watcher.l1_notification_receiver().recv(),
+        )
+        .await
+        .expect("timed out waiting for a structural L1 notification")
+        .unwrap();
+        if !matches!(notification.as_ref(), L1Notification::Processed(_) | L1Notification::Synced) {
             return notification
         }
     }
@@ -93,6 +101,7 @@ async fn test_should_detect_reorg() -> eyre::Result<()> {
         LOGS_QUERY_BLOCK_RANGE,
         L1_LIVENESS_THRESHOLD,
         L1_LIVENESS_CHECK_INTERVAL,
+        SignerRefreshPolicy::Static,
         false,
     )
     .await;
@@ -189,6 +198,7 @@ async fn test_should_fetch_gap_in_unfinalized_blocks() -> eyre::Result<()> {
         LOGS_QUERY_BLOCK_RANGE,
         L1_LIVENESS_THRESHOLD,
         L1_LIVENESS_CHECK_INTERVAL,
+        SignerRefreshPolicy::Static,
         false,
     )
     .await;

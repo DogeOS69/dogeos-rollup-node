@@ -1,4 +1,4 @@
-use crate::{BlockImportError, BlockValidationError};
+use crate::{BlockImportError, BlockValidationError, ConsensusError};
 
 use super::{
     BlockImportOutcome, BlockValidation, EthWireBlockWithPeer, EthWirePeerSender,
@@ -384,6 +384,12 @@ impl<
             Ok(BlockValidation::ValidHeader { new_block: msg }) => {
                 trace!(target: "scroll::network::manager", peer_id = ?peer, block = %Into::<BlockInfo>::into(&msg.block), "Block import successful - announcing block to network");
                 self.announce_block(msg).await;
+            }
+            Err(BlockImportError::Consensus(ConsensusError::AuthorizationPending)) => {
+                // Fail-closed transient state: the authorized signer for the current L1 head is
+                // not yet confirmed, so we cannot validate the block. This is not the peer's
+                // fault, so we neither accept nor penalize it.
+                trace!(target: "scroll::network::manager", peer_id = ?peer, "Block import withheld - authorization pending - not penalizing peer");
             }
             Err(BlockImportError::Consensus(err)) => {
                 trace!(target: "scroll::network::manager", peer_id = ?peer, ?err, "Block import failed - consensus error - penalizing peer");

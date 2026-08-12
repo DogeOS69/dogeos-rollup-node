@@ -11,7 +11,9 @@ use futures::StreamExt;
 use reth_network_api::{FullNetwork, PeerId};
 use reth_provider::BlockReader;
 use reth_tokio_util::EventStream;
-use rollup_node_chain_orchestrator::{ChainOrchestratorEvent, ChainOrchestratorHandle};
+use rollup_node_chain_orchestrator::{
+    ChainOrchestratorEvent, ChainOrchestratorHandle, ImportBlockError,
+};
 use scroll_network::{DogeosNetworkPrimitives, NewBlockWithPeer};
 use tokio::time::{interval, Duration};
 
@@ -176,7 +178,20 @@ where
                     self.last_imported_block = next_block_num;
                     chain_import
                 }
-                Ok(Err(e)) => {
+                Ok(Err(ImportBlockError::AuthorizationPending)) => {
+                    // The orchestrator is holding an authorization barrier open (signer rotation or
+                    // reorg-driven reset in progress) and deferred the trusted import rather than
+                    // applying it. Leave `last_imported_block` unchanged and return cleanly so the
+                    // next poll retries this same block once the barrier closes. This is an
+                    // expected transient condition, not a sync error, so it is
+                    // logged at debug and does not propagate an error up to the
+                    // poll loop.
+                    tracing::debug!(target: "scroll::remote_source",
+                        next_block_num,
+                        "Trusted import deferred: L1 authorization pending, will retry on next poll");
+                    return Ok(());
+                }
+                Ok(Err(ImportBlockError::Other(e))) => {
                     return Err(eyre::eyre!("Import block failed: {}", e));
                 }
                 Err(e) => {

@@ -1,4 +1,4 @@
-use crate::ChainOrchestratorStatus;
+use crate::{ChainOrchestratorStatus, ImportBlockError, ResetCommandError};
 
 use super::ChainOrchestratorEvent;
 // use crate::manager::metrics::HandleMetrics;
@@ -122,20 +122,28 @@ impl<N: FullNetwork<Primitives = DogeosNetworkPrimitives>> ChainOrchestratorHand
     }
 
     /// Revert the rollup node state to the specified L1 block number.
+    ///
+    /// The inner `Result` is the typed command outcome: `Ok(true)` on a completed reset, or a
+    /// [`ResetCommandError`] — in particular [`ResetCommandError::ResetInProgress`] when a reset to
+    /// a different block is already staged (retry that exact target instead).
     pub async fn revert_to_l1_block(
         &self,
         block_number: u64,
-    ) -> Result<bool, oneshot::error::RecvError> {
+    ) -> Result<Result<bool, ResetCommandError>, oneshot::error::RecvError> {
         let (tx, rx) = oneshot::channel();
         self.send_command(ChainOrchestratorCommand::RevertToL1Block((block_number, tx)));
         rx.await
     }
 
     /// Import a block from a remote source.
+    ///
+    /// The inner `Err(ImportBlockError::AuthorizationPending)` indicates the import was deferred
+    /// behind an open authorization barrier; callers should retry rather than treat it as a
+    /// failure.
     pub async fn import_block(
         &self,
         block_with_peer: NewBlockWithPeer,
-    ) -> Result<Result<ChainImport, String>, oneshot::error::RecvError> {
+    ) -> Result<Result<ChainImport, ImportBlockError>, oneshot::error::RecvError> {
         let (tx, rx) = oneshot::channel();
         self.send_command(ChainOrchestratorCommand::ImportBlock { block_with_peer, response: tx });
         rx.await

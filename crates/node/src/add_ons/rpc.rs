@@ -234,13 +234,24 @@ where
             )
         })?;
 
-        handle.revert_to_l1_block(block_number).await.map_err(|e| {
-            ErrorObjectOwned::owned(
+        match handle.revert_to_l1_block(block_number).await {
+            // Completed reset.
+            Ok(Ok(reverted)) => Ok(reverted),
+            // Typed command failure — e.g. `ResetInProgress { staged, requested }` — surfaced with
+            // its specific message so the operator knows the correct recovery (retry the staged
+            // target).
+            Ok(Err(e)) => Err(ErrorObjectOwned::owned(
                 error::INTERNAL_ERROR_CODE,
                 format!("Failed to revert to L1 block {}: {}", block_number, e),
                 None::<()>,
-            )
-        })
+            )),
+            // The orchestrator dropped the response channel without answering.
+            Err(e) => Err(ErrorObjectOwned::owned(
+                error::INTERNAL_ERROR_CODE,
+                format!("Failed to revert to L1 block {}: {}", block_number, e),
+                None::<()>,
+            )),
+        }
     }
 }
 

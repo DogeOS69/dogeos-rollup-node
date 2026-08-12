@@ -9,7 +9,7 @@ use rollup_node_primitives::{L1BlockStartupInfo, NodeConfig};
 use rollup_node_watcher::{
     random,
     test_utils::{chain, chain_from, provider::MockProvider},
-    Block, L1Notification, L1Watcher,
+    Block, L1Notification, L1Watcher, SignerRefreshPolicy,
 };
 use scroll_l1::abi::logs::{try_decode_log, QueueTransaction};
 use std::sync::Arc;
@@ -73,6 +73,7 @@ async fn test_should_not_miss_logs_on_reorg() -> eyre::Result<()> {
         LOGS_QUERY_BLOCK_RANGE,
         L1_LIVENESS_THRESHOLD,
         L1_LIVENESS_CHECK_INTERVAL,
+        SignerRefreshPolicy::Static,
         false,
     )
     .await;

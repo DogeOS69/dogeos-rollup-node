@@ -7,9 +7,11 @@ use rollup_node_primitives::sig_encode_hash;
 /// A type alias for a future that resolves to a `SignerEvent` or a `SignerError`.
 pub type SignerFuture = Pin<Box<dyn Future<Output = Result<SignerEvent, SignerError>> + Send>>;
 
-/// A future that signs a block using the provided signer.
+/// A future that signs a block using the provided signer, echoing the caller's `generation` tag
+/// back on the resulting event.
 pub fn sign_block(
     block: DogeosBlock,
+    generation: u64,
     signer: Arc<dyn alloy_signer::Signer + Send + Sync>,
 ) -> SignerFuture {
     Box::pin(async move {
@@ -17,6 +19,6 @@ pub fn sign_block(
         // (`signer.sign_message`)?
         let hash = sig_encode_hash(&block);
         let signature = signer.sign_hash(&hash).await?;
-        Ok(SignerEvent::SignedBlock { block, signature })
+        Ok(SignerEvent::SignedBlock { block, signature, generation })
     })
 }

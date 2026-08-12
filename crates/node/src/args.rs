@@ -35,7 +35,7 @@ use rollup_node_providers::{
 use rollup_node_sequencer::{
     L1MessageInclusionMode, PayloadBuildingConfig, Sequencer, SequencerConfig,
 };
-use rollup_node_watcher::{L1Watcher, L1WatcherCommand};
+use rollup_node_watcher::{L1Watcher, L1WatcherCommand, SignerRefreshPolicy};
 use scroll_db::{
     Database, DatabaseConnectionProvider, DatabaseError, DatabaseMaintenance,
     DatabaseReadOperations, DatabaseWriteOperations,
@@ -143,6 +143,23 @@ impl ScrollRollupNodeConfig {
             self.l1_provider_args.url.is_none()
         {
             return Err("System contract consensus requires either an authorized signer or a L1 provider URL".to_string());
+        }
+
+        // Reject contradictory uses of the experimental runtime-refresh gate rather than silently
+        // ignoring it: it only makes sense for system-contract consensus with no explicit signer.
+        if self.consensus_args.runtime_authorized_signer_refresh {
+            if self.consensus_args.algorithm != ConsensusAlgorithm::SystemContract {
+                return Err("--consensus.runtime-authorized-signer-refresh requires system-contract consensus".to_string());
+            }
+            if self.consensus_args.authorized_signer.is_some() {
+                return Err("--consensus.runtime-authorized-signer-refresh conflicts with an explicit --consensus.authorized-signer (the explicit signer is static)".to_string());
+            }
+            if self.l1_provider_args.url.is_none() {
+                return Err(
+                    "--consensus.runtime-authorized-signer-refresh requires a L1 provider URL"
+                        .to_string(),
+                );
+            }
         }
 
         if self.remote_block_source_args.enabled && self.remote_block_source_args.url.is_none() {
@@ -385,56 +402,95 @@ impl ScrollRollupNodeConfig {
         tracing::info!(target: "scroll::node::args", fcs = ?fcs, payload_building_duration = ?self.sequencer_args.payload_building_duration, "Starting engine driver");
         let engine = Engine::new(Arc::new(engine_api), fcs);
 
-        // Create the consensus.
-        let authorized_signer = if let Some(provider) = l1_provider.as_ref() {
-            Some(
-                provider
-                    .authorized_signer(node_config.address_book.system_contract_address)
-                    .await?,
-            )
-        } else {
-            None
-        };
+        // Determine the authorized-signer policy once, at the producer boundary. This splits two
+        // independent choices: whether the initial signer is read from L1 at startup, and whether
+        // it rotates at runtime (the experimental, default-off gate).
+        let signer_refresh = self.consensus_args.authorized_signer_source();
+        let system_contract_address = node_config.address_book.system_contract_address;
+
+        // Read the initial signer from L1 for system-contract consensus with no explicit signer, in
+        // both dynamic and static-snapshot modes (preserving the pre-PR default). In dynamic mode
+        // the read is a concrete head-hash probe, so an L1 interface that cannot serve
+        // hash-qualified (EIP-1898) reads fails at startup rather than halting the barrier
+        // at the first watcher step; in static-snapshot mode a `latest`-tag read is
+        // sufficient because the value is frozen. There is no unpinned fallback.
+        let authorized_signer =
+            match (self.consensus_args.reads_initial_signer_from_l1(), l1_provider.as_ref()) {
+                (true, Some(provider)) => {
+                    let block_id = if signer_refresh.is_dynamic() {
+                        let head = provider
+                            .get_block(alloy_eips::BlockNumberOrTag::Latest.into())
+                            .await?
+                            .ok_or_else(|| {
+                                eyre::eyre!("failed to fetch latest L1 block for signer probe")
+                            })?;
+                        alloy_eips::BlockId::from(head.header.hash)
+                    } else {
+                        alloy_eips::BlockNumberOrTag::Latest.into()
+                    };
+                    Some(provider.authorized_signer_at(system_contract_address, block_id).await?)
+                }
+                _ => None,
+            };
         let consensus = self.consensus_args.consensus(authorized_signer)?;
 
         let is_anvil_provider = self.blob_provider_args.anvil_url.is_some();
 
-        let (_l1_notification_tx, _l1_command_rx, l1_watcher_handle): (_, _, _) = if let Some(
-            provider,
-        ) =
-            l1_provider.filter(|_| !self.test_args.test || is_anvil_provider)
-        {
-            tracing::info!(target: "scroll::node::args", ?l1_block_startup_info, "Starting L1 watcher");
+        let (_l1_notification_tx, _l1_command_rx, _l1_control_tx, l1_watcher_handle): (_, _, _, _) =
+            if let Some(provider) =
+                l1_provider.filter(|_| !self.test_args.test || is_anvil_provider)
+            {
+                tracing::info!(target: "scroll::node::args", ?l1_block_startup_info, ?signer_refresh, "Starting L1 watcher");
 
-            let (notification_tx, handle) = L1Watcher::spawn(
-                provider,
-                l1_block_startup_info,
-                node_config,
-                self.l1_provider_args.logs_query_block_range,
-                self.l1_provider_args.liveness_threshold,
-                self.l1_provider_args.liveness_check_interval,
+                let (notification_tx, handle) = L1Watcher::spawn(
+                    provider,
+                    l1_block_startup_info,
+                    node_config,
+                    self.l1_provider_args.logs_query_block_range,
+                    self.l1_provider_args.liveness_threshold,
+                    self.l1_provider_args.liveness_check_interval,
+                    signer_refresh,
+                    #[cfg(feature = "test-utils")]
+                    self.test_args.skip_l1_synced,
+                )
+                .await;
+                (
+                    Some(notification_tx),
+                    None::<UnboundedReceiver<L1WatcherCommand>>,
+                    None,
+                    Some(handle),
+                )
+            } else {
+                // Create channels for L1 notifications and authorization control that we can use to
+                // inject L1 messages and consensus updates for testing.
                 #[cfg(feature = "test-utils")]
-                self.test_args.skip_l1_synced,
-            )
-            .await;
-            (Some(notification_tx), None::<UnboundedReceiver<L1WatcherCommand>>, Some(handle))
-        } else {
-            // Create a channel for L1 notifications that we can use to inject L1 messages for
-            // testing
-            #[cfg(feature = "test-utils")]
-            {
-                let (notification_tx, notification_rx) = tokio::sync::mpsc::channel(1000);
-                let (command_tx, command_rx) = tokio::sync::mpsc::unbounded_channel();
-                let handle = rollup_node_watcher::L1WatcherHandle::new(command_tx, notification_rx);
+                {
+                    let (notification_tx, notification_rx) = tokio::sync::mpsc::channel(1000);
+                    let (command_tx, command_rx) = tokio::sync::mpsc::unbounded_channel();
+                    let (control_tx, control_rx) = tokio::sync::mpsc::unbounded_channel();
+                    let handle = rollup_node_watcher::L1WatcherHandle::new(
+                        command_tx,
+                        notification_rx,
+                        control_rx,
+                    );
 
-                (Some(notification_tx), Some(command_rx), Some(handle))
-            }
+                    (Some(notification_tx), Some(command_rx), Some(control_tx), Some(handle))
+                }
 
-            #[cfg(not(feature = "test-utils"))]
-            {
-                (None, None, None)
-            }
-        };
+                #[cfg(not(feature = "test-utils"))]
+                {
+                    (
+                        None,
+                        None,
+                        None::<
+                            tokio::sync::mpsc::UnboundedSender<
+                                rollup_node_primitives::ConsensusUpdate,
+                            >,
+                        >,
+                        None,
+                    )
+                }
+            };
 
         // Construct the l1 provider.
         let l1_messages_provider = db.clone();
@@ -520,6 +576,7 @@ impl ScrollRollupNodeConfig {
             sequencer,
             signer,
             derivation_pipeline,
+            signer_refresh.is_dynamic(),
         )
         .await?;
 
@@ -529,6 +586,8 @@ impl ScrollRollupNodeConfig {
             let l1_watcher_mock = rollup_node_watcher::test_utils::L1WatcherMock {
                 command_rx,
                 notification_tx: _l1_notification_tx.expect("L1 notification sender should be set"),
+                consensus_control_tx: _l1_control_tx
+                    .expect("L1 authorization-control sender should be set"),
             };
             handle.with_l1_watcher_mock(Some(l1_watcher_mock))
         };
@@ -563,12 +622,62 @@ pub struct ConsensusArgs {
     /// The optional authorized signer for system contract consensus.
     #[arg(long = "consensus.authorized-signer", value_name = "ADDRESS")]
     pub authorized_signer: Option<Address>,
+
+    /// EXPERIMENTAL, default off: refresh the authorized signer from the L1 system contract at
+    /// runtime (dynamic rotation), instead of freezing the initial value as a static snapshot.
+    ///
+    /// Requires system-contract consensus with no explicit `--consensus.authorized-signer`, and an
+    /// L1 interface that supports hash-qualified (EIP-1898) `eth_getStorageAt` — the current
+    /// `DogeOS` synthetic `l1_interface` does not, so enabling this against it will fail at
+    /// startup. Leave off unless a compatible L1 interface is deployed.
+    #[arg(
+        long = "consensus.runtime-authorized-signer-refresh",
+        value_name = "ENABLED",
+        default_value_t = false
+    )]
+    pub runtime_authorized_signer_refresh: bool,
 }
 
 impl ConsensusArgs {
     /// Create a new [`ConsensusArgs`] with the no-op consensus algorithm.
     pub const fn noop() -> Self {
-        Self { algorithm: ConsensusAlgorithm::Noop, authorized_signer: None }
+        Self {
+            algorithm: ConsensusAlgorithm::Noop,
+            authorized_signer: None,
+            runtime_authorized_signer_refresh: false,
+        }
+    }
+
+    /// Returns whether the authorized signer is refreshed from the L1 system contract at runtime.
+    ///
+    /// Dynamic rotation is only enabled for system-contract consensus with no explicit
+    /// `--consensus.authorized-signer` *and* the experimental
+    /// `--consensus.runtime-authorized-signer-refresh` flag set. Every other configuration (an
+    /// explicit signer, no-op consensus, or the flag left off) is static and never opens the
+    /// runtime authorization barrier. This is independent of
+    /// [`Self::reads_initial_signer_from_l1`]: a gate-off system-contract node still reads its
+    /// initial signer once, but freezes it.
+    pub const fn authorized_signer_source(&self) -> SignerRefreshPolicy {
+        match self.algorithm {
+            ConsensusAlgorithm::SystemContract
+                if self.authorized_signer.is_none() && self.runtime_authorized_signer_refresh =>
+            {
+                SignerRefreshPolicy::L1Dynamic
+            }
+            _ => SignerRefreshPolicy::Static,
+        }
+    }
+
+    /// Returns whether the initial authorized signer must be read once from L1 at startup.
+    ///
+    /// This is true for system-contract consensus with no explicit signer regardless of the runtime
+    /// refresh gate: gate-on reads it as a dynamic starting point, gate-off reads it once and
+    /// freezes it as a static snapshot (preserving the pre-PR default that a node without an
+    /// explicit override still obtains its signer from L1). An explicit signer or no-op
+    /// consensus reads nothing.
+    pub const fn reads_initial_signer_from_l1(&self) -> bool {
+        matches!(self.algorithm, ConsensusAlgorithm::SystemContract) &&
+            self.authorized_signer.is_none()
     }
 
     /// Creates a consensus instance based on the configured algorithm and authorized signer.
@@ -1014,6 +1123,102 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
+    fn authorized_signer_source_policy() {
+        // System-contract, no explicit signer, gate OFF: reads the initial signer from L1 once but
+        // freezes it as a static snapshot (the pre-PR default).
+        let snapshot = ConsensusArgs {
+            algorithm: ConsensusAlgorithm::SystemContract,
+            authorized_signer: None,
+            runtime_authorized_signer_refresh: false,
+        };
+        assert_eq!(snapshot.authorized_signer_source(), SignerRefreshPolicy::Static);
+        assert!(snapshot.reads_initial_signer_from_l1());
+
+        // System-contract, no explicit signer, gate ON: dynamic rotation, still reads from L1.
+        let dynamic = ConsensusArgs {
+            algorithm: ConsensusAlgorithm::SystemContract,
+            authorized_signer: None,
+            runtime_authorized_signer_refresh: true,
+        };
+        assert_eq!(dynamic.authorized_signer_source(), SignerRefreshPolicy::L1Dynamic);
+        assert!(dynamic.reads_initial_signer_from_l1());
+
+        // An explicit authorized signer is static and authoritative: no L1 read, no barrier, even
+        // if the gate were (contradictorily) set — `validate` rejects that combination
+        // separately.
+        let explicit = ConsensusArgs {
+            algorithm: ConsensusAlgorithm::SystemContract,
+            authorized_signer: Some(Address::new([0x11; 20])),
+            runtime_authorized_signer_refresh: false,
+        };
+        assert_eq!(explicit.authorized_signer_source(), SignerRefreshPolicy::Static);
+        assert!(!explicit.reads_initial_signer_from_l1());
+
+        // No-op consensus never uses an L1 signer.
+        assert_eq!(ConsensusArgs::noop().authorized_signer_source(), SignerRefreshPolicy::Static);
+        assert!(!ConsensusArgs::noop().reads_initial_signer_from_l1());
+        let noop_with_signer = ConsensusArgs {
+            algorithm: ConsensusAlgorithm::Noop,
+            authorized_signer: Some(Address::new([0x22; 20])),
+            runtime_authorized_signer_refresh: false,
+        };
+        assert_eq!(noop_with_signer.authorized_signer_source(), SignerRefreshPolicy::Static);
+        assert!(!noop_with_signer.reads_initial_signer_from_l1());
+    }
+
+    #[test]
+    fn test_validate_runtime_refresh_gate_rejects_contradictions() {
+        // A base config that satisfies the experimental runtime-refresh gate: system-contract
+        // consensus, no explicit signer, an L1 provider URL, and the gate enabled. (The config does
+        // not derive `Default`, so the fields are spelled out as in the other `validate` tests.)
+        let base = || ScrollRollupNodeConfig {
+            test_args: TestArgs::default(),
+            sequencer_args: SequencerArgs::default(),
+            signer_args: SignerArgs::default(),
+            database_args: RollupNodeDatabaseArgs::default(),
+            engine_driver_args: EngineDriverArgs::default(),
+            chain_orchestrator_args: ChainOrchestratorArgs::default(),
+            l1_provider_args: L1ProviderArgs {
+                url: Some("http://localhost:8545".parse().unwrap()),
+                ..Default::default()
+            },
+            blob_provider_args: BlobProviderArgs::default(),
+            network_args: RollupNodeNetworkArgs::default(),
+            gas_price_oracle_args: RollupNodeGasPriceOracleArgs::default(),
+            consensus_args: ConsensusArgs {
+                algorithm: ConsensusAlgorithm::SystemContract,
+                authorized_signer: None,
+                runtime_authorized_signer_refresh: true,
+            },
+            database: None,
+            rpc_args: RpcArgs::default(),
+            pprof_args: PprofArgs::default(),
+            remote_block_source_args: RemoteBlockSourceArgs::default(),
+            require_l1_data_fee_buffer: false,
+        };
+
+        // Accepted: valid dynamic system-contract refresh.
+        assert!(base().validate().is_ok());
+
+        // Rejected: the gate only makes sense for system-contract consensus.
+        let mut noop = base();
+        noop.consensus_args.algorithm = ConsensusAlgorithm::Noop;
+        assert!(noop.validate().unwrap_err().contains("requires system-contract consensus"));
+
+        // Rejected: an explicit authorized signer is static and conflicts with runtime refresh.
+        let mut explicit = base();
+        explicit.consensus_args.authorized_signer = Some(Address::new([0x11; 20]));
+        assert!(explicit.validate().unwrap_err().contains("conflicts with an explicit"));
+
+        // Rejected: refreshing the signer from L1 requires a L1 provider URL. (System-contract
+        // consensus with neither an explicit signer nor a URL is already contradictory, so this is
+        // caught by the general requirement the gate presupposes.)
+        let mut no_url = base();
+        no_url.l1_provider_args.url = None;
+        assert!(no_url.validate().unwrap_err().contains("L1 provider URL"));
+    }
+
+    #[test]
     fn test_network_args_default_authorized_signer() {
         // Test Scroll mainnet
         let mainnet_signer =
@@ -1073,6 +1278,7 @@ mod tests {
             consensus_args: ConsensusArgs {
                 algorithm: ConsensusAlgorithm::SystemContract,
                 authorized_signer: None,
+                runtime_authorized_signer_refresh: false,
             },
             database: None,
             rpc_args: RpcArgs::default(),
@@ -1141,6 +1347,7 @@ mod tests {
             consensus_args: ConsensusArgs {
                 algorithm: ConsensusAlgorithm::SystemContract,
                 authorized_signer: None,
+                runtime_authorized_signer_refresh: false,
             },
             database: None,
             rpc_args: RpcArgs::default(),

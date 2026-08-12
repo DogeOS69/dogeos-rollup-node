@@ -17,6 +17,8 @@ pub struct WatcherMetrics {
     pub reorgs: Counter,
     /// A histogram of reorgs depth.
     pub reorg_depths: Histogram,
+    /// A counter on non-terminal `step` failures that triggered a watcher-level retry backoff.
+    pub step_failures: Counter,
 }
 
 impl WatcherMetrics {

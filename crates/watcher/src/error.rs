@@ -3,6 +3,7 @@ use alloy_json_rpc::RpcError;
 use alloy_primitives::B256;
 use alloy_sol_types::Error;
 use alloy_transport::TransportErrorKind;
+use rollup_node_primitives::ConsensusUpdate;
 use rollup_node_providers::L1ProviderError;
 use std::sync::Arc;
 use tokio::sync::mpsc::error::SendError;
@@ -28,9 +29,20 @@ pub enum L1WatcherError {
     /// The L1 nofication channel was closed.
     #[error("l1 notification channel closed")]
     SendError(#[from] SendError<Arc<L1Notification>>),
+    /// The authorization-control channel was closed.
+    #[error("l1 authorization control channel closed")]
+    ControlSendError(#[from] SendError<ConsensusUpdate>),
     /// An error that occurred when accessing data from the cache.
     #[error(transparent)]
     Cache(#[from] CacheError),
+}
+
+impl L1WatcherError {
+    /// Returns `true` if the error is a closed notification or authorization-control channel, which
+    /// is terminal for the watcher run loop.
+    pub const fn is_channel_closed(&self) -> bool {
+        matches!(self, Self::SendError(_) | Self::ControlSendError(_))
+    }
 }
 
 /// An error occurred during a request to the Ethereum JSON RPC provider.

@@ -3,7 +3,7 @@ use dogeos_reth_primitives::DogeosBlock;
 use metrics::Counter;
 use metrics_derive::Metrics;
 use reth_primitives_traits::GotExpected;
-use rollup_node_primitives::{sig_encode_hash, ConsensusUpdate};
+use rollup_node_primitives::{sig_encode_hash, BlockInfo, ConsensusUpdate};
 use scroll_network::ConsensusError;
 use std::fmt::Debug;
 
@@ -19,6 +19,23 @@ pub trait Consensus: Send + Sync + Debug {
     ) -> Result<(), ConsensusError>;
     /// Returns a boolean indicating whether the sequencer should sequence a block.
     fn should_sequence_block(&self, sequencer: &Address) -> bool;
+    /// Returns whether an authorization barrier is currently open, i.e. a dynamic L1 head
+    /// transition has been observed but its authorized signer has not yet been confirmed.
+    ///
+    /// While pending, the consumer must withhold sequencing, local block finalization/announcement,
+    /// and inbound block acceptance (fail-closed). The default is `false` for consensus
+    /// implementations that never participate in the head-qualified authorization protocol.
+    fn authorization_pending(&self) -> bool {
+        false
+    }
+    /// Synchronously enters a suspended authorization state (opens the barrier) with no specific
+    /// head.
+    ///
+    /// Used on an administrative reset in dynamic mode so authorization-sensitive work is withheld
+    /// against the pre-reset state until the fresh watcher re-establishes and closes a
+    /// head-qualified barrier. The default is a no-op for consensus implementations that never
+    /// participate in the authorization protocol.
+    fn suspend_authorization(&mut self) {}
 }
 
 /// A no-op consensus instance.
@@ -54,6 +71,14 @@ pub(crate) struct SystemContractConsensusMetrics {
 #[derive(Debug)]
 pub struct SystemContractConsensus {
     authorized_signer: Address,
+    /// The L1 head for which an authorized-signer confirmation is pending, i.e. the open
+    /// authorization barrier.
+    ///
+    /// Set by a phase-one [`ConsensusUpdate::AuthorizationPending`] and cleared by a phase-two
+    /// [`ConsensusUpdate::AuthorizedSigner`] whose `head` matches. A phase two for any other head
+    /// is stale (for example a replaced or reorged head) and must never clear or move the
+    /// barrier.
+    pending_authorization_head: Option<BlockInfo>,
 
     /// The metrics for the [`SystemContractConsensus`].
     metrics: SystemContractConsensusMetrics,
@@ -67,19 +92,49 @@ impl SystemContractConsensus {
             target: "scroll::consensus",
             "Initialized system contract consensus with authorized signer: {authorized_signer}"
         );
-        Self { authorized_signer, metrics: SystemContractConsensusMetrics::default() }
+        Self {
+            authorized_signer,
+            pending_authorization_head: None,
+            metrics: SystemContractConsensusMetrics::default(),
+        }
     }
 }
 
 impl Consensus for SystemContractConsensus {
     fn update_config(&mut self, update: &ConsensusUpdate) {
         match update {
-            ConsensusUpdate::AuthorizedSigner(signer) => {
+            ConsensusUpdate::AuthorizationPending(head) => {
+                // Open (or move) the barrier to this head. A newer pending head supersedes any
+                // earlier pending head, which is valid across an A -> B (or A -> B -> A) sequence.
+                tracing::debug!(
+                    target: "scroll::consensus",
+                    number = head.number,
+                    hash = ?head.hash,
+                    "authorization pending for L1 head; withholding sequencing and block import"
+                );
+                self.pending_authorization_head = Some(*head);
+            }
+            ConsensusUpdate::AuthorizedSigner { head, signer } => {
+                // Only a signer confirmation for the currently pending head may close the barrier;
+                // a stale head (replaced or reorged) is ignored and leaves the barrier untouched.
+                if self.pending_authorization_head != Some(*head) {
+                    tracing::debug!(
+                        target: "scroll::consensus",
+                        number = head.number,
+                        hash = ?head.hash,
+                        pending = ?self.pending_authorization_head,
+                        "ignoring stale authorized-signer update for non-pending L1 head"
+                    );
+                    return;
+                }
                 tracing::info!(
                     target: "scroll::consensus",
+                    number = head.number,
+                    hash = ?head.hash,
                     "Authorized signer updated to: {signer}"
                 );
-                self.authorized_signer = *signer
+                self.authorized_signer = *signer;
+                self.pending_authorization_head = None;
             }
         };
     }
@@ -89,6 +144,13 @@ impl Consensus for SystemContractConsensus {
         block: &DogeosBlock,
         signature: &Signature,
     ) -> Result<(), ConsensusError> {
+        // Fail-closed while the barrier is open: the authorized signer for the current L1 head is
+        // not yet confirmed, so no block can be validated. This is distinct from an incorrect
+        // signature and must not penalize the peer (see the network manager).
+        if self.pending_authorization_head.is_some() {
+            return Err(ConsensusError::AuthorizationPending)
+        }
+
         let hash = sig_encode_hash(&block.header);
         let signer = reth_primitives_traits::crypto::secp256k1::recover_signer(signature, hash)?;
 
@@ -103,7 +165,19 @@ impl Consensus for SystemContractConsensus {
     }
 
     fn should_sequence_block(&self, sequencer: &Address) -> bool {
-        sequencer == &self.authorized_signer
+        // Withhold sequencing while the barrier is open.
+        self.pending_authorization_head.is_none() && sequencer == &self.authorized_signer
+    }
+
+    fn authorization_pending(&self) -> bool {
+        self.pending_authorization_head.is_some()
+    }
+
+    fn suspend_authorization(&mut self) {
+        // Open the barrier with a sentinel head. The fresh watcher's `AuthorizationPending`
+        // overwrites this sentinel with the real head and its `AuthorizedSigner` then closes it, so
+        // the barrier is held open only for the reset window.
+        self.pending_authorization_head = Some(BlockInfo::default());
     }
 }
 
@@ -170,14 +244,114 @@ mod tests {
             },
         };
 
+        let head = BlockInfo {
+            number: 100,
+            hash: b256!("00000000000000000000000000000000000000000000000000000000000000aa"),
+        };
+        let reorged_head = BlockInfo {
+            number: 100,
+            hash: b256!("00000000000000000000000000000000000000000000000000000000000000bb"),
+        };
+
+        // Initially the old signer sequences and the block (signed by the new signer) is rejected
+        // with a precise `IncorrectSigner` payload.
         assert!(consensus.should_sequence_block(&old_signer));
         assert!(!consensus.should_sequence_block(&new_signer));
-        assert!(consensus.validate_new_block(&block, &signature).is_err());
+        assert!(!consensus.authorization_pending());
+        match consensus.validate_new_block(&block, &signature).unwrap_err() {
+            ConsensusError::IncorrectSigner(GotExpected { got, expected }) => {
+                assert_eq!(got, new_signer);
+                assert_eq!(expected, old_signer);
+            }
+            other => panic!("expected IncorrectSigner, got {other:?}"),
+        }
 
-        consensus.update_config(&ConsensusUpdate::AuthorizedSigner(new_signer));
+        // Opening the barrier withholds sequencing and fails block validation with the distinct,
+        // non-penalizing `AuthorizationPending` error rather than a signature mismatch.
+        consensus.update_config(&ConsensusUpdate::AuthorizationPending(head));
+        assert!(consensus.authorization_pending());
+        assert!(!consensus.should_sequence_block(&old_signer));
+        assert!(!consensus.should_sequence_block(&new_signer));
+        assert!(matches!(
+            consensus.validate_new_block(&block, &signature).unwrap_err(),
+            ConsensusError::AuthorizationPending
+        ));
 
+        // A stale phase-two update for a different (reorged) head must not close the barrier or
+        // move the signer.
+        consensus.update_config(&ConsensusUpdate::AuthorizedSigner {
+            head: reorged_head,
+            signer: new_signer,
+        });
+        assert!(consensus.authorization_pending());
+        assert!(!consensus.should_sequence_block(&new_signer));
+
+        // The matching phase-two update closes the barrier and rotates the signer.
+        consensus.update_config(&ConsensusUpdate::AuthorizedSigner { head, signer: new_signer });
+        assert!(!consensus.authorization_pending());
         assert!(!consensus.should_sequence_block(&old_signer));
         assert!(consensus.should_sequence_block(&new_signer));
         consensus.validate_new_block(&block, &signature).unwrap();
+
+        // An unchanged signer still opens and closes each head's barrier.
+        let next_head = BlockInfo {
+            number: 101,
+            hash: b256!("00000000000000000000000000000000000000000000000000000000000000cc"),
+        };
+        consensus.update_config(&ConsensusUpdate::AuthorizationPending(next_head));
+        assert!(consensus.authorization_pending());
+        consensus.update_config(&ConsensusUpdate::AuthorizedSigner {
+            head: next_head,
+            signer: new_signer,
+        });
+        assert!(!consensus.authorization_pending());
+        assert!(consensus.should_sequence_block(&new_signer));
+    }
+
+    #[test]
+    fn suspend_authorization_holds_barrier_until_fresh_refresh() {
+        let signer = address!("1111111111111111111111111111111111111111");
+        let new_signer = address!("2222222222222222222222222222222222222222");
+        let mut consensus = SystemContractConsensus::new(signer);
+
+        // Baseline: barrier closed, the authorized signer sequences.
+        assert!(!consensus.authorization_pending());
+        assert!(consensus.should_sequence_block(&signer));
+
+        // A reorg-driven reset (`RevertToL1Block` in dynamic mode) suspends authorization: the
+        // barrier opens immediately with a sentinel head so nothing sequences or imports under a
+        // signer that may be revoked, before the fresh watcher has re-read L1 for the reset head.
+        consensus.suspend_authorization();
+        assert!(consensus.authorization_pending());
+        assert!(!consensus.should_sequence_block(&signer));
+
+        // A stale phase-two update left over from before the reset can never match the sentinel
+        // head, so it cannot close the reset barrier.
+        let stale_head = BlockInfo {
+            number: 7,
+            hash: b256!("00000000000000000000000000000000000000000000000000000000000000dd"),
+        };
+        consensus.update_config(&ConsensusUpdate::AuthorizedSigner {
+            head: stale_head,
+            signer: new_signer,
+        });
+        assert!(consensus.authorization_pending());
+        assert!(!consensus.should_sequence_block(&new_signer));
+
+        // The fresh watcher's phase one overwrites the sentinel with the real reset head; phase two
+        // for that same head then closes the barrier and installs the refreshed signer.
+        let fresh_head = BlockInfo {
+            number: 9,
+            hash: b256!("00000000000000000000000000000000000000000000000000000000000000ee"),
+        };
+        consensus.update_config(&ConsensusUpdate::AuthorizationPending(fresh_head));
+        assert!(consensus.authorization_pending());
+        consensus.update_config(&ConsensusUpdate::AuthorizedSigner {
+            head: fresh_head,
+            signer: new_signer,
+        });
+        assert!(!consensus.authorization_pending());
+        assert!(consensus.should_sequence_block(&new_signer));
+        assert!(!consensus.should_sequence_block(&signer));
     }
 }

@@ -1,5 +1,6 @@
 use crate::{random, Header, L1Notification, L1WatcherCommand};
 use arbitrary::Arbitrary;
+use rollup_node_primitives::ConsensusUpdate;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 
@@ -19,6 +20,10 @@ pub struct L1WatcherMock {
     pub command_rx: Option<Arc<Mutex<mpsc::UnboundedReceiver<L1WatcherCommand>>>>,
     /// Sender for L1 notifications.
     pub notification_tx: mpsc::Sender<Arc<L1Notification>>,
+    /// Sender for the dedicated authorization-control channel. Test injections of head-qualified
+    /// consensus updates must use this path so they exercise the same unguarded control transport
+    /// used in production.
+    pub consensus_control_tx: mpsc::UnboundedSender<ConsensusUpdate>,
 }
 
 impl L1WatcherMock {
@@ -28,10 +33,11 @@ impl L1WatcherMock {
             let mut commands = command_rx.lock().await;
             if let Some(command) = commands.recv().await {
                 match command {
-                    L1WatcherCommand::ResetToBlock { block, tx } => {
+                    L1WatcherCommand::ResetToBlock { block, tx, consensus_control_tx } => {
                         // For testing purposes, we can just log the reset action.
                         tracing::info!(target: "scroll::watcher::test_utils", "L1 Watcher Mock resetting to block {}", block);
                         self.notification_tx = tx;
+                        self.consensus_control_tx = consensus_control_tx;
                     }
                 }
             }

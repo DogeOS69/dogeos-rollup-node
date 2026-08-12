@@ -1,4 +1,4 @@
-use crate::{ChainOrchestratorEvent, ChainOrchestratorStatus};
+use crate::{ChainOrchestratorEvent, ChainOrchestratorStatus, ImportBlockError, ResetCommandError};
 
 use reth_network_api::FullNetwork;
 use reth_tokio_util::EventStream;
@@ -26,14 +26,18 @@ pub enum ChainOrchestratorCommand<N: FullNetwork<Primitives = DogeosNetworkPrimi
     DisableAutomaticSequencing(oneshot::Sender<bool>),
     /// Send a database query to the rollup manager.
     DatabaseQuery(DatabaseQuery),
-    /// Revert the rollup node state to the specified L1 block number.
-    RevertToL1Block((u64, oneshot::Sender<bool>)),
+    /// Revert the rollup node state to the specified L1 block number. The response is `Ok(true)`
+    /// on a completed reset, or a typed [`ResetCommandError`] — notably
+    /// [`ResetCommandError::ResetInProgress`] when a reset to a different block is already staged.
+    RevertToL1Block((u64, oneshot::Sender<Result<bool, ResetCommandError>>)),
     /// Import a block from a remote source.
     ImportBlock {
         /// The block to import with peer info
         block_with_peer: NewBlockWithPeer,
-        /// Response channel
-        response: oneshot::Sender<Result<ChainImport, String>>,
+        /// Response channel. `Err(ImportBlockError::AuthorizationPending)` signals the import was
+        /// deferred behind an open authorization barrier and should be retried, not treated as a
+        /// failure.
+        response: oneshot::Sender<Result<ChainImport, ImportBlockError>>,
     },
     /// Enable gossiping of blocks to peers.
     #[cfg(feature = "test-utils")]

@@ -26,13 +26,16 @@ impl SignerHandle {
         Self { request_tx, event_rx, address }
     }
 
-    /// Sends a request to sign a block.
+    /// Sends a request to sign a block, tagging it with the caller's `generation` so the resulting
+    /// [`SignerEvent::SignedBlock`](super::SignerEvent::SignedBlock) can be matched back to (and
+    /// discarded for) a stale generation.
     pub fn sign_block(
         &self,
         block: dogeos_reth_primitives::DogeosBlock,
+        generation: u64,
     ) -> Result<(), SignerError> {
         self.request_tx
-            .send(SignerRequest::SignBlock(block))
+            .send(SignerRequest::SignBlock { block, generation })
             .map_err(|_| SignerError::RequestChannelClosed)?;
         Ok(())
     }

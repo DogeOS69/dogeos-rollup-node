@@ -13,7 +13,7 @@ use alloy_network::Ethereum;
 use alloy_primitives::{Address, BlockNumber, StorageValue, TxHash, B256, U256, U64};
 use alloy_provider::{EthGetBlock, Provider, ProviderCall, RootProvider, RpcWithBlock};
 use alloy_rpc_types_eth::{BlockId, Filter, Log, Transaction};
-use alloy_transport::TransportResult;
+use alloy_transport::{TransportErrorKind, TransportResult};
 
 /// A mock implementation of the [`Provider`] trait.
 #[derive(Debug)]
@@ -25,6 +25,13 @@ pub struct MockProvider {
     latest_blocks: Arc<Mutex<Vec<Block>>>,
     storage_responses: Arc<Mutex<VecDeque<TransportResult<StorageValue>>>>,
     storage_read_count: Arc<AtomicUsize>,
+    /// The block ids requested through [`Provider::get_storage_at`], in order.
+    storage_block_ids: Arc<Mutex<Vec<BlockId>>>,
+    /// The value returned when no scripted storage response remains. `None` (the default) is
+    /// strict and returns an error for unscripted reads; integration fixtures that
+    /// intentionally rely on a stable value must opt in via
+    /// [`MockProvider::with_default_storage_value`].
+    default_storage_response: Option<StorageValue>,
 }
 
 impl MockProvider {
@@ -49,6 +56,8 @@ impl MockProvider {
             latest_blocks: Arc::new(Mutex::new(latest_blocks)),
             storage_responses: Arc::new(Mutex::new(VecDeque::new())),
             storage_read_count: Arc::new(AtomicUsize::new(0)),
+            storage_block_ids: Arc::new(Mutex::new(Vec::new())),
+            default_storage_response: None,
         }
     }
 
@@ -61,9 +70,22 @@ impl MockProvider {
         self
     }
 
+    /// Opt in to a lenient default storage value returned once the scripted responses are
+    /// exhausted. Without this, unscripted [`Provider::get_storage_at`] reads return an error so a
+    /// test cannot silently depend on an implicit zero value.
+    pub const fn with_default_storage_value(mut self, value: StorageValue) -> Self {
+        self.default_storage_response = Some(value);
+        self
+    }
+
     /// Returns the number of storage requests made through this provider.
     pub fn storage_read_count(&self) -> usize {
         self.storage_read_count.load(Ordering::Relaxed)
+    }
+
+    /// Returns the block ids requested through [`Provider::get_storage_at`], in order.
+    pub fn storage_block_ids(&self) -> Vec<BlockId> {
+        self.storage_block_ids.lock().unwrap().clone()
     }
 }
 
@@ -131,10 +153,19 @@ impl Provider for MockProvider {
     ) -> RpcWithBlock<(Address, U256), StorageValue> {
         let storage_responses = Arc::clone(&self.storage_responses);
         let storage_read_count = Arc::clone(&self.storage_read_count);
-        RpcWithBlock::new_provider(move |_| {
+        let storage_block_ids = Arc::clone(&self.storage_block_ids);
+        let default_storage_response = self.default_storage_response;
+        RpcWithBlock::new_provider(move |block_id| {
             storage_read_count.fetch_add(1, Ordering::Relaxed);
-            let response =
-                storage_responses.lock().unwrap().pop_front().unwrap_or(Ok(StorageValue::ZERO));
+            storage_block_ids.lock().unwrap().push(block_id);
+            let response = storage_responses.lock().unwrap().pop_front().unwrap_or_else(|| {
+                default_storage_response.map(Ok).unwrap_or_else(|| {
+                    Err(TransportErrorKind::custom_str(
+                        "unscripted MockProvider::get_storage_at read (strict mode); \
+                         script a response or opt in with `with_default_storage_value`",
+                    ))
+                })
+            });
             ProviderCall::Ready(Some(response))
         })
     }

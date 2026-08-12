@@ -48,11 +48,16 @@ impl<'a> L1Helper<'a> {
         self.send_to_nodes(notification).await
     }
 
-    /// Send an L1 consensus notification.
+    /// Inject a head-qualified authorized-signer rotation, mirroring the watcher's two-phase
+    /// protocol: phase one (`AuthorizationPending`) opens the barrier on the priority control
+    /// channel, and phase two (`AuthorizedSigner`) closes it on the ordinary FIFO notification
+    /// channel — the same channels and ordering the watcher uses, so the consumer applies it
+    /// exactly as it would a watcher-driven rotation.
     pub async fn signer_update(self, new_signer: Address) -> eyre::Result<()> {
-        let notification =
-            Arc::new(L1Notification::Consensus(ConsensusUpdate::AuthorizedSigner(new_signer)));
-        self.send_to_nodes(notification).await
+        let head = BlockInfo { number: 0, hash: B256::random() };
+        self.send_control_to_nodes(ConsensusUpdate::AuthorizationPending(head)).await?;
+        self.send_to_nodes(Arc::new(L1Notification::AuthorizedSigner { head, signer: new_signer }))
+            .await
     }
 
     /// Send an L1 reorg notification.
@@ -126,6 +131,29 @@ impl<'a> L1Helper<'a> {
 
         for tx in senders {
             tx.send(notification.clone()).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Send an authorization-control update to target nodes on the dedicated control channel.
+    async fn send_control_to_nodes(&self, update: ConsensusUpdate) -> eyre::Result<()> {
+        let senders: Vec<_> = {
+            let indices: Vec<usize> = if let Some(index) = self.target_node_index {
+                vec![index]
+            } else {
+                (0..self.fixture.nodes.len()).collect()
+            };
+            indices
+                .into_iter()
+                .filter_map(|i| self.fixture.nodes.get(i).and_then(|o| o.as_ref()))
+                .filter_map(|node| node.rollup_manager_handle.l1_watcher_mock.as_ref())
+                .map(|mock| mock.consensus_control_tx.clone())
+                .collect()
+        };
+
+        for tx in senders {
+            tx.send(update.clone())?;
         }
 
         Ok(())

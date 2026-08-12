@@ -89,11 +89,11 @@ where
             tokio::sync::mpsc::channel(ETH_WIRE_BLOCK_CHANNEL_SIZE);
         *self.eth_wire_events.try_lock().unwrap() = Some(eth_wire_events);
 
-        let mut network_builder = ScrollNetworkBuilder::new(
-            self.config.database.clone().expect("database is set via hydration"),
-            eth_wire_block_tx,
-        )
-        .with_signer(self.config.network_args.signer_address);
+        let mut network_builder = ScrollNetworkBuilder::new(eth_wire_block_tx)
+            .with_signer(self.config.network_args.signer_address)
+            .with_legacy_geth_header_transform(
+                self.config.network_args.legacy_geth_header_transform,
+            );
 
         // Only add scroll-wire sub-protocol if enabled
         if self.config.network_args.enable_scroll_wire {

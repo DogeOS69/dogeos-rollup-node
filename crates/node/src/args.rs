@@ -663,6 +663,16 @@ pub struct RollupNodeNetworkArgs {
     /// The valid signer address for the network.
     #[arg(long = "network.valid_signer", value_name = "VALID_SIGNER")]
     pub signer_address: Option<Address>,
+    /// Temporary: enable the legacy geth-to-Reth downloaded-header transform for the one-way
+    /// Testnet crossover, where a lagging Reth node canonicalizes signed headers downloaded from
+    /// the last l2geth sequencer. Defaults to `false`, is rejected on `DogeOS` Mainnet, and is
+    /// scheduled for removal with the rest of the geth compatibility code.
+    #[arg(
+        long = "network.legacy-geth-header-transform",
+        default_value_t = false,
+        action = ArgAction::Set
+    )]
+    pub legacy_geth_header_transform: bool,
 }
 
 impl Default for RollupNodeNetworkArgs {
@@ -672,6 +682,7 @@ impl Default for RollupNodeNetworkArgs {
             enable_scroll_wire: true,
             sequencer_url: None,
             signer_address: None,
+            legacy_geth_header_transform: false,
         }
     }
 }

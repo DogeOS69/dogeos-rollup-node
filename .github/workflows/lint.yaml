@@ -28,6 +28,8 @@ jobs:
         run: cargo fetch --locked
       - name: Verify Reth dependency sources
         run: .github/assets/verify_reth_sources.sh
+      - name: Check source guard rejects noncanonical fixtures
+        run: .github/assets/verify_reth_sources_test.sh
 
   clippy:
     runs-on: ubuntu-latest

@@ -1,0 +1,71 @@
+#!/usr/bin/env sh
+# Fixtures for verify_reth_sources.sh: the unmodified dependency graph must
+# pass, and every mutated copy of it must be rejected. Requires a fetched
+# workspace (cargo metadata --locked --offline must succeed).
+set -eu
+
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+verify="$script_dir/verify_reth_sources.sh"
+
+workdir=$(mktemp -d)
+trap 'rm -rf "$workdir"' EXIT
+
+metadata_file="$workdir/metadata.json"
+cargo metadata --locked --offline --format-version 1 > "$metadata_file"
+
+# Positive control: the checked-in graph must pass through the file entry point.
+"$verify" "$metadata_file" > /dev/null
+echo "ok: guard accepts the checked-in dependency graph"
+
+fixture="$workdir/fixture.json"
+canonical_metadata="$workdir/metadata.canonical.json"
+jq -S . "$metadata_file" > "$canonical_metadata"
+
+expect_reject() {
+    description="$1"
+    mutation="$2"
+    jq "$mutation" "$metadata_file" > "$fixture"
+    # A fixture that does not change the metadata would trivially pass the
+    # guard; treat it as a broken fixture rather than a rejection.
+    if jq -S . "$fixture" | cmp -s - "$canonical_metadata"; then
+        echo "FAIL: fixture mutation for $description left the metadata unchanged" >&2
+        exit 1
+    fi
+    if "$verify" "$fixture" > /dev/null 2>&1; then
+        echo "FAIL: guard accepted $description" >&2
+        exit 1
+    fi
+    echo "ok: guard rejects $description"
+}
+
+expect_reject "a null-source DogeOS component" \
+    '.packages |= map(if .name == "dogeos-reth-evm" then .source = null else . end)'
+
+expect_reject "a path-source DogeOS component" \
+    '.packages |= map(if .name == "dogeos-chainspec" then .source = "path+file:///tmp/dogeos-chainspec" else . end)'
+
+expect_reject "a duplicate DogeOS component at a stale revision alongside the good anchors" \
+    '.packages += [first(.packages[] | select(.name == "dogeos-chainspec")) | .source = "git+https://github.com/DogeOS69/dogeos-reth.git?rev=fdf28d7000000000000000000000000000000000#fdf28d7000000000000000000000000000000000"]'
+
+expect_reject "a duplicate clean DogeOS Reth package at a noncanonical revision" \
+    '.packages += [first(.packages[] | select(.name == "reth-node-builder")) | .source = "git+https://github.com/DogeOS69/reth.git?rev=3333333333333333333333333333333333333333#3333333333333333333333333333333333333333"]'
+
+expect_reject "a retired dogeos-reth2 source without the .git suffix" \
+    '.packages += [first(.packages[] | select(.name == "reth-node-builder")) | .source = "git+https://github.com/DogeOS69/dogeos-reth2?rev=0000000000000000000000000000000000000000#0000000000000000000000000000000000000000"]'
+
+expect_reject "a retired scroll-reth source with alternate casing" \
+    '.packages += [first(.packages[] | select(.name == "reth-node-builder")) | .source = "git+https://github.com/DogeOS69/Scroll-Reth.git?branch=dev#0000000000000000000000000000000000000000"]'
+
+expect_reject "a retired scroll-tech/reth source without the .git suffix" \
+    '.packages += [first(.packages[] | select(.name == "reth-node-builder")) | .source = "git+https://github.com/scroll-tech/reth?branch=scroll#0000000000000000000000000000000000000000"]'
+
+expect_reject "a duplicate lowercase-organization DogeOS REVM source" \
+    '.packages += [first(.packages[] | select(.name == "revm-scroll")) | .source = "git+https://github.com/dogeos69/dogeos-revm?branch=dogeos#dcf087684f255131c96c0d20f3291eef9198e990"]'
+
+expect_reject "a wrong DogeOS REVM revision" \
+    '.packages |= map(if .name == "revm-scroll" then .source = "git+https://github.com/DogeOS69/dogeos-revm.git?branch=dogeos#1111111111111111111111111111111111111111" else . end)'
+
+expect_reject "a wrong official Reth revision" \
+    '.packages |= map(if .source != null and (.source | contains("paradigmxyz/reth")) then .source = "git+https://github.com/paradigmxyz/reth?rev=2222222222222222222222222222222222222222#2222222222222222222222222222222222222222" else . end)'
+
+echo "source guard fixtures passed"

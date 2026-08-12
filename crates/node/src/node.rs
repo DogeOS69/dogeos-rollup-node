@@ -15,17 +15,20 @@ use reth_node_builder::{
     components::{BasicPayloadServiceBuilder, ComponentsBuilder},
     FullNodeTypes, Node, NodeAdapter, NodeComponentsBuilder, NodeConfig,
 };
-use scroll_network::EthWireBlockWithPeer;
+use scroll_network::{EthWireBlockWithPeer, ETH_WIRE_BLOCK_CHANNEL_SIZE};
 use scroll_wire::{ScrollWireConfig, ScrollWireEvent, ScrollWireProtocolHandler};
 use std::sync::{Arc, OnceLock};
-use tokio::sync::{mpsc::UnboundedReceiver, Mutex};
+use tokio::sync::{
+    mpsc::{Receiver, UnboundedReceiver},
+    Mutex,
+};
 
 /// The Scroll node implementation.
 #[derive(Clone, Debug)]
 pub struct ScrollRollupNode {
     config: ScrollRollupNodeConfig,
     scroll_wire_events: Arc<Mutex<Option<UnboundedReceiver<ScrollWireEvent>>>>,
-    eth_wire_events: Arc<Mutex<Option<UnboundedReceiver<EthWireBlockWithPeer>>>>,
+    eth_wire_events: Arc<Mutex<Option<Receiver<EthWireBlockWithPeer>>>>,
     rollup_manager_handle: Arc<OnceLock<RollupManagerHandle>>,
 }
 
@@ -82,7 +85,8 @@ where
             ScrollWireProtocolHandler::new(ScrollWireConfig::new(true));
 
         *self.scroll_wire_events.try_lock().unwrap() = Some(events);
-        let (eth_wire_block_tx, eth_wire_events) = tokio::sync::mpsc::unbounded_channel();
+        let (eth_wire_block_tx, eth_wire_events) =
+            tokio::sync::mpsc::channel(ETH_WIRE_BLOCK_CHANNEL_SIZE);
         *self.eth_wire_events.try_lock().unwrap() = Some(eth_wire_events);
 
         let mut network_builder = ScrollNetworkBuilder::new(

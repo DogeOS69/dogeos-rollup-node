@@ -37,7 +37,7 @@ mod rollup;
 pub use rollup::IsDevChain;
 use rollup::RollupManagerAddOn;
 use scroll_network::{DogeosNetworkPrimitives, EthWireBlockWithPeer};
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::{Receiver, UnboundedReceiver};
 
 pub(crate) type RollupManagerHandle = rollup_node_chain_orchestrator::ChainOrchestratorHandle<
     reth_network::NetworkHandle<DogeosNetworkPrimitives>,
@@ -77,7 +77,7 @@ where
     pub fn new(
         config: ScrollRollupNodeConfig,
         scroll_wire_event: UnboundedReceiver<ScrollWireEvent>,
-        eth_wire_event: UnboundedReceiver<EthWireBlockWithPeer>,
+        eth_wire_event: Receiver<EthWireBlockWithPeer>,
         rollup_manager_handle: Arc<OnceLock<RollupManagerHandle>>,
     ) -> Self {
         let rpc_add_ons = RpcAddOns::new(

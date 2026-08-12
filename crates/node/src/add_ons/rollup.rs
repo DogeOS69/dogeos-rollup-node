@@ -11,7 +11,7 @@ use reth_rpc_eth_api::EthApiTypes;
 use rollup_node_chain_orchestrator::ChainOrchestratorHandle;
 use scroll_network::{DogeosNetworkPrimitives, EthWireBlockWithPeer};
 use scroll_wire::ScrollWireEvent;
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::{Receiver, UnboundedReceiver};
 
 /// Implementing the trait allows the type to return whether it is configured for dev chain.
 #[auto_impl::auto_impl(Arc)]
@@ -32,7 +32,7 @@ impl IsDevChain for DogeosChainSpec {
 pub struct RollupManagerAddOn {
     config: ScrollRollupNodeConfig,
     scroll_wire_event: UnboundedReceiver<ScrollWireEvent>,
-    eth_wire_event: UnboundedReceiver<EthWireBlockWithPeer>,
+    eth_wire_event: Receiver<EthWireBlockWithPeer>,
 }
 
 impl RollupManagerAddOn {
@@ -40,7 +40,7 @@ impl RollupManagerAddOn {
     pub const fn new(
         config: ScrollRollupNodeConfig,
         scroll_wire_event: UnboundedReceiver<ScrollWireEvent>,
-        eth_wire_event: UnboundedReceiver<EthWireBlockWithPeer>,
+        eth_wire_event: Receiver<EthWireBlockWithPeer>,
     ) -> Self {
         Self { config, scroll_wire_event, eth_wire_event }
     }

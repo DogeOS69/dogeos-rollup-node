@@ -19,7 +19,7 @@ use rollup_node_signer::SignatureAsBytes;
 use scroll_db::{Database, DatabaseReadOperations, DatabaseWriteOperations};
 use scroll_network::{EthWireBlockImport, EthWireBlockWithPeer};
 use std::{fmt, fmt::Debug, sync::Arc};
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::Sender;
 use tracing::{debug, info, trace, warn};
 
 use crate::args::RollupNodeNetworkArgs;
@@ -34,14 +34,14 @@ pub struct ScrollNetworkBuilder {
     /// The address for which we should persist and serve signatures for.
     signer: Option<Address>,
     /// Sender used to bridge Reth's `eth` block-import callback into the rollup network manager.
-    eth_wire_block_tx: UnboundedSender<EthWireBlockWithPeer>,
+    eth_wire_block_tx: Sender<EthWireBlockWithPeer>,
 }
 
 impl ScrollNetworkBuilder {
     /// Create a new [`ScrollNetworkBuilder`] with provided rollup node database.
     pub fn new(
         rollup_node_db: Arc<Database>,
-        eth_wire_block_tx: UnboundedSender<EthWireBlockWithPeer>,
+        eth_wire_block_tx: Sender<EthWireBlockWithPeer>,
     ) -> Self {
         Self {
             scroll_sub_protocols: RlpxSubProtocols::default(),

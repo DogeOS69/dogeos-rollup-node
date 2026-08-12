@@ -22,8 +22,8 @@ use scroll_wire::{
     LRU_CACHE_SIZE,
 };
 use std::{collections::HashMap, sync::Arc};
-use tokio::sync::mpsc::{self, UnboundedReceiver};
-use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio::sync::mpsc::{self, Receiver, UnboundedReceiver};
+use tokio_stream::wrappers::{ReceiverStream, UnboundedReceiverStream};
 use tracing::trace;
 
 /// The size of the ECDSA signature in bytes.
@@ -49,7 +49,7 @@ pub struct ScrollNetworkManager<N, CS> {
     /// [`NetworkHandleMessage`]s.
     from_handle_rx: UnboundedReceiverStream<NetworkHandleMessage>,
     /// The receiver for new blocks received from the network (used to bridge from eth-wire).
-    eth_wire_listener: Option<UnboundedReceiverStream<EthWireBlockWithPeer>>,
+    eth_wire_listener: Option<ReceiverStream<EthWireBlockWithPeer>>,
     /// The scroll wire protocol manager.
     pub scroll_wire: ScrollWireManager,
     /// The LRU cache used to track already seen (block,signature) pair.
@@ -76,7 +76,7 @@ impl<CS: EthChainSpec + Send + Sync + 'static>
         chain_spec: Arc<CS>,
         mut network_config: RethNetworkConfig<C, DogeosNetworkPrimitives>,
         scroll_wire_config: ScrollWireConfig,
-        eth_wire_listener: Option<UnboundedReceiver<EthWireBlockWithPeer>>,
+        eth_wire_listener: Option<Receiver<EthWireBlockWithPeer>>,
         td_constant: U128,
         authorized_signer: Option<Address>,
     ) -> (Self, ScrollNetworkHandle<RethNetworkHandle<DogeosNetworkPrimitives>>) {
@@ -139,7 +139,7 @@ impl<
         chain_spec: Arc<CS>,
         inner_network_handle: N,
         events: UnboundedReceiver<ScrollWireEvent>,
-        eth_wire_listener: Option<UnboundedReceiver<EthWireBlockWithPeer>>,
+        eth_wire_listener: Option<Receiver<EthWireBlockWithPeer>>,
         td_constant: U128,
         authorized_signer: Option<Address>,
     ) -> (Self, ScrollNetworkHandle<N>) {
@@ -227,7 +227,7 @@ impl<
     }
 
     async fn next_eth_wire_block(
-        eth_wire_listener: &mut Option<UnboundedReceiverStream<EthWireBlockWithPeer>>,
+        eth_wire_listener: &mut Option<ReceiverStream<EthWireBlockWithPeer>>,
     ) -> Option<EthWireBlockWithPeer> {
         match eth_wire_listener.as_mut() {
             Some(listener) => listener.next().await,

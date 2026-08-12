@@ -2,7 +2,9 @@ mod event;
 pub use event::{NewBlockWithPeer, ScrollNetworkManagerEvent};
 
 mod eth_wire;
-pub use eth_wire::{EthWireBlockImport, EthWireBlockWithPeer, EthWirePeerSender};
+pub use eth_wire::{
+    EthWireBlockImport, EthWireBlockWithPeer, EthWirePeerSender, ETH_WIRE_BLOCK_CHANNEL_SIZE,
+};
 
 mod handle;
 pub use handle::{NetworkHandleMessage, ScrollNetworkHandle};

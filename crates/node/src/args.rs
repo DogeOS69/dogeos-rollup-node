@@ -46,7 +46,7 @@ use scroll_migration::{traits::ScrollMigrator, MigratorTrait};
 use scroll_network::{DogeosNetworkPrimitives, EthWireBlockWithPeer, ScrollNetworkManager};
 use scroll_wire::ScrollWireEvent;
 use std::{fs, path::PathBuf, sync::Arc};
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::{Receiver, UnboundedReceiver};
 
 /// Test-related configuration arguments.
 #[derive(Debug, Clone, Default, clap::Args)]
@@ -180,7 +180,7 @@ impl ScrollRollupNodeConfig {
         self,
         ctx: RollupNodeContext<N, CS>,
         events: UnboundedReceiver<ScrollWireEvent>,
-        eth_wire_events: UnboundedReceiver<EthWireBlockWithPeer>,
+        eth_wire_events: Receiver<EthWireBlockWithPeer>,
         rpc_server_handles: RethRpcServerHandles,
     ) -> eyre::Result<(
         ChainOrchestrator<

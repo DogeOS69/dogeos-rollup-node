@@ -409,22 +409,12 @@ async fn can_forward_tx_to_sequencer() -> eyre::Result<()> {
     // generate rollup node manager event streams for each node
     let sequencer_rnm_handle = sequencer_node[0].rollup_manager_handle.clone();
     let mut sequencer_events = sequencer_rnm_handle.get_event_listener().await.unwrap();
-    let mut follower_events = follower_node[0]
-        .inner
-        .add_ons_handle
-        .rollup_manager_handle
-        .get_event_listener()
-        .await
-        .unwrap();
+    let mut follower_events =
+        follower_node[0].rollup_manager_handle.get_event_listener().await.unwrap();
 
     // Send a notification to set the L1 to synced
-    let sequencer_l1_watcher_mock = sequencer_node[0]
-        .inner
-        .add_ons_handle
-        .rollup_manager_handle
-        .l1_watcher_mock
-        .clone()
-        .unwrap();
+    let sequencer_l1_watcher_mock =
+        sequencer_node[0].rollup_manager_handle.l1_watcher_mock.clone().unwrap();
     sequencer_l1_watcher_mock.notification_tx.send(Arc::new(L1Notification::Synced)).await.unwrap();
     sequencer_events.next().await;
     sequencer_events.next().await;

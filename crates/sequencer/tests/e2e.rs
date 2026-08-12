@@ -6,7 +6,6 @@ use dogeos_chainspec::DOGEOS_DEV;
 use dogeos_protocol_types::{ScrollTransaction, TxL1Message};
 use futures::stream::StreamExt;
 use reth_e2e_test_utils::transaction::TransactionTestContext;
-use reth_scroll_node::test_utils::setup;
 use rollup_node::{
     constants::SCROLL_GAS_LIMIT,
     test_utils::{default_test_scroll_rollup_node_config, setup_engine},
@@ -33,8 +32,20 @@ use tokio::{
 async fn skip_block_with_no_transactions() {
     reth_tracing::init_test_tracing();
 
+    let chain_spec = DOGEOS_DEV.clone();
+
     // setup a test node
-    let (mut nodes, _wallet) = setup(1, false).await.unwrap();
+    let (mut nodes, _dbs, _wallet) = setup_engine(
+        default_test_scroll_rollup_node_config(),
+        1,
+        chain_spec,
+        false,
+        false,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
     let node = nodes.pop().unwrap();
 
     // create a fork choice state
@@ -87,8 +98,20 @@ async fn skip_block_with_no_transactions() {
 async fn can_build_blocks() {
     reth_tracing::init_test_tracing();
 
+    let chain_spec = DOGEOS_DEV.clone();
+
     // setup a test node
-    let (mut nodes, wallet) = setup(1, false).await.unwrap();
+    let (mut nodes, _dbs, wallet) = setup_engine(
+        default_test_scroll_rollup_node_config(),
+        1,
+        chain_spec,
+        false,
+        false,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
     let node = nodes.pop().unwrap();
     let wallet = Arc::new(Mutex::new(wallet));
 

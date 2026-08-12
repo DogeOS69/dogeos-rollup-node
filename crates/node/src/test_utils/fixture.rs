@@ -5,7 +5,7 @@ use super::{
 };
 use crate::{
     constants, BlobProviderArgs, ChainOrchestratorArgs, ConsensusAlgorithm, ConsensusArgs,
-    EngineDriverArgs, L1ProviderArgs, PprofArgs, RollupNodeDatabaseArgs,
+    DogeosChainSpecParser, EngineDriverArgs, L1ProviderArgs, PprofArgs, RollupNodeDatabaseArgs,
     RollupNodeGasPriceOracleArgs, RollupNodeNetworkArgs, RpcArgs, ScrollRollupNode,
     ScrollRollupNodeConfig, SequencerArgs, SignerArgs, TestArgs,
 };
@@ -34,7 +34,6 @@ use reth_node_builder::NodeTypes;
 use reth_node_core::exit::NodeExitFuture;
 use reth_node_types::NodeTypesWithDBAdapter;
 use reth_provider::providers::BlockchainProvider;
-use reth_scroll_cli::DogeosChainSpecParser;
 use reth_tasks::TaskExecutor;
 use reth_tokio_util::EventStream;
 use rollup_node_chain_orchestrator::{ChainOrchestratorEvent, ChainOrchestratorHandle};

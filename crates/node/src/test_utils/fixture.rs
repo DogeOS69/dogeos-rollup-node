@@ -5,7 +5,7 @@ use super::{
 };
 use crate::{
     constants, BlobProviderArgs, ChainOrchestratorArgs, ConsensusAlgorithm, ConsensusArgs,
-    EngineDriverArgs, L1ProviderArgs, PprofArgs, RollupNodeDatabaseArgs,
+    DogeosChainSpecParser, EngineDriverArgs, L1ProviderArgs, PprofArgs, RollupNodeDatabaseArgs,
     RollupNodeGasPriceOracleArgs, RollupNodeNetworkArgs, RpcArgs, ScrollRollupNode,
     ScrollRollupNodeConfig, SequencerArgs, SignerArgs, TestArgs,
 };
@@ -19,6 +19,10 @@ use alloy_rpc_types_anvil::ReorgOptions;
 use alloy_rpc_types_eth::Block;
 use alloy_signer_local::PrivateKeySigner;
 use alloy_transport::layers::RetryBackoffLayer;
+use dogeos_chainspec::{DogeosChainSpec, DOGEOS_DEV};
+use dogeos_protocol_types::ScrollPooledTransaction;
+use dogeos_reth_primitives::DogeosPrimitives;
+use dogeos_rpc_types::Transaction;
 use reth_chainspec::EthChainSpec;
 use reth_cli::chainspec::ChainSpecParser;
 use reth_e2e_test_utils::{wallet::Wallet, NodeHelperType, TmpDB};
@@ -30,18 +34,12 @@ use reth_node_builder::NodeTypes;
 use reth_node_core::exit::NodeExitFuture;
 use reth_node_types::NodeTypesWithDBAdapter;
 use reth_provider::providers::BlockchainProvider;
-use reth_scroll_chainspec::{ScrollChainSpec, SCROLL_DEV};
-use reth_scroll_cli::ScrollChainSpecParser;
-use reth_scroll_primitives::ScrollPrimitives;
 use reth_tasks::TaskExecutor;
 use reth_tokio_util::EventStream;
 use rollup_node_chain_orchestrator::{ChainOrchestratorEvent, ChainOrchestratorHandle};
 use rollup_node_primitives::BlockInfo;
 use rollup_node_sequencer::L1MessageInclusionMode;
-use scroll_alloy_consensus::ScrollPooledTransaction;
-use scroll_alloy_provider::{ScrollAuthApiEngineClient, ScrollEngineApi};
-use scroll_alloy_rpc_types::Transaction;
-use scroll_engine::{Engine, ForkchoiceState};
+use scroll_engine::{Engine, ForkchoiceState, ScrollAuthApiEngineClient, ScrollEngineApi};
 use std::{
     fmt::{Debug, Formatter},
     ops::{Deref, DerefMut},
@@ -106,7 +104,7 @@ impl Drop for TestFixture {
 
 /// The network handle to the Scroll network.
 pub type ScrollNetworkHandle =
-    NetworkHandle<BasicNetworkPrimitives<ScrollPrimitives, ScrollPooledTransaction>>;
+    NetworkHandle<BasicNetworkPrimitives<DogeosPrimitives, ScrollPooledTransaction>>;
 
 /// The blockchain test provider.
 pub type TestBlockChainProvider =
@@ -134,6 +132,8 @@ pub struct ScrollNodeTestComponents {
     pub task_executor: TaskExecutor,
     /// The exit future for the test node.
     pub exit_future: NodeExitFuture,
+    /// Handle to the rollup manager launched alongside the Reth node.
+    pub rollup_manager_handle: ChainOrchestratorHandle<ScrollNetworkHandle>,
 }
 
 impl ScrollNodeTestComponents {
@@ -142,8 +142,9 @@ impl ScrollNodeTestComponents {
         node: ScrollTestNode,
         task_executor: TaskExecutor,
         exit_future: NodeExitFuture,
+        rollup_manager_handle: ChainOrchestratorHandle<ScrollNetworkHandle>,
     ) -> Self {
-        Self { node, task_executor, exit_future }
+        Self { node, task_executor, exit_future, rollup_manager_handle }
     }
 }
 
@@ -196,9 +197,8 @@ impl NodeHandle {
         );
         let engine = Engine::new(Arc::new(engine_client), fcs);
 
-        let rollup_manager_handle = node.inner.add_ons_handle.rollup_manager_handle.clone();
-        let chain_orchestrator_rx =
-            node.inner.add_ons_handle.rollup_manager_handle.get_event_listener().await?;
+        let rollup_manager_handle = node.rollup_manager_handle.clone();
+        let chain_orchestrator_rx = rollup_manager_handle.get_event_listener().await?;
 
         Ok(Self { node, engine, chain_orchestrator_rx, rollup_manager_handle, typ })
     }
@@ -569,7 +569,7 @@ impl TestFixtureBuilder {
     /// If the input is a file path (contains '/' or ends with '.json'), it will
     /// load the genesis from the file.
     pub fn with_chain(mut self, chain: &str) -> eyre::Result<Self> {
-        let chain_spec: Arc<ScrollChainSpec> = ScrollChainSpecParser::parse(chain)?;
+        let chain_spec: Arc<DogeosChainSpec> = DogeosChainSpecParser::parse(chain)?;
         self.chain_spec = Some(chain_spec);
         Ok(self)
     }
@@ -735,7 +735,7 @@ impl TestFixtureBuilder {
 
     /// Build the test fixture.
     pub async fn build(mut self) -> eyre::Result<TestFixture> {
-        let chain_spec = self.chain_spec.unwrap_or_else(|| SCROLL_DEV.clone());
+        let chain_spec = self.chain_spec.unwrap_or_else(|| DOGEOS_DEV.clone());
 
         // Start Anvil if requested
         let anvil = if self.anvil_config.enabled {

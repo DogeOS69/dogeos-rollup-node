@@ -1,8 +1,8 @@
 use super::ScrollNetwork;
 use crate::ScrollNetworkManagerEvent;
 use alloy_primitives::Signature;
+use dogeos_reth_primitives::DogeosBlock;
 use reth_network_api::FullNetwork;
-use reth_scroll_primitives::ScrollBlock;
 use reth_tokio_util::EventStream;
 use std::sync::Arc;
 use tokio::sync::{mpsc::UnboundedSender, oneshot};
@@ -56,7 +56,7 @@ impl<N: FullNetwork> ScrollNetworkHandle<N> {
     }
 
     /// Announces a block to the network.
-    pub fn announce_block(&self, block: ScrollBlock, signature: Signature) {
+    pub fn announce_block(&self, block: DogeosBlock, signature: Signature) {
         self.send_message(NetworkHandleMessage::AnnounceBlock { block, signature });
     }
 
@@ -90,7 +90,7 @@ impl<N: FullNetwork> ScrollNetworkHandle<N> {
 #[derive(Debug)]
 pub enum NetworkHandleMessage {
     AnnounceBlock {
-        block: ScrollBlock,
+        block: DogeosBlock,
         signature: Signature,
     },
     BlockImportOutcome(super::BlockImportOutcome),

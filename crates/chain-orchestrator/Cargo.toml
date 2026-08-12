@@ -15,12 +15,11 @@ alloy-consensus = { workspace = true }
 alloy-eips = { workspace = true }
 alloy-json-rpc.workspace = true
 alloy-primitives.workspace = true
-alloy-provider.workspace = true
+alloy-provider = { workspace = true, features = ["engine-api"] }
 alloy-rpc-types-engine.workspace = true
 alloy-transport.workspace = true
 
 # rollup-node
-scroll-alloy-provider.workspace = true
 scroll-db.workspace = true
 scroll-engine.workspace = true
 rollup-node-providers.workspace = true
@@ -30,13 +29,11 @@ rollup-node-signer.workspace = true
 rollup-node-watcher.workspace = true
 
 # scroll
-reth-scroll-engine-primitives.workspace = true
-reth-scroll-consensus.workspace = true
-reth-scroll-node.workspace = true
-reth-scroll-primitives.workspace = true
-scroll-alloy-consensus.workspace = true
-scroll-alloy-hardforks.workspace = true
-scroll-alloy-network.workspace = true
+dogeos-reth-engine.workspace = true
+dogeos-reth-primitives.workspace = true
+dogeos-protocol-types.workspace = true
+dogeos-hardforks.workspace = true
+dogeos-rpc-types.workspace = true
 scroll-derivation-pipeline.workspace = true
 scroll-network.workspace = true
 
@@ -71,8 +68,7 @@ scroll-db = { workspace = true, features = ["test-utils"] }
 rollup-node-primitives = { workspace = true, features = ["arbitrary"] }
 
 # scroll
-reth-scroll-chainspec.workspace = true
-reth-scroll-forks.workspace = true
+dogeos-chainspec.workspace = true
 
 # reth
 reth-eth-wire-types.workspace = true
@@ -93,7 +89,6 @@ test-utils = [
     "reth-chainspec/test-utils",
     "reth-network-p2p/test-utils",
     "reth-primitives-traits/test-utils",
-    "reth-scroll-node/test-utils",
     "rollup-node-providers/test-utils",
     "rollup-node-watcher/test-utils",
     "scroll-db/test-utils",
@@ -112,10 +107,9 @@ serde = [
     "reth-eth-wire-types/serde",
     "reth-network-api/serde",
     "reth-primitives-traits/serde",
-    "reth-scroll-forks/serde",
-    "reth-scroll-primitives/serde",
-    "scroll-alloy-consensus/serde",
-    "scroll-alloy-hardforks/serde",
+    "dogeos-reth-primitives/serde",
+    "dogeos-protocol-types/serde",
+    "dogeos-hardforks/serde",
     "scroll-engine/serde",
     "scroll-network/serde",
     "rollup-node-primitives/serde",

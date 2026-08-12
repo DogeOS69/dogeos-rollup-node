@@ -140,6 +140,8 @@ jobs:
           push: false
           platforms: ${{ env.PLATFORM }}
           tags: ${{ env.DOCKER_TAGS }}
+          secrets: |
+            github_token=${{ secrets.DOGEOS_RETH_TOKEN || secrets.DOGEOS_RETH2_TOKEN || github.token }}
           labels: |
             org.opencontainers.image.title=rollup-node
             org.opencontainers.image.description=DogeOS rollup-node service
@@ -163,6 +165,8 @@ jobs:
           push: true
           platforms: ${{ env.PLATFORM }}
           tags: ${{ env.DOCKER_TAGS }}
+          secrets: |
+            github_token=${{ secrets.DOGEOS_RETH_TOKEN || secrets.DOGEOS_RETH2_TOKEN || github.token }}
           cache-from: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache
           cache-to: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache,mode=max
           labels: |

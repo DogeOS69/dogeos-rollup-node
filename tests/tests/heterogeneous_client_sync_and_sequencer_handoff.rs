@@ -2,11 +2,12 @@ use eyre::Result;
 use std::sync::{atomic::AtomicBool, Arc};
 use tests::*;
 
-/// Tests cross-client block propagation and synchronization between heterogeneous nodes.
+/// Tests the one-way Testnet crossover of block production from `l2geth` to the rollup node (Reth).
 ///
-/// This integration test validates that blocks can be successfully propagated between
-/// different Ethereum client implementations (l2geth and rollup-node) in various
-/// network topologies. The test exercises:
+/// This integration test validates cross-client block propagation between heterogeneous nodes
+/// (l2geth and rollup-node) up to and including the single, one-way sequencer handoff. It models
+/// the approved Tsuki Testnet contract: after the crossover, sequencing never returns to geth and
+/// there is no geth rollback or recovery path. The test exercises:
 ///
 /// 1. **Isolated Network Segments**: Initially runs l2geth nodes in isolation, verifying they can
 ///    produce and sync blocks independently
@@ -14,35 +15,22 @@ use tests::*;
 ///    - l2geth_sequencer produces blocks, l2geth_follower syncs
 ///    - Rollup nodes remain disconnected at block 0
 ///
-/// 2. **Cross-Client Synchronization**: Connects rollup nodes to the l2geth network, ensuring they
-///    can catch up to the current chain state
+/// 2. **Cross-Client Synchronization**: Connects rollup nodes to the l2geth network, ensuring the
+///    lagging Reth nodes can catch up to the current chain state
 ///    - Topology: `[rn_follower, rn_sequencer, l2geth_follower] -> l2geth_sequencer`
 ///    - All nodes connect to l2geth_sequencer as the single source of truth
 ///    - Rollup nodes sync from block 0 to current height
 ///
-/// 3. **Sequencer Handoff**: Transitions block production from l2geth to rollup-node, testing that
-///    all nodes stay synchronized during the transition
+/// 3. **One-Way Sequencer Handoff**: Freezes l2geth sequencing at its final head, proves the Reth
+///    nodes have reached that frozen head, and transitions block production to the rollup node.
+///    Production never returns to l2geth.
 ///    - Topology remains: `[rn_follower, rn_sequencer, l2geth_follower] -> l2geth_sequencer`
-///    - Block production switches from l2geth_sequencer to rn_sequencer
-///    - All nodes receive new blocks from rn_sequencer via l2geth_sequencer relay
+///    - l2geth sequencing is frozen; all nodes converge on the frozen final head
+///    - Block production switches from l2geth_sequencer to rn_sequencer for the remainder
+///    - A rollup follower is restarted mid-test to verify Reth state recovery
 ///
-/// 4. **Network Partition Recovery**: Disconnects l2geth nodes, continues production on rollup
-///    nodes, then reconnects to verify successful resynchronization
-///    - Initial partition: `rn_follower -> rn_sequencer` (isolated rollup network)
-///    - l2geth nodes disconnected, fall behind in block height
-///    - Reconnection topology: `[l2geth_follower, l2geth_sequencer] -> rn_sequencer`
-///    - l2geth nodes catch up by syncing from rn_sequencer
-///
-/// 5. **Bidirectional Compatibility**: Returns block production to l2geth after rollup nodes have
-///    extended the chain, ensuring backward compatibility
-///    - Final topology: `[rn_follower, l2geth_follower, l2geth_sequencer] -> rn_sequencer`
-///    - Block production returns to l2geth_sequencer
-///    - Validates that l2geth can continue the chain after rollup node blocks
-///
-/// The test validates that both client implementations maintain consensus despite
-/// network topology changes, sequencer transitions, and temporary network partitions.
-/// Each topology change tests different aspects of peer discovery, block gossip,
-/// and chain synchronization across heterogeneous client implementations.
+/// The test validates that both client implementations maintain consensus through the cross-client
+/// sync and the one-way sequencer handoff.
 #[tokio::test]
 async fn docker_test_heterogeneous_client_sync_and_sequencer_handoff() -> Result<()> {
     reth_tracing::init_test_tracing();
@@ -114,13 +102,14 @@ async fn docker_test_heterogeneous_client_sync_and_sequencer_handoff() -> Result
     let target_block = latest_block + 10;
     utils::wait_for_block(&nodes, target_block).await?;
 
+    // Freeze l2geth sequencing at its final head and prove the Reth nodes reached it.
     utils::miner_stop(&l2geth_sequencer).await?;
     let latest_block = l2geth_sequencer.get_block_number().await?;
     utils::wait_for_block(&nodes, latest_block).await?;
     utils::assert_blocks_match(&nodes, latest_block).await?;
-    tracing::info!("✅ All nodes reached block {}", latest_block);
+    tracing::info!("✅ All nodes reached geth's frozen final block {}", latest_block);
 
-    // Enable sequencing on RN sequencer
+    // One-way handoff: enable sequencing on the Reth sequencer. Production never returns to geth.
     tracing::info!("Enabling sequencing on RN sequencer");
     utils::enable_automatic_sequencing(&rn_sequencer).await?;
     let target_block = latest_block + 10;
@@ -144,83 +133,11 @@ async fn docker_test_heterogeneous_client_sync_and_sequencer_handoff() -> Result
 
     utils::wait_for_block(&nodes, target_block).await?;
 
-    utils::disable_automatic_sequencing(&rn_sequencer).await?;
+    // Reth is now the sole sequencer; confirm the full heterogeneous network agrees on its chain.
     let latest_block = rn_sequencer.get_block_number().await?;
     utils::wait_for_block(&nodes, latest_block).await?;
     utils::assert_blocks_match(&nodes, latest_block).await?;
-    tracing::info!("✅ All nodes reached block {}", latest_block);
-
-    // Disconnect l2geth follower from l2geth sequencer
-    // topology:
-    //  rn_follower -> rn_sequencer
-    utils::admin_remove_peer(&rn_follower, &env.l2geth_sequencer_enode()?).await?;
-    utils::admin_remove_peer(&rn_sequencer, &env.l2geth_sequencer_enode()?).await?;
-    utils::admin_remove_peer(&l2geth_follower, &env.l2geth_sequencer_enode()?).await?;
-    utils::admin_add_peer(&rn_follower, &env.rn_sequencer_enode()?).await?;
-
-    // Continue sequencing on RN sequencer for at least 10 blocks
-    utils::enable_automatic_sequencing(&rn_sequencer).await?;
-    let target_block = latest_block + 10;
-    utils::wait_for_block(&rn_nodes, target_block).await?;
-
-    // Make sure l2geth nodes are still at the old block -> they need to sync once reconnected
-    assert!(
-        l2geth_sequencer.get_block_number().await? <= target_block + 1,
-        "l2geth sequencer should be at most at block {}, but is at {}",
-        target_block + 1,
-        l2geth_sequencer.get_block_number().await?
-    );
-    assert!(
-        l2geth_follower.get_block_number().await? <= target_block + 1,
-        "l2geth follower should be at most at block {}, but is at {}",
-        target_block + 1,
-        l2geth_follower.get_block_number().await?
-    );
-
-    // restart RN sequencer to test it can recover its state after a restart
-    tracing::info!("Restarting RN sequencer");
-    utils::disable_automatic_sequencing(&rn_sequencer).await?;
-    let latest_block_before_restart = rn_sequencer.get_block_number().await?;
-    let chain_status_before_restart = utils::rollup_node_status(&rn_sequencer).await?;
-    env.stop_container(&rn_sequencer).await?;
-    env.start_container(&rn_sequencer).await?;
-    utils::assert_latest_block(&[&rn_sequencer], latest_block_before_restart).await?;
-    let chain_status_after_restart = utils::rollup_node_status(&rn_sequencer).await?;
-    assert!(
-        chain_status_after_restart.l2 == chain_status_before_restart.l2,
-        "L2 Chain status after restart does not match the one before restart {:?} != {:?}",
-        chain_status_after_restart.l2,
-        chain_status_before_restart.l2
-    );
-    utils::admin_add_peer(&rn_follower, &env.rn_sequencer_enode()?).await?;
-    utils::enable_automatic_sequencing(&rn_sequencer).await?;
-
-    // Reconnect l2geth follower to l2geth sequencer and let them sync
-    // topology:
-    //  rn_follower -> rn_sequencer
-    //  l2geth_follower -> rn_sequencer
-    //  l2geth_sequencer -> rn_sequencer
-    utils::admin_add_peer(&l2geth_follower, &env.rn_sequencer_enode()?).await?;
-    utils::admin_add_peer(&l2geth_sequencer, &env.rn_sequencer_enode()?).await?;
-
-    // Wait for all nodes to reach the same block again
-    let target_block = target_block + 10;
-    utils::wait_for_block(&nodes, target_block).await?;
-    tracing::info!("✅ l2geth nodes synced to block {}", target_block);
-
-    // Disable sequencing on RN sequencer
-    utils::disable_automatic_sequencing(&rn_sequencer).await?;
-    let latest_block = rn_sequencer.get_block_number().await?;
-    tracing::info!("Switched RN sequencing off at block {}", latest_block);
-    utils::wait_for_block(&nodes, latest_block).await?;
-    utils::assert_blocks_match(&nodes, latest_block).await?;
-
-    // start sequencing on l2geth sequencer again and make sure all nodes reach the same block in
-    // the end
-    utils::miner_start(&l2geth_sequencer).await?;
-    let target_block = latest_block + 20;
-    utils::wait_for_block(&nodes, target_block).await?;
-    assert_blocks_match(&nodes, target_block).await?;
+    tracing::info!("✅ All nodes agree on the Reth-sequenced chain at block {}", latest_block);
 
     utils::stop_continuous_tx_sender(stop.clone(), tx_sender).await?;
     utils::stop_continuous_l1_message_sender(stop, l1_message_sender).await?;

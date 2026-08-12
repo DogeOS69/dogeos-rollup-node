@@ -4,9 +4,9 @@ use super::fixture::TestFixture;
 use crate::test_utils::EventAssertions;
 
 use alloy_primitives::B256;
+use dogeos_protocol_types::ScrollTransaction;
+use dogeos_reth_primitives::DogeosBlock;
 use reth_primitives_traits::transaction::TxHashRef;
-use reth_scroll_primitives::ScrollBlock;
-use scroll_alloy_consensus::ScrollTransaction;
 
 /// Builder for constructing and validating blocks in tests.
 #[derive(Debug)]
@@ -91,7 +91,7 @@ impl<'a> BlockBuilder<'a> {
     }
 
     /// Build the block and validate against expectations.
-    pub async fn build_and_await_block(self) -> eyre::Result<ScrollBlock> {
+    pub async fn build_and_await_block(self) -> eyre::Result<DogeosBlock> {
         let sequencer_node =
             self.fixture.nodes[0].as_ref().expect("sequencer node has been shutdown");
 
@@ -124,7 +124,7 @@ impl<'a> BlockBuilder<'a> {
     }
 
     /// Validate the block against expectations.
-    fn validate_block(self, block: &ScrollBlock) -> eyre::Result<ScrollBlock> {
+    fn validate_block(self, block: &DogeosBlock) -> eyre::Result<DogeosBlock> {
         // Check transaction count
         if let Some(expected_count) = self.expected_tx_count {
             if block.body.transactions.len() != expected_count {

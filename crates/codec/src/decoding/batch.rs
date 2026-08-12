@@ -4,7 +4,7 @@ use crate::{
 };
 
 use alloy_primitives::{bytes::BufMut, keccak256, B256};
-use scroll_alloy_consensus::TxL1Message;
+use dogeos_protocol_types::TxL1Message;
 
 /// The deserialized batch data.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,7 +115,7 @@ mod tests {
     use crate::decoding::{test_utils::read_to_bytes, v0::decode_v0, v1::decode_v1};
 
     use alloy_primitives::b256;
-    use scroll_alloy_consensus::TxL1Message;
+    use dogeos_protocol_types::TxL1Message;
 
     #[test]
     fn test_should_compute_data_hash_v0() -> eyre::Result<()> {

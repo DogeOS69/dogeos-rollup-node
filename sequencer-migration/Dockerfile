@@ -7,9 +7,8 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /migration
 COPY . .
 
-RUN chmod +x migrate-sequencer.sh \
-           revert-l2geth-to-block.sh \
-           switch-to-l2geth.sh
+RUN chmod +x switch-to-l2reth.sh \
+           send-l1-messages.sh
 
 # Set default environment variables (can be overridden at runtime)
 ENV L2GETH_RPC_URL=http://host.docker.internal:8547

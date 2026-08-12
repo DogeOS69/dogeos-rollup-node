@@ -1,7 +1,7 @@
 use alloy_consensus::Header;
 use alloy_primitives::{Signature, B256};
+use dogeos_reth_primitives::DogeosBlock;
 use reth_network_peers::PeerId;
-use reth_scroll_primitives::ScrollBlock;
 use rollup_node_primitives::{
     BatchConsolidationOutcome, BatchInfo, BlockConsolidationOutcome, BlockInfo, ChainImport,
     L2BlockInfoWithL1Messages,
@@ -89,14 +89,14 @@ pub enum ChainOrchestratorEvent {
     /// An L2 consolidated block has been committed returning the [`L2BlockInfoWithL1Messages`].
     L2ConsolidatedBlockCommitted(L2BlockInfoWithL1Messages),
     /// A new block has been sequenced by the sequencer.
-    BlockSequenced(ScrollBlock),
+    BlockSequenced(DogeosBlock),
     /// Block building was skipped because the built payload was empty and empty blocks are
     /// disabled.
     BlockBuildingSkipped,
     /// A new block has been signed by the signer.
     SignedBlock {
         /// The signed block.
-        block: ScrollBlock,
+        block: DogeosBlock,
         /// The signature of the signed block.
         signature: Signature,
     },

@@ -1,12 +1,10 @@
 //! Test utilities for the engine crate.
 
-use alloy_primitives::{BlockHash, U64};
+use crate::{ScrollEngineApi, ScrollEngineApiResult};
 use alloy_rpc_types_engine::{
-    ClientVersionV1, ExecutionPayloadBodiesV1, ExecutionPayloadV1, ForkchoiceState,
-    ForkchoiceUpdated, PayloadId, PayloadStatus,
+    ExecutionPayloadV1, ForkchoiceState, ForkchoiceUpdated, PayloadId, PayloadStatus,
 };
-use scroll_alloy_provider::{ScrollEngineApi, ScrollEngineApiResult};
-use scroll_alloy_rpc_types_engine::ScrollPayloadAttributes;
+use dogeos_reth_engine::ScrollPayloadAttributes;
 
 /// A [`ScrollEngineApi`] implementation that panics when any method is called.
 #[derive(Debug)]
@@ -34,34 +32,5 @@ impl ScrollEngineApi for PanicEngineClient {
         _payload_id: PayloadId,
     ) -> ScrollEngineApiResult<ExecutionPayloadV1> {
         panic!("PanicEngineClient does not support get_payload_v1")
-    }
-
-    async fn get_payload_bodies_by_hash_v1(
-        &self,
-        _block_hashes: Vec<BlockHash>,
-    ) -> ScrollEngineApiResult<ExecutionPayloadBodiesV1> {
-        panic!("PanicEngineClient does not support get_payload_bodies_by_hash_v1")
-    }
-
-    async fn get_payload_bodies_by_range_v1(
-        &self,
-        _start: U64,
-        _count: U64,
-    ) -> ScrollEngineApiResult<ExecutionPayloadBodiesV1> {
-        panic!("PanicEngineClient does not support get_payload_bodies_by_range_v1")
-    }
-
-    async fn get_client_version_v1(
-        &self,
-        _client_version: ClientVersionV1,
-    ) -> ScrollEngineApiResult<Vec<ClientVersionV1>> {
-        panic!("PanicEngineClient does not support get_client_version_v1")
-    }
-
-    async fn exchange_capabilities(
-        &self,
-        _capabilities: Vec<String>,
-    ) -> ScrollEngineApiResult<Vec<String>> {
-        panic!("PanicEngineClient does not support exchange_capabilities")
     }
 }

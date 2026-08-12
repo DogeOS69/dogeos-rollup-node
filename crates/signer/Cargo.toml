@@ -15,7 +15,7 @@ alloy-primitives.workspace = true
 alloy-signer.workspace = true
 
 # reth-scroll
-reth-scroll-primitives = { workspace = true, features = ["std"] }
+dogeos-reth-primitives = { workspace = true, features = ["std"] }
 
 # rollup-node
 rollup-node-primitives.workspace = true

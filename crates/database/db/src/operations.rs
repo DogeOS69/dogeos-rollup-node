@@ -2,11 +2,11 @@ use super::{models, DatabaseError};
 use crate::{ReadConnectionProvider, WriteConnectionProvider};
 
 use alloy_primitives::{Signature, B256};
+use dogeos_reth_engine::BlockDataHint;
 use rollup_node_primitives::{
     BatchCommitData, BatchConsolidationOutcome, BatchInfo, BatchStatus, BlockInfo,
     L1BlockStartupInfo, L1MessageEnvelope, L2BlockInfoWithL1Messages, Metadata,
 };
-use scroll_alloy_rpc_types_engine::BlockDataHint;
 use sea_orm::{
     sea_query::{CaseStatement, Expr, OnConflict},
     ColumnTrait, Condition, DbErr, EntityTrait, QueryFilter, QueryOrder, QuerySelect,

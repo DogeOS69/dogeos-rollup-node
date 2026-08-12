@@ -10,9 +10,9 @@ use alloy_provider::{Provider, ProviderBuilder};
 use alloy_signer_local::PrivateKeySigner;
 use colored::Colorize;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use dogeos_rpc_types::Scroll;
 use reqwest::Url;
 use rollup_node_chain_orchestrator::ChainOrchestratorStatus;
-use scroll_alloy_network::Scroll;
 use std::{io::Write, path::PathBuf, time::Duration};
 
 /// Interactive REPL that attaches to a running node via JSON-RPC.

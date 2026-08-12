@@ -3,11 +3,10 @@ use crate::ChainOrchestratorStatus;
 use super::ChainOrchestratorEvent;
 // use crate::manager::metrics::HandleMetrics;
 use reth_network_api::FullNetwork;
-use reth_scroll_node::ScrollNetworkPrimitives;
 use reth_tokio_util::EventStream;
 use rollup_node_primitives::{BlockInfo, ChainImport, L1MessageEnvelope};
 use scroll_db::L1MessageKey;
-use scroll_network::{NewBlockWithPeer, ScrollNetworkHandle};
+use scroll_network::{DogeosNetworkPrimitives, NewBlockWithPeer, ScrollNetworkHandle};
 use tokio::sync::{mpsc, oneshot};
 use tracing::error;
 
@@ -19,7 +18,7 @@ use metrics::ChainOrchestratorHandleMetrics;
 
 /// The handle used to send commands to the rollup manager.
 #[derive(Debug, Clone)]
-pub struct ChainOrchestratorHandle<N: FullNetwork<Primitives = ScrollNetworkPrimitives>> {
+pub struct ChainOrchestratorHandle<N: FullNetwork<Primitives = DogeosNetworkPrimitives>> {
     /// The channel used to send commands to the rollup manager.
     to_manager_tx: mpsc::UnboundedSender<ChainOrchestratorCommand<N>>,
     /// The metrics for the handle.
@@ -29,7 +28,7 @@ pub struct ChainOrchestratorHandle<N: FullNetwork<Primitives = ScrollNetworkPrim
     pub l1_watcher_mock: Option<rollup_node_watcher::test_utils::L1WatcherMock>,
 }
 
-impl<N: FullNetwork<Primitives = ScrollNetworkPrimitives>> ChainOrchestratorHandle<N> {
+impl<N: FullNetwork<Primitives = DogeosNetworkPrimitives>> ChainOrchestratorHandle<N> {
     /// Create a new rollup manager handle.
     pub fn new(to_manager_tx: mpsc::UnboundedSender<ChainOrchestratorCommand<N>>) -> Self {
         Self {

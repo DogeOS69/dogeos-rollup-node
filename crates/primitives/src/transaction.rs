@@ -1,5 +1,5 @@
 use alloy_primitives::B256;
-use scroll_alloy_consensus::TxL1Message;
+use dogeos_protocol_types::TxL1Message;
 
 /// A L1 message envelope, containing extra information about the message.
 #[derive(Debug, Clone, PartialEq, Eq)]

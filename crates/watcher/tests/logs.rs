@@ -4,13 +4,13 @@
 use alloy_rpc_types_eth::Log;
 use alloy_sol_types::SolEvent;
 use arbitrary::Arbitrary;
+use dogeos_protocol_types::TxL1Message;
 use rollup_node_primitives::{L1BlockStartupInfo, NodeConfig};
 use rollup_node_watcher::{
     random,
     test_utils::{chain, chain_from, provider::MockProvider},
     Block, L1Notification, L1Watcher,
 };
-use scroll_alloy_consensus::TxL1Message;
 use scroll_l1::abi::logs::{try_decode_log, QueueTransaction};
 use std::sync::Arc;
 

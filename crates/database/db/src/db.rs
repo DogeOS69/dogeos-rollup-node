@@ -7,11 +7,11 @@ use crate::{
     UnwindResult,
 };
 use alloy_primitives::{Signature, B256};
+use dogeos_reth_engine::BlockDataHint;
 use rollup_node_primitives::{
     BatchCommitData, BatchConsolidationOutcome, BatchInfo, BlockInfo, L1BlockStartupInfo,
     L1MessageEnvelope, L2BlockInfoWithL1Messages,
 };
-use scroll_alloy_rpc_types_engine::BlockDataHint;
 use sea_orm::{
     sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions},
     DatabaseConnection, SqlxSqliteConnector, TransactionTrait,
@@ -864,12 +864,12 @@ mod test {
     use std::sync::Arc;
 
     use arbitrary::{Arbitrary, Unstructured};
+    use dogeos_protocol_types::TxL1Message;
     use futures::StreamExt;
     use rand::Rng;
     use rollup_node_primitives::{
         BatchCommitData, BatchInfo, BlockInfo, L1MessageEnvelope, L2BlockInfoWithL1Messages,
     };
-    use scroll_alloy_consensus::TxL1Message;
     use sea_orm::EntityTrait;
 
     #[tokio::test]

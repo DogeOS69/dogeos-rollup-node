@@ -4,14 +4,12 @@ use alloy_eips::BlockNumberOrTag;
 use alloy_primitives::{address, b256, Address, Bytes, Signature, B256, U256};
 use alloy_signer::Signer;
 use alloy_signer_local::PrivateKeySigner;
+use dogeos_chainspec::{DogeosChainSpec, DOGEOS_CHIKYU, DOGEOS_DEV, DOGEOS_MAINNET};
+use dogeos_reth_primitives::DogeosBlock;
 use futures::{task::noop_waker_ref, FutureExt, StreamExt};
 use reth_chainspec::EthChainSpec;
 use reth_network::{NetworkConfigBuilder, NetworkEventListenerProvider, PeersInfo};
-use reth_network_api::block::EthWireProvider;
 use reth_rpc_api::EthApiServer;
-use reth_scroll_chainspec::{ScrollChainSpec, SCROLL_DEV, SCROLL_MAINNET, SCROLL_SEPOLIA};
-use reth_scroll_node::ScrollNetworkPrimitives;
-use reth_scroll_primitives::ScrollBlock;
 use reth_storage_api::BlockReader;
 use reth_tasks::shutdown::signal as shutdown_signal;
 use reth_tokio_util::EventStream;
@@ -28,7 +26,7 @@ use rollup_node_chain_orchestrator::{ChainOrchestratorEvent, SyncMode};
 use rollup_node_primitives::{sig_encode_hash, BatchCommitData, BlockInfo};
 use rollup_node_watcher::L1Notification;
 use scroll_db::{test_utils::setup_test_db, L1MessageKey};
-use scroll_network::NewBlockWithPeer;
+use scroll_network::{DogeosNetworkPrimitives, NewBlockWithPeer};
 use scroll_wire::{ScrollWireConfig, ScrollWireProtocolHandler};
 use std::{
     future::Future,
@@ -133,7 +131,7 @@ async fn can_penalize_peer_for_invalid_block() -> eyre::Result<()> {
     fixture.check_reputation_on(1).of_node(0).await?.equals(0).await?;
 
     // Create invalid block
-    let mut block = ScrollBlock::default();
+    let mut block = DogeosBlock::default();
     block.header.number = 1;
     block.header.parent_hash = fixture.chain_spec.genesis_header.hash();
 
@@ -174,7 +172,7 @@ async fn can_penalize_peer_for_invalid_block() -> eyre::Result<()> {
 async fn can_penalize_peer_for_invalid_signature() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    let chain_spec = (*SCROLL_DEV).clone();
+    let chain_spec = (*DOGEOS_DEV).clone();
 
     // Create two signers - one authorized and one unauthorized
     let authorized_signer = PrivateKeySigner::random().with_chain_id(Some(chain_spec.chain().id()));
@@ -389,7 +387,7 @@ async fn can_forward_tx_to_sequencer() -> eyre::Result<()> {
     let mut follower_node_config = default_test_scroll_rollup_node_config();
 
     // Create the chain spec for scroll mainnet with Euclid v2 activated and a test genesis.
-    let chain_spec = (*SCROLL_DEV).clone();
+    let chain_spec = (*DOGEOS_DEV).clone();
     let (mut sequencer_node, _dbs, _wallet) =
         setup_engine(sequencer_node_config, 1, chain_spec.clone(), false, true, None, None)
             .await
@@ -408,24 +406,14 @@ async fn can_forward_tx_to_sequencer() -> eyre::Result<()> {
     sequencer_node[0].network.next_session_established().await;
 
     // generate rollup node manager event streams for each node
-    let sequencer_rnm_handle = sequencer_node[0].inner.add_ons_handle.rollup_manager_handle.clone();
+    let sequencer_rnm_handle = sequencer_node[0].rollup_manager_handle.clone();
     let mut sequencer_events = sequencer_rnm_handle.get_event_listener().await.unwrap();
-    let mut follower_events = follower_node[0]
-        .inner
-        .add_ons_handle
-        .rollup_manager_handle
-        .get_event_listener()
-        .await
-        .unwrap();
+    let mut follower_events =
+        follower_node[0].rollup_manager_handle.get_event_listener().await.unwrap();
 
     // Send a notification to set the L1 to synced
-    let sequencer_l1_watcher_mock = sequencer_node[0]
-        .inner
-        .add_ons_handle
-        .rollup_manager_handle
-        .l1_watcher_mock
-        .clone()
-        .unwrap();
+    let sequencer_l1_watcher_mock =
+        sequencer_node[0].rollup_manager_handle.l1_watcher_mock.clone().unwrap();
     sequencer_l1_watcher_mock.notification_tx.send(Arc::new(L1Notification::Synced)).await.unwrap();
     sequencer_events.next().await;
     sequencer_events.next().await;
@@ -565,7 +553,7 @@ async fn can_bridge_blocks() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
     // Create the chain spec for scroll dev with Feynman activated and a test genesis.
-    let chain_spec = (*SCROLL_DEV).clone();
+    let chain_spec = (*DOGEOS_DEV).clone();
 
     // Setup the bridge node and a standard node.
     let (mut nodes, _dbs, _wallet) = setup_engine(
@@ -581,13 +569,13 @@ async fn can_bridge_blocks() -> eyre::Result<()> {
     let mut bridge_node = nodes.pop().unwrap();
     let bridge_peer_id = bridge_node.network.record().id;
     let bridge_node_l1_watcher_tx =
-        bridge_node.inner.add_ons_handle.rollup_manager_handle.l1_watcher_mock.clone().unwrap();
+        bridge_node.rollup_manager_handle.l1_watcher_mock.clone().unwrap();
 
     // Send a notification to set the L1 to synced
     bridge_node_l1_watcher_tx.notification_tx.send(Arc::new(L1Notification::Synced)).await.unwrap();
 
     // Instantiate the scroll NetworkManager.
-    let network_config = NetworkConfigBuilder::<ScrollNetworkPrimitives>::with_rng_secret_key()
+    let network_config = NetworkConfigBuilder::<DogeosNetworkPrimitives>::with_rng_secret_key()
         .disable_discovery()
         .with_unused_listener_port()
         .with_pow()
@@ -610,7 +598,7 @@ async fn can_bridge_blocks() -> eyre::Result<()> {
     bridge_node.network.next_session_established().await;
 
     // Create a standard NetworkManager to send blocks to the bridge node.
-    let network_config = NetworkConfigBuilder::<ScrollNetworkPrimitives>::with_rng_secret_key()
+    let network_config = NetworkConfigBuilder::<DogeosNetworkPrimitives>::with_rng_secret_key()
         .disable_discovery()
         .with_pow()
         .with_unused_listener_port()
@@ -632,7 +620,7 @@ async fn can_bridge_blocks() -> eyre::Result<()> {
     let _ = network_events.next().await;
 
     // Send a block from the standard NetworkManager to the bridge node.
-    let mut block_1: reth_scroll_primitives::ScrollBlock =
+    let mut block_1: dogeos_reth_primitives::DogeosBlock =
         serde_json::from_str(include_str!("../assets/block.json")).unwrap();
 
     // Compute the block hash while masking the extra data which isn't used in block hash
@@ -673,7 +661,7 @@ async fn can_bridge_blocks() -> eyre::Result<()> {
 #[tokio::test]
 async fn shutdown_consolidates_most_recent_batch_on_startup() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
-    let chain_spec = (*SCROLL_MAINNET).clone();
+    let chain_spec = (*DOGEOS_MAINNET).clone();
 
     // Launch a node
     let (mut nodes, _dbs, _wallet) = setup_engine(
@@ -709,7 +697,7 @@ async fn shutdown_consolidates_most_recent_batch_on_startup() -> eyre::Result<()
                 node.inner.task_executor.clone(),
             ),
             events,
-            node.inner.add_ons_handle.rpc_handle.rpc_server_handles.clone(),
+            node.inner.add_ons_handle.rpc_server_handles.clone(),
         )
         .await?;
 
@@ -869,7 +857,7 @@ async fn shutdown_consolidates_most_recent_batch_on_startup() -> eyre::Result<()
                 node.inner.task_executor.clone(),
             ),
             events,
-            node.inner.add_ons_handle.rpc_handle.rpc_server_handles.clone(),
+            node.inner.add_ons_handle.rpc_server_handles.clone(),
         )
         .await?;
     let l1_notification_tx = handle.l1_watcher_mock.clone().unwrap();
@@ -956,7 +944,7 @@ async fn shutdown_consolidates_most_recent_batch_on_startup() -> eyre::Result<()
 #[tokio::test]
 async fn graceful_shutdown_sets_fcs_to_latest_signed_block_in_db_on_start_up() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
-    let chain_spec = (*SCROLL_DEV).clone();
+    let chain_spec = (*DOGEOS_DEV).clone();
 
     // Create a config with a random signer.
     let mut config = default_sequencer_test_scroll_rollup_node_config();
@@ -987,7 +975,7 @@ async fn graceful_shutdown_sets_fcs_to_latest_signed_block_in_db_on_start_up() -
                 node.inner.task_executor.clone(),
             ),
             events,
-            node.inner.add_ons_handle.rpc_handle.rpc_server_handles.clone(),
+            node.inner.add_ons_handle.rpc_server_handles.clone(),
         )
         .await?;
     let (_signal, shutdown) = shutdown_signal();
@@ -1061,7 +1049,7 @@ async fn graceful_shutdown_sets_fcs_to_latest_signed_block_in_db_on_start_up() -
                 node.inner.task_executor.clone(),
             ),
             events,
-            node.inner.add_ons_handle.rpc_handle.rpc_server_handles.clone(),
+            node.inner.add_ons_handle.rpc_server_handles.clone(),
         )
         .await?;
 
@@ -1084,10 +1072,10 @@ async fn graceful_shutdown_sets_fcs_to_latest_signed_block_in_db_on_start_up() -
 async fn can_revert_to_l1_block() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    // Create a follower test fixture using SCROLL_MAINNET chain spec
+    // Create a follower test fixture using DOGEOS_MAINNET chain spec
     let mut fixture = TestFixture::builder()
         .followers(1)
-        .with_chain_spec(SCROLL_MAINNET.clone())
+        .with_chain_spec(DOGEOS_MAINNET.clone())
         .with_memory_db()
         .build()
         .await?;
@@ -1194,10 +1182,10 @@ async fn can_revert_to_l1_block() -> eyre::Result<()> {
 async fn consolidates_committed_batches_after_chain_consolidation() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    // Create a follower test fixture using SCROLL_MAINNET chain spec
+    // Create a follower test fixture using DOGEOS_MAINNET chain spec
     let mut fixture = TestFixture::builder()
         .followers(1)
-        .with_chain_spec(SCROLL_MAINNET.clone())
+        .with_chain_spec(DOGEOS_MAINNET.clone())
         .with_memory_db()
         .build()
         .await?;
@@ -1290,10 +1278,10 @@ async fn consolidates_committed_batches_after_chain_consolidation() -> eyre::Res
 async fn can_handle_batch_revert_with_reorg() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    // Create a follower test fixture using SCROLL_MAINNET chain spec
+    // Create a follower test fixture using DOGEOS_MAINNET chain spec
     let mut fixture = TestFixture::builder()
         .followers(1)
-        .with_chain_spec(SCROLL_MAINNET.clone())
+        .with_chain_spec(DOGEOS_MAINNET.clone())
         .with_memory_db()
         .build()
         .await?;
@@ -1666,9 +1654,9 @@ async fn test_custom_genesis_block_production_and_propagation() -> eyre::Result<
     let custom_genesis =
         serde_json::from_str(custom_genesis_json).expect("Custom genesis JSON should be valid");
 
-    // Create a custom ScrollChainSpec using the from_custom_genesis method
+    // Create a custom DogeosChainSpec using the from_custom_genesis method
     // This simulates what would happen when using --chain flag with a custom file
-    let custom_chain_spec = Arc::new(ScrollChainSpec::from_custom_genesis(custom_genesis));
+    let custom_chain_spec = Arc::new(DogeosChainSpec::from_custom_genesis(custom_genesis));
 
     // Launch 2 nodes: node0=sequencer and node1=follower.
     let mut fixture = TestFixture::builder()
@@ -1679,9 +1667,9 @@ async fn test_custom_genesis_block_production_and_propagation() -> eyre::Result<
         .await?;
 
     // Verify the genesis hash is different from all predefined networks
-    assert_ne!(custom_chain_spec.genesis_hash(), SCROLL_DEV.genesis_hash());
-    assert_ne!(custom_chain_spec.genesis_hash(), SCROLL_SEPOLIA.genesis_hash());
-    assert_ne!(custom_chain_spec.genesis_hash(), SCROLL_MAINNET.genesis_hash());
+    assert_ne!(custom_chain_spec.genesis_hash(), DOGEOS_DEV.genesis_hash());
+    assert_ne!(custom_chain_spec.genesis_hash(), DOGEOS_CHIKYU.genesis_hash());
+    assert_ne!(custom_chain_spec.genesis_hash(), DOGEOS_MAINNET.genesis_hash());
 
     // Verify both nodes start with the same genesis hash from the custom chain spec
     assert_eq!(
@@ -1915,28 +1903,31 @@ async fn can_reject_l2_block_with_unknown_l1_message() -> eyre::Result<()> {
 async fn can_gossip_over_eth_wire() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    // Create the chain spec for scroll dev with Feynman activated and a test genesis.
+    // Create 2 nodes with scroll-wire disabled so blocks can only propagate over eth-wire.
     let mut fixture = TestFixture::builder()
         .sequencer()
         .followers(1)
-        .with_sequencer_auto_start(true)
-        .block_time(40)
+        .block_time(0)
+        .allow_empty_blocks(true)
         .with_scroll_wire(false)
+        .payload_building_duration(1000)
         .build()
         .await?;
 
-    // Set the L1 synced on the sequencer node to start block production.
+    // Set the L1 to synced on the sequencer node.
     fixture.l1().for_node(0).sync().await?;
-    fixture.expect_event().l1_synced().await?;
+    fixture.expect_event_on(0).l1_synced().await?;
 
-    let mut eth_wire_blocks =
-        fixture.follower(0).node.inner.network.eth_wire_block_listener().await?;
+    // Build a block on the sequencer.
+    let block = fixture.build_block().build_and_await_block().await?;
 
-    if let Some(block) = eth_wire_blocks.next().await {
-        println!("Received block from eth-wire network: {block:?}");
-    } else {
-        panic!("Failed to receive block from eth-wire network");
-    }
+    // The follower must receive the sequenced block over eth-wire and extend its chain.
+    let received = fixture.expect_event_on(1).new_block_received().await?;
+    fixture.expect_event_on(1).chain_extended(block.header.number).await?;
+    assert_eq!(received.header.hash_slow(), block.header.hash_slow());
+
+    // Assert the follower imported exactly the sequenced block.
+    assert_eq!(fixture.get_block(1).await?.header.hash_slow(), block.header.hash_slow());
 
     Ok(())
 }
@@ -1947,7 +1938,7 @@ async fn signer_rotation() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
     // Create the chain spec for scroll dev with Feynman activated and a test genesis.
-    let chain_spec = (*SCROLL_DEV).clone();
+    let chain_spec = (*DOGEOS_DEV).clone();
 
     // Create two signers.
     let signer_1 = PrivateKeySigner::random().with_chain_id(Some(chain_spec.chain().id()));

@@ -61,6 +61,7 @@ arbitrary = [
     "dogeos-protocol-types/arbitrary",
     "alloy-eips/arbitrary",
     "dogeos-reth-primitives/std",
+    "dogeos-reth-primitives/arbitrary",
     "reth-primitives-traits/arbitrary",
     "alloy-consensus/arbitrary",
     "alloy-rpc-types-engine/arbitrary",

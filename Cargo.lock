@@ -4245,6 +4245,7 @@ dependencies = [
  "alloy-eips",
  "alloy-primitives",
  "alloy-rlp",
+ "arbitrary",
  "bytes",
  "dogeos-protocol-types",
  "modular-bitfield 0.13.1",

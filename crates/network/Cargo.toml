@@ -51,6 +51,7 @@ serde = [
     "reth-storage-api/serde",
     "dogeos-hardforks/serde",
     "rollup-node-primitives/serde",
+    "dogeos-protocol-types/serde",
 ]
 test-utils = [
     "reth-chainspec/test-utils",

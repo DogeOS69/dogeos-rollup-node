@@ -348,8 +348,8 @@ mod tests {
         // header: signer checking is observability only.
         let transform = ScrollHeaderTransform::new(Some(Address::repeat_byte(7)));
         let input = vec![
-            header_with_extra(1, vec![0x01; 65]), // parseable length, unauthorized signer
-            header_with_extra(2, vec![0x02; 3]),  // unparseable length
+            header_with_extra(1, vec![0x01; 65]), // valid length, unauthorized signer
+            header_with_extra(2, vec![0x02; 3]),  // wrong length, cannot recover a signature
         ];
 
         let out = transform.map(input).await;

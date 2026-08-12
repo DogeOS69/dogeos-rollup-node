@@ -1,10 +1,11 @@
-FROM rust:1.91-bookworm AS chef
+FROM rust:1.93-bookworm AS chef
 
 ARG CARGO_FEATURES=""
+ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
 
 # Install basic packages
 RUN apt-get update && apt-get -y upgrade && apt-get install -y libclang-dev pkg-config
-RUN cargo install cargo-chef --locked
+RUN cargo install cargo-chef --locked --version 0.1.71
 
 FROM chef AS planner
 WORKDIR /app

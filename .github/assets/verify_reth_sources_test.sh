@@ -44,11 +44,11 @@ expect_reject "a null-source DogeOS component" \
 expect_reject "a path-source DogeOS component" \
     '.packages |= map(if .name == "dogeos-chainspec" then .source = "path+file:///tmp/dogeos-chainspec" else . end)'
 
-expect_reject "a duplicate DogeOS component at a stale revision alongside the good anchors" \
-    '.packages += [first(.packages[] | select(.name == "dogeos-chainspec")) | .source = "git+https://github.com/DogeOS69/dogeos-reth.git?rev=fdf28d7000000000000000000000000000000000#fdf28d7000000000000000000000000000000000"]'
+expect_reject "the obsolete c5198f7 DogeOS component source alongside the good anchors" \
+    '.packages += [first(.packages[] | select(.name == "dogeos-chainspec")) | .source = "git+https://github.com/DogeOS69/dogeos-reth.git?rev=c5198f722a4fcbd47e8c0a10fe8f9835a801c2d2#c5198f722a4fcbd47e8c0a10fe8f9835a801c2d2"]'
 
-expect_reject "a duplicate clean DogeOS Reth package at a noncanonical revision" \
-    '.packages += [first(.packages[] | select(.name == "reth-node-builder")) | .source = "git+https://github.com/DogeOS69/reth.git?rev=3333333333333333333333333333333333333333#3333333333333333333333333333333333333333"]'
+expect_reject "the obsolete PR #3 ae160090 clean-Reth source alongside the good anchors" \
+    '.packages += [first(.packages[] | select(.name == "reth-node-builder")) | .source = "git+https://github.com/DogeOS69/reth.git?rev=ae160090003d9b04be0521e9e4760558798cdf40#ae160090003d9b04be0521e9e4760558798cdf40"]'
 
 expect_reject "a retired dogeos-reth2 source without the .git suffix" \
     '.packages += [first(.packages[] | select(.name == "reth-node-builder")) | .source = "git+https://github.com/DogeOS69/dogeos-reth2?rev=0000000000000000000000000000000000000000#0000000000000000000000000000000000000000"]'

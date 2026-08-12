@@ -3315,46 +3315,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "console-api"
-version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e8599749b6667e2f0c910c1d0dff6901163ff698a52d5a39720f61b5be4b20d3"
-dependencies = [
- "futures-core",
- "prost 0.14.4",
- "prost-types 0.14.4",
- "tonic",
- "tonic-prost",
- "tracing-core",
-]
-
-[[package]]
-name = "console-subscriber"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fb4915b7d8dd960457a1b6c380114c2944f728e7c65294ab247ae6b6f1f37592"
-dependencies = [
- "console-api",
- "crossbeam-channel",
- "crossbeam-utils",
- "futures-task",
- "hdrhistogram",
- "humantime",
- "hyper-util",
- "prost 0.14.4",
- "prost-types 0.14.4",
- "serde",
- "serde_json",
- "thread_local",
- "tokio",
- "tokio-stream",
- "tonic",
- "tracing",
- "tracing-core",
- "tracing-subscriber 0.3.23",
-]
-
-[[package]]
 name = "const-hex"
 version = "1.19.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6124,10 +6084,7 @@ version = "7.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "765c9198f173dd59ce26ff9f95ef0aafd0a0fe01fb9d72841bc5066a4c06511d"
 dependencies = [
- "base64 0.21.7",
  "byteorder",
- "flate2",
- "nom",
  "num-traits",
 ]
 
@@ -9291,7 +9248,7 @@ dependencies = [
  "petgraph",
  "prettyplease",
  "prost 0.12.6",
- "prost-types 0.12.6",
+ "prost-types",
  "regex",
  "syn 2.0.118",
  "tempfile",
@@ -9330,15 +9287,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9091c90b0a32608e984ff2fa4091273cbdd755d54935c51d520887f4a1dbd5b0"
 dependencies = [
  "prost 0.12.6",
-]
-
-[[package]]
-name = "prost-types"
-version = "0.14.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f94967dc7688f3054c7fac87473ffae4cc4c3904800e2d9f5b857246d8963b0a"
-dependencies = [
- "prost 0.14.4",
 ]
 
 [[package]]
@@ -13250,7 +13198,6 @@ dependencies = [
  "clap",
  "color-eyre",
  "colored 3.1.1",
- "console-subscriber",
  "crossterm 0.28.1",
  "dogeos-chainspec",
  "dogeos-hardforks",
@@ -15783,7 +15730,6 @@ version = "1.52.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8fc7f01b389ac15039e4dc9531aa973a135d7a4135281b12d7c1bc79fd57fffe"
 dependencies = [
- "backtrace",
  "bytes",
  "libc",
  "mio",
@@ -15990,10 +15936,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ac2a5518c70fa84342385732db33fb3f44bc4cc748936eb5833d2df34d6445ef"
 dependencies = [
  "async-trait",
- "axum",
  "base64 0.22.1",
  "bytes",
- "h2 0.4.15",
  "http 1.4.2",
  "http-body 1.0.1",
  "http-body-util",
@@ -16002,7 +15946,6 @@ dependencies = [
  "hyper-util",
  "percent-encoding",
  "pin-project",
- "socket2 0.6.4",
  "sync_wrapper",
  "tokio",
  "tokio-stream",

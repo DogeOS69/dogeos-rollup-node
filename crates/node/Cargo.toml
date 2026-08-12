@@ -127,7 +127,6 @@ reqwest.workspace = true
 reqwest-13 = { package = "reqwest", version = "0.13", default-features = false, features = ["rustls"] }
 tokio.workspace = true
 tracing.workspace = true
-console-subscriber = "0.5.0"
 
 # pprof dependencies
 pprof = { version = "0.15.0", features = ["flamegraph", "prost-codec"] }

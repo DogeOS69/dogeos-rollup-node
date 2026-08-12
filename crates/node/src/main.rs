@@ -38,11 +38,6 @@ fn main() {
         std::env::set_var("RUST_LOG", "info");
     }
 
-    // enable tokio-console subscriber
-    if std::env::var("ENABLE_CONSOLE_SUBSCRIBER").is_ok_and(|v| v == "1") {
-        console_subscriber::init();
-    }
-
     reth_cli_util::sigsegv_handler::install();
 
     // Enable backtraces unless a RUST_BACKTRACE value has already been explicitly provided.

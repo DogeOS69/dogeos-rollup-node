@@ -9,7 +9,6 @@ use dogeos_reth_primitives::DogeosBlock;
 use futures::{task::noop_waker_ref, FutureExt, StreamExt};
 use reth_chainspec::EthChainSpec;
 use reth_network::{NetworkConfigBuilder, NetworkEventListenerProvider, PeersInfo};
-use reth_network_api::block::EthWireProvider;
 use reth_rpc_api::EthApiServer;
 use reth_storage_api::BlockReader;
 use reth_tasks::shutdown::signal as shutdown_signal;
@@ -1904,28 +1903,31 @@ async fn can_reject_l2_block_with_unknown_l1_message() -> eyre::Result<()> {
 async fn can_gossip_over_eth_wire() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    // Create the chain spec for scroll dev with Feynman activated and a test genesis.
+    // Create 2 nodes with scroll-wire disabled so blocks can only propagate over eth-wire.
     let mut fixture = TestFixture::builder()
         .sequencer()
         .followers(1)
-        .with_sequencer_auto_start(true)
-        .block_time(40)
+        .block_time(0)
+        .allow_empty_blocks(true)
         .with_scroll_wire(false)
+        .payload_building_duration(1000)
         .build()
         .await?;
 
-    // Set the L1 synced on the sequencer node to start block production.
+    // Set the L1 to synced on the sequencer node.
     fixture.l1().for_node(0).sync().await?;
-    fixture.expect_event().l1_synced().await?;
+    fixture.expect_event_on(0).l1_synced().await?;
 
-    let mut eth_wire_blocks =
-        fixture.follower(0).node.inner.network.eth_wire_block_listener().await?;
+    // Build a block on the sequencer.
+    let block = fixture.build_block().build_and_await_block().await?;
 
-    if let Some(block) = eth_wire_blocks.next().await {
-        println!("Received block from eth-wire network: {block:?}");
-    } else {
-        panic!("Failed to receive block from eth-wire network");
-    }
+    // The follower must receive the sequenced block over eth-wire and extend its chain.
+    let received = fixture.expect_event_on(1).new_block_received().await?;
+    fixture.expect_event_on(1).chain_extended(block.header.number).await?;
+    assert_eq!(received.header.hash_slow(), block.header.hash_slow());
+
+    // Assert the follower imported exactly the sequenced block.
+    assert_eq!(fixture.get_block(1).await?.header.hash_slow(), block.header.hash_slow());
 
     Ok(())
 }

@@ -128,6 +128,13 @@ impl DerivationDriver {
         self.attempt_sleep = Some(Box::pin(tokio::time::sleep_until(TokioInstant::now())));
     }
 
+    /// Cancels the held batch and any scheduled retry after a control-plane unwind invalidates the
+    /// L1 epoch from which it was derived.
+    pub(crate) fn invalidate(&mut self) -> Option<BatchInfo> {
+        self.attempt_sleep = None;
+        self.pending.take().map(|pending| pending.batch.batch_info)
+    }
+
     /// Waits until it is time to run the next attempt. Resolves immediately once the deadline has
     /// passed; never resolves when no attempt is scheduled (guarded by
     /// [`Self::is_attempt_scheduled`] in the run loop `select!`).
@@ -1251,6 +1258,89 @@ mod tests {
         assert_eq!(client.fork_choice_updated_calls(), 1);
         assert_eq!(client.get_payload_calls(), 0);
         assert_eq!(client.new_payload_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn invalidation_cancels_retry_without_engine_persistence_or_fatal() {
+        let db = setup_test_db().await;
+        insert_batch_commit(&db, 1).await;
+        let client = Arc::new(ScriptedEngineClient::new());
+        client
+            .push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Syncing, None)));
+        let mut engine = engine_at_safe(client.clone());
+        let asserter = Asserter::new();
+        push_absent_block(&asserter);
+        let provider = mock_provider(asserter);
+        let mut driver = DerivationDriver::new(DerivedBatchRetryConfig {
+            max_attempts: 2,
+            initial_backoff_ms: 10,
+            max_backoff_ms: 10,
+        });
+
+        driver.hold_batch(reorg_batch(1, SAFE + 1));
+        driver.wait_for_attempt().await;
+        assert!(matches!(
+            driver.run_attempt(&provider, &mut engine, &db).await,
+            AttemptStep::Retrying
+        ));
+        assert_eq!(client.fork_choice_updated_calls(), 1);
+
+        assert_eq!(driver.invalidate(), Some(BatchInfo::new(1, B256::repeat_byte(0xba))));
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        assert!(driver.can_accept_batch());
+        assert!(!driver.is_attempt_scheduled());
+        assert_eq!(client.fork_choice_updated_calls(), 1, "the orphaned batch must not retry");
+        assert_eq!(client.get_payload_calls(), 0);
+        assert_eq!(client.new_payload_calls(), 0);
+        assert_eq!(
+            db.get_batch_status_by_hash(B256::repeat_byte(0xba)).await.unwrap(),
+            Some(BatchStatus::Committed),
+            "an invalidated attempt must not persist a consolidation outcome"
+        );
+    }
+
+    #[tokio::test]
+    async fn reorg_signal_preempts_in_flight_attempt_and_invalidates_it() {
+        let db = setup_test_db().await;
+        insert_batch_commit(&db, 1).await;
+        let client = Arc::new(ScriptedEngineClient::new());
+        client.push_fork_choice_updated(ScriptedResponse::DelayThen(
+            Duration::from_secs(30),
+            Box::new(ScriptedResponse::Ok(fcu(
+                PayloadStatusEnum::Valid,
+                Some(PayloadId::new([7; 8])),
+            ))),
+        ));
+        let mut engine = engine_at_safe(client.clone());
+        let asserter = Asserter::new();
+        push_absent_block(&asserter);
+        let provider = mock_provider(asserter);
+        let mut driver = DerivationDriver::new(short_retry(2));
+        driver.hold_batch(reorg_batch(1, SAFE + 1));
+        driver.wait_for_attempt().await;
+
+        let preempted = {
+            let mut attempt = Box::pin(driver.run_attempt(&provider, &mut engine, &db));
+            tokio::select! {
+                biased;
+                () = tokio::time::sleep(Duration::from_millis(20)) => true,
+                step = &mut attempt => panic!("reorg must preempt the attempt, got {step:?}"),
+            }
+        };
+        assert!(preempted);
+        assert_eq!(driver.invalidate(), Some(BatchInfo::new(1, B256::repeat_byte(0xba))));
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(!driver.is_attempt_scheduled(), "the invalidated batch must not retry");
+        assert_eq!(client.fork_choice_updated_calls(), 1);
+        assert_eq!(client.get_payload_calls(), 0);
+        assert_eq!(client.new_payload_calls(), 0);
+        assert_eq!(
+            db.get_batch_status_by_hash(B256::repeat_byte(0xba)).await.unwrap(),
+            Some(BatchStatus::Committed),
+            "the preempted batch must not persist"
+        );
     }
 
     #[tokio::test]

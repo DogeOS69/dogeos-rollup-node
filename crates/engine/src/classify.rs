@@ -127,12 +127,12 @@ pub fn classify_new_payload(status: &PayloadStatus) -> PayloadOutcome {
 /// same type wrapped by both `EngineError::TransportError` and the orchestrator's `RpcError`
 /// variant, so this single function classifies both.
 ///
-/// The authenticated Engine client folds every jsonrpsee error (timeouts and JSON-RPC error
-/// responses alike) into `TransportErrorKind::Custom(Box<jsonrpsee::core::ClientError>)`, so
-/// precise classification downcasts the inner client error. JSON-RPC error responses are terminal
-/// here regardless of code; the one method-specific exception (`getPayload` `-38001`) is handled by
-/// [`get_payload_error_is_transient`]. An un-downcastable `Custom` payload is treated as terminal —
-/// we never classify by message text.
+/// The authenticated Engine client folds jsonrpsee errors into `Custom`, and the production HTTP
+/// canonical-L2 provider does the same with Alloy HTTP's re-exported reqwest error. Precise
+/// classification downcasts those concrete types. JSON-RPC error responses are terminal here
+/// regardless of code; the one method-specific exception (`getPayload` `-38001`) is handled by
+/// [`get_payload_error_is_transient`]. An un-downcastable `Custom` payload is terminal — we never
+/// classify by message text.
 pub fn transport_error_is_transient(err: &TransportError) -> bool {
     match err {
         RpcError::Transport(kind) => transport_kind_is_transient(kind),
@@ -157,15 +157,27 @@ fn transport_kind_is_transient(kind: &TransportErrorKind) -> bool {
         TransportErrorKind::HttpError(http) => {
             http.is_rate_limit_err() || http.is_temporarily_unavailable()
         }
-        // The authenticated Engine client wraps jsonrpsee errors here.
-        TransportErrorKind::Custom(boxed) => boxed
-            .downcast_ref::<jsonrpsee::core::ClientError>()
-            .is_some_and(client_error_is_transient),
+        // The authenticated Engine client wraps jsonrpsee errors here, while the production HTTP
+        // canonical-L2 provider wraps the HTTP transport's own re-exported reqwest version.
+        TransportErrorKind::Custom(boxed) => {
+            boxed
+                .downcast_ref::<jsonrpsee::core::ClientError>()
+                .is_some_and(client_error_is_transient) ||
+                boxed
+                    .downcast_ref::<alloy_transport_http::reqwest::Error>()
+                    .is_some_and(reqwest_error_is_transient)
+        }
         // `BackendGone`, `PubsubUnavailable`, and any future (`#[non_exhaustive]`) variant:
         // terminal unless positively identified above. Retrying the same client cannot
         // repair a gone backend.
         _ => false,
     }
+}
+
+fn reqwest_error_is_transient(err: &alloy_transport_http::reqwest::Error) -> bool {
+    // Connection failures are request errors in reqwest. Body errors cover interrupted response
+    // streams; decode, builder/configuration, redirect, status, and unknown errors remain terminal.
+    err.is_timeout() || err.is_request() || err.is_body()
 }
 
 const fn client_error_is_transient(err: &jsonrpsee::core::ClientError) -> bool {
@@ -202,8 +214,10 @@ fn transport_error_is_unknown_payload(err: &TransportError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_provider::{Provider, ProviderBuilder};
     use alloy_rpc_types_engine::PayloadId;
     use alloy_transport::TransportErrorKind;
+    use std::net::TcpListener;
 
     fn fcu(status: PayloadStatusEnum, payload_id: Option<PayloadId>) -> ForkchoiceUpdated {
         ForkchoiceUpdated {
@@ -325,5 +339,20 @@ mod tests {
     #[test]
     fn backend_gone_is_terminal() {
         assert!(!transport_error_is_transient(&TransportErrorKind::backend_gone()));
+    }
+
+    #[tokio::test]
+    async fn production_http_connection_failure_is_transient() {
+        // Reserve and release a loopback port so the production Alloy HTTP provider receives a
+        // real reqwest connection-refused error rather than a hand-built transport payload.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback port");
+        let address = listener.local_addr().expect("read loopback address");
+        drop(listener);
+
+        let url = format!("http://{address}").parse().expect("valid loopback URL");
+        let provider = ProviderBuilder::new().connect_http(url);
+        let err = provider.get_block_number().await.expect_err("closed port must refuse request");
+
+        assert!(transport_error_is_transient(&err));
     }
 }

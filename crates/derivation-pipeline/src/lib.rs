@@ -26,7 +26,59 @@ mod metrics;
 pub use metrics::DerivationPipelineMetrics;
 
 use crate::data_source::CodecDataSource;
-use std::{boxed::Box, sync::Arc, time::Instant, vec::Vec};
+use std::{
+    boxed::Box,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Instant,
+    vec::Vec,
+};
+
+#[derive(Debug)]
+struct EpochResult {
+    epoch: u64,
+    result: BatchDerivationResult,
+}
+
+#[derive(Debug)]
+enum WorkerResultSender {
+    Plain(UnboundedSender<BatchDerivationResult>),
+    Epoch(UnboundedSender<EpochResult>),
+}
+
+impl WorkerResultSender {
+    fn send(&self, result: EpochResult) -> Result<(), ()> {
+        match self {
+            Self::Plain(sender) => sender.send(result.result).map_err(|_| ()),
+            Self::Epoch(sender) => sender.send(result).map_err(|_| ()),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct EpochRequest {
+    epoch: u64,
+    request: Arc<BatchDerivationRequest>,
+}
+
+#[derive(Debug)]
+enum WorkerRequestReceiver {
+    Plain(UnboundedReceiver<Arc<BatchDerivationRequest>>),
+    Epoch(UnboundedReceiver<Arc<EpochRequest>>),
+}
+
+impl WorkerRequestReceiver {
+    async fn recv(&mut self, epoch: u64) -> Option<Arc<EpochRequest>> {
+        match self {
+            Self::Plain(receiver) => {
+                receiver.recv().await.map(|request| Arc::new(EpochRequest { epoch, request }))
+            }
+            Self::Epoch(receiver) => receiver.recv().await,
+        }
+    }
+}
 
 /// The derivation pipeline that derives [`BatchDerivationResult`] from [`BatchInfo`].
 ///
@@ -37,11 +89,13 @@ use std::{boxed::Box, sync::Arc, time::Instant, vec::Vec};
 #[derive(Debug)]
 pub struct DerivationPipeline {
     /// The sender for the pipeline used to push new batches to be processed.
-    batch_sender: UnboundedSender<Arc<BatchDerivationRequest>>,
+    batch_sender: UnboundedSender<Arc<EpochRequest>>,
     /// The receiver for the pipeline used to receive the results of the batch processing.
-    result_receiver: UnboundedReceiver<BatchDerivationResult>,
+    result_receiver: UnboundedReceiver<EpochResult>,
     /// The number of active batches being processed.
     len: u64,
+    /// Generation of requests that are still valid after the most recent control-plane unwind.
+    epoch: Arc<AtomicU64>,
 }
 
 impl DerivationPipeline {
@@ -54,18 +108,33 @@ impl DerivationPipeline {
     where
         P: L1Provider + Clone + Send + Sync + 'static,
     {
-        let (batch_sender, result_receiver) =
-            DerivationPipelineWorker::spawn(l1_provider, database, l1_v2_message_queue_start_index)
-                .await;
-        Self { batch_sender, result_receiver, len: 0 }
+        let (batch_sender, result_receiver, epoch) = DerivationPipelineWorker::spawn_epoch(
+            l1_provider,
+            database,
+            l1_v2_message_queue_start_index,
+        )
+        .await;
+        Self { batch_sender, result_receiver, len: 0, epoch }
     }
 
     /// Pushes a new batch info to the derivation pipeline.
     pub async fn push_batch(&mut self, batch_info: BatchInfo, target_status: BatchStatus) {
         self.batch_sender
-            .send(Arc::new(BatchDerivationRequest { batch_info, target_status }))
+            .send(Arc::new(EpochRequest {
+                epoch: self.epoch.load(Ordering::Acquire),
+                request: Arc::new(BatchDerivationRequest { batch_info, target_status }),
+            }))
             .expect("Failed to send batch info to derivation pipeline");
         self.len += 1;
+    }
+
+    /// Invalidates every queued or in-flight result from the current L1 epoch.
+    ///
+    /// Workers may finish obsolete futures after this returns, but generation checks prevent those
+    /// results (and failed-work retries) from being observed by the orchestrator.
+    pub fn invalidate(&mut self) {
+        self.epoch.fetch_add(1, Ordering::AcqRel);
+        self.len = 0;
     }
 
     /// Returns the number of active batches being processed.
@@ -87,12 +156,18 @@ impl Stream for DerivationPipeline {
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
-        match Pin::new(&mut this.result_receiver).poll_recv(cx) {
-            Poll::Ready(Some(result)) => {
-                this.len = this.len.saturating_sub(1);
-                Poll::Ready(Some(result))
+        loop {
+            match Pin::new(&mut this.result_receiver).poll_recv(cx) {
+                Poll::Ready(Some(result)) => {
+                    if result.epoch != this.epoch.load(Ordering::Acquire) {
+                        continue
+                    }
+                    this.len = this.len.saturating_sub(1);
+                    return Poll::Ready(Some(result.result))
+                }
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Pending => return Poll::Pending,
             }
-            _ => Poll::Pending,
         }
     }
 }
@@ -104,9 +179,9 @@ const DERIVATION_PIPELINE_WORKER_CONCURRENCY: usize = 3;
 #[derive(Debug)]
 pub struct DerivationPipelineWorker<P> {
     /// The receiver for the pipeline used to receive new batches to be derived.
-    batch_receiver: UnboundedReceiver<Arc<BatchDerivationRequest>>,
+    batch_receiver: WorkerRequestReceiver,
     /// The sender for the pipeline used to send the results of the batch derivation.
-    result_sender: UnboundedSender<BatchDerivationResult>,
+    result_sender: WorkerResultSender,
     /// The active batch derivation futures.
     futures: FuturesOrdered<DerivationPipelineFuture>,
     /// A reference to the database.
@@ -119,6 +194,8 @@ pub struct DerivationPipelineWorker<P> {
     l1_v2_message_queue_start_index: u64,
     /// The metrics of the pipeline.
     metrics: DerivationPipelineMetrics,
+    /// Current valid generation, shared with the receiving pipeline.
+    epoch: Arc<AtomicU64>,
 }
 
 impl<P> DerivationPipelineWorker<P> {
@@ -129,6 +206,25 @@ impl<P> DerivationPipelineWorker<P> {
         l1_v2_message_queue_start_index: u64,
         batch_receiver: UnboundedReceiver<Arc<BatchDerivationRequest>>,
         result_sender: UnboundedSender<BatchDerivationResult>,
+    ) -> Result<Self, DerivationPipelineError> {
+        Self::new_inner(
+            l1_provider,
+            database,
+            l1_v2_message_queue_start_index,
+            WorkerRequestReceiver::Plain(batch_receiver),
+            WorkerResultSender::Plain(result_sender),
+            Arc::new(AtomicU64::new(0)),
+        )
+        .await
+    }
+
+    async fn new_inner(
+        l1_provider: P,
+        database: Arc<Database>,
+        l1_v2_message_queue_start_index: u64,
+        batch_receiver: WorkerRequestReceiver,
+        result_sender: WorkerResultSender,
+        epoch: Arc<AtomicU64>,
     ) -> Result<Self, DerivationPipelineError> {
         let cache =
             PreFetchCache::new(database.clone(), CACHE_SIZE, CACHE_TTL, PREFETCH_RANGE_SIZE)
@@ -142,6 +238,7 @@ impl<P> DerivationPipelineWorker<P> {
             l1_provider,
             l1_v2_message_queue_start_index,
             metrics: DerivationPipelineMetrics::default(),
+            epoch,
         })
     }
 }
@@ -177,6 +274,34 @@ where
         (batch_sender, result_receiver)
     }
 
+    async fn spawn_epoch(
+        l1_provider: P,
+        database: Arc<Database>,
+        l1_v2_message_queue_start_index: u64,
+    ) -> (UnboundedSender<Arc<EpochRequest>>, UnboundedReceiver<EpochResult>, Arc<AtomicU64>) {
+        let (batch_sender, batch_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (result_sender, result_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let epoch = Arc::new(AtomicU64::new(0));
+        let worker_epoch = epoch.clone();
+
+        tokio::task::spawn(async move {
+            let worker = Self::new_inner(
+                l1_provider,
+                database,
+                l1_v2_message_queue_start_index,
+                WorkerRequestReceiver::Epoch(batch_receiver),
+                WorkerResultSender::Epoch(result_sender),
+                worker_epoch,
+            )
+            .await
+            .expect("Failed to create derivation pipeline worker");
+
+            worker.run().await;
+        });
+
+        (batch_sender, result_receiver, epoch)
+    }
+
     /// Runs the derivation pipeline worker.
     async fn run(mut self) {
         tracing::info!(target: "scroll::derivation_pipeline", "Starting derivation pipeline worker");
@@ -185,12 +310,13 @@ where
             tokio::select! {
                 biased;
 
-                maybe_batch = self.batch_receiver.recv(), if self.futures.len() < DERIVATION_PIPELINE_WORKER_CONCURRENCY => {
+                maybe_batch = self.batch_receiver.recv(self.epoch.load(Ordering::Acquire)), if self.futures.len() < DERIVATION_PIPELINE_WORKER_CONCURRENCY => {
                     match maybe_batch {
-                        Some(request) => {
+                        Some(request) if request.epoch == self.epoch.load(Ordering::Acquire) => {
                             let fut = self.derivation_future(request);
                             self.futures.push_back(fut);
                         }
+                        Some(_) => {}
                         None => {
                             tracing::info!(target: "scroll::derivation_pipeline", "Batch channel closed, shutting down derivation pipeline worker");
                             break;
@@ -200,15 +326,18 @@ where
                 }
                 Some(result) = self.futures.next() => {
                     match result {
-                        Ok(res) => {
+                        Ok(res) if res.epoch == self.epoch.load(Ordering::Acquire) => {
                             if self.result_sender.send(res).is_err() {
                                 tracing::info!(target: "scroll::derivation_pipeline", "Result channel closed, shutting down derivation pipeline worker");
                                 break;
                             }
                         }
+                        Ok(_) => {}
                         Err((batch_info, err)) => {
-                            tracing::error!(target: "scroll::derivation_pipeline", ?batch_info, ?err, "Failed to derive payload attributes");
-                            self.futures.push_front(self.derivation_future(batch_info));
+                            if batch_info.epoch == self.epoch.load(Ordering::Acquire) {
+                                tracing::error!(target: "scroll::derivation_pipeline", ?batch_info, ?err, "Failed to derive payload attributes");
+                                self.futures.push_front(self.derivation_future(batch_info));
+                            }
                         }
                     }
                 }
@@ -216,7 +345,7 @@ where
         }
     }
 
-    fn derivation_future(&self, request: Arc<BatchDerivationRequest>) -> DerivationPipelineFuture {
+    fn derivation_future(&self, request: Arc<EpochRequest>) -> DerivationPipelineFuture {
         let db = self.database.clone();
         let cache = self.cache.clone();
         let metrics = self.metrics.clone();
@@ -225,8 +354,9 @@ where
 
         Box::pin(async move {
             let derive_start = Instant::now();
-            let batch_info = request.batch_info;
-            let target_status = request.target_status;
+            let batch_info = request.request.batch_info;
+            let target_status = request.request.target_status;
+            let epoch = request.epoch;
 
             // get the batch commit data.
             let batch = db
@@ -248,7 +378,7 @@ where
             metrics.derived_blocks.increment(result.attributes.len() as u64);
             let execution_duration = derive_start.elapsed().as_secs_f64();
             metrics.blocks_per_second.set(result.attributes.len() as f64 / execution_duration);
-            Ok(result)
+            Ok(EpochResult { epoch, result })
         })
     }
 }
@@ -287,12 +417,8 @@ pub struct DerivedAttributes {
 /// A future that resolves to a stream of [`BatchDerivationResult`].
 type DerivationPipelineFuture = Pin<
     Box<
-        dyn Future<
-                Output = Result<
-                    BatchDerivationResult,
-                    (Arc<BatchDerivationRequest>, DerivationPipelineError),
-                >,
-            > + Send,
+        dyn Future<Output = Result<EpochResult, (Arc<EpochRequest>, DerivationPipelineError)>>
+            + Send,
     >,
 >;
 
@@ -498,6 +624,35 @@ mod tests {
             input: bytes!("8ef1332e0000000000000000000000007f2b8c31f88b6006c382775eea88297ec1e3e9050000000000000000000000006ea73e05adc79974b931123675ea8f78ffdacdf000000000000000000000000000000000000000000000000000470de4df820000000000000000000000000000000000000000000000000000000000000000002200000000000000000000000000000000000000000000000000000000000000a000000000000000000000000000000000000000000000000000000000000000a4232e8748000000000000000000000000982fe4a7cbd74bb3422ebe46333c3e8046c12c7f000000000000000000000000982fe4a7cbd74bb3422ebe46333c3e8046c12c7f00000000000000000000000000000000000000000000000000470de4df8200000000000000000000000000000000000000000000000000000000000000000080000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"),
         },
     };
+
+    #[tokio::test]
+    async fn invalidation_discards_results_from_the_previous_epoch() {
+        let (batch_sender, _batch_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (result_sender, result_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let epoch = Arc::new(AtomicU64::new(0));
+        let mut pipeline =
+            DerivationPipeline { batch_sender, result_receiver, len: 1, epoch: epoch.clone() };
+        let result = || BatchDerivationResult {
+            attributes: Vec::new(),
+            batch_info: BatchInfo::new(1, B256::ZERO),
+            skipped_l1_messages: Vec::new(),
+            target_status: BatchStatus::Consolidated,
+        };
+
+        pipeline.invalidate();
+        result_sender.send(EpochResult { epoch: 0, result: result() }).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), pipeline.next()).await.is_err(),
+            "an obsolete worker result must not escape after invalidation"
+        );
+
+        pipeline.len = 1;
+        result_sender
+            .send(EpochResult { epoch: epoch.load(Ordering::Acquire), result: result() })
+            .unwrap();
+        assert!(pipeline.next().await.is_some(), "current-epoch results must still be delivered");
+        assert!(pipeline.is_empty());
+    }
 
     #[tokio::test]
     async fn test_should_retry_on_derivation_error() -> eyre::Result<()> {

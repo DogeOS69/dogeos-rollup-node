@@ -57,6 +57,7 @@ mod error;
 pub use error::ChainOrchestratorError;
 
 mod handle;
+use handle::DeferredCommands;
 pub use handle::{ChainOrchestratorCommand, ChainOrchestratorHandle, DatabaseQuery};
 
 mod metrics;
@@ -135,6 +136,10 @@ pub struct ChainOrchestrator<
     derivation_pipeline: DerivationPipeline,
     /// Drives ordered, bounded-retry reconciliation of the single derived batch currently held.
     derivation_driver: DerivationDriver,
+    /// FIFO L1 notifications observed while derivation work from the current L1 epoch is pending.
+    buffered_l1_notifications: VecDeque<Arc<L1Notification>>,
+    /// FIFO state-mutating commands deferred until no derived batch is queued or held.
+    deferred_commands: DeferredCommands<ChainOrchestratorCommand<N>>,
     /// Optional event sender for broadcasting events to listeners.
     event_sender: Option<EventSender<ChainOrchestratorEvent>>,
     /// The metrics handler.
@@ -182,6 +187,8 @@ impl<
                 signer,
                 derivation_pipeline,
                 derivation_driver,
+                buffered_l1_notifications: VecDeque::new(),
+                deferred_commands: DeferredCommands::default(),
                 handle_rx,
                 event_sender: None,
                 metric_handler: MetricsHandler::default(),
@@ -203,6 +210,47 @@ impl<
         mut shutdown: impl std::future::Future<Output = ()> + Unpin,
     ) -> Result<(), ChainOrchestratorError> {
         loop {
+            // Discover a queued reorg before starting a due attempt. Ordinary notifications are
+            // retained in FIFO order; draining the currently ready L1 queue prevents a reorg
+            // behind them from losing a race with the retry deadline.
+            let mut queued_reorg = None;
+            if self.has_pending_derivation_work() && self.sync_state.l2().is_synced() {
+                let ready_notifications = self.l1_watcher.l1_notification_receiver().len();
+                for _ in 0..ready_notifications {
+                    match self.l1_watcher.l1_notification_receiver().try_recv() {
+                        Ok(notification) => match &*notification {
+                            L1Notification::Reorg(block_number) => {
+                                queued_reorg = Some(*block_number);
+                                break
+                            }
+                            _ => self.buffered_l1_notifications.push_back(notification),
+                        },
+                        Err(_) => break,
+                    }
+                }
+            }
+            if let Some(block_number) = queued_reorg {
+                let res = self.invalidate_and_handle_l1_reorg(block_number).await;
+                self.handle_outcome(res);
+                continue
+            }
+
+            // Once current-epoch derivation is idle, preserve the original L1 FIFO before
+            // releasing deferred mutators. A due reconciliation never reaches this path.
+            if !self.has_pending_derivation_work() {
+                if let Some(notification) = self.buffered_l1_notifications.pop_front() {
+                    let res = self.handle_l1_notification(notification).await;
+                    self.handle_outcome(res);
+                    continue
+                }
+                if let Some(command) = self.deferred_commands.pop_front() {
+                    if let Err(err) = self.handle_command(command).await {
+                        tracing::error!(target: "scroll::chain_orchestrator", ?err, "Error handling deferred command");
+                    }
+                    continue
+                }
+            }
+
             tokio::select! {
                 biased;
 
@@ -223,38 +271,69 @@ impl<
                         .expect("metric exists")
                         .clone();
                     let started = Instant::now();
-                    tokio::select! {
-                        biased;
-                        _guard = &mut shutdown => {
-                            self.notify(ChainOrchestratorEvent::Shutdown);
-                            return Ok(());
-                        }
-                        step = self.derivation_driver.run_attempt(&*self.l2_client, &mut self.engine, &self.database) => {
-                            // Preserve the pre-existing batch-reconciliation task-duration series,
-                            // now measured once per completed attempt (including failed attempts).
-                            metric.task_duration.record(started.elapsed().as_secs_f64());
-                            match step {
-                                AttemptStep::Completed(consolidated) => {
-                                    // Persistence has committed; only now surface the staged block
-                                    // events followed by the single batch event.
-                                    for outcome in consolidated.block_outcomes {
-                                        self.notify(ChainOrchestratorEvent::BlockConsolidated(outcome));
+                    let mut preempting_reorg = None;
+                    let mut shutdown_during_attempt = false;
+                    let step = {
+                        let mut attempt = Box::pin(self.derivation_driver.run_attempt(
+                            &*self.l2_client,
+                            &mut self.engine,
+                            &self.database,
+                        ));
+                        loop {
+                            tokio::select! {
+                                biased;
+                                _guard = &mut shutdown => {
+                                    shutdown_during_attempt = true;
+                                    break None
+                                }
+                                Some(notification) = self.l1_watcher.l1_notification_receiver().recv(), if self.sync_state.l2().is_synced() => {
+                                    if let L1Notification::Reorg(block_number) = &*notification {
+                                        preempting_reorg = Some(*block_number);
+                                        break None
                                     }
-                                    self.notify(ChainOrchestratorEvent::BatchConsolidated(
-                                        consolidated.batch_outcome,
-                                    ));
+                                    self.buffered_l1_notifications.push_back(notification);
                                 }
-                                AttemptStep::Retrying => {}
-                                AttemptStep::Fatal(err) => {
-                                    self.handle_fatal(&err);
-                                    return Err(err);
-                                }
+                                step = &mut attempt => break Some(step),
                             }
+                        }
+                    };
+
+                    if shutdown_during_attempt {
+                        self.notify(ChainOrchestratorEvent::Shutdown);
+                        return Ok(())
+                    }
+
+                    // Dropping the attempt future above cancels all local work before the unwind.
+                    if let Some(block_number) = preempting_reorg {
+                        metric.task_duration.record(started.elapsed().as_secs_f64());
+                        let res = self.invalidate_and_handle_l1_reorg(block_number).await;
+                        self.handle_outcome(res);
+                        continue
+                    }
+
+                    // Preserve the pre-existing batch-reconciliation task-duration series, now
+                    // measured once per completed attempt (including failed attempts).
+                    metric.task_duration.record(started.elapsed().as_secs_f64());
+                    match step.expect("attempt only exits without a result for a reorg") {
+                        AttemptStep::Completed(consolidated) => {
+                            // Persistence has committed; only now surface the staged block events
+                            // followed by the single batch event.
+                            for outcome in consolidated.block_outcomes {
+                                self.notify(ChainOrchestratorEvent::BlockConsolidated(outcome));
+                            }
+                            self.notify(ChainOrchestratorEvent::BatchConsolidated(
+                                consolidated.batch_outcome,
+                            ));
+                        }
+                        AttemptStep::Retrying => {}
+                        AttemptStep::Fatal(err) => {
+                            self.handle_fatal(&err);
+                            return Err(err);
                         }
                     }
                 }
                 Some(command) = self.handle_rx.recv(), if self.derivation_driver.can_poll_commands() => {
-                    if let Err(err) = self.handle_command(command).await {
+                    if let Err(err) = self.handle_or_defer_command(command).await {
                         tracing::error!(target: "scroll::chain_orchestrator", ?err, "Error handling command");
                     }
                 }
@@ -274,7 +353,7 @@ impl<
                     } else {
                         unreachable!()
                     }
-                }, if self.sequencer.is_some() && self.sync_state.is_synced() && self.derivation_driver.can_accept_batch() => {
+                }, if self.sequencer.is_some() && self.sync_state.is_synced() && !self.has_pending_derivation_work() => {
                     let res = self.handle_sequencer_event(event).await;
                     self.handle_outcome(res);
                 }
@@ -283,16 +362,60 @@ impl<
                     // it. No later derivation result is polled while this batch is held.
                     self.derivation_driver.hold_batch(batch);
                 }
-                Some(event) = self.network.events().next() => {
+                Some(event) = self.network.events().next(), if !self.has_pending_derivation_work() => {
                     let res = self.handle_network_event(event).await;
                     self.handle_outcome(res);
                 }
-                Some(notification) = self.l1_watcher.l1_notification_receiver().recv(), if self.sync_state.l2().is_synced() && self.derivation_pipeline.is_empty() && self.derivation_driver.can_accept_batch() => {
-                    let res = self.handle_l1_notification(notification).await;
+                Some(notification) = self.l1_watcher.l1_notification_receiver().recv(), if self.sync_state.l2().is_synced() => {
+                    let res = self.handle_or_buffer_l1_notification(notification).await;
                     self.handle_outcome(res);
                 }
 
             }
+        }
+    }
+
+    /// Returns whether a derived batch is being produced, queued, held, or retried.
+    const fn has_pending_derivation_work(&self) -> bool {
+        !self.derivation_driver.can_accept_batch() || !self.derivation_pipeline.is_empty()
+    }
+
+    /// Handles read-only/control commands during recovery, deferring state mutations in FIFO order.
+    async fn handle_or_defer_command(
+        &mut self,
+        command: ChainOrchestratorCommand<N>,
+    ) -> Result<(), ChainOrchestratorError> {
+        if !self.has_pending_derivation_work() {
+            return self.handle_command(command).await
+        }
+
+        let must_defer = command.must_defer_during_derivation();
+        let Some(command) = self.deferred_commands.route(command, true, must_defer) else {
+            return Ok(())
+        };
+
+        match command {
+            ChainOrchestratorCommand::RevertToL1Block((block_number, tx)) => {
+                self.handle_revert_to_l1_block(block_number, tx).await
+            }
+            command => self.handle_command(command).await,
+        }
+    }
+
+    /// Buffers ordinary FIFO L1 notifications behind current derivation, while reorgs preempt and
+    /// invalidate all work from the obsolete L1 epoch.
+    async fn handle_or_buffer_l1_notification(
+        &mut self,
+        notification: Arc<L1Notification>,
+    ) -> Result<Option<ChainOrchestratorEvent>, ChainOrchestratorError> {
+        if let L1Notification::Reorg(block_number) = &*notification {
+            return self.invalidate_and_handle_l1_reorg(*block_number).await
+        }
+        if self.has_pending_derivation_work() {
+            self.buffered_l1_notifications.push_back(notification);
+            Ok(None)
+        } else {
+            self.handle_l1_notification(notification).await
         }
     }
 
@@ -492,28 +615,7 @@ impl<
                 }
             },
             ChainOrchestratorCommand::RevertToL1Block((block_number, tx)) => {
-                self.sync_state.l1_mut().set_syncing();
-                let unwind_result = self.database.unwind(block_number).await?;
-
-                // Check if the unwind impacts the fcs safe head.
-                if let Some(block_info) = unwind_result.l2_safe_block_info {
-                    // If the new safe head is above the current finalized head, update the fcs safe
-                    // head to the new safe head.
-                    if block_info.number >= self.engine.fcs().finalized_block_info().number {
-                        self.engine.update_fcs(None, Some(block_info), None).await?;
-                    } else {
-                        // Otherwise, update the fcs safe head to the finalized head.
-                        self.engine
-                            .update_fcs(None, Some(*self.engine.fcs().finalized_block_info()), None)
-                            .await?;
-                    }
-                }
-
-                // Revert the L1 watcher to the specified block.
-                self.l1_watcher.revert_to_l1_block(block_number);
-
-                self.notify(ChainOrchestratorEvent::UnwoundToL1Block(block_number));
-                let _ = tx.send(true);
+                self.handle_revert_to_l1_block(block_number, tx).await?;
             }
             ChainOrchestratorCommand::ImportBlock { block_with_peer, response } => {
                 let result = self
@@ -568,7 +670,7 @@ impl<
                 Ok(None)
             }
             L1Notification::Reorg(block_number) => {
-                metered!(Task::L1Reorg, self, handle_l1_reorg(*block_number))
+                self.invalidate_and_handle_l1_reorg(*block_number).await
             }
             L1Notification::Consensus(update) => {
                 self.consensus.update_config(update);
@@ -615,6 +717,73 @@ impl<
                 )
             }
         }
+    }
+
+    /// Invalidates all derived work from the current L1 epoch before an unwind.
+    async fn invalidate_derivation_work(&mut self) -> Result<(), ChainOrchestratorError> {
+        let held_batch = self.derivation_driver.invalidate();
+        let buffered_notifications = self.buffered_l1_notifications.len();
+        let deferred_commands = self.deferred_commands.len();
+        self.derivation_pipeline.invalidate();
+        self.buffered_l1_notifications.clear();
+        // Mutators submitted against the pre-unwind state are no longer safe to execute. Dropping
+        // their response channels reports cancellation to callers that expect a response.
+        self.deferred_commands.clear();
+        self.database.change_batch_processing_to_committed_status().await?;
+        tracing::info!(
+            target: "scroll::chain_orchestrator",
+            ?held_batch,
+            buffered_notifications,
+            deferred_commands,
+            "Invalidated pending derivation work for L1 unwind"
+        );
+        Ok(())
+    }
+
+    /// Requeues every surviving unprocessed batch in index order after an unwind.
+    async fn rediscover_surviving_batches(&mut self) -> Result<(), ChainOrchestratorError> {
+        let finalized_l1_block = self.database.get_finalized_l1_block_number().await?;
+        let finalized = self
+            .database
+            .fetch_and_update_unprocessed_finalized_batches(finalized_l1_block)
+            .await?;
+        let committed = self.database.fetch_and_update_unprocessed_committed_batches().await?;
+        let mut batches = finalized
+            .into_iter()
+            .map(|batch| (batch, BatchStatus::Finalized))
+            .chain(committed.into_iter().map(|batch| (batch, BatchStatus::Consolidated)))
+            .collect::<Vec<_>>();
+        batches.sort_unstable_by_key(|(batch, _)| batch.index);
+        for (batch, target_status) in batches {
+            self.derivation_pipeline.push_batch(batch, target_status).await;
+        }
+        Ok(())
+    }
+
+    /// Cancels obsolete derivation, unwinds database and Engine state, then rediscovers survivors.
+    async fn invalidate_and_handle_l1_reorg(
+        &mut self,
+        block_number: u64,
+    ) -> Result<Option<ChainOrchestratorEvent>, ChainOrchestratorError> {
+        self.invalidate_derivation_work().await?;
+        let event = metered!(Task::L1Reorg, self, handle_l1_reorg(block_number))?;
+        self.rediscover_surviving_batches().await?;
+        Ok(event)
+    }
+
+    /// Routes an administrative unwind through the same invalidation and recovery path as an L1
+    /// reorg.
+    async fn handle_revert_to_l1_block(
+        &mut self,
+        block_number: u64,
+        tx: tokio::sync::oneshot::Sender<bool>,
+    ) -> Result<(), ChainOrchestratorError> {
+        self.sync_state.l1_mut().set_syncing();
+        self.invalidate_and_handle_l1_reorg(block_number).await?;
+        self.l1_watcher.revert_to_l1_block(block_number);
+        self.notify(ChainOrchestratorEvent::UnwoundToL1Block(block_number));
+        let _ = tx.send(true);
+        Ok(())
     }
 
     async fn handle_l1_new_block(

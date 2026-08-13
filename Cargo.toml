@@ -155,6 +155,7 @@ alloy-sol-types = { version = "1.5.7", default-features = false }
 alloy-signer = { version = "=1.8.2", default-features = false }
 alloy-signer-local = { version = "=1.8.2", default-features = false }
 alloy-transport = { version = "=1.8.3", default-features = false }
+alloy-transport-http = { version = "=1.8.3", default-features = false, features = ["reqwest"] }
 
 # reth
 reth-chainspec = { git = "https://github.com/DogeOS69/reth.git", rev = "f851224ee9aaf21c76a14e844cbd12d9756f5f3b", default-features = false }

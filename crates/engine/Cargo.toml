@@ -17,6 +17,7 @@ alloy-primitives.workspace = true
 alloy-provider = { workspace = true, features = ["engine-api"] }
 alloy-rpc-types-engine.workspace = true
 alloy-transport.workspace = true
+alloy-transport-http.workspace = true
 
 # DogeOS protocol
 dogeos-hardforks.workspace = true
@@ -49,11 +50,13 @@ jsonrpsee = { version = "0.26.0", features = ["client"] }
 
 [dev-dependencies]
 alloy-consensus.workspace = true
+alloy-provider = { workspace = true, features = ["reqwest"] }
 arbitrary.workspace = true
 async-trait.workspace = true
 reth-testing-utils.workspace = true
 dogeos-protocol-types = { workspace = true, features = ["arbitrary"] }
 dogeos-reth-engine.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [features]
 test-utils = [

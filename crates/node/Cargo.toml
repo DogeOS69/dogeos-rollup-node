@@ -186,6 +186,7 @@ test-utils = [
     "rollup-node-watcher/test-utils",
     "scroll-db/test-utils",
     "scroll-engine/test-utils",
+    "scroll-l1/test-utils",
     "rollup-node/test-utils",
     "reth-e2e-test-utils",
     "reth-rpc-server-types",

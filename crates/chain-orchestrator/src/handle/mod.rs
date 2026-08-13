@@ -11,6 +11,7 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::error;
 
 mod command;
+pub(crate) use command::DeferredCommands;
 pub use command::{ChainOrchestratorCommand, DatabaseQuery};
 
 mod metrics;

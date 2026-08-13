@@ -11936,6 +11936,7 @@ dependencies = [
  "alloy-provider",
  "alloy-rpc-types-engine",
  "alloy-transport",
+ "alloy-transport-http",
  "arbitrary",
  "async-trait",
  "dogeos-chainspec",

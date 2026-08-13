@@ -92,10 +92,9 @@ use reth_db::test_utils::create_test_rw_db_with_path;
 use reth_e2e_test_utils::{
     node::NodeTestContext, transaction::TransactionTestContext, wallet::Wallet,
 };
-use reth_engine_local::LocalPayloadAttributesBuilder;
 use reth_node_builder::{
     EngineNodeLauncher, Node, NodeBuilder, NodeConfig, NodeHandle as RethNodeHandle, NodeTypes,
-    PayloadAttributesBuilder, PayloadTypes, TreeConfig,
+    TreeConfig,
 };
 use reth_node_core::args::{
     DiscoveryArgs, NetworkArgs, PayloadBuilderArgs, RpcServerArgs, TxPoolArgs,
@@ -124,13 +123,7 @@ pub async fn setup_engine(
     Vec<ScrollNodeTestComponents>,
     Vec<Arc<reth_db::test_utils::TempDatabase<reth_db::DatabaseEnv>>>,
     Wallet,
-)>
-where
-    LocalPayloadAttributesBuilder<<ScrollRollupNode as NodeTypes>::ChainSpec>:
-        PayloadAttributesBuilder<
-            <<ScrollRollupNode as NodeTypes>::Payload as PayloadTypes>::PayloadAttributes,
-        >,
-{
+)> {
     let network_config = NetworkArgs {
         discovery: DiscoveryArgs { disable_discovery: true, ..DiscoveryArgs::default() },
         trusted_peers: trusted_peers.clone().unwrap_or_default(),

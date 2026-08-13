@@ -90,7 +90,7 @@ aws-config = "1.8.0"
 aws-sdk-kms = "1.76.0"
 
 # test-utils
-anvil = { git = "https://github.com/scroll-tech/foundry.git", rev = "e451ccfdf77f8f543e987703c66543c29eba9258", default-features = false, optional = true }
+alloy-node-bindings = { workspace = true, optional = true }
 alloy-rpc-types-eth = { workspace = true, optional = true }
 alloy-rpc-types-anvil = { workspace = true, optional = true }
 reth-db = { workspace = true, optional = true, features = ["test-utils"] }
@@ -192,12 +192,12 @@ test-utils = [
     "reth-network-p2p/test-utils",
     "rollup-node-chain-orchestrator/test-utils",
     "scroll-network/test-utils",
-    "anvil",
+    "alloy-node-bindings",
     "reth-storage-api",
     "alloy-rpc-types-eth",
     "alloy-rpc-types-anvil",
     "alloy-provider/anvil-api",
-    "alloy-provider/anvil-node",
+    "alloy-provider/reqwest",
     "reth-db?/test-utils",
     "reth-tasks/test-utils",
 ]

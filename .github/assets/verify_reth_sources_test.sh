@@ -65,7 +65,12 @@ expect_reject "a duplicate lowercase-organization DogeOS REVM source" \
 expect_reject "a wrong DogeOS REVM revision" \
     '.packages |= map(if .name == "revm-scroll" then .source = "git+https://github.com/DogeOS69/dogeos-revm.git?branch=dogeos#1111111111111111111111111111111111111111" else . end)'
 
-expect_reject "a wrong official Reth revision" \
-    '.packages |= map(if .source != null and (.source | contains("paradigmxyz/reth")) then .source = "git+https://github.com/paradigmxyz/reth?rev=2222222222222222222222222222222222222222#2222222222222222222222222222222222222222" else . end)'
+# The reviewed official Reth subtree only ever entered the graph through the
+# removed Foundry/Tempo subtree, so the clean graph no longer contains a
+# paradigmxyz/reth package to mutate. Inject a wrong official-Reth source onto a
+# non-anchor, non-reth-* package so the rejection is attributed specifically to the
+# repository-level official-Reth rule rather than the reth-* naming rule.
+expect_reject "a wrong official Reth revision alongside the good anchors" \
+    '.packages += [first(.packages[] | select(.name == "alloy-node-bindings")) | .source = "git+https://github.com/paradigmxyz/reth?rev=2222222222222222222222222222222222222222#2222222222222222222222222222222222222222"]'
 
 echo "source guard fixtures passed"

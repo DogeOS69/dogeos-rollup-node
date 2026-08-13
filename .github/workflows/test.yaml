@@ -12,11 +12,9 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
 
-# Override this repository variable with a compatible x64 Linux runner label when the standard
-# public runner does not provide enough memory or disk for the workspace build.
 jobs:
   unit:
-    runs-on: ${{ vars.CI_TEST_RUNNER || 'ubuntu-latest' }}
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 60
     env:
       RUST_BACKTRACE: 1
@@ -34,7 +32,7 @@ jobs:
         run: cargo nextest run --all-features --workspace --locked -E '!kind(test)'
 
   integration:
-    runs-on: ${{ vars.CI_TEST_RUNNER || 'ubuntu-latest' }}
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 60
     env:
       RUST_BACKTRACE: 1
@@ -55,7 +53,7 @@ jobs:
             -- --skip test_should_consolidate_to_block_15k
 
   integration-docker-compose:
-    runs-on: ${{ vars.CI_TEST_RUNNER || 'ubuntu-latest' }}
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 90
     env:
       RUST_BACKTRACE: 1

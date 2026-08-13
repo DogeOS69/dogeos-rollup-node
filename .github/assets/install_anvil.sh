@@ -91,7 +91,7 @@ err "checksum verified: ${expected_sha}"
 # --- Extract only the anvil executable -------------------------------------------
 mkdir -p "${DEST_DIR}"
 tar -xzf "${archive_path}" -C "${DEST_DIR}" anvil
-anvil_bin="${DEST_DIR}/anvil"
+anvil_bin="$(cd "${DEST_DIR}" && pwd -P)/anvil"
 chmod +x "${anvil_bin}"
 
 # --- Verify the installed binary -------------------------------------------------

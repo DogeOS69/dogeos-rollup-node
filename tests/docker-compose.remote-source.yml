@@ -18,7 +18,9 @@ services:
   rollup-node-sequencer:
     build:
       context: ../
-      dockerfile: Dockerfile.test
+      dockerfile: Dockerfile
+      cache_from:
+        - type=registry,ref=dogeos69/rollup-node:buildcache
     entrypoint: ["bash", "/launch_rollup_node_sequencer.bash"]
     environment:
       - RUST_LOG=info
@@ -36,7 +38,9 @@ services:
   rollup-node-remote-source:
     build:
       context: ../
-      dockerfile: Dockerfile.test
+      dockerfile: Dockerfile
+      cache_from:
+        - type=registry,ref=dogeos69/rollup-node:buildcache
     entrypoint: ["bash", "/launch_rollup_node_remote_source.bash"]
     environment:
       - RUST_LOG=info

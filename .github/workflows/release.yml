@@ -15,6 +15,7 @@ on:
       - ".cargo/**"
       - "Cargo.lock"
       - "Cargo.toml"
+      - ".dockerignore"
       - "Dockerfile"
       - "crates/**"
   workflow_dispatch:
@@ -35,7 +36,7 @@ env:
 
 jobs:
   build-and-publish:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-8vcpu-ubuntu-2404
     permissions:
       contents: read
 
@@ -140,6 +141,7 @@ jobs:
           push: false
           platforms: ${{ env.PLATFORM }}
           tags: ${{ env.DOCKER_TAGS }}
+          cache-from: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache
           labels: |
             org.opencontainers.image.title=rollup-node
             org.opencontainers.image.description=DogeOS rollup-node service

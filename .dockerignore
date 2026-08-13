@@ -14,9 +14,6 @@
 !deny.toml
 !Makefile
 
-# include for vergen constants
-!/.git
-
 # include licenses
 !LICENSE-*
 

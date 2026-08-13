@@ -99,7 +99,7 @@ impl<'a> BlockBuilder<'a> {
         let handle = &sequencer_node.rollup_manager_handle;
 
         // Trigger block building
-        handle.build_block();
+        handle.build_block().await??;
 
         // If extract the block number.
         let expect = self.fixture.expect_event();

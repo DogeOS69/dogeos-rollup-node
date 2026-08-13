@@ -76,8 +76,8 @@ where
     }
 
     /// Cancels the current payload building job, if any.
-    pub fn cancel_payload_building_job(&mut self) {
-        self.payload_building_job = None;
+    pub fn cancel_payload_building_job(&mut self) -> bool {
+        self.payload_building_job.take().is_some()
     }
 
     /// Enables the sequencer.
@@ -88,9 +88,9 @@ where
     }
 
     /// Disables the sequencer.
-    pub fn disable(&mut self) {
+    pub fn disable(&mut self) -> bool {
         self.trigger = None;
-        self.cancel_payload_building_job();
+        self.cancel_payload_building_job()
     }
 
     /// Creates a new block using the pending transactions from the message queue and

@@ -1,4 +1,6 @@
-use crate::{ChainOrchestratorStatus, ImportBlockError, ResetCommandError};
+use crate::{
+    BuildBlockError, BuildBlockTicket, ChainOrchestratorStatus, ImportBlockError, ResetCommandError,
+};
 
 use super::ChainOrchestratorEvent;
 // use crate::manager::metrics::HandleMetrics;
@@ -57,9 +59,16 @@ impl<N: FullNetwork<Primitives = DogeosNetworkPrimitives>> ChainOrchestratorHand
         }
     }
 
-    /// Sends a command to the rollup manager to build a block.
-    pub fn build_block(&self) {
-        self.send_command(ChainOrchestratorCommand::BuildBlock);
+    /// Requests a manual block build.
+    ///
+    /// The inner result reports admission. An admitted build returns a [`BuildBlockTicket`] whose
+    /// completion is correlated with that build and resolves as sequenced, skipped, or failed.
+    pub async fn build_block(
+        &self,
+    ) -> Result<Result<BuildBlockTicket, BuildBlockError>, oneshot::error::RecvError> {
+        let (tx, rx) = oneshot::channel();
+        self.send_command(ChainOrchestratorCommand::BuildBlock(tx));
+        rx.await
     }
 
     /// Sends a command to the rollup manager to get the network handle.

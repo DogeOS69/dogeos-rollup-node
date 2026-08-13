@@ -7,12 +7,10 @@ use alloy_provider::{Provider, ProviderBuilder, RootProvider};
 use alloy_rpc_client::RpcClient;
 use alloy_transport::layers::RetryBackoffLayer;
 use dogeos_rpc_types::Scroll;
-use futures::StreamExt;
 use reth_network_api::{FullNetwork, PeerId};
 use reth_provider::BlockReader;
-use reth_tokio_util::EventStream;
 use rollup_node_chain_orchestrator::{
-    ChainOrchestratorEvent, ChainOrchestratorHandle, ImportBlockError,
+    BuildBlockError, BuildBlockOutcome, ChainOrchestratorHandle, ImportBlockError,
 };
 use scroll_network::{DogeosNetworkPrimitives, NewBlockWithPeer};
 use tokio::time::{interval, Duration};
@@ -28,9 +26,6 @@ where
     config: RemoteBlockSourceArgs,
     /// Handle to the chain orchestrator for sending commands.
     orchestrator_handle: ChainOrchestratorHandle<N>,
-    /// An event stream for listening to chain orchestrator events, used to wait for block build
-    /// completion.
-    events: EventStream<ChainOrchestratorEvent>,
     /// A provider for the remote node, used to fetch blocks and block information.
     remote: RootProvider<Scroll>,
     /// Tracks the last block number we imported from remote.
@@ -56,15 +51,6 @@ where
         let retry_layer = RetryBackoffLayer::new(10, 100, 330);
         let client = RpcClient::builder().layer(retry_layer).http(url);
         let remote = ProviderBuilder::<_, _, Scroll>::default().connect_client(client);
-
-        // Get event listener for waiting on block completion
-        let events = match handle.get_event_listener().await {
-            Ok(stream) => stream,
-            Err(e) => {
-                tracing::error!(target: "scroll::remote_source", ?e, "Failed to get event listener");
-                return Err(eyre::eyre!(e));
-            }
-        };
 
         // Determine the last imported block by finding the highest common block
         // between the local chain and the remote node.
@@ -99,7 +85,7 @@ where
             "Determined highest common block with remote"
         );
 
-        Ok(Self { config, orchestrator_handle: handle, events, remote, last_imported_block })
+        Ok(Self { config, orchestrator_handle: handle, remote, last_imported_block })
     }
 
     /// Runs the remote block source until shutdown.
@@ -113,8 +99,17 @@ where
             tokio::select! {
                 biased;
                 _guard = &mut shutdown => break,
-                _ = poll_interval.tick() => {
-                    if let Err(e) = self.follow_and_build().await {
+                _ = poll_interval.tick() => {}
+            }
+
+            // Keep the whole import/build/completion cycle shutdown-aware. In particular, no
+            // timeout is used for an accepted build because resuming polling while that payload is
+            // still active could misattribute its late completion to a later request.
+            tokio::select! {
+                biased;
+                _guard = &mut shutdown => break,
+                result = self.follow_and_build() => {
+                    if let Err(e) = result {
                         tracing::error!(target: "scroll::remote_source", ?e, "Sync error");
                     }
                 }
@@ -216,30 +211,50 @@ where
                 continue;
             }
 
-            // Trigger block building on top of the imported block
-            self.orchestrator_handle.build_block();
+            // Trigger block building on top of the imported block. Policy rejections are expected
+            // transient outcomes; the imported height has already advanced, so skip the local
+            // build and continue. Configuration and payload-start failures retain operational
+            // error visibility, while the committed import is still not retried.
+            let ticket = match self.orchestrator_handle.build_block().await {
+                Ok(Ok(ticket)) => ticket,
+                Ok(Err(
+                    err @ (BuildBlockError::AuthorizationPending |
+                    BuildBlockError::ResetInProgress |
+                    BuildBlockError::UnauthorizedSigner { .. } |
+                    BuildBlockError::BuildInProgress |
+                    BuildBlockError::NotSynced),
+                )) => {
+                    tracing::debug!(target: "scroll::remote_source", ?err, "Block build rejected by sequencing policy, skipping local build");
+                    continue;
+                }
+                Ok(Err(err)) => {
+                    return Err(eyre::eyre!("Block build failed after import: {}", err));
+                }
+                Err(err) => {
+                    return Err(eyre::eyre!(
+                        "chain orchestrator command channel error while building block: {}",
+                        err
+                    ));
+                }
+            };
 
-            // Wait for BlockSequenced event
+            // Wait on the completion receiver uniquely associated with this admitted build.
             tracing::debug!(target: "scroll::remote_source", "Waiting for block to be built...");
-            loop {
-                match self.events.next().await {
-                    Some(ChainOrchestratorEvent::BlockSequenced(block)) => {
-                        tracing::info!(target: "scroll::remote_source",
-                            block_number = block.header.number,
-                            block_hash = ?block.hash_slow(),
-                            "Block built successfully, proceeding to next");
-                        break;
-                    }
-                    Some(ChainOrchestratorEvent::BlockBuildingSkipped) => {
-                        tracing::debug!(target: "scroll::remote_source", "Block building skipped (empty block)");
-                        break;
-                    }
-                    Some(_) => {
-                        // Ignore other events, keep waiting
-                    }
-                    None => {
-                        return Err(eyre::eyre!("Event stream ended unexpectedly"));
-                    }
+            match ticket.wait().await {
+                Ok(BuildBlockOutcome::Sequenced(block)) => {
+                    tracing::info!(target: "scroll::remote_source",
+                        block_number = block.header.number,
+                        block_hash = ?block.hash_slow(),
+                        "Block built successfully, proceeding to next");
+                }
+                Ok(BuildBlockOutcome::Skipped) => {
+                    tracing::debug!(target: "scroll::remote_source", "Block building skipped or cancelled");
+                }
+                Ok(BuildBlockOutcome::Failed(error)) => {
+                    return Err(eyre::eyre!("Admitted block build failed: {}", error));
+                }
+                Err(error) => {
+                    return Err(eyre::eyre!("Block build completion channel closed: {}", error));
                 }
             }
 

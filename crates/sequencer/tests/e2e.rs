@@ -580,7 +580,7 @@ async fn can_sequence_blocks_with_private_key_file() -> eyre::Result<()> {
     let tx_hash = nodes[0].rpc.inject_tx(raw_tx).await?;
 
     // Build block
-    sequencer_rnm_handle.build_block();
+    sequencer_rnm_handle.build_block().await??;
 
     // Verify block was successfully sequenced
     if let Some(ChainOrchestratorEvent::BlockSequenced(block)) = sequencer_events.next().await {
@@ -686,7 +686,7 @@ async fn can_sequence_blocks_with_hex_key_file_without_prefix() -> eyre::Result<
     let tx_hash = nodes[0].rpc.inject_tx(raw_tx).await?;
 
     // Build block
-    sequencer_rnm_handle.build_block();
+    sequencer_rnm_handle.build_block().await??;
 
     // Verify block was successfully sequenced
     if let Some(ChainOrchestratorEvent::BlockSequenced(block)) = sequencer_events.next().await {

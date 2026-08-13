@@ -1,5 +1,5 @@
 use alloy_json_rpc::RpcError;
-use alloy_primitives::B256;
+use alloy_primitives::{Address, B256};
 use alloy_transport::TransportErrorKind;
 use rollup_node_primitives::{BatchInfo, BlockInfo};
 use rollup_node_sequencer::SequencerError;
@@ -24,6 +24,38 @@ pub enum ImportBlockError {
     /// underlying [`ChainOrchestratorError`].
     #[error("{0}")]
     Other(String),
+}
+
+/// The typed outcome of a rejected `BuildBlock` command.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum BuildBlockError {
+    /// Building is temporarily withheld while an L1 authorization update is in progress.
+    #[error("block building deferred: L1 authorization pending")]
+    AuthorizationPending,
+    /// Building is temporarily withheld while a committed reset is in progress.
+    #[error("block building deferred: reset in progress")]
+    ResetInProgress,
+    /// The node has no local signer configured.
+    #[error("cannot build block: local signer is not configured")]
+    MissingSigner,
+    /// The local signer is no longer authorized to sequence blocks.
+    #[error("cannot build block: local signer {signer} is not authorized")]
+    UnauthorizedSigner {
+        /// The rejected local signer.
+        signer: Address,
+    },
+    /// The node has no sequencer configured.
+    #[error("cannot build block: sequencer is not configured")]
+    MissingSequencer,
+    /// Another payload job is already active.
+    #[error("cannot build block: another payload build is already in progress")]
+    BuildInProgress,
+    /// The orchestrator is not fully synchronized, so the sequencer branch cannot poll a payload.
+    #[error("cannot build block: chain orchestrator is not fully synced")]
+    NotSynced,
+    /// The sequencer failed to start the payload job.
+    #[error("failed to start payload building: {0}")]
+    PayloadStartFailed(String),
 }
 
 /// The typed outcome of a failed `RevertToL1Block` command, surfaced to the admin/RPC caller so it

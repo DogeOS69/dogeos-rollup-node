@@ -1,6 +1,8 @@
 //! Contains tests related to RN and EN sync.
 
 use alloy_primitives::{b256, Address, B256, U256};
+use alloy_signer::Signer;
+use alloy_signer_local::PrivateKeySigner;
 use dogeos_chainspec::{DOGEOS_CHIKYU, DOGEOS_DEV};
 use dogeos_protocol_types::TxL1Message;
 use futures::StreamExt;
@@ -17,7 +19,7 @@ use rollup_node::{
     PprofArgs, RollupNodeDatabaseArgs, RollupNodeGasPriceOracleArgs, RollupNodeNetworkArgs,
     RpcArgs, ScrollRollupNodeConfig, SequencerArgs, TestArgs,
 };
-use rollup_node_chain_orchestrator::ChainOrchestratorEvent;
+use rollup_node_chain_orchestrator::{BuildBlockOutcome, ChainOrchestratorEvent};
 use rollup_node_primitives::BlockInfo;
 use rollup_node_sequencer::L1MessageInclusionMode;
 use rollup_node_watcher::L1Notification;
@@ -187,6 +189,119 @@ async fn test_should_trigger_pipeline_sync_for_execution_node() -> eyre::Result<
 
     // Assert that the unsynced node triggers a chain extension on the optimistic chain.
     follower.expect_event().chain_extended(num).await?;
+
+    Ok(())
+}
+
+/// Phase two of an authorization refresh must remain reachable after optimistic sync marks L2 as
+/// syncing; otherwise both network import and the barrier close wait on each other forever.
+#[allow(clippy::large_stack_frames)]
+#[tokio::test]
+async fn authorization_refresh_closes_during_optimistic_sync() -> eyre::Result<()> {
+    reth_tracing::init_test_tracing();
+
+    const OPTIMISTIC_SYNC_TRIGGER: u64 = 5;
+    const FAR_BLOCK: u64 = OPTIMISTIC_SYNC_TRIGGER + 5;
+
+    let chain_spec = (*DOGEOS_DEV).clone();
+    let signer = PrivateKeySigner::random().with_chain_id(Some(chain_spec.chain().id()));
+    let signer_address = signer.address();
+
+    let mut sequencer = TestFixture::builder()
+        .sequencer()
+        .with_test(false)
+        .with_consensus_system_contract(Some(signer_address))
+        .with_signer(signer)
+        .with_eth_scroll_bridge(false)
+        .allow_empty_blocks(true)
+        .auto_start(true)
+        .block_time(40)
+        .optimistic_sync_trigger(OPTIMISTIC_SYNC_TRIGGER)
+        .build()
+        .await?;
+    let mut follower = TestFixture::builder()
+        .followers(1)
+        .with_test(false)
+        .with_consensus_system_contract(Some(signer_address))
+        .with_eth_scroll_bridge(false)
+        .optimistic_sync_trigger(OPTIMISTIC_SYNC_TRIGGER)
+        .build()
+        .await?;
+
+    sequencer.l1().sync().await?;
+    sequencer.expect_event().block_sequenced(FAR_BLOCK).await?;
+    sequencer.sequencer().node.connect(&mut follower.follower(0).node).await;
+
+    // The far peer block has already switched L2 to Syncing before this event is emitted. Queue
+    // both authorization phases now: phase one pauses network import, while phase two must still be
+    // consumed from the ordinary L1 channel despite L2 remaining in Syncing.
+    follower.expect_event().optimistic_sync().await?;
+    follower.l1().signer_update(signer_address).await?;
+
+    // A later peer block can only be imported after phase two closes the barrier. The old guard
+    // deadlocked here because L2 could become synced only through the network branch it disabled.
+    follower
+        .expect_event()
+        .timeout(std::time::Duration::from_secs(10))
+        .chain_extended(FAR_BLOCK)
+        .await?;
+    assert!(follower.follower(0).node.rollup_manager_handle.status().await?.l2.status.is_synced());
+
+    Ok(())
+}
+
+/// Entering optimistic sync must terminalize a previously admitted payload before the full-sync
+/// sequencer guard stops polling it.
+#[allow(clippy::large_stack_frames)]
+#[tokio::test]
+async fn optimistic_sync_cancels_admitted_manual_build() -> eyre::Result<()> {
+    reth_tracing::init_test_tracing();
+
+    const OPTIMISTIC_SYNC_TRIGGER: u64 = 5;
+    const FAR_BLOCK: u64 = OPTIMISTIC_SYNC_TRIGGER + 5;
+
+    let chain_spec = (*DOGEOS_DEV).clone();
+    let signer = PrivateKeySigner::random().with_chain_id(Some(chain_spec.chain().id()));
+    let signer_address = signer.address();
+
+    let mut producer = TestFixture::builder()
+        .sequencer()
+        .with_test(false)
+        .with_consensus_system_contract(Some(signer_address))
+        .with_signer(signer.clone())
+        .with_eth_scroll_bridge(false)
+        .allow_empty_blocks(true)
+        .auto_start(true)
+        .block_time(40)
+        .optimistic_sync_trigger(OPTIMISTIC_SYNC_TRIGGER)
+        .build()
+        .await?;
+    let mut victim = TestFixture::builder()
+        .sequencer()
+        .with_test(false)
+        .with_consensus_system_contract(Some(signer_address))
+        .with_signer(signer)
+        .with_eth_scroll_bridge(false)
+        .allow_empty_blocks(true)
+        .payload_building_duration(60_000)
+        .optimistic_sync_trigger(OPTIMISTIC_SYNC_TRIGGER)
+        .build()
+        .await?;
+
+    producer.l1().sync().await?;
+    victim.l1().sync().await?;
+    victim.expect_event().l1_synced().await?;
+    producer.expect_event().block_sequenced(FAR_BLOCK).await?;
+
+    let ticket = victim.sequencer().node.rollup_manager_handle.build_block().await??;
+    producer.sequencer().node.connect(&mut victim.sequencer().node).await;
+    victim.expect_event().optimistic_sync().await?;
+
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_secs(2), ticket.wait()).await??,
+        BuildBlockOutcome::Skipped
+    );
+    assert!(victim.sequencer().node.rollup_manager_handle.status().await?.l2.status.is_syncing());
 
     Ok(())
 }
@@ -624,7 +739,7 @@ async fn test_chain_orchestrator_l1_reorg() -> eyre::Result<()> {
         )
         .await;
 
-        sequencer_handle.build_block();
+        sequencer_handle.build_block().await??;
         wait_n_events(
             &mut sequencer_events,
             |e| matches!(e, ChainOrchestratorEvent::BlockSequenced(_)),
@@ -691,7 +806,7 @@ async fn test_chain_orchestrator_l1_reorg() -> eyre::Result<()> {
         )
         .await;
 
-        sequencer_handle.build_block();
+        sequencer_handle.build_block().await??;
         wait_n_events(
             &mut sequencer_events,
             |e| matches!(e, ChainOrchestratorEvent::BlockSequenced(_)),
@@ -705,7 +820,7 @@ async fn test_chain_orchestrator_l1_reorg() -> eyre::Result<()> {
 
     // now build a final block
     sequencer_handle.set_gossip(true).await.unwrap();
-    sequencer_handle.build_block();
+    sequencer_handle.build_block().await??;
 
     // The follower node should reject the new block as it has a different view of L1 data.
     wait_n_events(
@@ -724,7 +839,7 @@ async fn test_chain_orchestrator_l1_reorg() -> eyre::Result<()> {
         .await;
 
     // Now build a new block on the sequencer to trigger the reorg on the follower
-    sequencer_handle.build_block();
+    sequencer_handle.build_block().await??;
 
     // Wait for the follower node to accept the new chain
     wait_n_events(

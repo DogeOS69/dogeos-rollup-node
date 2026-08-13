@@ -35,6 +35,10 @@ use scroll_network::{
 use std::{collections::VecDeque, sync::Arc, time::Instant, vec};
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 
+mod build;
+use build::{build_block_channel, BuildBlockCompletion};
+pub use build::{BuildBlockOutcome, BuildBlockTicket};
+
 mod config;
 pub use config::ChainOrchestratorConfig;
 
@@ -48,7 +52,7 @@ mod event;
 pub use event::ChainOrchestratorEvent;
 
 mod error;
-pub use error::{ChainOrchestratorError, ImportBlockError, ResetCommandError};
+pub use error::{BuildBlockError, ChainOrchestratorError, ImportBlockError, ResetCommandError};
 
 mod handle;
 pub use handle::{ChainOrchestratorCommand, ChainOrchestratorHandle, DatabaseQuery};
@@ -118,6 +122,46 @@ const fn retains_failed_l1_notification(
 ) -> bool {
     dynamic_authorization &&
         matches!(notification, L1Notification::Reorg(_) | L1Notification::NewBlock(_))
+}
+
+/// Returns whether the ordinary L1 stream may make progress.
+///
+/// Phase two of a dynamic authorization update is delivered on this stream, so it must remain
+/// reachable while the authorization barrier is open even when optimistic sync has marked L2 as
+/// syncing. The derivation and committed-reset gates still preserve structural-before-phase-two
+/// ordering.
+const fn should_process_l1_notification(
+    l2_synced: bool,
+    authorization_pending: bool,
+    derivation_empty: bool,
+    reset_tail_pending: bool,
+) -> bool {
+    (l2_synced || authorization_pending) && derivation_empty && !reset_tail_pending
+}
+
+/// Maps payload processing onto the terminal result for the uniquely associated manual build.
+fn requested_build_outcome(
+    result: &Result<Option<ChainOrchestratorEvent>, ChainOrchestratorError>,
+) -> BuildBlockOutcome {
+    match result {
+        Ok(Some(ChainOrchestratorEvent::BlockSequenced(block))) => {
+            BuildBlockOutcome::Sequenced(block.clone())
+        }
+        Ok(Some(ChainOrchestratorEvent::BlockBuildingSkipped)) => BuildBlockOutcome::Skipped,
+        Err(err) => BuildBlockOutcome::Failed(err.to_string()),
+        Ok(_) => BuildBlockOutcome::Failed(
+            "payload processing ended without a terminal outcome".to_string(),
+        ),
+    }
+}
+
+fn complete_requested_build_from_payload_result(
+    completion: &mut Option<BuildBlockCompletion>,
+    result: &Result<Option<ChainOrchestratorEvent>, ChainOrchestratorError>,
+) {
+    if let Some(completion) = completion.take() {
+        completion.complete(requested_build_outcome(result));
+    }
 }
 
 /// A committed administrative reset whose forkchoice/watcher tail has not yet fully succeeded.
@@ -289,6 +333,8 @@ pub struct ChainOrchestrator<
     engine: Engine<EC>,
     /// The sequencer used to build blocks.
     sequencer: Option<Sequencer<L1MP, ChainSpec>>,
+    /// Completion channel for the currently admitted manual build, if any.
+    requested_build_completion: Option<BuildBlockCompletion>,
     /// The signer used to sign messages.
     signer: Option<SignerHandle>,
     /// The derivation pipeline used to derive L2 blocks from batches.
@@ -346,6 +392,7 @@ impl<
                 dynamic_authorization,
                 engine,
                 sequencer,
+                requested_build_completion: None,
                 signer,
                 derivation_pipeline,
                 handle_rx,
@@ -408,7 +455,14 @@ impl<
                         unreachable!()
                     }
                 }, if self.sequencer.is_some() && self.sync_state.is_synced() && !self.consensus.authorization_pending() && !self.reset_tail_pending() => {
+                    let payload_ready = matches!(&event, SequencerEvent::PayloadReady(_));
                     let res = self.handle_sequencer_event(event).await;
+                    if payload_ready {
+                        complete_requested_build_from_payload_result(
+                            &mut self.requested_build_completion,
+                            &res,
+                        );
+                    }
                     self.handle_outcome(res);
                 }
                 Some(batch) = self.derivation_pipeline.next(), if !self.reset_tail_pending() => {
@@ -441,7 +495,12 @@ impl<
                     } else {
                         self.l1_watcher.l1_notification_receiver().recv().await
                     }
-                }, if self.sync_state.l2().is_synced() && self.derivation_pipeline.is_empty() && !self.reset_tail_pending() => {
+                }, if should_process_l1_notification(
+                    self.sync_state.l2().is_synced(),
+                    self.consensus.authorization_pending(),
+                    self.derivation_pipeline.is_empty(),
+                    self.reset_tail_pending(),
+                ) => {
                     let res = self.handle_l1_notification(notification.clone()).await;
                     if res.is_err() &&
                         retains_failed_l1_notification(self.dynamic_authorization, &notification)
@@ -483,10 +542,40 @@ impl<
     fn handle_consensus_control(&mut self, update: &ConsensusUpdate) {
         self.consensus.update_config(update);
         if self.consensus.authorization_pending() {
-            if let Some(sequencer) = self.sequencer.as_mut() {
-                sequencer.cancel_payload_building_job();
-            }
+            self.cancel_payload_building_job();
         }
+    }
+
+    /// Cancels an accepted payload job and reports that outcome to any caller waiting for its
+    /// completion. No event is emitted when there was no active job to remove.
+    fn cancel_payload_building_job(&mut self) -> bool {
+        let cancelled = self.sequencer.as_mut().is_some_and(Sequencer::cancel_payload_building_job);
+        if cancelled {
+            self.complete_requested_block_build(BuildBlockOutcome::Skipped);
+            self.notify(ChainOrchestratorEvent::BlockBuildingSkipped);
+        }
+        cancelled
+    }
+
+    /// Resolves the per-request waiter for the active manual build, if there is one.
+    fn complete_requested_block_build(&mut self, outcome: BuildBlockOutcome) {
+        if let Some(completion) = self.requested_build_completion.take() {
+            completion.complete(outcome);
+        }
+    }
+
+    /// Enters L1 syncing only after cancelling any payload that the full-sync sequencer guard would
+    /// otherwise leave permanently unpolled. This runs before the fallible reset unwind.
+    fn set_l1_syncing(&mut self) {
+        self.cancel_payload_building_job();
+        self.sync_state.l1_mut().set_syncing();
+    }
+
+    /// Enters L2 optimistic syncing only after cancelling any payload that the full-sync sequencer
+    /// guard would otherwise leave permanently unpolled.
+    fn set_l2_syncing(&mut self) {
+        self.cancel_payload_building_job();
+        self.sync_state.l2_mut().set_syncing();
     }
 
     /// Drains and applies any queued authorization-control updates, returning whether the barrier
@@ -645,9 +734,7 @@ impl<
     /// per unwind.
     fn begin_committed_unwind(&mut self) {
         self.unwind_generation = self.unwind_generation.wrapping_add(1);
-        if let Some(sequencer) = self.sequencer.as_mut() {
-            sequencer.cancel_payload_building_job();
-        }
+        self.cancel_payload_building_job();
     }
 
     /// Records that an administrative reset's database unwind for `block_number` has committed.
@@ -722,7 +809,9 @@ impl<
             return Err(ChainOrchestratorError::ResetInProgress { staged, requested: block_number });
         }
 
-        self.sync_state.l1_mut().set_syncing();
+        // Cancellation precedes the fallible unwind so even an unwind error cannot strand a build
+        // after this reset transition disables the sequencer branch.
+        self.set_l1_syncing();
 
         // Stage 1 — reuse the committed unwind already staged for this exact target (a prior
         // attempt failed in the tail); otherwise unwind fresh. `staged_reset` here is
@@ -763,6 +852,41 @@ impl<
         Ok(())
     }
 
+    /// Applies every gate for an explicitly requested payload build. The command handler sends
+    /// this outcome through its oneshot on every path, including configuration and start errors.
+    async fn start_requested_block_build(&mut self) -> Result<(), BuildBlockError> {
+        if self.apply_pending_authorization_control() {
+            return Err(BuildBlockError::AuthorizationPending);
+        }
+        if self.reset_tail_pending() {
+            return Err(BuildBlockError::ResetInProgress);
+        }
+        if self.sequencer.is_none() {
+            return Err(BuildBlockError::MissingSequencer);
+        }
+        if !self.sync_state.is_synced() {
+            return Err(BuildBlockError::NotSynced);
+        }
+        if self.requested_build_completion.is_some() ||
+            self.sequencer
+                .as_ref()
+                .is_some_and(|sequencer| sequencer.payload_building_job().is_some())
+        {
+            return Err(BuildBlockError::BuildInProgress);
+        }
+
+        let signer = self.signer.as_ref().ok_or(BuildBlockError::MissingSigner)?.address;
+        if !self.consensus.should_sequence_block(&signer) {
+            return Err(BuildBlockError::UnauthorizedSigner { signer });
+        }
+
+        let sequencer = self.sequencer.as_mut().expect("sequencer existence checked above");
+        sequencer
+            .start_payload_building(&mut self.engine)
+            .await
+            .map_err(|err| BuildBlockError::PayloadStartFailed(err.to_string()))
+    }
+
     /// Handles a command sent to the chain orchestrator.
     async fn handle_command(
         &mut self,
@@ -770,7 +894,7 @@ impl<
     ) -> Result<(), ChainOrchestratorError> {
         tracing::debug!(target: "scroll::chain_orchestrator", ?command, "Handling command");
         match command {
-            ChainOrchestratorCommand::BuildBlock => {
+            ChainOrchestratorCommand::BuildBlock(response) => {
                 // A `BuildBlock` command (admin/debug handle, or the optional remote block source
                 // after a trusted import) is a state-changing block-production entry point. Drain
                 // any queued authorization-control update first so a barrier that
@@ -782,24 +906,36 @@ impl<
                 // withheld while a committed administrative reset tail is pending, so no block is
                 // produced against a partially-reset database (this is the only fail-closed gate in
                 // static mode, where authorization is never suspended).
-                self.apply_pending_authorization_control();
-                let authorized = !self.reset_tail_pending() &&
-                    self.signer
-                        .as_ref()
-                        .map(|s| s.address)
-                        .is_some_and(|address| self.consensus.should_sequence_block(&address));
-                if !authorized {
-                    tracing::warn!(
-                        target: "scroll::chain_orchestrator",
-                        pending = self.consensus.authorization_pending(),
-                        reset_tail_pending = self.reset_tail_pending(),
-                        "Ignoring BuildBlock command: sequencing withheld (authorization pending, reset in progress, or signer not authorized)"
-                    );
-                } else if let Some(sequencer) = self.sequencer.as_mut() {
-                    sequencer.start_payload_building(&mut self.engine).await?;
-                } else {
-                    tracing::error!(target: "scroll::chain_orchestrator", "Received BuildBlock command but sequencer is not configured");
+                let result = self.start_requested_block_build().await;
+                let result = result.map(|()| {
+                    let (completion, ticket) = build_block_channel();
+                    self.requested_build_completion = Some(completion);
+                    ticket
+                });
+                match &result {
+                    Err(
+                        err @ (BuildBlockError::AuthorizationPending |
+                        BuildBlockError::ResetInProgress |
+                        BuildBlockError::UnauthorizedSigner { .. } |
+                        BuildBlockError::BuildInProgress |
+                        BuildBlockError::NotSynced),
+                    ) => {
+                        tracing::warn!(
+                            target: "scroll::chain_orchestrator",
+                            ?err,
+                            "BuildBlock command rejected by sequencing policy"
+                        );
+                    }
+                    Err(err) => {
+                        tracing::error!(
+                            target: "scroll::chain_orchestrator",
+                            ?err,
+                            "BuildBlock command failed"
+                        );
+                    }
+                    Ok(_) => {}
                 }
+                let _ = response.send(result);
             }
             ChainOrchestratorCommand::EventListener(tx) => {
                 let _ = tx.send(self.event_listener());
@@ -870,7 +1006,11 @@ impl<
             }
             ChainOrchestratorCommand::DisableAutomaticSequencing(tx) => {
                 if let Some(sequencer) = self.sequencer.as_mut() {
-                    sequencer.disable();
+                    let cancelled = sequencer.disable();
+                    if cancelled {
+                        self.complete_requested_block_build(BuildBlockOutcome::Skipped);
+                        self.notify(ChainOrchestratorEvent::BlockBuildingSkipped);
+                    }
                     let _ = tx.send(true);
                 } else {
                     tracing::error!(target: "scroll::chain_orchestrator", "Received DisableAutomaticSequencing command but sequencer is not configured");
@@ -1231,9 +1371,7 @@ impl<
                     .hash_slow();
 
                 // Cancel the inflight payload building job if the head has changed.
-                if let Some(s) = self.sequencer.as_mut() {
-                    s.cancel_payload_building_job();
-                };
+                self.cancel_payload_building_job();
 
                 // Collect transactions of reverted blocks from l2 client.
                 let reverted_transactions = self
@@ -1255,9 +1393,7 @@ impl<
                 .and_then(|s| s.payload_building_job().map(|p| p.l1_origin()))
                 .flatten()
         {
-            if let Some(s) = self.sequencer.as_mut() {
-                s.cancel_payload_building_job();
-            };
+            self.cancel_payload_building_job();
         }
 
         // TODO: Add retry logic
@@ -1543,7 +1679,9 @@ impl<
                 hash: block_with_peer.block.header.hash_slow(),
             };
             self.engine.optimistic_sync(block_info).await?;
-            self.sync_state.l2_mut().set_syncing();
+            // The engine transition succeeded. Cancel synchronously before changing the sync flag,
+            // which disables the only branch that polls the payload job.
+            self.set_l2_syncing();
 
             // Purge all L1 message to L2 block mappings as they may be invalid after an
             // optimistic sync.
@@ -1968,7 +2106,7 @@ async fn compute_l1_message_queue_hash(
 
 #[cfg(test)]
 mod l1_retry_tests {
-    use super::retains_failed_l1_notification;
+    use super::{retains_failed_l1_notification, should_process_l1_notification};
     use rollup_node_primitives::BlockInfo;
     use rollup_node_watcher::L1Notification;
 
@@ -2007,6 +2145,40 @@ mod l1_retry_tests {
             &L1Notification::NewBlock(BlockInfo::default())
         ));
         assert!(!retains_failed_l1_notification(false, &L1Notification::Synced));
+    }
+
+    #[test]
+    fn authorization_phase_two_remains_reachable_during_l2_sync() {
+        // The ordinary L1 stream is normally gated on L2 being synced.
+        assert!(!should_process_l1_notification(false, false, true, false));
+        assert!(should_process_l1_notification(true, false, true, false));
+
+        // An open authorization barrier relaxes only that L2 gate, allowing phase two to close the
+        // barrier and unblock network import. Structural ordering gates remain mandatory.
+        assert!(should_process_l1_notification(false, true, true, false));
+        assert!(!should_process_l1_notification(false, true, false, false));
+        assert!(!should_process_l1_notification(false, true, true, true));
+    }
+}
+
+#[cfg(test)]
+mod requested_build_tests {
+    use super::{build_block_channel, complete_requested_build_from_payload_result};
+    use crate::{BuildBlockOutcome, ChainOrchestratorError};
+
+    #[tokio::test]
+    async fn post_admission_payload_error_reaches_correlated_waiter() {
+        let (completion, ticket) = build_block_channel();
+        let mut completion = Some(completion);
+        let result = Err(ChainOrchestratorError::InvalidBlock);
+
+        complete_requested_build_from_payload_result(&mut completion, &result);
+
+        assert!(completion.is_none());
+        assert_eq!(
+            ticket.wait().await.unwrap(),
+            BuildBlockOutcome::Failed("Received an invalid block from peer".to_string())
+        );
     }
 }
 

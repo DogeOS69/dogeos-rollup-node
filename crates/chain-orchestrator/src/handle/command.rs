@@ -1,4 +1,7 @@
-use crate::{ChainOrchestratorEvent, ChainOrchestratorStatus, ImportBlockError, ResetCommandError};
+use crate::{
+    BuildBlockError, BuildBlockTicket, ChainOrchestratorEvent, ChainOrchestratorStatus,
+    ImportBlockError, ResetCommandError,
+};
 
 use reth_network_api::FullNetwork;
 use reth_tokio_util::EventStream;
@@ -10,8 +13,8 @@ use tokio::sync::oneshot;
 /// The commands that can be sent to the rollup manager.
 #[derive(Debug)]
 pub enum ChainOrchestratorCommand<N: FullNetwork<Primitives = DogeosNetworkPrimitives>> {
-    /// Command to build a new block.
-    BuildBlock,
+    /// Command to admit a new manual block build and return its correlated completion ticket.
+    BuildBlock(oneshot::Sender<Result<BuildBlockTicket, BuildBlockError>>),
     /// Returns an event stream for rollup manager events.
     EventListener(oneshot::Sender<EventStream<ChainOrchestratorEvent>>),
     /// Report the current status of the manager via the oneshot channel.

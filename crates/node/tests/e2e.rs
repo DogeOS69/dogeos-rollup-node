@@ -22,7 +22,9 @@ use rollup_node::{
     },
     RollupNodeAdminApiClient, RollupNodeContext,
 };
-use rollup_node_chain_orchestrator::{ChainOrchestratorEvent, SyncMode};
+use rollup_node_chain_orchestrator::{
+    BuildBlockError, BuildBlockOutcome, ChainOrchestratorEvent, SyncMode,
+};
 use rollup_node_primitives::{sig_encode_hash, BatchCommitData, BlockInfo};
 use rollup_node_watcher::L1Notification;
 use scroll_db::{test_utils::setup_test_db, L1MessageKey};
@@ -419,7 +421,7 @@ async fn can_forward_tx_to_sequencer() -> eyre::Result<()> {
     sequencer_events.next().await;
 
     // have the sequencer build an empty block and gossip it to follower
-    sequencer_rnm_handle.build_block();
+    sequencer_rnm_handle.build_block().await??;
 
     // wait for the sequencer to build a block with no transactions
     if let Some(ChainOrchestratorEvent::BlockSequenced(block)) = sequencer_events.next().await {
@@ -451,7 +453,7 @@ async fn can_forward_tx_to_sequencer() -> eyre::Result<()> {
     tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
 
     // build block
-    sequencer_rnm_handle.build_block();
+    sequencer_rnm_handle.build_block().await??;
 
     // wait for the sequencer to build a block with transactions
     wait_n_events(
@@ -1027,7 +1029,17 @@ async fn graceful_shutdown_sets_fcs_to_latest_signed_block_in_db_on_start_up() -
     // Wait for the EN to be synced to block 10.
     let execution_node_provider = &node.inner.provider;
     loop {
-        handle.build_block();
+        let mut build = pin!(handle.build_block());
+        loop {
+            let _ = rnm.poll_unpin(&mut Context::from_waker(noop_waker_ref()));
+            if let Poll::Ready(result) =
+                build.as_mut().poll(&mut Context::from_waker(noop_waker_ref()))
+            {
+                result??;
+                break
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         let block_number = loop {
             let _ = rnm.poll_unpin(&mut Context::from_waker(noop_waker_ref()));
             if let Poll::Ready(Some(ChainOrchestratorEvent::SignedBlock { block, signature: _ })) =
@@ -2054,6 +2066,160 @@ async fn signer_rotation_applied_via_authorization_barrier() -> eyre::Result<()>
             }
         })
         .await?;
+
+    Ok(())
+}
+
+/// A rejected manual build must answer its caller instead of silently dropping the command.
+#[allow(clippy::large_stack_frames)]
+#[tokio::test]
+async fn build_block_reports_unauthorized_signer() -> eyre::Result<()> {
+    reth_tracing::init_test_tracing();
+
+    let chain_spec = (*DOGEOS_DEV).clone();
+    let authorized = PrivateKeySigner::random().with_chain_id(Some(chain_spec.chain().id()));
+    let local = PrivateKeySigner::random().with_chain_id(Some(chain_spec.chain().id()));
+    let local_address = local.address();
+
+    let mut fixture = TestFixture::builder()
+        .sequencer()
+        .with_test(false)
+        .with_consensus_system_contract(Some(authorized.address()))
+        .with_signer(local)
+        .with_eth_scroll_bridge(false)
+        .build()
+        .await?;
+    fixture.l1().sync().await?;
+    fixture.expect_event().l1_synced().await?;
+
+    let outcome = time::timeout(
+        Duration::from_secs(2),
+        fixture.sequencer().node.rollup_manager_handle.build_block(),
+    )
+    .await??;
+    assert!(matches!(
+        outcome,
+        Err(BuildBlockError::UnauthorizedSigner { signer }) if signer == local_address
+    ));
+
+    let mut follower = TestFixture::builder().followers(1).build().await?;
+    let outcome = time::timeout(
+        Duration::from_secs(2),
+        follower.follower(0).node.rollup_manager_handle.build_block(),
+    )
+    .await??;
+    assert!(matches!(outcome, Err(BuildBlockError::MissingSequencer)));
+
+    let unsynced_signer = PrivateKeySigner::random().with_chain_id(Some(chain_spec.chain().id()));
+    let unsynced_address = unsynced_signer.address();
+    let mut unsynced = TestFixture::builder()
+        .sequencer()
+        .with_test(false)
+        .with_consensus_system_contract(Some(unsynced_address))
+        .with_signer(unsynced_signer)
+        .with_eth_scroll_bridge(false)
+        .build()
+        .await?;
+    let outcome = time::timeout(
+        Duration::from_secs(2),
+        unsynced.sequencer().node.rollup_manager_handle.build_block(),
+    )
+    .await??;
+    assert!(matches!(outcome, Err(BuildBlockError::NotSynced)));
+
+    Ok(())
+}
+
+/// Cancelling an accepted payload build must release completion waiters exactly once.
+#[allow(clippy::large_stack_frames)]
+#[tokio::test]
+async fn cancelling_accepted_build_emits_one_skipped_event() -> eyre::Result<()> {
+    reth_tracing::init_test_tracing();
+
+    let chain_spec = (*DOGEOS_DEV).clone();
+    let signer = PrivateKeySigner::random().with_chain_id(Some(chain_spec.chain().id()));
+    let signer_address = signer.address();
+    let mut fixture = TestFixture::builder()
+        .sequencer()
+        .with_test(false)
+        .with_consensus_system_contract(Some(signer_address))
+        .with_signer(signer)
+        .with_eth_scroll_bridge(false)
+        .payload_building_duration(60_000)
+        .build()
+        .await?;
+
+    fixture.l1().sync().await?;
+    fixture.expect_event().l1_synced().await?;
+    let handle = fixture.sequencer().node.rollup_manager_handle.clone();
+    let mut events = handle.get_event_listener().await?;
+
+    let ticket = time::timeout(Duration::from_secs(2), handle.build_block()).await???;
+    assert!(handle.disable_automatic_sequencing().await?);
+    assert_eq!(
+        time::timeout(Duration::from_secs(2), ticket.wait()).await??,
+        BuildBlockOutcome::Skipped
+    );
+
+    time::timeout(Duration::from_secs(2), async {
+        loop {
+            match events.next().await {
+                Some(ChainOrchestratorEvent::BlockBuildingSkipped) => break,
+                Some(_) => {}
+                None => panic!("chain orchestrator event stream ended"),
+            }
+        }
+    })
+    .await?;
+
+    // A second disable has no active accepted job to remove and therefore emits no duplicate.
+    assert!(handle.disable_automatic_sequencing().await?);
+    assert!(time::timeout(Duration::from_millis(200), async {
+        loop {
+            match events.next().await {
+                Some(ChainOrchestratorEvent::BlockBuildingSkipped) => break,
+                Some(_) => {}
+                None => panic!("chain orchestrator event stream ended"),
+            }
+        }
+    })
+    .await
+    .is_err());
+
+    Ok(())
+}
+
+/// Reset initiation cancels an admitted build before L1 enters syncing and before the unwind can
+/// fail, so the full-sync sequencer guard cannot strand its ticket.
+#[allow(clippy::large_stack_frames)]
+#[tokio::test]
+async fn reset_transition_cancels_admitted_manual_build() -> eyre::Result<()> {
+    reth_tracing::init_test_tracing();
+
+    let chain_spec = (*DOGEOS_DEV).clone();
+    let signer = PrivateKeySigner::random().with_chain_id(Some(chain_spec.chain().id()));
+    let signer_address = signer.address();
+    let mut fixture = TestFixture::builder()
+        .sequencer()
+        .with_test(false)
+        .with_consensus_system_contract(Some(signer_address))
+        .with_signer(signer)
+        .with_eth_scroll_bridge(false)
+        .payload_building_duration(60_000)
+        .build()
+        .await?;
+
+    fixture.l1().sync().await?;
+    fixture.expect_event().l1_synced().await?;
+    let handle = fixture.sequencer().node.rollup_manager_handle.clone();
+    let ticket = handle.build_block().await??;
+
+    handle.revert_to_l1_block(0).await??;
+    assert_eq!(
+        time::timeout(Duration::from_secs(2), ticket.wait()).await??,
+        BuildBlockOutcome::Skipped
+    );
+    assert!(handle.status().await?.l1.status.is_syncing());
 
     Ok(())
 }

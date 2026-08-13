@@ -548,7 +548,7 @@ impl DebugRepl {
         }
 
         // Trigger block building - events will be displayed through normal event stream
-        handle.build_block();
+        handle.build_block().await??;
         println!("{}", "Block build triggered!".green());
 
         Ok(())

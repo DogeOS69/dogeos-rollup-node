@@ -165,7 +165,8 @@ impl Action for BuildBlocksAction {
                 .as_ref()
                 .expect("sequencer")
                 .rollup_manager_handle
-                .build_block();
+                .build_block()
+                .await??;
             print!("  Block {} triggered, waiting...", i);
             let _ = std::io::Write::flush(&mut std::io::stdout());
 
@@ -281,7 +282,8 @@ impl Action for StressTestAction {
                     .as_ref()
                     .expect("sequencer")
                     .rollup_manager_handle
-                    .build_block();
+                    .build_block()
+                    .await??;
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 wallet = fixture.wallet.lock().await;
                 print!("B");
@@ -295,7 +297,8 @@ impl Action for StressTestAction {
             .as_ref()
             .expect("sequencer")
             .rollup_manager_handle
-            .build_block();
+            .build_block()
+            .await??;
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
         println!();

@@ -5,22 +5,21 @@ use futures::{stream::FuturesOrdered, TryStreamExt};
 use rollup_node_primitives::{
     BatchConsolidationOutcome, BatchInfo, BatchStatus, L2BlockInfoWithL1Messages,
 };
-use scroll_derivation_pipeline::{BatchDerivationResult, DerivedAttributes};
+use scroll_derivation_pipeline::BatchDerivationResult;
 use scroll_engine::{block_matches_attributes, ForkchoiceState};
 
 /// Reconciles a batch of derived attributes with the L2 chain to produce a reconciliation result.
 ///
 /// The batch is borrowed rather than consumed so that the derived-batch driver can recompute
 /// reconciliation from fresh canonical L2 state on every retry attempt without cloning the
-/// (potentially large) attribute set. Only per-reorg attributes are cloned, and only for the blocks
-/// that actually require a reorg.
+/// (potentially large) attribute set. Reorg actions retain stable indices into the held batch.
 pub(crate) async fn reconcile_batch<L2P: Provider<Scroll>>(
     l2_provider: L2P,
     batch: &BatchDerivationResult,
     fcs: &ForkchoiceState,
 ) -> Result<BatchReconciliationResult, ChainOrchestratorError> {
     let mut futures = FuturesOrdered::new();
-    for attributes in &batch.attributes {
+    for (index, attributes) in batch.attributes.iter().enumerate() {
         let l2_provider = &l2_provider;
         let fut = async move {
             // Fetch the block corresponding to the derived attributes from the L2 provider.
@@ -34,9 +33,7 @@ pub(crate) async fn reconcile_batch<L2P: Provider<Scroll>>(
                 block
             } else {
                 // The block does not exist, a reorg is needed.
-                return Ok::<_, ChainOrchestratorError>(BlockConsolidationAction::Reorg(
-                    attributes.clone(),
-                ));
+                return Ok::<_, ChainOrchestratorError>(BlockConsolidationAction::Reorg(index));
             };
 
             // Check if the block matches the derived attributes.
@@ -55,7 +52,7 @@ pub(crate) async fn reconcile_batch<L2P: Provider<Scroll>>(
                 }
             } else {
                 // The block does not match the derived attributes, a reorg is needed.
-                Ok::<_, ChainOrchestratorError>(BlockConsolidationAction::Reorg(attributes.clone()))
+                Ok::<_, ChainOrchestratorError>(BlockConsolidationAction::Reorg(index))
             }
         };
         futures.push_back(fut);
@@ -147,8 +144,8 @@ pub(crate) enum BlockConsolidationAction {
     /// The derived attributes match the L2 chain and the safe head is already at or beyond the
     /// block, so no action is needed.
     Skip(L2BlockInfoWithL1Messages),
-    /// Reorganize the chain with the given derived attributes.
-    Reorg(DerivedAttributes),
+    /// Reorganize the chain with the derived attributes at this stable pending-batch index.
+    Reorg(usize),
 }
 
 impl BlockConsolidationAction {
@@ -172,7 +169,7 @@ impl BlockConsolidationAction {
     pub(crate) fn into_block_info(self) -> Option<L2BlockInfoWithL1Messages> {
         match self {
             Self::UpdateFcs(info) | Self::Skip(info) => Some(info),
-            Self::Reorg(_attrs) => None,
+            Self::Reorg(_) => None,
         }
     }
 }
@@ -184,9 +181,7 @@ impl std::fmt::Display for BlockConsolidationAction {
                 write!(f, "UpdateSafeHead to block {}", info.block_info.number)
             }
             Self::Skip(info) => write!(f, "Skip block {}", info.block_info.number),
-            Self::Reorg(attrs) => {
-                write!(f, "Reorg to block {}", attrs.block_number)
-            }
+            Self::Reorg(index) => write!(f, "Reorg with derived attributes at index {index}"),
         }
     }
 }

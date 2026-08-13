@@ -93,13 +93,11 @@ pub enum ChainOrchestratorError {
     /// transient, but remains distinct from `SYNCING` so status, fatal exhaustion, and events
     /// retain the actual Engine response.
     #[error(
-        "Engine returned ACCEPTED during {method} while reconciling derived batch {batch_info:?}"
+        "Engine returned ACCEPTED during newPayload while reconciling derived batch {batch_info:?}"
     )]
     DerivedBatchEngineAccepted {
         /// The batch being reconciled.
         batch_info: BatchInfo,
-        /// The Engine method that returned `ACCEPTED`.
-        method: &'static str,
     },
     /// An Engine request failed before returning an Engine status while reconciling a derived
     /// batch. The method is retained because some JSON-RPC codes are method-specific.
@@ -202,13 +200,12 @@ impl CanRetry for ChainOrchestratorError {
 
 /// Classifies a derived Engine request error with the method context needed for `UnknownPayload`.
 fn derived_engine_error_can_retry(method: &str, err: &EngineError) -> bool {
-    match err {
-        EngineError::TransportError(inner) if method == "get_payload" => {
-            get_payload_error_is_transient(inner)
+    if method == "get_payload" {
+        if let EngineError::TransportError(inner) = err {
+            return get_payload_error_is_transient(inner);
         }
-        EngineError::TransportError(inner) => transport_error_is_transient(inner),
-        EngineError::FcsError(_) => false,
     }
+    engine_error_can_retry(err)
 }
 
 /// Classifies an [`EngineError`] as retryable. Transport failures delegate to the shared transport

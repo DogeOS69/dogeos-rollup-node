@@ -556,7 +556,7 @@ impl DatabaseReadOperations for Database {
         )
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-utils"))]
     async fn get_batch_status_by_hash(
         &self,
         batch_hash: B256,

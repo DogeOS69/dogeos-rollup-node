@@ -139,6 +139,7 @@ alloy-chains.workspace = true
 alloy-consensus.workspace = true
 alloy-genesis.workspace = true
 alloy-eips.workspace = true
+alloy-sol-types.workspace = true
 futures.workspace = true
 reth-db = { workspace = true, features = ["test-utils"] }
 reth-e2e-test-utils.workspace = true
@@ -152,6 +153,7 @@ reth-tasks.workspace = true
 reth-tokio-util.workspace = true
 reth-tracing.workspace = true
 rollup-node = { workspace = true, features = ["test-utils"] }
+scroll-l1.workspace = true
 serde_json = { workspace = true, features = ["alloc"] }
 color-eyre = "0.6"
 alloy-rpc-types-eth = { workspace = true }

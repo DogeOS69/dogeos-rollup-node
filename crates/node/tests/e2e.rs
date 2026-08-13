@@ -4,6 +4,7 @@ use alloy_eips::BlockNumberOrTag;
 use alloy_primitives::{address, b256, Address, Bytes, Signature, B256, U256};
 use alloy_signer::Signer;
 use alloy_signer_local::PrivateKeySigner;
+use alloy_sol_types::SolCall;
 use dogeos_chainspec::{DogeosChainSpec, DOGEOS_CHIKYU, DOGEOS_DEV, DOGEOS_MAINNET};
 use dogeos_reth_primitives::DogeosBlock;
 use futures::{task::noop_waker_ref, FutureExt, StreamExt};
@@ -23,9 +24,12 @@ use rollup_node::{
     RollupNodeAdminApiClient, RollupNodeContext,
 };
 use rollup_node_chain_orchestrator::{ChainOrchestratorEvent, SyncMode};
-use rollup_node_primitives::{sig_encode_hash, BatchCommitData, BlockInfo};
+use rollup_node_primitives::{sig_encode_hash, BatchCommitData, BatchStatus, BlockInfo};
 use rollup_node_watcher::L1Notification;
-use scroll_db::{test_utils::setup_test_db, L1MessageKey};
+use scroll_db::{
+    test_utils::setup_test_db, DatabaseReadOperations, DatabaseWriteOperations, L1MessageKey,
+};
+use scroll_l1::abi::calls::commitBatchCall;
 use scroll_network::{DogeosNetworkPrimitives, NewBlockWithPeer, ETH_WIRE_BLOCK_CHANNEL_SIZE};
 use scroll_wire::{ScrollWireConfig, ScrollWireProtocolHandler};
 use std::{
@@ -665,7 +669,8 @@ async fn can_bridge_blocks() -> eyre::Result<()> {
 #[tokio::test]
 async fn shutdown_consolidates_most_recent_batch_on_startup() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
-    let chain_spec = (*DOGEOS_MAINNET).clone();
+    let chain_spec = (*DOGEOS_DEV).clone();
+    let genesis_timestamp = chain_spec.genesis_header().timestamp;
 
     // Launch a node
     let (mut nodes, _dbs, _wallet) = setup_engine(
@@ -688,6 +693,7 @@ async fn shutdown_consolidates_most_recent_batch_on_startup() -> eyre::Result<()
         .parse()
         .expect("valid url that will not be used as test batches use calldata")]);
     config.hydrate(node.inner.config.clone()).await?;
+    let database = config.database.clone().expect("hydrated config has a database");
 
     let (_, events) = ScrollWireProtocolHandler::new(ScrollWireConfig::new(true));
     // Hold the ETH-wire block sender for as long as the orchestrator runs; dropping it would
@@ -712,14 +718,14 @@ async fn shutdown_consolidates_most_recent_batch_on_startup() -> eyre::Result<()
 
     // Spawn a task that constantly polls the rnm to make progress.
     let (signal, shutdown) = shutdown_signal();
-    tokio::spawn(async {
+    let orchestrator_task = tokio::spawn(async {
         let (_signal, inner) = shutdown_signal();
         let chain_orchestrator = chain_orchestrator.run_until_shutdown(inner);
         tokio::select! {
             biased;
 
-            _ = shutdown => {},
-            _ = chain_orchestrator => {},
+            _ = shutdown => Ok(()),
+            result = chain_orchestrator => result,
         }
     });
 
@@ -731,7 +737,7 @@ async fn shutdown_consolidates_most_recent_batch_on_startup() -> eyre::Result<()
 
     // Load test batches
     let block_0_info = BlockInfo { number: 18318207, hash: B256::random() };
-    let raw_calldata_0 = read_to_bytes("./tests/testdata/batch_0_calldata.bin")?;
+    let raw_calldata_0 = empty_batch_calldata(1, 4, genesis_timestamp + 1);
     let batch_0_data = BatchCommitData {
         hash: b256!("5AAEB6101A47FC16866E80D77FFE090B6A7B3CF7D988BE981646AB6AEDFA2C42"),
         index: 1,
@@ -743,7 +749,7 @@ async fn shutdown_consolidates_most_recent_batch_on_startup() -> eyre::Result<()
         reverted_block_number: None,
     };
     let block_1_info = BlockInfo { number: 18318215, hash: B256::random() };
-    let raw_calldata_1 = read_to_bytes("./tests/testdata/batch_1_calldata.bin")?;
+    let raw_calldata_1 = empty_batch_calldata(5, 53, genesis_timestamp + 2);
     let batch_1_data = BatchCommitData {
         hash: b256!("AA8181F04F8E305328A6117FA6BC13FA2093A3C4C990C5281DF95A1CB85CA18F"),
         index: 2,
@@ -781,14 +787,21 @@ async fn shutdown_consolidates_most_recent_batch_on_startup() -> eyre::Result<()
     // Lets iterate over all blocks expected to be derived from the first batch commit.
     let consolidation_outcome = loop {
         let event = rnm_events.next().await;
-        println!("Received event: {:?}", event);
         if let Some(ChainOrchestratorEvent::BatchConsolidated(consolidation_outcome)) = event {
             break consolidation_outcome;
         }
     };
     assert_eq!(consolidation_outcome.blocks.len(), 4, "Expected 4 blocks to be consolidated");
 
-    // Now we send the second batch commit and finalize it.
+    l1_notification_tx.notification_tx.send(Arc::new(L1Notification::Synced)).await?;
+    loop {
+        if matches!(rnm_events.next().await, Some(ChainOrchestratorEvent::ChainConsolidated { .. }))
+        {
+            break;
+        }
+    }
+
+    // Start the second batch, then stop while its remote Engine effects are only partially applied.
     l1_notification_tx
         .notification_tx
         .send(Arc::new(L1Notification::BatchCommit {
@@ -796,62 +809,38 @@ async fn shutdown_consolidates_most_recent_batch_on_startup() -> eyre::Result<()
             data: batch_1_data.clone(),
         }))
         .await?;
-    l1_notification_tx
-        .notification_tx
-        .send(Arc::new(L1Notification::BatchFinalization {
-            hash: batch_1_data.hash,
-            index: batch_1_data.index,
-            block_info: block_1_info,
-        }))
-        .await?;
-
-    // Lets finalize the second batch.
-    l1_notification_tx
-        .notification_tx
-        .send(Arc::new(L1Notification::Finalized(block_1_info.number)))
-        .await?;
-
-    // The second batch commit contains 42 blocks (5-57), lets iterate until the rnm has
-    // consolidated up to block 40.
-    let mut i = 5;
-    let hash = loop {
-        let hash = loop {
-            if let Some(ChainOrchestratorEvent::BlockConsolidated(consolidation_outcome)) =
-                rnm_events.next().await
-            {
-                assert_eq!(consolidation_outcome.block_info().block_info.number, i);
-                break consolidation_outcome.block_info().block_info.hash;
-            }
-        };
-        if i == 40 {
-            break hash;
-        }
-        i += 1;
-    };
-
-    // Fetch the safe and head block hashes from the EN.
     let rpc = node.rpc.inner.eth_api();
-    let safe_block_hash =
-        rpc.block_by_number(BlockNumberOrTag::Safe, false).await?.expect("safe block must exist");
-    let head_block_hash =
-        rpc.block_by_number(BlockNumberOrTag::Latest, false).await?.expect("head block must exist");
+    let partial_head = loop {
+        let latest = rpc
+            .block_by_number(BlockNumberOrTag::Latest, false)
+            .await?
+            .expect("latest block must exist")
+            .header
+            .number;
+        if latest >= 40 {
+            break latest;
+        }
+        tokio::task::yield_now().await;
+    };
+    assert!(partial_head < 57, "shutdown must interrupt batch 2 before completion");
 
-    // Assert that the safe block hash is the same as the hash of the last consolidated block.
-    assert_eq!(
-        safe_block_hash.header.hash, hash,
-        "Safe block hash does not match expected
-    hash"
-    );
-    assert_eq!(
-        head_block_hash.header.hash, hash,
-        "Head block hash does not match
-    expected hash"
-    );
-
-    // Simulate a shutdown of the rollup node manager by dropping it.
+    // Stop the orchestrator and wait for it to release the database before rebuilding it.
     signal.fire();
     drop(l1_notification_tx);
     drop(rnm_events);
+    orchestrator_task.await??;
+    time::timeout(Duration::from_secs(10), async {
+        loop {
+            if rpc.block_by_number(5.into(), false).await.ok().flatten().is_some() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the partial canonical chain must become queryable before restart");
+    database.update_batch_status(batch_1_data.hash, BatchStatus::Processing).await?;
+    assert_eq!(database.get_l2_head_block_number().await?, 4);
 
     // Start the RNM again.
     let (_, events) = ScrollWireProtocolHandler::new(ScrollWireConfig::new(true));
@@ -874,59 +863,70 @@ async fn shutdown_consolidates_most_recent_batch_on_startup() -> eyre::Result<()
         )
         .await?;
     let l1_notification_tx = handle.l1_watcher_mock.clone().unwrap();
+    assert_eq!(
+        database.get_batch_status_by_hash(batch_1_data.hash).await?,
+        Some(BatchStatus::Committed),
+        "startup must make the interrupted batch eligible for rediscovery"
+    );
 
     // Spawn a task that constantly polls the rnm to make progress.
-    let (_signal, shutdown) = shutdown_signal();
-    tokio::spawn(async {
+    let (restart_signal, shutdown) = shutdown_signal();
+    let restarted_task = tokio::spawn(async {
         let (_signal, inner) = shutdown_signal();
         let chain_orchestrator = chain_orchestrator.run_until_shutdown(inner);
         tokio::select! {
             biased;
 
-            _ = shutdown => {},
-            _ = chain_orchestrator => {},
+            _ = shutdown => Ok(()),
+            result = chain_orchestrator => result,
         }
     });
 
     // Request an event stream from the rollup node manager.
     let mut rnm_events = handle.get_event_listener().await?;
 
-    // Send the second batch again to mimic the watcher behaviour.
-    let block_1_info = BlockInfo { number: 18318215, hash: B256::random() };
-    l1_notification_tx
-        .notification_tx
-        .send(Arc::new(L1Notification::Finalized(block_1_info.number)))
-        .await?;
+    let status_database = database.clone();
+    let batch_hash = batch_1_data.hash;
+    let processing_observer = tokio::spawn(async move {
+        loop {
+            match status_database.get_batch_status_by_hash(batch_hash).await {
+                Ok(Some(BatchStatus::Processing)) => return true,
+                Ok(Some(BatchStatus::Consolidated)) | Err(_) => return false,
+                Ok(_) => tokio::task::yield_now().await,
+            }
+        }
+    });
 
-    // Lets fetch the first consolidated block event - this should be the first block of the batch.
-    let l2_block = loop {
-        if let Some(ChainOrchestratorEvent::BlockConsolidated(consolidation_outcome)) =
-            rnm_events.next().await
-        {
-            break consolidation_outcome.block_info().clone();
+    l1_notification_tx.notification_tx.send(Arc::new(L1Notification::Synced)).await?;
+
+    let mut recovered_blocks = Vec::new();
+    let recovered_outcome = loop {
+        match rnm_events.next().await {
+            Some(ChainOrchestratorEvent::BlockConsolidated(outcome)) => {
+                recovered_blocks.push(outcome.block_info().block_info.number);
+            }
+            Some(ChainOrchestratorEvent::BatchConsolidated(outcome))
+                if outcome.batch_info.index == batch_1_data.index =>
+            {
+                break outcome;
+            }
+            _ => {}
         }
     };
 
-    // One issue #273 is completed, we will again have safe blocks != finalized blocks, and this
-    // should be changed to 1. Assert that the consolidated block is the first block that was not
-    // previously processed of the batch.
+    assert!(processing_observer.await?, "startup catch-up must mark the batch Processing");
     assert_eq!(
-        l2_block.block_info.number, 41,
-        "Consolidated block number does not match expected number"
+        recovered_blocks,
+        (partial_head..=57).collect::<Vec<_>>(),
+        "the matching partial head must be reused before building only the missing suffix"
     );
-
-    // Lets now iterate over all remaining blocks expected to be derived from the second batch
-    // commit.
-    for i in 42..=57 {
-        loop {
-            if let Some(ChainOrchestratorEvent::BlockConsolidated(consolidation_outcome)) =
-                rnm_events.next().await
-            {
-                assert!(consolidation_outcome.block_info().block_info.number == i);
-                break;
-            }
-        }
-    }
+    assert_eq!(recovered_outcome.blocks.len(), 53);
+    assert_eq!(recovered_outcome.target_status, BatchStatus::Consolidated);
+    assert_eq!(
+        database.get_batch_status_by_hash(batch_1_data.hash).await?,
+        Some(BatchStatus::Consolidated)
+    );
+    assert_eq!(database.get_l2_head_block_number().await?, 57);
 
     let finalized_block = rpc
         .block_by_number(BlockNumberOrTag::Finalized, false)
@@ -937,8 +937,8 @@ async fn shutdown_consolidates_most_recent_batch_on_startup() -> eyre::Result<()
     let head_block =
         rpc.block_by_number(BlockNumberOrTag::Latest, false).await?.expect("head block must exist");
     assert_eq!(
-        finalized_block.header.number, 57,
-        "Finalized block number should be 57 after all blocks are consolidated"
+        finalized_block.header.number, 4,
+        "restart recovery must not finalize an unfinalized batch"
     );
     assert_eq!(
         safe_block.header.number, 57,
@@ -948,6 +948,9 @@ async fn shutdown_consolidates_most_recent_batch_on_startup() -> eyre::Result<()
         head_block.header.number, 57,
         "Head block number should be 57 after all blocks are consolidated"
     );
+
+    restart_signal.fire();
+    restarted_task.await??;
 
     Ok(())
 }
@@ -1078,7 +1081,7 @@ async fn graceful_shutdown_sets_fcs_to_latest_signed_block_in_db_on_start_up() -
     // Launch the rnm in a task.
     tokio::spawn(async {
         let (_signal, inner) = shutdown_signal();
-        rnm.run_until_shutdown(inner).await;
+        rnm.run_until_shutdown(inner).await.expect("restarted orchestrator must keep running");
     });
 
     // Check the fcs.
@@ -2047,6 +2050,37 @@ async fn signer_rotation() -> eyre::Result<()> {
 pub fn read_to_bytes<P: AsRef<std::path::Path>>(path: P) -> eyre::Result<Bytes> {
     use std::str::FromStr;
     Ok(Bytes::from_str(&std::fs::read_to_string(path)?)?)
+}
+
+/// Encodes one V0 calldata batch containing deterministic transaction-free blocks.
+fn empty_batch_calldata(first_block: u64, block_count: u8, timestamp: u64) -> Bytes {
+    let mut parent_batch_header = Vec::with_capacity(89);
+    parent_batch_header.push(0);
+    parent_batch_header.extend_from_slice(&0u64.to_be_bytes());
+    parent_batch_header.extend_from_slice(&0u64.to_be_bytes());
+    parent_batch_header.extend_from_slice(&0u64.to_be_bytes());
+    parent_batch_header.extend_from_slice(B256::ZERO.as_slice());
+    parent_batch_header.extend_from_slice(B256::ZERO.as_slice());
+
+    let mut chunk = Vec::with_capacity(1 + usize::from(block_count) * 60);
+    chunk.push(block_count);
+    for number in first_block..first_block + u64::from(block_count) {
+        chunk.extend_from_slice(&number.to_be_bytes());
+        chunk.extend_from_slice(&timestamp.to_be_bytes());
+        chunk.extend_from_slice(&U256::ZERO.to_be_bytes::<32>());
+        chunk.extend_from_slice(&SCROLL_GAS_LIMIT.to_be_bytes());
+        chunk.extend_from_slice(&0u16.to_be_bytes());
+        chunk.extend_from_slice(&0u16.to_be_bytes());
+    }
+
+    commitBatchCall {
+        version: 0,
+        parent_batch_header: parent_batch_header.into(),
+        chunks: vec![chunk.into()],
+        skipped_l1_message_bitmap: Bytes::new(),
+    }
+    .abi_encode()
+    .into()
 }
 
 /// Waits for n events to be emitted.

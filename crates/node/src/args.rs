@@ -496,12 +496,15 @@ impl ScrollRollupNodeConfig {
         );
         let l1_v2_message_queue_start_index =
             l1_v2_message_queue_start_index(chain_spec.chain().named());
-        let derived_batch_retry = self.chain_orchestrator_args.derived_batch_retry_config()?;
         let config: ChainOrchestratorConfig<Arc<CS>> = ChainOrchestratorConfig::new(
             chain_spec,
             self.chain_orchestrator_args.optimistic_sync_trigger,
             l1_v2_message_queue_start_index,
-            derived_batch_retry,
+            DerivedBatchRetryConfig {
+                max_attempts: self.chain_orchestrator_args.derived_batch_max_attempts,
+                initial_backoff_ms: self.chain_orchestrator_args.derived_batch_initial_backoff_ms,
+                max_backoff_ms: self.chain_orchestrator_args.derived_batch_max_backoff_ms,
+            },
         )?;
 
         // Instantiate the derivation pipeline
@@ -658,19 +661,6 @@ impl Default for ChainOrchestratorArgs {
             derived_batch_initial_backoff_ms: DEFAULT_DERIVED_BATCH_INITIAL_BACKOFF_MS,
             derived_batch_max_backoff_ms: DEFAULT_DERIVED_BATCH_MAX_BACKOFF_MS,
         }
-    }
-}
-
-impl ChainOrchestratorArgs {
-    /// Builds and validates the derived-batch retry configuration from these arguments.
-    pub fn derived_batch_retry_config(&self) -> eyre::Result<DerivedBatchRetryConfig> {
-        let config = DerivedBatchRetryConfig {
-            max_attempts: self.derived_batch_max_attempts,
-            initial_backoff_ms: self.derived_batch_initial_backoff_ms,
-            max_backoff_ms: self.derived_batch_max_backoff_ms,
-        };
-        config.validate().map_err(|err| eyre::eyre!(err))?;
-        Ok(config)
     }
 }
 

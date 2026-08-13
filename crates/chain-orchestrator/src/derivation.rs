@@ -32,8 +32,8 @@ use scroll_engine::{
     classify_fcu_with_attributes, classify_new_payload, Engine, EngineError, FcuAttributesOutcome,
     PayloadOutcome, ScrollEngineApi, StrictFcuStatus,
 };
-use std::time::Instant;
-use tokio::time::Instant as TokioInstant;
+use std::{pin::Pin, time::Instant};
+use tokio::time::{Instant as TokioInstant, Sleep};
 
 /// The successful outcome of a single reconciliation attempt: the persisted batch outcome plus the
 /// block outcomes staged in memory during the attempt. Both are surfaced as events by the caller,
@@ -65,8 +65,6 @@ struct PendingBatch {
     batch: BatchDerivationResult,
     /// The number of attempts started for this batch so far.
     attempts_completed: u32,
-    /// Whether the batch is currently waiting out a retry backoff.
-    backing_off: bool,
     /// The backoff scheduled before the next attempt, in milliseconds, when backing off.
     retry_backoff_ms: Option<u64>,
     /// The last classified reconciliation error, if any attempt has failed.
@@ -80,20 +78,16 @@ struct PendingBatch {
 pub(crate) struct DerivationDriver {
     retry: DerivedBatchRetryConfig,
     pending: Option<PendingBatch>,
-    /// The instant at which the next attempt should start, when a batch is held.
-    attempt_deadline: Option<TokioInstant>,
+    /// The timer for the next attempt. It remains pinned and is reused across `select!`
+    /// cancellations caused by unrelated events.
+    attempt_sleep: Option<Pin<Box<Sleep>>>,
     metrics: DerivedBatchMetrics,
 }
 
 impl DerivationDriver {
     /// Creates a new driver with the given retry policy.
     pub(crate) fn new(retry: DerivedBatchRetryConfig) -> Self {
-        Self {
-            retry,
-            pending: None,
-            attempt_deadline: None,
-            metrics: DerivedBatchMetrics::default(),
-        }
+        Self { retry, pending: None, attempt_sleep: None, metrics: DerivedBatchMetrics::default() }
     }
 
     /// Returns true if no batch is currently held, i.e. the pipeline may be polled for the next
@@ -104,14 +98,14 @@ impl DerivationDriver {
 
     /// Returns true if an attempt is currently scheduled (either immediately or after a backoff).
     pub(crate) const fn is_attempt_scheduled(&self) -> bool {
-        self.attempt_deadline.is_some()
+        self.attempt_sleep.is_some()
     }
 
     /// Returns true while commands may be polled without delaying a due reconciliation attempt.
     /// Commands remain available during retry backoff, but once the deadline is ready the attempt
     /// is given priority even under continuous traffic on the unbounded command channel.
     pub(crate) fn can_poll_commands(&self) -> bool {
-        self.attempt_deadline.is_none_or(|deadline| deadline > TokioInstant::now())
+        self.attempt_sleep.as_ref().is_none_or(|sleep| sleep.deadline() > TokioInstant::now())
     }
 
     /// Moves a freshly yielded derivation result into the pending slot and schedules its first
@@ -128,19 +122,18 @@ impl DerivationDriver {
         self.pending = Some(PendingBatch {
             batch,
             attempts_completed: 0,
-            backing_off: false,
             retry_backoff_ms: None,
             last_error: None,
         });
-        self.attempt_deadline = Some(TokioInstant::now());
+        self.attempt_sleep = Some(Box::pin(tokio::time::sleep_until(TokioInstant::now())));
     }
 
     /// Waits until it is time to run the next attempt. Resolves immediately once the deadline has
     /// passed; never resolves when no attempt is scheduled (guarded by
     /// [`Self::is_attempt_scheduled`] in the run loop `select!`).
-    pub(crate) async fn wait_for_attempt(&self) {
-        match self.attempt_deadline {
-            Some(deadline) => tokio::time::sleep_until(deadline).await,
+    pub(crate) async fn wait_for_attempt(&mut self) {
+        match self.attempt_sleep.as_mut() {
+            Some(sleep) => sleep.as_mut().await,
             None => std::future::pending().await,
         }
     }
@@ -162,11 +155,10 @@ impl DerivationDriver {
         EC: ScrollEngineApi + Sync + Send + 'static,
     {
         // Consume the deadline that triggered this attempt; a retry reschedules a new one below.
-        self.attempt_deadline = None;
+        self.attempt_sleep = None;
         let attempts = {
             let pending = self.pending.as_mut().expect("run_attempt requires a held batch");
             pending.attempts_completed += 1;
-            pending.backing_off = false;
             pending.retry_backoff_ms = None;
             pending.attempts_completed
         };
@@ -188,7 +180,7 @@ impl DerivationDriver {
         match result {
             Ok(consolidated) => {
                 self.pending = None;
-                self.attempt_deadline = None;
+                self.attempt_sleep = None;
                 self.metrics.derived_batch_successes.increment(1);
                 tracing::info!(
                     target: "scroll::chain_orchestrator",
@@ -215,10 +207,10 @@ impl DerivationDriver {
                         "Derived batch reconciliation attempt failed; scheduling retry"
                     );
                     let pending = self.pending.as_mut().expect("held batch");
-                    pending.backing_off = true;
                     pending.retry_backoff_ms = Some(backoff_ms);
                     pending.last_error = Some(err.to_string());
-                    self.attempt_deadline = Some(TokioInstant::now() + backoff);
+                    self.attempt_sleep =
+                        Some(Box::pin(tokio::time::sleep_until(TokioInstant::now() + backoff)));
                     AttemptStep::Retrying
                 } else {
                     self.metrics.derived_batch_terminal_failures.increment(1);
@@ -231,9 +223,6 @@ impl DerivationDriver {
                     } else {
                         err
                     };
-                    if let Some(pending) = self.pending.as_mut() {
-                        pending.last_error = Some(err.to_string());
-                    }
                     AttemptStep::Fatal(err)
                 }
             }
@@ -259,7 +248,7 @@ impl DerivationDriver {
                 batch_hash: pending.batch.batch_info.hash,
                 attempts_completed: pending.attempts_completed,
                 max_attempts: self.retry.max_attempts,
-                backing_off: pending.backing_off,
+                backing_off: pending.retry_backoff_ms.is_some(),
                 retry_backoff_ms: pending.retry_backoff_ms,
                 last_error: pending.last_error.clone(),
                 queued_behind: queued,
@@ -333,7 +322,8 @@ where
 
                 BlockConsolidationOutcome::UpdateFcs(block_info)
             }
-            BlockConsolidationAction::Reorg(attributes) => {
+            BlockConsolidationAction::Reorg(attribute_index) => {
+                let attributes = &batch.attributes[attribute_index];
                 let safe = *engine.fcs().safe_block_info();
                 if safe.number != attributes.block_number - 1 {
                     return Err(ChainOrchestratorError::InvalidBatchReorg {
@@ -345,8 +335,8 @@ where
 
                 // Forkchoice update with payload attributes to begin the payload build.
                 let start = Instant::now();
-                let payload_id = match engine.build_payload(Some(safe), attributes.attributes).await
-                {
+                let payload_attributes = attributes.attributes.clone();
+                let payload_id = match engine.build_payload(Some(safe), payload_attributes).await {
                     Ok(fcu) => {
                         let outcome = classify_fcu_with_attributes(&fcu);
                         record_engine_request_latency(
@@ -535,10 +525,9 @@ fn interpret_new_payload(
             batch_info,
             method: "new_payload",
         }),
-        PayloadOutcome::Accepted => Err(ChainOrchestratorError::DerivedBatchEngineAccepted {
-            batch_info,
-            method: "new_payload",
-        }),
+        PayloadOutcome::Accepted => {
+            Err(ChainOrchestratorError::DerivedBatchEngineAccepted { batch_info })
+        }
         PayloadOutcome::Invalid(details) => Err(ChainOrchestratorError::InvalidDerivedPayload {
             batch_info,
             method: "new_payload",
@@ -852,10 +841,7 @@ mod tests {
 
         // ACCEPTED from newPayload is transient (unlike ACCEPTED from a forkchoice update).
         assert!(err.can_retry(), "newPayload ACCEPTED must be transient");
-        assert!(matches!(
-            err,
-            ChainOrchestratorError::DerivedBatchEngineAccepted { method: "new_payload", .. }
-        ));
+        assert!(matches!(err, ChainOrchestratorError::DerivedBatchEngineAccepted { .. }));
     }
 
     #[tokio::test]
@@ -996,8 +982,8 @@ mod tests {
         DerivedBatchRetryConfig { max_attempts, initial_backoff_ms: 1, max_backoff_ms: 2 }
     }
 
-    #[test]
-    fn due_attempt_closes_command_polling_gate() {
+    #[tokio::test]
+    async fn due_attempt_closes_command_polling_gate() {
         let mut driver = DerivationDriver::new(short_retry(3));
         assert!(driver.can_poll_commands());
 
@@ -1007,6 +993,25 @@ mod tests {
         assert!(
             !driver.can_poll_commands(),
             "a ready first attempt must win over continuous unbounded command traffic"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_wait_retains_the_scheduled_timer() {
+        let mut driver = DerivationDriver::new(short_retry(3));
+        driver.attempt_sleep = Some(Box::pin(tokio::time::sleep(Duration::from_secs(30))));
+        let timer = driver.attempt_sleep.as_ref().map(|sleep| &raw const **sleep).unwrap();
+
+        tokio::select! {
+            biased;
+            () = std::future::ready(()) => {}
+            () = driver.wait_for_attempt() => panic!("the timer should still be pending"),
+        }
+
+        let retained = driver.attempt_sleep.as_ref().map(|sleep| &raw const **sleep).unwrap();
+        assert!(
+            std::ptr::eq(retained, timer),
+            "select cancellation must retain the pinned retry timer"
         );
     }
 

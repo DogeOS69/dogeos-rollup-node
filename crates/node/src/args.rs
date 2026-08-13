@@ -25,8 +25,10 @@ use reth_network_api::FullNetwork;
 use reth_network_p2p::FullBlockClient;
 use reth_node_builder::{rpc::RethRpcServerHandles, NodeConfig as RethNodeConfig};
 use rollup_node_chain_orchestrator::{
-    ChainOrchestrator, ChainOrchestratorConfig, ChainOrchestratorHandle, Consensus, NoopConsensus,
-    SystemContractConsensus,
+    ChainOrchestrator, ChainOrchestratorConfig, ChainOrchestratorHandle, Consensus,
+    DerivedBatchRetryConfig, NoopConsensus, SystemContractConsensus,
+    DEFAULT_DERIVED_BATCH_INITIAL_BACKOFF_MS, DEFAULT_DERIVED_BATCH_MAX_ATTEMPTS,
+    DEFAULT_DERIVED_BATCH_MAX_BACKOFF_MS,
 };
 use rollup_node_primitives::{BlockInfo, NodeConfig};
 use rollup_node_providers::{
@@ -494,11 +496,13 @@ impl ScrollRollupNodeConfig {
         );
         let l1_v2_message_queue_start_index =
             l1_v2_message_queue_start_index(chain_spec.chain().named());
+        let derived_batch_retry = self.chain_orchestrator_args.derived_batch_retry_config()?;
         let config: ChainOrchestratorConfig<Arc<CS>> = ChainOrchestratorConfig::new(
             chain_spec,
             self.chain_orchestrator_args.optimistic_sync_trigger,
             l1_v2_message_queue_start_index,
-        );
+            derived_batch_retry,
+        )?;
 
         // Instantiate the derivation pipeline
         let derivation_pipeline = DerivationPipeline::new(
@@ -632,6 +636,17 @@ pub struct ChainOrchestratorArgs {
     /// The size of the in-memory chain buffer used by the chain orchestrator.
     #[arg(long = "chain.chain-buffer-size", default_value_t = constants::CHAIN_BUFFER_SIZE)]
     pub chain_buffer_size: usize,
+    /// The maximum number of ordered reconciliation attempts (including the first) for a derived
+    /// batch before the node fail-stops. Must be at least 1.
+    #[arg(long = "chain.derived-batch-max-attempts", default_value_t = DEFAULT_DERIVED_BATCH_MAX_ATTEMPTS)]
+    pub derived_batch_max_attempts: u32,
+    /// The initial backoff before the second derived-batch reconciliation attempt, in
+    /// milliseconds. Must not exceed `chain.derived-batch-max-backoff-ms`.
+    #[arg(long = "chain.derived-batch-initial-backoff-ms", default_value_t = DEFAULT_DERIVED_BATCH_INITIAL_BACKOFF_MS)]
+    pub derived_batch_initial_backoff_ms: u64,
+    /// The maximum backoff between derived-batch reconciliation attempts, in milliseconds.
+    #[arg(long = "chain.derived-batch-max-backoff-ms", default_value_t = DEFAULT_DERIVED_BATCH_MAX_BACKOFF_MS)]
+    pub derived_batch_max_backoff_ms: u64,
 }
 
 impl Default for ChainOrchestratorArgs {
@@ -639,7 +654,23 @@ impl Default for ChainOrchestratorArgs {
         Self {
             optimistic_sync_trigger: constants::BLOCK_GAP_TRIGGER,
             chain_buffer_size: constants::CHAIN_BUFFER_SIZE,
+            derived_batch_max_attempts: DEFAULT_DERIVED_BATCH_MAX_ATTEMPTS,
+            derived_batch_initial_backoff_ms: DEFAULT_DERIVED_BATCH_INITIAL_BACKOFF_MS,
+            derived_batch_max_backoff_ms: DEFAULT_DERIVED_BATCH_MAX_BACKOFF_MS,
         }
+    }
+}
+
+impl ChainOrchestratorArgs {
+    /// Builds and validates the derived-batch retry configuration from these arguments.
+    pub fn derived_batch_retry_config(&self) -> eyre::Result<DerivedBatchRetryConfig> {
+        let config = DerivedBatchRetryConfig {
+            max_attempts: self.derived_batch_max_attempts,
+            initial_backoff_ms: self.derived_batch_initial_backoff_ms,
+            max_backoff_ms: self.derived_batch_max_backoff_ms,
+        };
+        config.validate().map_err(|err| eyre::eyre!(err))?;
+        Ok(config)
     }
 }
 

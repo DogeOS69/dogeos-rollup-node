@@ -145,6 +145,9 @@ pub fn event_type_name(event: &ChainOrchestratorEvent) -> String {
         ChainOrchestratorEvent::L1MessageCommitted(_) => "L1MessageCommitted".to_string(),
         ChainOrchestratorEvent::L1Reorg { .. } => "L1Reorg".to_string(),
         ChainOrchestratorEvent::BatchConsolidated(_) => "BatchConsolidated".to_string(),
+        ChainOrchestratorEvent::DerivedBatchReconciliationFailed { .. } => {
+            "DerivedBatchReconciliationFailed".to_string()
+        }
         ChainOrchestratorEvent::UnwoundToL1Block(_) => "UnwoundToL1Block".to_string(),
         ChainOrchestratorEvent::BlockConsolidated(_) => "BlockConsolidated".to_string(),
         ChainOrchestratorEvent::BatchReverted { .. } => "BatchReverted".to_string(),
@@ -211,6 +214,14 @@ pub fn format_event_short(event: &ChainOrchestratorEvent) -> String {
         ChainOrchestratorEvent::BatchConsolidated(outcome) => {
             format!("BatchConsolidated {{ blocks: {} }}", outcome.blocks.len())
         }
+        ChainOrchestratorEvent::DerivedBatchReconciliationFailed {
+            batch_info,
+            attempts,
+            error,
+        } => format!(
+            "DerivedBatchReconciliationFailed {{ index: {}, attempts: {}, error: {} }}",
+            batch_info.index, attempts, error
+        ),
         ChainOrchestratorEvent::UnwoundToL1Block(num) => {
             format!("UnwoundToL1Block {{ block: {} }}", num)
         }

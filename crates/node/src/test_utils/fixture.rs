@@ -468,6 +468,7 @@ impl TestFixtureBuilder {
             chain_orchestrator_args: ChainOrchestratorArgs {
                 optimistic_sync_trigger: 100,
                 chain_buffer_size: 100,
+                ..Default::default()
             },
             sequencer_args: SequencerArgs {
                 payload_building_duration: 1000,

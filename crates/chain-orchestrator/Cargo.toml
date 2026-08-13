@@ -65,6 +65,7 @@ alloy-transport.workspace = true
 
 # rollup-node
 scroll-db = { workspace = true, features = ["test-utils"] }
+scroll-engine = { workspace = true, features = ["test-utils"] }
 rollup-node-primitives = { workspace = true, features = ["arbitrary"] }
 
 # scroll

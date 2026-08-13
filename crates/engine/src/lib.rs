@@ -7,6 +7,13 @@ mod error;
 mod api;
 pub use api::{ScrollAuthApiEngineClient, ScrollEngineApi, ScrollEngineApiResult};
 
+mod classify;
+pub use classify::{
+    classify_fcu_no_attributes, classify_fcu_with_attributes, classify_new_payload,
+    get_payload_error_is_transient, transport_error_is_transient, FcuAttributesOutcome,
+    InvalidPayloadDetails, PayloadOutcome, StrictFcuStatus, ENGINE_UNKNOWN_PAYLOAD_CODE,
+};
+
 pub use fcs::{genesis_hash_from_chain_spec, ForkchoiceState};
 mod fcs;
 

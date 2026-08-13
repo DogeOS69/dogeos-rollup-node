@@ -72,11 +72,19 @@ impl RollupManagerAddOn {
                 rpc.rpc_server_handles,
             )
             .await?;
-        ctx.node
-            .task_executor()
-            .spawn_critical_with_graceful_shutdown_signal("rollup_node_manager", |shutdown| {
-                chain_orchestrator.run_until_shutdown(shutdown.ignore_guard())
-            });
+        ctx.node.task_executor().spawn_critical_with_graceful_shutdown_signal(
+            "rollup_node_manager",
+            |shutdown| async move {
+                // A terminal derived-batch reconciliation failure (or retry exhaustion) returns an
+                // error here. Panicking turns it into a process fail-stop via reth's critical-task
+                // exit path; a clean shutdown returns `Ok(())` and does not panic.
+                if let Err(err) =
+                    chain_orchestrator.run_until_shutdown(shutdown.ignore_guard()).await
+                {
+                    panic!("fatal chain orchestrator error: {err}");
+                }
+            },
+        );
         Ok(handle)
     }
 }

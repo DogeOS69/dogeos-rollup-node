@@ -1,5 +1,5 @@
 use super::{EngineError, ForkchoiceState};
-use crate::ScrollEngineApi;
+use crate::{classify::classify_fcu_no_attributes, ScrollEngineApi, StrictFcuStatus};
 use alloy_rpc_types_engine::{
     ExecutionPayloadV1, ForkchoiceUpdated, PayloadStatus, PayloadStatusEnum,
 };
@@ -71,6 +71,40 @@ where
         }
 
         Ok(result)
+    }
+
+    /// Update the fork choice state with strict status handling for the derived-batch
+    /// reconciliation path.
+    ///
+    /// Unlike [`Engine::update_fcs`], which advances the in-memory fork choice state whenever the
+    /// engine response is not `INVALID` (treating `SYNCING` as good enough for optimistic sync),
+    /// this method advances the local state **only** on a fully `VALID` response. `SYNCING`,
+    /// `INVALID`, and `ACCEPTED` leave the local state untouched and are returned to the caller for
+    /// classification. It never panics on an unexpected status.
+    pub async fn update_fcs_strict(
+        &mut self,
+        head: Option<BlockInfo>,
+        safe: Option<BlockInfo>,
+        finalized: Option<BlockInfo>,
+    ) -> Result<StrictFcuStatus, EngineError> {
+        tracing::trace!(target: "scroll::engine", ?head, ?safe, ?finalized, current = ?self.fcs, "Updating fork choice state (strict)");
+        if head.is_none() && safe.is_none() && finalized.is_none() {
+            return Err(EngineError::fcs_no_update_provided());
+        }
+
+        // Clone the fcs and apply the invariant-checked update to the clone before issuing the
+        // request; the local state is only committed once the engine confirms `VALID`.
+        let mut fcs = self.fcs.clone();
+        fcs.update(head, safe, finalized)?;
+
+        let result = self.client.fork_choice_updated_v1(fcs.get_alloy_fcs(), None).await?;
+        let status = classify_fcu_no_attributes(&result);
+
+        if status == StrictFcuStatus::Valid {
+            self.fcs = fcs;
+        }
+
+        Ok(status)
     }
 
     /// Optimistically sync to the given block.

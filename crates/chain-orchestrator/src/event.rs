@@ -115,6 +115,17 @@ pub enum ChainOrchestratorEvent {
     BatchConsolidated(BatchConsolidationOutcome),
     /// An L1 derived block has been consolidated, returning the outcome of the consolidation.
     BlockConsolidated(BlockConsolidationOutcome),
+    /// Ordered reconciliation of a derived batch failed terminally (a terminal Engine outcome or
+    /// retry exhaustion). This is a best-effort, in-process signal emitted immediately before the
+    /// critical orchestrator task returns an error and the node fail-stops.
+    DerivedBatchReconciliationFailed {
+        /// The batch whose reconciliation failed.
+        batch_info: BatchInfo,
+        /// The number of attempts made before failing.
+        attempts: u32,
+        /// The rendered classified error that caused the terminal failure.
+        error: String,
+    },
     /// The chain has been consolidated from `from` block number to `to` block number (inclusive).
     ChainConsolidated {
         /// The starting block number of the consolidation (safe block number).

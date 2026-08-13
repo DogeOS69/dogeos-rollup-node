@@ -15,8 +15,8 @@ use reth_network_api::{BlockDownloaderProvider, FullNetwork};
 use reth_network_p2p::{sync::SyncState as RethSyncState, FullBlockClient};
 use reth_tokio_util::{EventSender, EventStream};
 use rollup_node_primitives::{
-    BatchCommitData, BatchInfo, BatchStatus, BlockConsolidationOutcome, BlockInfo, ChainImport,
-    L1MessageEnvelope, L2BlockInfoWithL1Messages,
+    BatchCommitData, BatchInfo, BatchStatus, BlockInfo, ChainImport, L1MessageEnvelope,
+    L2BlockInfoWithL1Messages,
 };
 use rollup_node_providers::L1MessageProvider;
 use rollup_node_sequencer::{Sequencer, SequencerEvent};
@@ -26,7 +26,7 @@ use scroll_db::{
     Database, DatabaseError, DatabaseReadOperations, DatabaseWriteOperations, L1MessageKey,
     UnwindResult,
 };
-use scroll_derivation_pipeline::{BatchDerivationResult, DerivationPipeline};
+use scroll_derivation_pipeline::DerivationPipeline;
 use scroll_engine::{Engine, ScrollEngineApi};
 use scroll_network::{
     BlockImportOutcome, DogeosNetworkPrimitives, NewBlockWithPeer, ScrollNetwork,
@@ -36,13 +36,19 @@ use std::{collections::VecDeque, sync::Arc, time::Instant, vec};
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 
 mod config;
-pub use config::ChainOrchestratorConfig;
+pub use config::{
+    ChainOrchestratorConfig, DerivedBatchRetryConfig, DerivedBatchRetryConfigError,
+    DEFAULT_DERIVED_BATCH_INITIAL_BACKOFF_MS, DEFAULT_DERIVED_BATCH_MAX_ATTEMPTS,
+    DEFAULT_DERIVED_BATCH_MAX_BACKOFF_MS,
+};
 
 mod consensus;
 pub use consensus::{Consensus, NoopConsensus, SystemContractConsensus};
 
 mod consolidation;
-use consolidation::{reconcile_batch, BlockConsolidationAction};
+
+mod derivation;
+use derivation::{AttemptStep, DerivationDriver};
 
 mod event;
 pub use event::ChainOrchestratorEvent;
@@ -60,7 +66,7 @@ mod sync;
 pub use sync::{SyncMode, SyncState};
 
 mod status;
-pub use status::ChainOrchestratorStatus;
+pub use status::{ChainOrchestratorStatus, DerivationPipelineStatus, ReconcilingBatch};
 
 /// Wraps a future, metering the completion of it.
 macro_rules! metered {
@@ -127,6 +133,8 @@ pub struct ChainOrchestrator<
     signer: Option<SignerHandle>,
     /// The derivation pipeline used to derive L2 blocks from batches.
     derivation_pipeline: DerivationPipeline,
+    /// Drives ordered, bounded-retry reconciliation of the single derived batch currently held.
+    derivation_driver: DerivationDriver,
     /// Optional event sender for broadcasting events to listeners.
     event_sender: Option<EventSender<ChainOrchestratorEvent>>,
     /// The metrics handler.
@@ -158,6 +166,7 @@ impl<
     ) -> Result<(Self, ChainOrchestratorHandle<N>), ChainOrchestratorError> {
         let (handle_tx, handle_rx) = mpsc::unbounded_channel();
         let handle = ChainOrchestratorHandle::new(handle_tx);
+        let derivation_driver = DerivationDriver::new(*config.derived_batch_retry());
         Ok((
             Self {
                 block_client,
@@ -172,6 +181,7 @@ impl<
                 sequencer,
                 signer,
                 derivation_pipeline,
+                derivation_driver,
                 handle_rx,
                 event_sender: None,
                 metric_handler: MetricsHandler::default(),
@@ -180,20 +190,70 @@ impl<
         ))
     }
 
-    /// Drives the [`ChainOrchestrator`] future until a shutdown signal is received.
+    /// Drives the [`ChainOrchestrator`] future until a shutdown signal is received or a derived
+    /// batch fails reconciliation terminally.
+    ///
+    /// Returns `Ok(())` on a clean shutdown. Returns `Err` when ordered reconciliation of a derived
+    /// batch fails terminally (a terminal Engine outcome or retry exhaustion); the critical-task
+    /// wrapper turns that error into a process fail-stop. A normal shutdown while a batch is
+    /// pending is not retry exhaustion: the batch is left for the established startup
+    /// rediscovery path.
     pub async fn run_until_shutdown(
         mut self,
         mut shutdown: impl std::future::Future<Output = ()> + Unpin,
-    ) {
+    ) -> Result<(), ChainOrchestratorError> {
         loop {
             tokio::select! {
                 biased;
 
                 _guard = &mut shutdown => {
                     self.notify(ChainOrchestratorEvent::Shutdown);
-                    break;
+                    return Ok(());
                 }
-                Some(command) = self.handle_rx.recv() => {
+                // A due attempt is immediately below shutdown and explicitly closes the command
+                // gate, so even a continuously populated unbounded command queue cannot starve it.
+                // During retry backoff this branch is not ready and the gate remains open, keeping
+                // status and administrative commands responsive.
+                () = self.derivation_driver.wait_for_attempt(), if self.derivation_driver.is_attempt_scheduled() => {
+                    // Run the attempt, but let shutdown cancel it in flight. Cancellation is safe:
+                    // nothing is emitted until after the atomic consolidation commit, and every
+                    // attempt recomputes from fresh canonical state.
+                    let metric = self.metric_handler
+                        .get(Task::BatchReconciliation)
+                        .expect("metric exists")
+                        .clone();
+                    let started = Instant::now();
+                    tokio::select! {
+                        biased;
+                        _guard = &mut shutdown => {
+                            self.notify(ChainOrchestratorEvent::Shutdown);
+                            return Ok(());
+                        }
+                        step = self.derivation_driver.run_attempt(&*self.l2_client, &mut self.engine, &self.database) => {
+                            // Preserve the pre-existing batch-reconciliation task-duration series,
+                            // now measured once per completed attempt (including failed attempts).
+                            metric.task_duration.record(started.elapsed().as_secs_f64());
+                            match step {
+                                AttemptStep::Completed(consolidated) => {
+                                    // Persistence has committed; only now surface the staged block
+                                    // events followed by the single batch event.
+                                    for outcome in consolidated.block_outcomes {
+                                        self.notify(ChainOrchestratorEvent::BlockConsolidated(outcome));
+                                    }
+                                    self.notify(ChainOrchestratorEvent::BatchConsolidated(
+                                        consolidated.batch_outcome,
+                                    ));
+                                }
+                                AttemptStep::Retrying => {}
+                                AttemptStep::Fatal(err) => {
+                                    self.handle_fatal(&err);
+                                    return Err(err);
+                                }
+                            }
+                        }
+                    }
+                }
+                Some(command) = self.handle_rx.recv(), if self.derivation_driver.can_poll_commands() => {
                     if let Err(err) = self.handle_command(command).await {
                         tracing::error!(target: "scroll::chain_orchestrator", ?err, "Error handling command");
                     }
@@ -214,24 +274,48 @@ impl<
                     } else {
                         unreachable!()
                     }
-                }, if self.sequencer.is_some() && self.sync_state.is_synced() => {
+                }, if self.sequencer.is_some() && self.sync_state.is_synced() && self.derivation_driver.can_accept_batch() => {
                     let res = self.handle_sequencer_event(event).await;
                     self.handle_outcome(res);
                 }
-                Some(batch) = self.derivation_pipeline.next() => {
-                    let res = metered!(Task::BatchReconciliation, self, handle_derived_batch(batch));
-                    self.handle_outcome(res);
+                Some(batch) = self.derivation_pipeline.next(), if self.derivation_driver.can_accept_batch() => {
+                    // Move the yielded result into the pending slot; the attempt branch reconciles
+                    // it. No later derivation result is polled while this batch is held.
+                    self.derivation_driver.hold_batch(batch);
                 }
                 Some(event) = self.network.events().next() => {
                     let res = self.handle_network_event(event).await;
                     self.handle_outcome(res);
                 }
-                Some(notification) = self.l1_watcher.l1_notification_receiver().recv(), if self.sync_state.l2().is_synced() && self.derivation_pipeline.is_empty() => {
+                Some(notification) = self.l1_watcher.l1_notification_receiver().recv(), if self.sync_state.l2().is_synced() && self.derivation_pipeline.is_empty() && self.derivation_driver.can_accept_batch() => {
                     let res = self.handle_l1_notification(notification).await;
                     self.handle_outcome(res);
                 }
 
             }
+        }
+    }
+
+    /// Emits the terminal derived-batch failure signals (structured log, best-effort event, metric
+    /// increment) immediately before the critical task returns an error and the node fail-stops.
+    /// This is the single authoritative structured terminal record; retryable attempts are logged
+    /// by the driver, but terminal attempts are surfaced only here.
+    fn handle_fatal(&self, err: &ChainOrchestratorError) {
+        let batch_info = self.derivation_driver.pending_batch_info();
+        let attempts = self.derivation_driver.attempts();
+        tracing::error!(
+            target: "scroll::chain_orchestrator",
+            ?batch_info,
+            attempts,
+            %err,
+            "Derived batch reconciliation failed terminally; chain orchestrator is fail-stopping"
+        );
+        if let Some(batch_info) = batch_info {
+            self.notify(ChainOrchestratorEvent::DerivedBatchReconciliationFailed {
+                batch_info,
+                attempts,
+                error: err.to_string(),
+            });
         }
     }
 
@@ -354,6 +438,7 @@ impl<
                     l1_finalized,
                     l1_processed,
                     self.engine.fcs().clone(),
+                    self.derivation_driver.status(self.derivation_pipeline.len()),
                 );
                 let _ = tx.send(status);
             }
@@ -469,98 +554,6 @@ impl<
         if let Some(s) = self.event_sender.as_ref() {
             s.notify(event);
         }
-    }
-
-    /// Handles a derived batch by inserting the derived blocks into the database.
-    async fn handle_derived_batch(
-        &mut self,
-        batch: BatchDerivationResult,
-    ) -> Result<Option<ChainOrchestratorEvent>, ChainOrchestratorError> {
-        let batch_info = batch.batch_info;
-        tracing::info!(target: "scroll::chain_orchestrator", batch_info = ?batch_info, num_blocks = batch.attributes.len(), "Handling derived batch");
-
-        let skipped_l1_messages = batch.skipped_l1_messages.clone();
-        let batch_reconciliation_result =
-            reconcile_batch(&self.l2_client, batch, self.engine.fcs()).await?;
-        let aggregated_actions = batch_reconciliation_result.aggregate_actions();
-
-        let mut reorg_results = vec![];
-        for action in aggregated_actions.actions {
-            let outcome = match action {
-                BlockConsolidationAction::Skip(_) => {
-                    unreachable!("Skip actions have been filtered out in aggregation")
-                }
-                BlockConsolidationAction::UpdateFcs(block_info) => {
-                    tracing::info!(target: "scroll::chain_orchestrator", ?block_info, "Updating safe head to consolidated block");
-                    let finalized_block_info = batch_reconciliation_result
-                        .target_status
-                        .is_finalized()
-                        .then_some(block_info.block_info);
-                    self.engine
-                        .update_fcs(None, Some(block_info.block_info), finalized_block_info)
-                        .await?;
-                    BlockConsolidationOutcome::UpdateFcs(block_info)
-                }
-                BlockConsolidationAction::Reorg(attributes) => {
-                    tracing::info!(target: "scroll::chain_orchestrator", block_number = ?attributes.block_number, "Reorging chain to derived block");
-                    // We reorg the head to the safe block and then build the payload for the
-                    // attributes.
-                    let head = *self.engine.fcs().safe_block_info();
-                    if head.number != attributes.block_number - 1 {
-                        return Err(ChainOrchestratorError::InvalidBatchReorg {
-                            batch_info,
-                            safe_block_number: head.number,
-                            derived_block_number: attributes.block_number,
-                        });
-                    }
-                    let fcu = self.engine.build_payload(Some(head), attributes.attributes).await?;
-                    let payload = self
-                        .engine
-                        .get_payload(fcu.payload_id.expect("payload_id can not be None"))
-                        .await?;
-
-                    let block_info: L2BlockInfoWithL1Messages = (&payload)
-                        .try_into()
-                        .map_err(ChainOrchestratorError::RollupNodePrimitiveError)?;
-                    let result = self.engine.new_payload(payload).await?;
-                    if result.is_invalid() {
-                        return Err(ChainOrchestratorError::InvalidBatch(
-                            block_info.block_info,
-                            batch_info,
-                        ));
-                    }
-
-                    // Update the forkchoice state to the new head.
-                    let finalized_block_info = batch_reconciliation_result
-                        .target_status
-                        .is_finalized()
-                        .then_some(block_info.block_info);
-                    self.engine
-                        .update_fcs(
-                            Some(block_info.block_info),
-                            Some(block_info.block_info),
-                            finalized_block_info,
-                        )
-                        .await?;
-
-                    reorg_results.push(block_info.clone());
-                    BlockConsolidationOutcome::Reorged(block_info)
-                }
-            };
-
-            self.notify(ChainOrchestratorEvent::BlockConsolidated(outcome.clone()));
-        }
-
-        let batch_consolidation_outcome =
-            batch_reconciliation_result.into_batch_consolidation_outcome(reorg_results).await?;
-
-        // Insert the batch consolidation outcome into the database.
-        let mut consolidation_outcome = batch_consolidation_outcome.clone();
-        consolidation_outcome.with_skipped_l1_messages(skipped_l1_messages);
-
-        self.database.insert_batch_consolidation_outcome(consolidation_outcome).await?;
-
-        Ok(Some(ChainOrchestratorEvent::BatchConsolidated(batch_consolidation_outcome)))
     }
 
     /// Handles an L1 notification.

@@ -9,14 +9,20 @@ use scroll_derivation_pipeline::{BatchDerivationResult, DerivedAttributes};
 use scroll_engine::{block_matches_attributes, ForkchoiceState};
 
 /// Reconciles a batch of derived attributes with the L2 chain to produce a reconciliation result.
+///
+/// The batch is borrowed rather than consumed so that the derived-batch driver can recompute
+/// reconciliation from fresh canonical L2 state on every retry attempt without cloning the
+/// (potentially large) attribute set. Only per-reorg attributes are cloned, and only for the blocks
+/// that actually require a reorg.
 pub(crate) async fn reconcile_batch<L2P: Provider<Scroll>>(
     l2_provider: L2P,
-    batch: BatchDerivationResult,
+    batch: &BatchDerivationResult,
     fcs: &ForkchoiceState,
 ) -> Result<BatchReconciliationResult, ChainOrchestratorError> {
     let mut futures = FuturesOrdered::new();
-    for attributes in batch.attributes {
-        let fut = async {
+    for attributes in &batch.attributes {
+        let l2_provider = &l2_provider;
+        let fut = async move {
             // Fetch the block corresponding to the derived attributes from the L2 provider.
             let current_block = l2_provider
                 .get_block(attributes.block_number.into())
@@ -28,7 +34,9 @@ pub(crate) async fn reconcile_batch<L2P: Provider<Scroll>>(
                 block
             } else {
                 // The block does not exist, a reorg is needed.
-                return Ok::<_, ChainOrchestratorError>(BlockConsolidationAction::Reorg(attributes));
+                return Ok::<_, ChainOrchestratorError>(BlockConsolidationAction::Reorg(
+                    attributes.clone(),
+                ));
             };
 
             // Check if the block matches the derived attributes.
@@ -47,7 +55,7 @@ pub(crate) async fn reconcile_batch<L2P: Provider<Scroll>>(
                 }
             } else {
                 // The block does not match the derived attributes, a reorg is needed.
-                Ok::<_, ChainOrchestratorError>(BlockConsolidationAction::Reorg(attributes))
+                Ok::<_, ChainOrchestratorError>(BlockConsolidationAction::Reorg(attributes.clone()))
             }
         };
         futures.push_back(fut);
@@ -99,13 +107,15 @@ impl BatchReconciliationResult {
     pub(crate) async fn into_batch_consolidation_outcome(
         self,
         reorg_results: Vec<L2BlockInfoWithL1Messages>,
+        update_fcs_replaced_head: bool,
     ) -> Result<BatchConsolidationOutcome, ChainOrchestratorError> {
-        // Create the batch consolidation outcome with the L2 head block number updated if there
-        // were any reorgs.
+        // Persist the final block as the L2 head after a reorg or after a matching-block FCU that
+        // actually supplied a replacement head. An UpdateFcs that retained a later canonical head
+        // must not regress the durable head to this batch's final block.
         let mut consolidate_chain = BatchConsolidationOutcome::new(
             self.batch_info,
             self.target_status,
-            !reorg_results.is_empty(),
+            !reorg_results.is_empty() || update_fcs_replaced_head,
         );
 
         // First append all non-reorg results to the consolidated chain.

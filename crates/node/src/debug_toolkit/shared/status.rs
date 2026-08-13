@@ -1,7 +1,40 @@
 //! Shared rendering for rollup node status outputs.
 
 use colored::Colorize;
-use rollup_node_chain_orchestrator::ChainOrchestratorStatus;
+use rollup_node_chain_orchestrator::{ChainOrchestratorStatus, DerivationPipelineStatus};
+
+/// Print the derivation-pipeline / derived-batch reconciliation section.
+pub(crate) fn print_derivation_status(status: &ChainOrchestratorStatus) {
+    println!("{}", "Derivation:".underline());
+    match &status.derivation {
+        DerivationPipelineStatus::Idle => {
+            println!("  State:     {}", "idle".green());
+        }
+        DerivationPipelineStatus::Deriving { queued } => {
+            println!("  State:     {}", "deriving".yellow());
+            println!("  Queued:    {queued}");
+        }
+        DerivationPipelineStatus::Reconciling(batch) => {
+            println!("  State:     {}", "reconciling".yellow());
+            println!(
+                "  Batch:     #{} ({:.12}...)",
+                batch.batch_index,
+                format!("{:?}", batch.batch_hash)
+            );
+            println!("  Attempt:   {}/{}", batch.attempts_completed, batch.max_attempts);
+            if batch.backing_off {
+                let backoff = batch.retry_backoff_ms.unwrap_or_default();
+                println!("  Retrying:  {} (backoff {}ms)", "true".red(), backoff);
+            }
+            if let Some(err) = &batch.last_error {
+                println!("  Last err:  {}", err.red());
+            }
+            if batch.queued_behind > 0 {
+                println!("  Queued:    {}", batch.queued_behind);
+            }
+        }
+    }
+}
 
 /// Print L2/L1 overview sections used by `status`.
 pub(crate) fn print_status_overview(status: &ChainOrchestratorStatus) {
@@ -36,6 +69,8 @@ pub(crate) fn print_status_overview(status: &ChainOrchestratorStatus) {
         "  Synced:    {}",
         if status.l1.status.is_synced() { "true".green() } else { "false".red() }
     );
+
+    print_derivation_status(status);
 }
 
 /// Print detailed sync status used by `sync-status`.
@@ -65,6 +100,8 @@ pub(crate) fn print_sync_status(status: &ChainOrchestratorStatus) {
             format!("{:?}", status.l2.status).yellow().to_string().into()
         }
     );
+    println!();
+    print_derivation_status(status);
     println!();
     println!("{}", "Forkchoice:".underline());
 

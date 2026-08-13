@@ -294,6 +294,7 @@ pub fn default_test_scroll_rollup_node_config() -> ScrollRollupNodeConfig {
         chain_orchestrator_args: ChainOrchestratorArgs {
             optimistic_sync_trigger: 100,
             chain_buffer_size: 100,
+            ..Default::default()
         },
         sequencer_args: SequencerArgs {
             payload_building_duration: 1000,
@@ -330,6 +331,7 @@ pub fn default_sequencer_test_scroll_rollup_node_config() -> ScrollRollupNodeCon
         chain_orchestrator_args: ChainOrchestratorArgs {
             optimistic_sync_trigger: 100,
             chain_buffer_size: 100,
+            ..Default::default()
         },
         sequencer_args: SequencerArgs {
             sequencer_enabled: true,

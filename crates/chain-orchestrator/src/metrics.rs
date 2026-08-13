@@ -1,5 +1,5 @@
 use dogeos_reth_primitives::DogeosBlock;
-use metrics::Histogram;
+use metrics::{Counter, Histogram};
 use metrics_derive::Metrics;
 use std::{collections::HashMap, time::Instant};
 use strum::{EnumIter, IntoEnumIterator};
@@ -115,6 +115,42 @@ impl Task {
 pub(crate) struct ChainOrchestratorMetrics {
     /// The duration of the task for the chain orchestrator.
     pub task_duration: Histogram,
+}
+
+/// Metrics for ordered reconciliation of derived batches.
+#[derive(Metrics, Clone)]
+#[metrics(scope = "chain_orchestrator")]
+pub(crate) struct DerivedBatchMetrics {
+    /// The number of derived-batch reconciliation attempts started.
+    pub derived_batch_attempts: Counter,
+    /// The number of derived-batch reconciliation retries scheduled.
+    pub derived_batch_retries: Counter,
+    /// The number of derived batches that reconciled successfully.
+    pub derived_batch_successes: Counter,
+    /// The number of terminal derived-batch reconciliation failures (fail-stop).
+    pub derived_batch_terminal_failures: Counter,
+    /// The retry backoff waited between derived-batch reconciliation attempts, in seconds.
+    pub derived_batch_retry_backoff_seconds: Histogram,
+}
+
+/// Records the round-trip latency of a single Engine request made during derived-batch
+/// reconciliation, labelled by method and classified outcome.
+///
+/// This is the request/round-trip latency observed by the rollup node, not the execution client's
+/// internal queueing delay (which is not observable from the loopback client). Labels are bounded
+/// to a fixed set of methods and outcomes; batch identities and error text belong in status and
+/// logs.
+pub(crate) fn record_engine_request_latency(
+    method: &'static str,
+    outcome: &'static str,
+    seconds: f64,
+) {
+    metrics::histogram!(
+        "chain_orchestrator_engine_request_latency_seconds",
+        "method" => method,
+        "outcome" => outcome,
+    )
+    .record(seconds);
 }
 
 /// A block building meter.

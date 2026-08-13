@@ -15,6 +15,7 @@ on:
       - ".cargo/**"
       - "Cargo.lock"
       - "Cargo.toml"
+      - ".dockerignore"
       - "Dockerfile"
       - "crates/**"
   workflow_dispatch:

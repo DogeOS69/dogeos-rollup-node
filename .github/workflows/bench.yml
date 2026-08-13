@@ -4,6 +4,7 @@ on:
   pull_request:
   push:
     branches: [main]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -14,6 +15,7 @@ name: bench
 jobs:
   codspeed:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     permissions:
       contents: read
       id-token: write
@@ -29,9 +31,9 @@ jobs:
         with:
           tool: cargo-codspeed
       - name: Build the benchmark target(s)
-        run: cargo codspeed build -p scroll-derivation-pipeline --profile profiling
+        run: cargo codspeed build --measurement-mode simulation --package scroll-derivation-pipeline
       - name: Run the benchmarks
         uses: CodSpeedHQ/action@v5
         with:
           mode: simulation
-          run: cargo codspeed run --workspace
+          run: cargo codspeed run

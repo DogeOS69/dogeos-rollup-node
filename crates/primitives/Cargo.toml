@@ -9,6 +9,10 @@ exclude.workspace = true
 [lints]
 workspace = true
 
+[lib]
+# The library doesn't define any `#[bench]` function: skip the additional test harness build.
+bench = false
+
 [dependencies]
 # alloy
 alloy-chains.workspace = true
@@ -35,6 +39,9 @@ arbitrary = { workspace = true, optional = true }
 derive_more = { workspace = true, features = ["from"] }
 eyre.workspace = true
 serde.workspace = true
+
+[dev-dependencies]
+criterion = { package = "codspeed-criterion-compat", version = "4.0.2" }
 
 [features]
 default = ["std"]
@@ -82,3 +89,7 @@ serde = [
     "scroll-alloy-rpc-types-engine/serde",
     "alloy-rpc-types-eth/serde",
 ]
+
+[[bench]]
+name = "signature"
+harness = false

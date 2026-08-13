@@ -22,8 +22,13 @@ thiserror = { version = "2.0", default-features = false }
 zstd = "=0.13.3"
 
 [dev-dependencies]
+criterion = { package = "codspeed-criterion-compat", version = "4.0.2" }
 eyre.workspace = true
 serde_json = "1.0"
 
 [features]
 test-utils = ["dep:eyre", "scroll-l1/test-utils"]
+
+[[bench]]
+name = "decoding"
+harness = false

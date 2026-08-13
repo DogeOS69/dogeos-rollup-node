@@ -2,6 +2,7 @@
 
 [![test](https://github.com/scroll-tech/rollup-node/actions/workflows/test.yaml/badge.svg)](https://github.com/scroll-tech/rollup-node/actions/workflows/test.yaml)
 [![lint](https://github.com/scroll-tech/rollup-node/actions/workflows/lint.yaml/badge.svg)](https://github.com/scroll-tech/rollup-node/actions/workflows/lint.yaml)
+[![CodSpeed](https://img.shields.io/endpoint?url=https://codspeed.io/badge.json)](https://app.codspeed.io/DogeOS69/dogeos-rollup-node?utm_source=badge)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 ![Rust](https://img.shields.io/badge/rust-2021-orange)
 

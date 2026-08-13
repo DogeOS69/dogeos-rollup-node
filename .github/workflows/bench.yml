@@ -4,6 +4,13 @@ on:
   pull_request:
   push:
     branches: [main]
+  # Allows CodSpeed to trigger a backtest of the benchmarks on demand.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  # Required for the OpenID Connect authentication with CodSpeed.
+  id-token: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -14,6 +21,7 @@ name: bench
 jobs:
   codspeed:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v6
       - uses: rui314/setup-mold@v1
@@ -26,9 +34,13 @@ jobs:
         with:
           tool: cargo-codspeed
       - name: Build the benchmark target(s)
-        run: cargo codspeed build -p scroll-derivation-pipeline --profile profiling
+        run: |
+          cargo codspeed build --measurement-mode simulation \
+            --package scroll-codec \
+            --package rollup-node-primitives \
+            --package scroll-derivation-pipeline
       - name: Run the benchmarks
-        uses: CodSpeedHQ/action@v4
+        uses: CodSpeedHQ/action@v5
         with:
-          mode: instrumentation
-          run: cargo codspeed run --workspace
+          mode: simulation
+          run: cargo codspeed run

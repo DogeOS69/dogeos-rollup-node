@@ -9,8 +9,7 @@ on:
 
 jobs:
   build-and-push:
-    runs-on:
-        group: scroll-reth-runner-group
+    runs-on: ubuntu-latest
     permissions: {}
 
     steps:

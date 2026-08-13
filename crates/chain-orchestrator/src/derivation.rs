@@ -1077,6 +1077,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn syncing_retry_allows_peer_import_then_matching_block_success() {
+        let db = setup_test_db().await;
+        insert_batch_commit(&db, 1).await;
+        let (peer_block, target) = matching_rpc_block(SAFE + 1);
+        let client = Arc::new(ScriptedEngineClient::new());
+        // Attempt 1 cannot build because the Engine is missing the derived block.
+        client
+            .push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Syncing, None)));
+        // Between attempts, the peer import submits that block and advances the Engine head.
+        client.push_new_payload(ScriptedResponse::Ok(payload_status(PayloadStatusEnum::Valid)));
+        client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Valid, None)));
+        // Attempt 2 observes the canonical match and advances safe through strict UpdateFcs.
+        client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Valid, None)));
+        let mut engine = engine_at_safe(client.clone());
+
+        let asserter = Asserter::new();
+        push_absent_block(&asserter);
+        push_block(&asserter, &peer_block);
+        let provider = mock_provider(asserter);
+        let mut driver = DerivationDriver::new(DerivedBatchRetryConfig {
+            max_attempts: 2,
+            initial_backoff_ms: 30_000,
+            max_backoff_ms: 30_000,
+        });
+        driver.hold_batch(matching_batch(1, target.number));
+
+        driver.wait_for_attempt().await;
+        assert!(matches!(
+            driver.run_attempt(&provider, &mut engine, &db).await,
+            AttemptStep::Retrying
+        ));
+
+        // Mirrors the outer run loop while the retry timer is pending: the peer event must remain
+        // runnable and provide the Engine data required for reconciliation progress.
+        tokio::select! {
+            biased;
+            () = driver.wait_for_attempt() => panic!("the retry must not run before its backoff"),
+            import = async {
+                let payload = execution_payload_with_hash(target.number, target.hash);
+                let status = engine.new_payload(payload).await.unwrap();
+                assert!(status.is_valid());
+                let fcu = engine.update_fcs(Some(target), None, None).await.unwrap();
+                assert!(fcu.is_valid());
+                db.set_l2_head_block_number(target.number).await.unwrap();
+            } => import,
+        }
+
+        // Make the scheduled retry due without waiting for the production-shaped backoff.
+        driver.attempt_sleep = Some(Box::pin(tokio::time::sleep(Duration::ZERO)));
+        driver.wait_for_attempt().await;
+        let consolidated = match driver.run_attempt(&provider, &mut engine, &db).await {
+            AttemptStep::Completed(consolidated) => consolidated,
+            other => panic!("expected successful retry after peer import, got {other:?}"),
+        };
+
+        assert!(matches!(
+            consolidated.block_outcomes.as_slice(),
+            [BlockConsolidationOutcome::UpdateFcs(block)] if block.block_info == target
+        ));
+        assert_eq!(client.new_payload_calls(), 1, "the retry must not rebuild the peer block");
+        assert_eq!(client.get_payload_calls(), 0, "the retry must reuse the canonical peer block");
+        assert_eq!(*engine.fcs().safe_block_info(), target);
+        assert_eq!(db.get_l2_head_block_number().await.unwrap(), target.number);
+    }
+
+    #[tokio::test]
     async fn driver_exhausts_retries_and_fails_fatally() {
         let db = setup_test_db().await;
         insert_batch_commit(&db, 1).await;

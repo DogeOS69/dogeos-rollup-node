@@ -362,7 +362,10 @@ impl<
                     // it. No later derivation result is polled while this batch is held.
                     self.derivation_driver.hold_batch(batch);
                 }
-                Some(event) = self.network.events().next(), if !self.has_pending_derivation_work() => {
+                // Peer imports remain live between reconciliation attempts. A SYNCING response can
+                // mean the Engine needs precisely the block arriving here before the retry can
+                // succeed; the biased due-attempt branch above still prevents retry starvation.
+                Some(event) = self.network.events().next() => {
                     let res = self.handle_network_event(event).await;
                     self.handle_outcome(res);
                 }

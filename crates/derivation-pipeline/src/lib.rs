@@ -12,7 +12,10 @@ use rollup_node_primitives::{BatchCommitData, BatchInfo, BatchStatus, L1MessageE
 use rollup_node_providers::L1Provider;
 use scroll_codec::{decoding::payload::PayloadData, Codec, CodecError, DecodingError};
 use scroll_db::{Database, DatabaseReadOperations, L1MessageKey};
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::{
+    mpsc::{UnboundedReceiver, UnboundedSender},
+    Notify,
+};
 
 mod cache;
 use cache::{PreFetchCache, CACHE_SIZE, CACHE_TTL, PREFETCH_RANGE_SIZE};
@@ -96,6 +99,8 @@ pub struct DerivationPipeline {
     len: u64,
     /// Generation of requests that are still valid after the most recent control-plane unwind.
     epoch: Arc<AtomicU64>,
+    /// Wakeable signal used to cancel obsolete worker futures after an unwind.
+    invalidation: Arc<Notify>,
 }
 
 impl DerivationPipeline {
@@ -108,13 +113,14 @@ impl DerivationPipeline {
     where
         P: L1Provider + Clone + Send + Sync + 'static,
     {
-        let (batch_sender, result_receiver, epoch) = DerivationPipelineWorker::spawn_epoch(
-            l1_provider,
-            database,
-            l1_v2_message_queue_start_index,
-        )
-        .await;
-        Self { batch_sender, result_receiver, len: 0, epoch }
+        let (batch_sender, result_receiver, epoch, invalidation) =
+            DerivationPipelineWorker::spawn_epoch(
+                l1_provider,
+                database,
+                l1_v2_message_queue_start_index,
+            )
+            .await;
+        Self { batch_sender, result_receiver, len: 0, epoch, invalidation }
     }
 
     /// Pushes a new batch info to the derivation pipeline.
@@ -130,11 +136,12 @@ impl DerivationPipeline {
 
     /// Invalidates every queued or in-flight result from the current L1 epoch.
     ///
-    /// Workers may finish obsolete futures after this returns, but generation checks prevent those
-    /// results (and failed-work retries) from being observed by the orchestrator.
+    /// The worker is woken so it can drop obsolete futures immediately. Generation checks remain
+    /// as a final guard against results that raced with invalidation.
     pub fn invalidate(&mut self) {
         self.epoch.fetch_add(1, Ordering::AcqRel);
         self.len = 0;
+        self.invalidation.notify_one();
     }
 
     /// Returns the number of active batches being processed.
@@ -196,6 +203,8 @@ pub struct DerivationPipelineWorker<P> {
     metrics: DerivationPipelineMetrics,
     /// Current valid generation, shared with the receiving pipeline.
     epoch: Arc<AtomicU64>,
+    /// Wakes the worker so obsolete ordered futures cannot block the current generation.
+    invalidation: Arc<Notify>,
 }
 
 impl<P> DerivationPipelineWorker<P> {
@@ -214,6 +223,7 @@ impl<P> DerivationPipelineWorker<P> {
             WorkerRequestReceiver::Plain(batch_receiver),
             WorkerResultSender::Plain(result_sender),
             Arc::new(AtomicU64::new(0)),
+            Arc::new(Notify::new()),
         )
         .await
     }
@@ -225,6 +235,7 @@ impl<P> DerivationPipelineWorker<P> {
         batch_receiver: WorkerRequestReceiver,
         result_sender: WorkerResultSender,
         epoch: Arc<AtomicU64>,
+        invalidation: Arc<Notify>,
     ) -> Result<Self, DerivationPipelineError> {
         let cache =
             PreFetchCache::new(database.clone(), CACHE_SIZE, CACHE_TTL, PREFETCH_RANGE_SIZE)
@@ -239,6 +250,7 @@ impl<P> DerivationPipelineWorker<P> {
             l1_v2_message_queue_start_index,
             metrics: DerivationPipelineMetrics::default(),
             epoch,
+            invalidation,
         })
     }
 }
@@ -278,11 +290,18 @@ where
         l1_provider: P,
         database: Arc<Database>,
         l1_v2_message_queue_start_index: u64,
-    ) -> (UnboundedSender<Arc<EpochRequest>>, UnboundedReceiver<EpochResult>, Arc<AtomicU64>) {
+    ) -> (
+        UnboundedSender<Arc<EpochRequest>>,
+        UnboundedReceiver<EpochResult>,
+        Arc<AtomicU64>,
+        Arc<Notify>,
+    ) {
         let (batch_sender, batch_receiver) = tokio::sync::mpsc::unbounded_channel();
         let (result_sender, result_receiver) = tokio::sync::mpsc::unbounded_channel();
         let epoch = Arc::new(AtomicU64::new(0));
         let worker_epoch = epoch.clone();
+        let invalidation = Arc::new(Notify::new());
+        let worker_invalidation = invalidation.clone();
 
         tokio::task::spawn(async move {
             let worker = Self::new_inner(
@@ -292,6 +311,7 @@ where
                 WorkerRequestReceiver::Epoch(batch_receiver),
                 WorkerResultSender::Epoch(result_sender),
                 worker_epoch,
+                worker_invalidation,
             )
             .await
             .expect("Failed to create derivation pipeline worker");
@@ -299,17 +319,23 @@ where
             worker.run().await;
         });
 
-        (batch_sender, result_receiver, epoch)
+        (batch_sender, result_receiver, epoch, invalidation)
     }
 
     /// Runs the derivation pipeline worker.
     async fn run(mut self) {
         tracing::info!(target: "scroll::derivation_pipeline", "Starting derivation pipeline worker");
+        let invalidation = self.invalidation.clone();
 
         loop {
             tokio::select! {
                 biased;
 
+                () = invalidation.notified() => {
+                    // FuturesOrdered does not yield a ready item behind an unresolved front item.
+                    // Drop every active old-generation future so rediscovered work can progress.
+                    self.futures.clear();
+                }
                 maybe_batch = self.batch_receiver.recv(self.epoch.load(Ordering::Acquire)), if self.futures.len() < DERIVATION_PIPELINE_WORKER_CONCURRENCY => {
                     match maybe_batch {
                         Some(request) if request.epoch == self.epoch.load(Ordering::Acquire) => {
@@ -630,8 +656,14 @@ mod tests {
         let (batch_sender, _batch_receiver) = tokio::sync::mpsc::unbounded_channel();
         let (result_sender, result_receiver) = tokio::sync::mpsc::unbounded_channel();
         let epoch = Arc::new(AtomicU64::new(0));
-        let mut pipeline =
-            DerivationPipeline { batch_sender, result_receiver, len: 1, epoch: epoch.clone() };
+        let invalidation = Arc::new(Notify::new());
+        let mut pipeline = DerivationPipeline {
+            batch_sender,
+            result_receiver,
+            len: 1,
+            epoch: epoch.clone(),
+            invalidation,
+        };
         let result = || BatchDerivationResult {
             attributes: Vec::new(),
             batch_info: BatchInfo::new(1, B256::ZERO),
@@ -652,6 +684,92 @@ mod tests {
             .unwrap();
         assert!(pipeline.next().await.is_some(), "current-epoch results must still be delivered");
         assert!(pipeline.is_empty());
+    }
+
+    #[tokio::test]
+    async fn invalidation_cancels_pending_obsolete_future_and_unblocks_rediscovery() {
+        struct NotifyOnDrop(Option<tokio::sync::oneshot::Sender<()>>);
+
+        impl Drop for NotifyOnDrop {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+
+        let database = Arc::new(setup_test_db().await);
+        let batch_hash = b256!("7f26edf8e3decbc1620b4d2ba5f010a6bdd10d6bb16430c4f458134e36ab3961");
+        database
+            .insert_batch(BatchCommitData {
+                hash: batch_hash,
+                index: 12,
+                block_number: 18319648,
+                block_timestamp: 1696935971,
+                calldata: Arc::new(read_to_bytes("./testdata/calldata_v0.bin").unwrap()),
+                blob_versioned_hash: None,
+                finalized_block_number: None,
+                reverted_block_number: None,
+            })
+            .await
+            .unwrap();
+        database.insert_l1_message(L1_MESSAGE_INDEX_33).await.unwrap();
+        database.insert_l1_message(L1_MESSAGE_INDEX_34).await.unwrap();
+        let l1_provider = MockL1Provider { db: database.clone(), blobs: HashMap::new() };
+        let (batch_sender, batch_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (result_sender, mut result_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let epoch = Arc::new(AtomicU64::new(0));
+        let invalidation = Arc::new(Notify::new());
+        let mut worker = DerivationPipelineWorker::new_inner(
+            l1_provider,
+            database,
+            u64::MAX,
+            WorkerRequestReceiver::Epoch(batch_receiver),
+            WorkerResultSender::Epoch(result_sender),
+            epoch.clone(),
+            invalidation.clone(),
+        )
+        .await
+        .unwrap();
+
+        let (dropped_sender, dropped_receiver) = tokio::sync::oneshot::channel();
+        worker.futures.push_back(Box::pin(async move {
+            let _drop_signal = NotifyOnDrop(Some(dropped_sender));
+            std::future::pending::<
+                Result<EpochResult, (Arc<EpochRequest>, DerivationPipelineError)>,
+            >()
+            .await
+        }));
+
+        let worker_task = tokio::spawn(worker.run());
+        tokio::task::yield_now().await;
+        epoch.fetch_add(1, Ordering::AcqRel);
+        invalidation.notify_one();
+
+        tokio::time::timeout(Duration::from_secs(1), dropped_receiver)
+            .await
+            .expect("invalidation must wake the worker and cancel the obsolete future")
+            .expect("the obsolete future must be dropped");
+        assert!(!worker_task.is_finished(), "the worker must remain available for rediscovery");
+
+        batch_sender
+            .send(Arc::new(EpochRequest {
+                epoch: epoch.load(Ordering::Acquire),
+                request: Arc::new(BatchDerivationRequest {
+                    batch_info: BatchInfo::new(12, batch_hash),
+                    target_status: BatchStatus::Consolidated,
+                }),
+            }))
+            .unwrap();
+        let rediscovered = tokio::time::timeout(Duration::from_secs(1), result_receiver.recv())
+            .await
+            .expect("rediscovered work must not remain blocked behind the obsolete future")
+            .expect("the worker must return the rediscovered batch");
+        assert_eq!(rediscovered.epoch, epoch.load(Ordering::Acquire));
+        assert_eq!(rediscovered.result.batch_info, BatchInfo::new(12, batch_hash));
+
+        drop(batch_sender);
+        worker_task.await.unwrap();
     }
 
     #[tokio::test]

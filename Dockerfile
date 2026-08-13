@@ -2,9 +2,13 @@ FROM rust:1.88.0 AS chef
 
 ARG CARGO_FEATURES=""
 
-# Install basic packages
-RUN apt-get update && apt-get -y upgrade && apt-get install -y libclang-dev pkg-config
-RUN cargo install cargo-chef --locked --version  0.1.71
+# Install only the packages required to compile the workspace. Upgrading the
+# entire base image adds network and package churn without changing the Rust
+# build inputs.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libclang-dev pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+RUN cargo install cargo-chef --locked --version 0.1.71
 
 FROM chef AS planner
 WORKDIR /app
@@ -15,9 +19,14 @@ FROM chef AS builder
 WORKDIR /app
 COPY --from=planner /recipe.json recipe.json
 COPY .cargo /app/.cargo
+
+# The source bind mount in the final build shadows /app, including
+# /app/target. Keep cargo-chef's artifacts outside that mount so the final
+# cargo build can reuse them instead of compiling the dependency graph twice.
+ENV CARGO_TARGET_DIR=/app-target
 RUN cargo chef cook --release --recipe-path recipe.json
 RUN --mount=target=. \
-    cargo build ${CARGO_FEATURES:+--features $CARGO_FEATURES} --release --target-dir=/app-target
+    cargo build ${CARGO_FEATURES:+--features $CARGO_FEATURES} --release
 
 # Release
 

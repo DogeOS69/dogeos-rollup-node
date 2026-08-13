@@ -96,6 +96,7 @@ mod tests {
     use alloy_consensus::Header;
     use alloy_eips::Encodable2718;
     use alloy_primitives::{Bytes, B256, U256};
+    use alloy_rpc_types_engine::PayloadAttributes;
     use arbitrary::{Arbitrary, Unstructured};
     use dogeos_protocol_types::ScrollTxEnvelope;
     use dogeos_reth_engine::BlockDataHint;
@@ -119,11 +120,12 @@ mod tests {
         let timestamp = u64::arbitrary(&mut unstructured)?;
         let block_data_hint = BlockDataHint::default();
 
-        let mut attributes = ScrollPayloadAttributes::default();
-        attributes.transactions = Some(encoded_transactions);
-        attributes.payload_attributes.timestamp = timestamp;
-        attributes.payload_attributes.prev_randao = prev_randao;
-        attributes.block_data_hint = block_data_hint.clone();
+        let attributes = ScrollPayloadAttributes {
+            payload_attributes: PayloadAttributes { timestamp, prev_randao, ..Default::default() },
+            transactions: Some(encoded_transactions),
+            block_data_hint: block_data_hint.clone(),
+            ..Default::default()
+        };
 
         let block = DogeosBlock {
             header: Header {

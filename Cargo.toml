@@ -239,13 +239,6 @@ tokio-stream = { version = "0.1", default-features = false }
 tracing = "0.1.0"
 getrandom = { version = "0.2", features = ["js"] }
 
-[patch.crates-io]
-# solar: foundry patches these from crates.io to a git rev that has MIN_SOLIDITY_VERSION
-solar-compiler = { git = "https://github.com/paradigmxyz/solar", rev = "530f129b1b2d7138df973dd71d2fc1e592b593d7" }
-solar-interface = { git = "https://github.com/paradigmxyz/solar", rev = "530f129b1b2d7138df973dd71d2fc1e592b593d7" }
-solar-ast = { git = "https://github.com/paradigmxyz/solar", rev = "530f129b1b2d7138df973dd71d2fc1e592b593d7" }
-solar-sema = { git = "https://github.com/paradigmxyz/solar", rev = "530f129b1b2d7138df973dd71d2fc1e592b593d7" }
-
 # [patch."https://github.com/DogeOS69/reth.git"]
 # reth-chainspec = { path = "../reth/crates/chainspec" }
 # reth-e2e-test-utils = { path = "../reth/crates/e2e-test-utils" }

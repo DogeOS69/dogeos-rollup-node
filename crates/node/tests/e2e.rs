@@ -26,7 +26,7 @@ use rollup_node_chain_orchestrator::{ChainOrchestratorEvent, SyncMode};
 use rollup_node_primitives::{sig_encode_hash, BatchCommitData, BlockInfo};
 use rollup_node_watcher::L1Notification;
 use scroll_db::{test_utils::setup_test_db, L1MessageKey};
-use scroll_network::{DogeosNetworkPrimitives, NewBlockWithPeer};
+use scroll_network::{DogeosNetworkPrimitives, NewBlockWithPeer, ETH_WIRE_BLOCK_CHANNEL_SIZE};
 use scroll_wire::{ScrollWireConfig, ScrollWireProtocolHandler};
 use std::{
     future::Future,
@@ -575,11 +575,13 @@ async fn can_bridge_blocks() -> eyre::Result<()> {
     bridge_node_l1_watcher_tx.notification_tx.send(Arc::new(L1Notification::Synced)).await.unwrap();
 
     // Instantiate the scroll NetworkManager.
-    let network_config = NetworkConfigBuilder::<DogeosNetworkPrimitives>::with_rng_secret_key()
-        .disable_discovery()
-        .with_unused_listener_port()
-        .with_pow()
-        .build_with_noop_provider(chain_spec.clone());
+    let network_config = NetworkConfigBuilder::<DogeosNetworkPrimitives>::with_rng_secret_key(
+        bridge_node.task_executor.clone(),
+    )
+    .disable_discovery()
+    .with_unused_listener_port()
+    .with_pow()
+    .build_with_noop_provider(chain_spec.clone());
     let scroll_wire_config = ScrollWireConfig::new(true);
     let (scroll_network, scroll_network_handle) = scroll_network::ScrollNetworkManager::new(
         chain_spec.clone(),
@@ -598,11 +600,13 @@ async fn can_bridge_blocks() -> eyre::Result<()> {
     bridge_node.network.next_session_established().await;
 
     // Create a standard NetworkManager to send blocks to the bridge node.
-    let network_config = NetworkConfigBuilder::<DogeosNetworkPrimitives>::with_rng_secret_key()
-        .disable_discovery()
-        .with_pow()
-        .with_unused_listener_port()
-        .build_with_noop_provider(chain_spec);
+    let network_config = NetworkConfigBuilder::<DogeosNetworkPrimitives>::with_rng_secret_key(
+        bridge_node.task_executor.clone(),
+    )
+    .disable_discovery()
+    .with_pow()
+    .with_unused_listener_port()
+    .build_with_noop_provider(chain_spec);
 
     // Create the standard NetworkManager.
     let network = reth_network::NetworkManager::new(network_config)
@@ -686,6 +690,10 @@ async fn shutdown_consolidates_most_recent_batch_on_startup() -> eyre::Result<()
     config.hydrate(node.inner.config.clone()).await?;
 
     let (_, events) = ScrollWireProtocolHandler::new(ScrollWireConfig::new(true));
+    // Hold the ETH-wire block sender for as long as the orchestrator runs; dropping it would
+    // close the receiver the orchestrator polls.
+    let (_eth_wire_block_tx, eth_wire_block_rx) =
+        tokio::sync::mpsc::channel(ETH_WIRE_BLOCK_CHANNEL_SIZE);
     let (chain_orchestrator, handle) = config
         .clone()
         .build(
@@ -697,6 +705,7 @@ async fn shutdown_consolidates_most_recent_batch_on_startup() -> eyre::Result<()
                 node.inner.task_executor.clone(),
             ),
             events,
+            eth_wire_block_rx,
             node.inner.add_ons_handle.rpc_server_handles.clone(),
         )
         .await?;
@@ -846,6 +855,9 @@ async fn shutdown_consolidates_most_recent_batch_on_startup() -> eyre::Result<()
 
     // Start the RNM again.
     let (_, events) = ScrollWireProtocolHandler::new(ScrollWireConfig::new(true));
+    // Separately named sender for the restarted orchestrator, held for its lifetime.
+    let (_eth_wire_block_tx_restart, eth_wire_block_rx_restart) =
+        tokio::sync::mpsc::channel(ETH_WIRE_BLOCK_CHANNEL_SIZE);
     let (chain_orchestrator, handle) = config
         .clone()
         .build(
@@ -857,6 +869,7 @@ async fn shutdown_consolidates_most_recent_batch_on_startup() -> eyre::Result<()
                 node.inner.task_executor.clone(),
             ),
             events,
+            eth_wire_block_rx_restart,
             node.inner.add_ons_handle.rpc_server_handles.clone(),
         )
         .await?;
@@ -964,6 +977,10 @@ async fn graceful_shutdown_sets_fcs_to_latest_signed_block_in_db_on_start_up() -
     config.hydrate(node.inner.config.clone()).await?;
 
     let (_, events) = ScrollWireProtocolHandler::new(ScrollWireConfig::new(true));
+    // Hold the ETH-wire block sender for as long as the orchestrator runs; dropping it would
+    // close the receiver the orchestrator polls.
+    let (_eth_wire_block_tx, eth_wire_block_rx) =
+        tokio::sync::mpsc::channel(ETH_WIRE_BLOCK_CHANNEL_SIZE);
     let (rnm, handle) = config
         .clone()
         .build(
@@ -975,6 +992,7 @@ async fn graceful_shutdown_sets_fcs_to_latest_signed_block_in_db_on_start_up() -
                 node.inner.task_executor.clone(),
             ),
             events,
+            eth_wire_block_rx,
             node.inner.add_ons_handle.rpc_server_handles.clone(),
         )
         .await?;
@@ -1038,6 +1056,9 @@ async fn graceful_shutdown_sets_fcs_to_latest_signed_block_in_db_on_start_up() -
 
     // Start the RNM again.
     let (_, events) = ScrollWireProtocolHandler::new(ScrollWireConfig::new(true));
+    // Separately named sender for the restarted orchestrator, held for its lifetime.
+    let (_eth_wire_block_tx_restart, eth_wire_block_rx_restart) =
+        tokio::sync::mpsc::channel(ETH_WIRE_BLOCK_CHANNEL_SIZE);
     let (rnm, handle) = config
         .clone()
         .build(
@@ -1049,6 +1070,7 @@ async fn graceful_shutdown_sets_fcs_to_latest_signed_block_in_db_on_start_up() -
                 node.inner.task_executor.clone(),
             ),
             events,
+            eth_wire_block_rx_restart,
             node.inner.add_ons_handle.rpc_server_handles.clone(),
         )
         .await?;

@@ -42,6 +42,7 @@ async fn test_should_consolidate_to_block_15k() -> eyre::Result<()> {
             enable_scroll_wire: false,
             sequencer_url: None,
             signer_address: None,
+            legacy_geth_header_transform: false,
         },
         database_args: RollupNodeDatabaseArgs::default(),
         chain_orchestrator_args: ChainOrchestratorArgs {

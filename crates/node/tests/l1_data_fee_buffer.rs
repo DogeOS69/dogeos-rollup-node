@@ -41,13 +41,8 @@ async fn test_l1_data_fee_buffer() -> eyre::Result<()> {
     }
 
     // Build the chain spec with the modified genesis.
-    let chain_spec = Arc::new(
-        DogeosChainSpecBuilder::default()
-            .chain(DOGEOS_DEV.chain())
-            .genesis(genesis)
-            .with_forks(DOGEOS_DEV.hardforks.clone())
-            .build(ScrollChainConfig::dev()),
-    );
+    let chain_spec =
+        Arc::new(DogeosChainSpecBuilder::dev().genesis(genesis).build(ScrollChainConfig::dev()));
 
     // Base test fixture builder (created twice since .build() consumes it)
     let base_fixture = || {

@@ -30,17 +30,11 @@ impl TestFixture {
         }
 
         tracing::info!("Shutting down node at index {}", node_index);
-        let NodeHandle {
-            node,
-            engine: _,
-            mut chain_orchestrator_rx,
-            rollup_manager_handle: _r_h,
-            typ: _,
-        } = self
-            .nodes
-            .get_mut(node_index)
-            .and_then(|opt| opt.take())
-            .expect("Node existence checked above");
+        let NodeHandle { node, mut chain_orchestrator_rx, rollup_manager_handle: _r_h, typ: _ } =
+            self.nodes
+                .get_mut(node_index)
+                .and_then(|opt| opt.take())
+                .expect("Node existence checked above");
         let ScrollNodeTestComponents { node, task_executor, exit_future, rollup_manager_handle: _ } =
             node;
 

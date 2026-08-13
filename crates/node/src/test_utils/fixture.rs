@@ -12,6 +12,7 @@ use crate::{
 
 use alloy_eips::BlockNumberOrTag;
 use alloy_network::Ethereum;
+use alloy_node_bindings::{Anvil, AnvilInstance};
 use alloy_primitives::Address;
 use alloy_provider::{ext::AnvilApi, layers::CacheLayer, Provider, ProviderBuilder};
 use alloy_rpc_client::RpcClient;
@@ -22,8 +23,7 @@ use alloy_transport::layers::RetryBackoffLayer;
 use dogeos_chainspec::{DogeosChainSpec, DOGEOS_DEV};
 use dogeos_protocol_types::ScrollPooledTransaction;
 use dogeos_reth_primitives::DogeosPrimitives;
-use dogeos_rpc_types::Transaction;
-use reth_chainspec::EthChainSpec;
+use dogeos_rpc_types::ScrollRpcTransaction;
 use reth_cli::chainspec::ChainSpecParser;
 use reth_e2e_test_utils::{wallet::Wallet, NodeHelperType, TmpDB};
 use reth_eth_wire_types::BasicNetworkPrimitives;
@@ -37,13 +37,13 @@ use reth_provider::providers::BlockchainProvider;
 use reth_tasks::TaskExecutor;
 use reth_tokio_util::EventStream;
 use rollup_node_chain_orchestrator::{ChainOrchestratorEvent, ChainOrchestratorHandle};
-use rollup_node_primitives::BlockInfo;
 use rollup_node_sequencer::L1MessageInclusionMode;
-use scroll_engine::{Engine, ForkchoiceState, ScrollAuthApiEngineClient, ScrollEngineApi};
 use std::{
+    ffi::{OsStr, OsString},
     fmt::{Debug, Formatter},
     ops::{Deref, DerefMut},
-    path::PathBuf,
+    path::{Path, PathBuf},
+    process::Command,
     sync::Arc,
 };
 use tokio::sync::Mutex;
@@ -66,7 +66,9 @@ pub struct TestFixture {
     /// L1 provider for making L1 RPC calls (if connected to real L1).
     pub l1_provider: Option<L1Provider>,
     /// Optional Anvil instance for L1 simulation.
-    pub anvil: Option<anvil::NodeHandle>,
+    ///
+    /// Owns the external `anvil` child process; dropping the fixture terminates it.
+    pub anvil: Option<AnvilInstance>,
     /// The configuration for the nodes.
     pub config: ScrollRollupNodeConfig,
     /// Whether this fixture has a remote source node (always the last node).
@@ -172,8 +174,6 @@ impl Deref for ScrollNodeTestComponents {
 pub struct NodeHandle {
     /// The underlying node context.
     pub node: ScrollNodeTestComponents,
-    /// Engine instance for this node.
-    pub engine: Engine<Arc<dyn ScrollEngineApi + Send + Sync + 'static>>,
     /// Chain orchestrator listener.
     pub chain_orchestrator_rx: EventStream<ChainOrchestratorEvent>,
     /// Chain orchestrator handle.
@@ -185,22 +185,12 @@ pub struct NodeHandle {
 impl NodeHandle {
     /// Create a new node handle.
     pub async fn new(node: ScrollNodeTestComponents, typ: NodeType) -> eyre::Result<Self> {
-        // Create engine for the node
-        let genesis_hash = node.inner.chain_spec().genesis_hash();
-        let auth_client = node.inner.engine_http_client();
-        let engine_client = Arc::new(ScrollAuthApiEngineClient::new(auth_client))
-            as Arc<dyn ScrollEngineApi + Send + Sync + 'static>;
-        let fcs = ForkchoiceState::new(
-            BlockInfo { hash: genesis_hash, number: 0 },
-            Default::default(),
-            Default::default(),
-        );
-        let engine = Engine::new(Arc::new(engine_client), fcs);
-
+        // Block production drives the node through the rollup-manager handle, so the
+        // handle only needs to observe chain-orchestrator events.
         let rollup_manager_handle = node.rollup_manager_handle.clone();
         let chain_orchestrator_rx = rollup_manager_handle.get_event_listener().await?;
 
-        Ok(Self { node, engine, chain_orchestrator_rx, rollup_manager_handle, typ })
+        Ok(Self { node, chain_orchestrator_rx, rollup_manager_handle, typ })
     }
 
     /// Returns true if this is a handle to the sequencer.
@@ -223,7 +213,6 @@ impl Debug for NodeHandle {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NodeHandle")
             .field("node", &"NodeHelper")
-            .field("engine", &"Box<dyn ScrollEngineApi>")
             .field("rollup_manager_handle", &self.rollup_manager_handle)
             .finish()
     }
@@ -305,7 +294,7 @@ impl TestFixture {
     }
 
     /// Get the current (latest) block from a specific node.
-    pub async fn get_block(&self, node_index: usize) -> eyre::Result<Block<Transaction>> {
+    pub async fn get_block(&self, node_index: usize) -> eyre::Result<Block<ScrollRpcTransaction>> {
         use reth_rpc_api::EthApiServer;
 
         let node = self.nodes[node_index]
@@ -321,7 +310,7 @@ impl TestFixture {
     }
 
     /// Get the current (latest) block from the sequencer node.
-    pub async fn get_sequencer_block(&self) -> eyre::Result<Block<Transaction>> {
+    pub async fn get_sequencer_block(&self) -> eyre::Result<Block<ScrollRpcTransaction>> {
         self.get_block(0).await
     }
 
@@ -354,7 +343,7 @@ impl TestFixture {
             );
             let client = RpcClient::builder()
                 .layer(retry_layer)
-                .http(anvil.http_endpoint().parse().expect("failed to parse anvil http endpoint"));
+                .http(anvil.endpoint().parse().expect("failed to parse anvil http endpoint"));
             let cache_layer = CacheLayer::new(constants::L1_PROVIDER_CACHE_MAX_ITEMS);
             ProviderBuilder::new().layer(cache_layer).connect_client(client)
         })
@@ -744,12 +733,11 @@ impl TestFixtureBuilder {
                 self.anvil_config.chain_id,
                 self.anvil_config.block_time,
                 self.anvil_config.slots_in_an_epoch,
-            )
-            .await?;
+            )?;
 
             // Parse endpoint URL once and reuse
             let endpoint_url = handle
-                .http_endpoint()
+                .endpoint()
                 .parse::<reqwest::Url>()
                 .map_err(|e| eyre::eyre!("Failed to parse Anvil endpoint URL: {}", e))?;
 
@@ -831,37 +819,171 @@ impl TestFixtureBuilder {
         })
     }
 
-    /// Spawn an Anvil instance with the given configuration.
-    async fn spawn_anvil(
-        state_path: Option<&std::path::Path>,
+    /// Spawn an external Anvil instance with the given configuration.
+    ///
+    /// The `anvil` executable is resolved from the [`ANVIL_BIN_ENV`] environment
+    /// variable, falling back to `anvil` on `PATH`. A compatibility preflight
+    /// (see [`check_anvil_version`]) runs before every spawn so that a missing or
+    /// mismatched binary produces an actionable error rather than an opaque test
+    /// failure.
+    fn spawn_anvil(
+        state_path: Option<&Path>,
         chain_id: Option<u64>,
         block_time: Option<u64>,
         slots_in_an_epoch: u64,
-    ) -> eyre::Result<anvil::NodeHandle> {
-        let mut config = anvil::NodeConfig { port: 0, ..Default::default() };
+    ) -> eyre::Result<AnvilInstance> {
+        let program = anvil_executable();
+        preflight_anvil_version(&program)?;
+
+        // Bind to an ephemeral port; `try_spawn` parses the real port from stdout.
+        let mut anvil = Anvil::new().path(program).port(0u16);
 
         if let Some(id) = chain_id {
-            config.chain_id = Some(id);
+            anvil = anvil.chain_id(id);
         }
 
-        // Configure block time
         if let Some(time) = block_time {
-            config.block_time = Some(std::time::Duration::from_secs(time));
+            anvil = anvil.block_time(time);
         }
 
-        // Load state from file if provided
+        // Load the pre-populated L1 state (batch contracts, funded accounts) that the
+        // in-process backend previously deserialized via `SerializableState::load`.
         if let Some(path) = state_path {
-            let state = anvil::eth::backend::db::SerializableState::load(path).map_err(|e| {
-                eyre::eyre!("Failed to load Anvil state from {}: {:?}", path.display(), e)
-            })?;
-            tracing::info!("Loaded Anvil state from: {}", path.display());
-            config.init_state = Some(state);
+            if !path.exists() {
+                return Err(eyre::eyre!("Anvil state file not found: {}", path.display()));
+            }
+            anvil = anvil.arg("--load-state").arg(path);
+            tracing::info!("Loading Anvil state from: {}", path.display());
         }
 
-        config.slots_in_an_epoch = slots_in_an_epoch;
+        anvil = anvil.arg("--slots-in-an-epoch").arg(slots_in_an_epoch.to_string());
 
-        // Spawn Anvil and return the NodeHandle
-        let (_api, handle) = anvil::spawn(config).await;
-        Ok(handle)
+        anvil.try_spawn().map_err(|e| eyre::eyre!("Failed to spawn Anvil: {e}"))
+    }
+}
+
+/// Environment variable that overrides the `anvil` executable used by the L1
+/// integration-test fixture. When unset, `anvil` is resolved from `PATH`.
+pub const ANVIL_BIN_ENV: &str = "ANVIL_BIN";
+
+/// The commit that uniquely identifies the accepted Anvil build: the official
+/// Foundry `v1.5.0` release. This is the definitive pin — the same source is
+/// published both as the immutable `v1.5.0` tag (whose `--version` reports
+/// `1.5.0-v1.5.0`) and via the mutable `stable` channel (`1.5.0-stable`), so the
+/// version string is matched only by prefix. See `.github/assets/install_anvil.sh`.
+const REQUIRED_ANVIL_COMMIT: &str = "1c57854462289b2e71ee7654cd6666217ed86ffd";
+
+/// Version prefix the accepted release reports, ignoring the build-channel suffix.
+const REQUIRED_ANVIL_VERSION_PREFIX: &str = "1.5.0";
+
+/// Resolve the `anvil` executable, honoring the [`ANVIL_BIN_ENV`] override.
+fn anvil_executable() -> OsString {
+    std::env::var_os(ANVIL_BIN_ENV).unwrap_or_else(|| OsString::from("anvil"))
+}
+
+/// Run the Anvil compatibility preflight, returning an actionable error unless the
+/// resolved binary reports the pinned version and commit.
+fn preflight_anvil_version(program: &OsStr) -> eyre::Result<()> {
+    let output = Command::new(program).arg("--version").output().map_err(|e| {
+        eyre::eyre!(
+            "failed to execute Anvil binary `{}`: {e}\nInstall the pinned release with \
+             .github/assets/install_anvil.sh and point {ANVIL_BIN_ENV} at it (or add `anvil` to PATH).",
+            program.to_string_lossy(),
+        )
+    })?;
+
+    if !output.status.success() {
+        return Err(eyre::eyre!(
+            "Anvil binary `{}` exited with {} for `--version`; stderr: {}",
+            program.to_string_lossy(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim(),
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    check_anvil_version(&stdout).map_err(|e| {
+        eyre::eyre!(
+            "{e}\nresolved Anvil binary: `{}`\nInstall the pinned release with \
+             .github/assets/install_anvil.sh and point {ANVIL_BIN_ENV} at it.",
+            program.to_string_lossy(),
+        )
+    })
+}
+
+/// Verify that `anvil --version` output matches the pinned release.
+///
+/// The commit is matched exactly; the version is matched by prefix because the same
+/// build is published under different channel suffixes. The expected output begins
+/// with two lines of the form:
+///
+/// ```text
+/// anvil Version: 1.5.0-v1.5.0
+/// Commit SHA: 1c57854462289b2e71ee7654cd6666217ed86ffd
+/// ```
+fn check_anvil_version(version_output: &str) -> eyre::Result<()> {
+    let version = parse_version_field(version_output, "anvil Version:").ok_or_else(|| {
+        eyre::eyre!("could not find `anvil Version:` line in `anvil --version` output")
+    })?;
+    let commit = parse_version_field(version_output, "Commit SHA:").ok_or_else(|| {
+        eyre::eyre!("could not find `Commit SHA:` line in `anvil --version` output")
+    })?;
+
+    if !version.starts_with(REQUIRED_ANVIL_VERSION_PREFIX) || commit != REQUIRED_ANVIL_COMMIT {
+        return Err(eyre::eyre!(
+            "incompatible Anvil: found version `{version}` commit `{commit}`, \
+             require version `{REQUIRED_ANVIL_VERSION_PREFIX}*` commit `{REQUIRED_ANVIL_COMMIT}`",
+        ));
+    }
+
+    Ok(())
+}
+
+/// Extract the trimmed value following `label` from the first matching line.
+fn parse_version_field<'a>(output: &'a str, label: &str) -> Option<&'a str> {
+    output.lines().find_map(|line| line.trim().strip_prefix(label).map(str::trim))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{check_anvil_version, REQUIRED_ANVIL_COMMIT};
+
+    fn version_output(version: &str, commit: &str) -> String {
+        format!(
+            "anvil Version: {version}\nCommit SHA: {commit}\nBuild Timestamp: \
+             2025-11-26T09:14:24.173470686Z\nBuild Profile: maxperf\n",
+        )
+    }
+
+    #[test]
+    fn accepts_tagged_release_suffix() {
+        // The immutable `v1.5.0` archive CI installs reports this suffix.
+        let output = version_output("1.5.0-v1.5.0", REQUIRED_ANVIL_COMMIT);
+        assert!(check_anvil_version(&output).is_ok());
+    }
+
+    #[test]
+    fn accepts_stable_channel_suffix() {
+        // A local `foundryup stable` build at the same commit reports this suffix.
+        let output = version_output("1.5.0-stable", REQUIRED_ANVIL_COMMIT);
+        assert!(check_anvil_version(&output).is_ok());
+    }
+
+    #[test]
+    fn rejects_wrong_version() {
+        let output = version_output("1.4.0-stable", REQUIRED_ANVIL_COMMIT);
+        assert!(check_anvil_version(&output).is_err());
+    }
+
+    #[test]
+    fn rejects_wrong_commit() {
+        let output = version_output("1.5.0-v1.5.0", "0000000000000000000000000000000000000000");
+        assert!(check_anvil_version(&output).is_err());
+    }
+
+    #[test]
+    fn rejects_missing_fields() {
+        assert!(check_anvil_version("anvil 1.5.0\n").is_err());
+        assert!(check_anvil_version("").is_err());
     }
 }

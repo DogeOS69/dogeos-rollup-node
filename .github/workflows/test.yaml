@@ -48,6 +48,10 @@ jobs:
         with:
           cache-on-failure: true
       - uses: taiki-e/install-action@nextest
+      - name: Install pinned Anvil
+        run: |
+          ANVIL_BIN="$(.github/assets/install_anvil.sh "$RUNNER_TEMP/anvil" | tail -n1)"
+          echo "ANVIL_BIN=$ANVIL_BIN" >> "$GITHUB_ENV"
       - name: Run integration tests
         run: |
           cargo nextest run --all-features --workspace --locked \

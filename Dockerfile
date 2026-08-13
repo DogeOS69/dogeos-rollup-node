@@ -24,9 +24,9 @@ COPY .cargo /app/.cargo
 # /app/target. Keep cargo-chef's artifacts outside that mount so the final
 # cargo build can reuse them instead of compiling the dependency graph twice.
 ENV CARGO_TARGET_DIR=/app-target
-RUN cargo chef cook --release --recipe-path recipe.json
+RUN cargo chef cook --release --bin rollup-node --recipe-path recipe.json
 RUN --mount=target=. \
-    cargo build ${CARGO_FEATURES:+--features $CARGO_FEATURES} --release
+    cargo build ${CARGO_FEATURES:+--features $CARGO_FEATURES} --release --bin rollup-node
 
 # Release
 

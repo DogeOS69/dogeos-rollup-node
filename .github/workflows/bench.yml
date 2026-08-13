@@ -14,6 +14,9 @@ name: bench
 jobs:
   codspeed:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v6
       - uses: rui314/setup-mold@v1
@@ -28,7 +31,7 @@ jobs:
       - name: Build the benchmark target(s)
         run: cargo codspeed build -p scroll-derivation-pipeline --profile profiling
       - name: Run the benchmarks
-        uses: CodSpeedHQ/action@v4
+        uses: CodSpeedHQ/action@v5
         with:
-          mode: instrumentation
+          mode: simulation
           run: cargo codspeed run --workspace

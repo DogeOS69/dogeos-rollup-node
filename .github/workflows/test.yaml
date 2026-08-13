@@ -12,10 +12,11 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
 
+# Override this repository variable with a compatible x64 Linux runner label when the standard
+# public runner does not provide enough memory or disk for the workspace build.
 jobs:
   unit:
-    runs-on:
-      group: scroll-reth-runner-group
+    runs-on: ${{ vars.CI_TEST_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 60
     env:
       RUST_BACKTRACE: 1
@@ -33,8 +34,7 @@ jobs:
         run: cargo nextest run --all-features --workspace --locked -E '!kind(test)'
 
   integration:
-    runs-on:
-      group: scroll-reth-runner-group
+    runs-on: ${{ vars.CI_TEST_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 60
     env:
       RUST_BACKTRACE: 1
@@ -55,8 +55,7 @@ jobs:
             -- --skip test_should_consolidate_to_block_15k
 
   integration-docker-compose:
-    runs-on:
-      group: scroll-reth-runner-group
+    runs-on: ${{ vars.CI_TEST_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 90
     env:
       RUST_BACKTRACE: 1

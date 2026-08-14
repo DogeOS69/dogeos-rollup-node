@@ -221,9 +221,7 @@ impl<
                 signer,
                 derivation_pipeline,
                 derivation_driver: DerivationDriver::default(),
-                buffered_l1_notifications: VecDeque::with_capacity(
-                    buffered_l1_notification_capacity,
-                ),
+                buffered_l1_notifications: VecDeque::new(),
                 buffered_l1_notification_capacity,
                 handle_rx,
                 event_sender: None,
@@ -1945,11 +1943,13 @@ mod run_loop_policy_tests {
         database.update_batch_status(batch_info.hash, BatchStatus::Processing).await.unwrap();
 
         let engine_client = Arc::new(ScriptedEngineClient::new());
-        engine_client
-            .push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Syncing, None)));
+        engine_client.push_fork_choice_updated(ScriptedResponse::DelayThen(
+            Duration::from_secs(30),
+            Box::new(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Syncing, None))),
+        ));
         let asserter = Asserter::new();
         asserter.push_success(&Option::<()>::None);
-        let (orchestrator, handle, notification_tx) = test_orchestrator(
+        let (orchestrator, _handle, notification_tx) = test_orchestrator(
             database.clone(),
             engine_client.clone(),
             asserter,
@@ -1970,19 +1970,12 @@ mod run_loop_policy_tests {
             let _ = shutdown_rx.await;
         })));
         time::timeout(Duration::from_secs(2), async {
-            loop {
-                let status = handle.status().await.unwrap();
-                if matches!(
-                    status.derivation,
-                    DerivationStatus::Held(HeldBatchStatus { attempts_started: 1, .. })
-                ) {
-                    break
-                }
+            while engine_client.fork_choice_updated_calls() == 0 {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("first Engine SYNCING response must hold the batch");
+        .expect("build forkchoiceUpdated must be pending before FIFO overflow");
 
         for block_number in 0..=TEST_L1_NOTIFICATION_CAPACITY {
             notification_tx
@@ -2009,11 +2002,15 @@ mod run_loop_policy_tests {
             "overflow must preserve ownership for restart recovery"
         );
         assert_eq!(engine_client.fork_choice_updated_calls(), 1);
+        assert_eq!(engine_client.get_payload_calls(), 0);
+        assert_eq!(engine_client.new_payload_calls(), 0);
 
-        // Wait beyond the first retry deadline to prove the cancelled run loop cannot call the
-        // Engine again.
-        time::sleep(Duration::from_millis(2_100)).await;
+        // The delayed response would still be pending, so any additional call here would prove
+        // that overflow failed to drop the attempt and terminate its run loop.
+        time::sleep(Duration::from_millis(100)).await;
         assert_eq!(engine_client.fork_choice_updated_calls(), 1);
+        assert_eq!(engine_client.get_payload_calls(), 0);
+        assert_eq!(engine_client.new_payload_calls(), 0);
     }
 
     #[tokio::test]

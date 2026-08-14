@@ -13,7 +13,7 @@ use rollup_node_primitives::{
     BatchConsolidationOutcome, BatchInfo, BatchStatus, BlockConsolidationOutcome,
     L2BlockInfoWithL1Messages,
 };
-use scroll_db::{Database, DatabaseReadOperations, DatabaseWriteOperations};
+use scroll_db::{Database, DatabaseReadOperations, DatabaseWriteOperations, UnwindResult};
 use scroll_derivation_pipeline::BatchDerivationResult;
 use scroll_engine::{Engine, ScrollEngineApi};
 use std::{pin::Pin, time::Duration};
@@ -228,42 +228,68 @@ impl DerivationDriver {
         })
     }
 
-    /// Revalidates the held row after the database has unwound to `ancestor`.
-    pub(crate) async fn revalidate_after_unwind(
+    /// Atomically unwinds the database and decides whether the held row survives `ancestor`.
+    pub(crate) async fn unwind_and_revalidate(
         &mut self,
         database: &Database,
         ancestor: u64,
-    ) -> Result<HeldReorgOutcome, ChainOrchestratorError> {
-        let Some(held) = self.held_identity() else { return Ok(HeldReorgOutcome::NoHeldBatch) };
+    ) -> Result<(UnwindResult, HeldReorgOutcome), ChainOrchestratorError> {
+        let held = self.held_identity();
+        let (unwind_result, outcome) = database
+            .tx_mut(move |tx| async move {
+                let unwind_result = tx.unwind(ancestor).await?;
+                let Some(held) = held else {
+                    return Ok::<_, ChainOrchestratorError>((
+                        unwind_result,
+                        HeldReorgOutcome::NoHeldBatch,
+                    ))
+                };
 
-        let stored = database.get_batch_by_index(held.batch_info.index).await?;
-        let surviving_row = stored
-            .as_ref()
-            .filter(|batch| batch.hash == held.batch_info.hash && batch.block_number <= ancestor);
-        let finalization_invalid = held.target_status.is_finalized() &&
-            surviving_row.is_some_and(|batch| {
-                batch.finalized_block_number.is_none_or(|number| number > ancestor)
-            });
-        let invalid_reason = match stored.as_ref() {
-            None => Some("batch row removed"),
-            Some(batch) if batch.hash != held.batch_info.hash => Some("batch hash changed"),
-            Some(batch) if batch.block_number > ancestor => Some("batch commit reverted"),
-            Some(_) if finalization_invalid => Some("batch finalization reverted"),
-            Some(_) => None,
-        };
+                let stored = tx.get_batch_by_index(held.batch_info.index).await?;
+                let surviving_row = stored.as_ref().filter(|batch| {
+                    batch.hash == held.batch_info.hash && batch.block_number <= ancestor
+                });
+                let finalization_invalid = held.target_status.is_finalized() &&
+                    surviving_row.is_some_and(|batch| {
+                        batch.finalized_block_number.is_none_or(|number| number > ancestor)
+                    });
+                let invalid_reason = match stored.as_ref() {
+                    None => Some("batch row removed or reverted"),
+                    Some(batch) if batch.hash != held.batch_info.hash => Some("batch hash changed"),
+                    Some(batch) if batch.block_number > ancestor => Some("batch commit reverted"),
+                    Some(_) if finalization_invalid => Some("batch finalization reverted"),
+                    Some(_) => None,
+                };
 
-        if let Some(reason) = invalid_reason {
-            if finalization_invalid {
-                // A yielded derivation result owns a Processing row. Reset only this surviving row
-                // so L1 catch-up can rediscover it with a non-finalized target.
-                database.update_batch_status(held.batch_info.hash, BatchStatus::Committed).await?;
+                let outcome = if let Some(reason) = invalid_reason {
+                    if finalization_invalid {
+                        // Do not overwrite a concurrent or unwind-produced status such as
+                        // Reverted/Consolidated. Only the row still owned as Processing may be
+                        // returned to Committed for catch-up rediscovery.
+                        tx.transition_batch_status(
+                            held.batch_info.hash,
+                            BatchStatus::Processing,
+                            BatchStatus::Committed,
+                        )
+                        .await?;
+                    }
+                    HeldReorgOutcome::Invalidated { batch_info: held.batch_info, reason }
+                } else {
+                    HeldReorgOutcome::Survived { batch_info: held.batch_info }
+                };
+
+                Ok((unwind_result, outcome))
+            })
+            .await?;
+
+        match outcome {
+            HeldReorgOutcome::Invalidated { .. } => {
+                self.invalidate();
             }
-            self.invalidate();
-            Ok(HeldReorgOutcome::Invalidated { batch_info: held.batch_info, reason })
-        } else {
-            self.schedule_fresh_reconciliation();
-            Ok(HeldReorgOutcome::Survived { batch_info: held.batch_info })
+            HeldReorgOutcome::Survived { .. } | HeldReorgOutcome::NoHeldBatch => {}
         }
+
+        Ok((unwind_result, outcome))
     }
 
     /// Clears an invalid held slot and its timer.
@@ -274,6 +300,11 @@ impl DerivationDriver {
             self.metrics.held.set(0.0);
         }
         batch_info
+    }
+
+    /// Cancels only the scheduled/in-flight attempt state while retaining ownership of the batch.
+    pub(crate) fn cancel_attempt(&mut self) {
+        self.attempt_sleep = None;
     }
 
     /// Schedules a fresh reconciliation after an in-flight attempt was cancelled by an L1 reorg.
@@ -312,6 +343,11 @@ impl DerivationDriver {
                 saturating_millis(pending.held_since.elapsed()),
             )
         })
+    }
+
+    /// Records a fail-stop discovered outside the Engine attempt itself.
+    pub(crate) fn record_fatal(&self) {
+        self.metrics.fatal.increment(1);
     }
 
     fn schedule_immediate(&mut self) {
@@ -361,9 +397,16 @@ where
             }
             BlockConsolidationAction::UpdateFcs(block_info) => {
                 let target = block_info.block_info;
+                let current_head = *engine.fcs().head_block_info();
+                // A prior checked FCU may have returned SYNCING, intentionally leaving the local
+                // FCS at its last confirmed value. If fresh reconciliation now finds the target
+                // canonical, advance head with safe so the candidate remains coherent. This also
+                // avoids an equal-height, different-hash head/safe pair.
+                let head = (current_head.number <= target.number && current_head != target)
+                    .then_some(target);
                 let finalized = target_status.is_finalized().then_some(target);
                 let response = engine
-                    .update_fcs_checked(None, Some(target), finalized)
+                    .update_fcs_checked(head, Some(target), finalized)
                     .await
                     .map_err(|source| {
                         AttemptFailure::fatal(
@@ -601,11 +644,14 @@ fn invalid_status(
 mod tests {
     use super::*;
     use crate::{ChainOrchestratorStatus, SyncState};
-    use alloy_primitives::{Address, Bloom, Bytes, B256, U256};
+    use alloy_consensus::Header as ConsensusHeader;
+    use alloy_primitives::{Address, Bloom, Bytes, Sealable, B256, U256};
     use alloy_provider::ProviderBuilder;
     use alloy_rpc_types_engine::{ExecutionPayloadV1, PayloadId};
+    use alloy_rpc_types_eth::{Block as RpcBlock, Header as RpcHeader};
     use alloy_transport::mock::Asserter;
     use dogeos_reth_engine::ScrollPayloadAttributes;
+    use dogeos_rpc_types::ScrollRpcTransaction;
     use rollup_node_primitives::{BatchCommitData, BlockInfo};
     use scroll_db::{test_utils::setup_test_db, DatabaseReadOperations};
     use scroll_derivation_pipeline::DerivedAttributes;
@@ -700,6 +746,28 @@ mod tests {
 
     fn push_absent_block(asserter: &Asserter) {
         asserter.push_success(&Option::<()>::None);
+    }
+
+    fn push_matching_empty_block(
+        asserter: &Asserter,
+        attributes: &ScrollPayloadAttributes,
+    ) -> BlockInfo {
+        let header = ConsensusHeader {
+            number: SAFE + 1,
+            timestamp: attributes.payload_attributes.timestamp,
+            mix_hash: attributes.payload_attributes.prev_randao,
+            beneficiary: attributes.block_data_hint.coinbase.unwrap_or_default(),
+            extra_data: attributes.block_data_hint.extra_data.clone().unwrap_or_default(),
+            state_root: attributes.block_data_hint.state_root.unwrap_or_default(),
+            nonce: attributes.block_data_hint.nonce.unwrap_or_default().into(),
+            ..Default::default()
+        };
+        let sealed = header.seal_slow();
+        let block_info = BlockInfo { number: SAFE + 1, hash: sealed.hash() };
+        let rpc_header = RpcHeader::from_consensus(sealed, None, None);
+        let block = RpcBlock::<ScrollRpcTransaction, _>::empty(rpc_header);
+        asserter.push_success(&Some(block));
+        block_info
     }
 
     fn make_attempt_due(driver: &mut DerivationDriver) {
@@ -819,6 +887,49 @@ mod tests {
     #[tokio::test]
     async fn build_fcu_syncing_holds_then_completes_once() {
         assert_hold_then_complete(HoldBoundary::BuildFcuSyncing).await;
+    }
+
+    #[tokio::test]
+    async fn build_fcu_syncing_then_canonical_match_completes_once() {
+        let database = setup_test_db().await;
+        insert_batch(&database, 1, 1, None).await;
+        let client = Arc::new(ScriptedEngineClient::new());
+        client
+            .push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Syncing, None)));
+        client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Valid, None)));
+        let mut engine = engine_at_safe(client.clone());
+
+        let mut derived = batch(1, BatchStatus::Consolidated);
+        derived.attributes[0].attributes.transactions = Some(vec![]);
+        let asserter = Asserter::new();
+        push_absent_block(&asserter);
+        let canonical = push_matching_empty_block(&asserter, &derived.attributes[0].attributes);
+        let provider = absent_block_provider(asserter);
+        let mut driver = DerivationDriver::default();
+        driver.hold_batch(derived);
+
+        driver.wait_for_attempt().await;
+        assert!(matches!(
+            driver.run_attempt(&provider, &mut engine, &database).await,
+            AttemptStep::Held
+        ));
+        assert_eq!(engine.fcs().head_block_info().number, SAFE);
+
+        make_attempt_due(&mut driver);
+        driver.wait_for_attempt().await;
+        assert!(matches!(
+            driver.run_attempt(&provider, &mut engine, &database).await,
+            AttemptStep::Completed(_)
+        ));
+        assert_eq!(*engine.fcs().head_block_info(), canonical);
+        assert_eq!(*engine.fcs().safe_block_info(), canonical);
+        assert_eq!(client.fork_choice_updated_calls(), 2);
+        assert_eq!(client.get_payload_calls(), 0);
+        assert_eq!(client.new_payload_calls(), 0);
+        assert_eq!(
+            database.get_batch_status_by_hash(B256::repeat_byte(1)).await.unwrap(),
+            Some(BatchStatus::Consolidated)
+        );
     }
 
     #[tokio::test]
@@ -1013,8 +1124,7 @@ mod tests {
             AttemptStep::Held
         ));
 
-        database.unwind(5).await.unwrap();
-        let outcome = driver.revalidate_after_unwind(&database, 5).await.unwrap();
+        let (_, outcome) = driver.unwind_and_revalidate(&database, 5).await.unwrap();
         assert!(matches!(
             outcome,
             HeldReorgOutcome::Invalidated { batch_info: BatchInfo { index: 1, .. }, .. }
@@ -1028,6 +1138,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn surviving_unwind_waits_for_post_commit_repair_before_retry() {
+        let database = setup_test_db().await;
+        insert_batch(&database, 1, 1, None).await;
+        let mut driver = DerivationDriver::default();
+        driver.hold_batch(batch(1, BatchStatus::Consolidated));
+        driver.cancel_attempt();
+
+        let (_, outcome) = driver.unwind_and_revalidate(&database, 5).await.unwrap();
+        assert!(matches!(outcome, HeldReorgOutcome::Survived { .. }));
+        assert!(!driver.can_accept_batch());
+        assert!(
+            !driver.is_attempt_scheduled(),
+            "post-unwind provider/FCS repair must succeed before retry is scheduled"
+        );
+
+        driver.schedule_fresh_reconciliation();
+        assert!(driver.is_attempt_scheduled());
+    }
+
+    #[tokio::test]
     async fn reverted_finalization_resets_only_its_surviving_processing_row() {
         let database = setup_test_db().await;
         insert_batch(&database, 1, 1, Some(10)).await;
@@ -1037,11 +1167,8 @@ mod tests {
         let mut driver = DerivationDriver::default();
         driver.hold_batch(batch(1, BatchStatus::Finalized));
 
-        database.unwind(5).await.unwrap();
-        assert!(matches!(
-            driver.revalidate_after_unwind(&database, 5).await.unwrap(),
-            HeldReorgOutcome::Invalidated { .. }
-        ));
+        let (_, outcome) = driver.unwind_and_revalidate(&database, 5).await.unwrap();
+        assert!(matches!(outcome, HeldReorgOutcome::Invalidated { .. }));
         assert_eq!(
             database.get_batch_status_by_hash(B256::repeat_byte(1)).await.unwrap(),
             Some(BatchStatus::Committed)
@@ -1050,6 +1177,32 @@ mod tests {
             database.get_batch_status_by_hash(B256::repeat_byte(2)).await.unwrap(),
             Some(BatchStatus::Processing),
             "unrelated Processing rows must remain untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn reverted_held_row_is_not_reset_to_committed() {
+        let database = setup_test_db().await;
+        insert_batch(&database, 1, 1, Some(10)).await;
+        database.update_batch_status(B256::repeat_byte(1), BatchStatus::Processing).await.unwrap();
+        database
+            .set_batch_revert_block_number_for_batch_range(
+                1,
+                1,
+                BlockInfo { number: 4, hash: B256::repeat_byte(4) },
+            )
+            .await
+            .unwrap();
+        let mut driver = DerivationDriver::default();
+        driver.hold_batch(batch(1, BatchStatus::Finalized));
+        driver.cancel_attempt();
+
+        let (_, outcome) = driver.unwind_and_revalidate(&database, 5).await.unwrap();
+        assert!(matches!(outcome, HeldReorgOutcome::Invalidated { .. }));
+        assert_eq!(
+            database.get_batch_status_by_hash(B256::repeat_byte(1)).await.unwrap(),
+            Some(BatchStatus::Reverted),
+            "the targeted Processing -> Committed reset must not overwrite Reverted"
         );
     }
 }

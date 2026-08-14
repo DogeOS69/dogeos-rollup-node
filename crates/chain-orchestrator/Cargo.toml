@@ -61,15 +61,18 @@ tracing.workspace = true
 alloy-consensus = { workspace = true, features = ["arbitrary"] }
 alloy-primitives = { workspace = true, features = ["arbitrary"] }
 alloy-rpc-client.workspace = true
+alloy-rpc-types-eth.workspace = true
 alloy-transport.workspace = true
 
 # rollup-node
+rollup-node-providers = { workspace = true, features = ["test-utils"] }
 scroll-db = { workspace = true, features = ["test-utils"] }
 scroll-engine = { workspace = true, features = ["test-utils"] }
 rollup-node-primitives = { workspace = true, features = ["arbitrary"] }
 
 # scroll
 dogeos-chainspec.workspace = true
+dogeos-reth-consensus.workspace = true
 
 # reth
 reth-eth-wire-types.workspace = true

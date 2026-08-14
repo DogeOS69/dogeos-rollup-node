@@ -107,6 +107,14 @@ pub trait DatabaseWriteOperations {
         status: BatchStatus,
     ) -> Result<(), DatabaseError>;
 
+    /// Changes a batch status only when its current status matches `from`.
+    async fn transition_batch_status(
+        &self,
+        batch_hash: B256,
+        from: BatchStatus,
+        to: BatchStatus,
+    ) -> Result<bool, DatabaseError>;
+
     /// Delete all [`BatchCommitData`]s with a batch index greater than the provided index.
     async fn delete_batches_gt_batch_index(&self, batch_index: u64) -> Result<u64, DatabaseError>;
 
@@ -380,6 +388,24 @@ impl<T: WriteConnectionProvider + ?Sized + Sync> DatabaseWriteOperations for T {
             .await?;
 
         Ok(())
+    }
+
+    async fn transition_batch_status(
+        &self,
+        batch_hash: B256,
+        from: BatchStatus,
+        to: BatchStatus,
+    ) -> Result<bool, DatabaseError> {
+        tracing::trace!(target: "scroll::db", ?batch_hash, ?from, ?to, "Conditionally updating batch status in database.");
+
+        let result = models::batch_commit::Entity::update_many()
+            .filter(models::batch_commit::Column::Hash.eq(batch_hash.to_vec()))
+            .filter(models::batch_commit::Column::Status.eq(from.as_str()))
+            .col_expr(models::batch_commit::Column::Status, Expr::value(to.as_str()))
+            .exec(self.get_connection())
+            .await?;
+
+        Ok(result.rows_affected == 1)
     }
 
     async fn finalize_batches_up_to_index(

@@ -253,6 +253,19 @@ impl DatabaseWriteOperations for Database {
         )
     }
 
+    async fn transition_batch_status(
+        &self,
+        batch_hash: B256,
+        from: rollup_node_primitives::BatchStatus,
+        to: rollup_node_primitives::BatchStatus,
+    ) -> Result<bool, DatabaseError> {
+        metered!(
+            DatabaseOperation::UpdateBatchStatus,
+            self,
+            tx_mut(move |tx| async move { tx.transition_batch_status(batch_hash, from, to).await })
+        )
+    }
+
     async fn insert_batch(&self, batch_commit: BatchCommitData) -> Result<(), DatabaseError> {
         metered!(
             DatabaseOperation::InsertBatch,

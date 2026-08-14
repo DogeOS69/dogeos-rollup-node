@@ -810,25 +810,38 @@ async fn shutdown_consolidates_most_recent_batch_on_startup() -> eyre::Result<()
         }))
         .await?;
     let rpc = node.rpc.inner.eth_api();
-    let partial_head = loop {
-        let latest = rpc
-            .block_by_number(BlockNumberOrTag::Latest, false)
-            .await?
-            .expect("latest block must exist")
-            .header
-            .number;
-        if latest >= 40 {
-            break latest;
+    time::timeout(Duration::from_secs(10), async {
+        loop {
+            let latest = rpc
+                .block_by_number(BlockNumberOrTag::Latest, false)
+                .await?
+                .expect("latest block must exist")
+                .header
+                .number;
+            if latest >= 5 {
+                return Ok::<_, eyre::Report>(())
+            }
+            tokio::task::yield_now().await;
         }
-        tokio::task::yield_now().await;
-    };
-    assert!(partial_head < 57, "shutdown must interrupt batch 2 before completion");
+    })
+    .await
+    .expect("batch 2 must start building before shutdown")?;
 
     // Stop the orchestrator and wait for it to release the database before rebuilding it.
     signal.fire();
     drop(l1_notification_tx);
     drop(rnm_events);
     orchestrator_task.await??;
+    let partial_head = rpc
+        .block_by_number(BlockNumberOrTag::Latest, false)
+        .await?
+        .expect("latest block must exist after shutdown")
+        .header
+        .number;
+    assert!(
+        (5..57).contains(&partial_head),
+        "shutdown must leave an actual partial batch-2 Engine head, got {partial_head}"
+    );
     time::timeout(Duration::from_secs(10), async {
         loop {
             if rpc.block_by_number(5.into(), false).await.ok().flatten().is_some() {
@@ -899,20 +912,24 @@ async fn shutdown_consolidates_most_recent_batch_on_startup() -> eyre::Result<()
 
     l1_notification_tx.notification_tx.send(Arc::new(L1Notification::Synced)).await?;
 
-    let mut recovered_blocks = Vec::new();
-    let recovered_outcome = loop {
-        match rnm_events.next().await {
-            Some(ChainOrchestratorEvent::BlockConsolidated(outcome)) => {
-                recovered_blocks.push(outcome.block_info().block_info.number);
+    let (recovered_blocks, recovered_outcome) = time::timeout(Duration::from_secs(10), async {
+        let mut recovered_blocks = Vec::new();
+        loop {
+            match rnm_events.next().await {
+                Some(ChainOrchestratorEvent::BlockConsolidated(outcome)) => {
+                    recovered_blocks.push(outcome.block_info().block_info.number);
+                }
+                Some(ChainOrchestratorEvent::BatchConsolidated(outcome))
+                    if outcome.batch_info.index == batch_1_data.index =>
+                {
+                    break (recovered_blocks, outcome)
+                }
+                _ => {}
             }
-            Some(ChainOrchestratorEvent::BatchConsolidated(outcome))
-                if outcome.batch_info.index == batch_1_data.index =>
-            {
-                break outcome;
-            }
-            _ => {}
         }
-    };
+    })
+    .await
+    .expect("restart recovery must consolidate batch 2");
 
     assert!(processing_observer.await?, "startup catch-up must mark the batch Processing");
     assert_eq!(

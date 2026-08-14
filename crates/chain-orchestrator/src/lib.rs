@@ -109,7 +109,7 @@ const fn ordinary_l1_notifications_may_apply(held_slot: bool, pipeline_empty: bo
 }
 
 const fn l1_receiver_may_poll(held_slot: bool, pipeline_empty: bool) -> bool {
-    held_slot || ordinary_l1_notifications_may_apply(held_slot, pipeline_empty)
+    held_slot || pipeline_empty
 }
 
 /// The batch size for batch validation.

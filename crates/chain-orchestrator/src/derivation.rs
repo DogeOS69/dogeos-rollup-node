@@ -15,7 +15,7 @@ use rollup_node_primitives::{
 };
 use scroll_db::{Database, DatabaseReadOperations, DatabaseWriteOperations, UnwindResult};
 use scroll_derivation_pipeline::BatchDerivationResult;
-use scroll_engine::{Engine, ScrollEngineApi};
+use scroll_engine::{Engine, EngineError, ScrollEngineApi};
 use std::{pin::Pin, time::Duration};
 use tokio::time::{Instant, Sleep};
 
@@ -282,24 +282,19 @@ impl DerivationDriver {
             })
             .await?;
 
-        match outcome {
-            HeldReorgOutcome::Invalidated { .. } => {
-                self.invalidate();
-            }
-            HeldReorgOutcome::Survived { .. } | HeldReorgOutcome::NoHeldBatch => {}
+        if matches!(outcome, HeldReorgOutcome::Invalidated { .. }) {
+            self.invalidate();
         }
 
         Ok((unwind_result, outcome))
     }
 
     /// Clears an invalid held slot and its timer.
-    pub(crate) fn invalidate(&mut self) -> Option<BatchInfo> {
+    pub(crate) fn invalidate(&mut self) {
         self.attempt_sleep = None;
-        let batch_info = self.pending.take().map(|pending| pending.batch.batch_info);
-        if batch_info.is_some() {
+        if self.pending.take().is_some() {
             self.metrics.held.set(0.0);
         }
-        batch_info
     }
 
     /// Cancels only the scheduled/in-flight attempt state while retaining ownership of the batch.
@@ -408,17 +403,7 @@ where
                 let response = engine
                     .update_fcs_checked(head, Some(target), finalized)
                     .await
-                    .map_err(|source| {
-                        AttemptFailure::fatal(
-                            FCU_METHOD,
-                            "ERROR",
-                            ChainOrchestratorError::DerivedBatchEngineRequest {
-                                batch_info,
-                                method: FCU_METHOD,
-                                source,
-                            },
-                        )
-                    })?;
+                    .map_err(engine_request_failure(batch_info, FCU_METHOD))?;
                 classify_checked_fcu(response, batch_info, Some(target.number))?;
                 BlockConsolidationOutcome::UpdateFcs(block_info)
             }
@@ -440,30 +425,13 @@ where
                 let build_response = engine
                     .build_payload(Some(safe), attributes.attributes.clone())
                     .await
-                    .map_err(|source| {
-                        AttemptFailure::fatal(
-                            BUILD_FCU_METHOD,
-                            "ERROR",
-                            ChainOrchestratorError::DerivedBatchEngineRequest {
-                                batch_info,
-                                method: BUILD_FCU_METHOD,
-                                source,
-                            },
-                        )
-                    })?;
+                    .map_err(engine_request_failure(batch_info, BUILD_FCU_METHOD))?;
                 let payload_id = classify_build_fcu(build_response, batch_info)?;
 
-                let payload = engine.get_payload(payload_id).await.map_err(|source| {
-                    AttemptFailure::fatal(
-                        GET_PAYLOAD_METHOD,
-                        "ERROR",
-                        ChainOrchestratorError::DerivedBatchEngineRequest {
-                            batch_info,
-                            method: GET_PAYLOAD_METHOD,
-                            source,
-                        },
-                    )
-                })?;
+                let payload = engine
+                    .get_payload(payload_id)
+                    .await
+                    .map_err(engine_request_failure(batch_info, GET_PAYLOAD_METHOD))?;
                 let block_info: L2BlockInfoWithL1Messages =
                     (&payload).try_into().map_err(|error| {
                         AttemptFailure::fatal(
@@ -473,17 +441,10 @@ where
                         )
                     })?;
 
-                let payload_status = engine.new_payload(payload).await.map_err(|source| {
-                    AttemptFailure::fatal(
-                        NEW_PAYLOAD_METHOD,
-                        "ERROR",
-                        ChainOrchestratorError::DerivedBatchEngineRequest {
-                            batch_info,
-                            method: NEW_PAYLOAD_METHOD,
-                            source,
-                        },
-                    )
-                })?;
+                let payload_status = engine
+                    .new_payload(payload)
+                    .await
+                    .map_err(engine_request_failure(batch_info, NEW_PAYLOAD_METHOD))?;
                 classify_new_payload(payload_status, batch_info, block_info.block_info.number)?;
 
                 let finalized = target_status.is_finalized().then_some(block_info.block_info);
@@ -494,17 +455,7 @@ where
                         finalized,
                     )
                     .await
-                    .map_err(|source| {
-                        AttemptFailure::fatal(
-                            FCU_METHOD,
-                            "ERROR",
-                            ChainOrchestratorError::DerivedBatchEngineRequest {
-                                batch_info,
-                                method: FCU_METHOD,
-                                source,
-                            },
-                        )
-                    })?;
+                    .map_err(engine_request_failure(batch_info, FCU_METHOD))?;
                 classify_checked_fcu(final_fcu, batch_info, Some(block_info.block_info.number))?;
 
                 reorg_results.push(block_info.clone());
@@ -529,6 +480,19 @@ where
     })?;
 
     Ok(ConsolidatedBatch { batch_outcome, block_outcomes })
+}
+
+fn engine_request_failure(
+    batch_info: BatchInfo,
+    method: &'static str,
+) -> impl FnOnce(EngineError) -> AttemptFailure {
+    move |source| {
+        AttemptFailure::fatal(
+            method,
+            "ERROR",
+            ChainOrchestratorError::DerivedBatchEngineRequest { batch_info, method, source },
+        )
+    }
 }
 
 fn classify_build_fcu(

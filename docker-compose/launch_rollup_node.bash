@@ -8,6 +8,10 @@ wait_for_l1_devnet() {
     done
 }
 
+# Supervised follower example (do not use for a sequencer or with a pinned signer):
+# exec rollup-node node --chain scroll-sepolia --l1.url <L1_URL> \
+#   --consensus.exit-on-signer-rotation
+
 if [ "${ENV:-}" = "dev" ]; then
   exec rollup-node node --chain dev --datadir=/l2reth  --metrics=0.0.0.0:6060 --disable-discovery \
     --http --http.addr=0.0.0.0 --http.port=8545 --http.corsdomain "*" --http.api admin,debug,eth,net,trace,txpool,web3,rpc,reth,ots,flashbots,miner,mev \

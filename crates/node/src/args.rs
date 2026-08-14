@@ -3,6 +3,7 @@ use crate::{
     constants::{self},
     context::RollupNodeContext,
     pprof::PprofConfig,
+    signer_rotation::SignerRotationWatchdog,
 };
 use alloy_chains::NamedChain;
 use alloy_consensus::BlockHeader;
@@ -45,7 +46,7 @@ use scroll_engine::{Engine, ForkchoiceState, ScrollAuthApiEngineClient, ScrollEn
 use scroll_migration::{traits::ScrollMigrator, MigratorTrait};
 use scroll_network::{DogeosNetworkPrimitives, EthWireBlockWithPeer, ScrollNetworkManager};
 use scroll_wire::ScrollWireEvent;
-use std::{fs, path::PathBuf, sync::Arc};
+use std::{fmt, fs, path::PathBuf, sync::Arc};
 use tokio::sync::mpsc::{Receiver, UnboundedReceiver};
 
 /// Test-related configuration arguments.
@@ -138,6 +139,22 @@ impl ScrollRollupNodeConfig {
             }
         }
 
+        if self.consensus_args.exit_on_signer_rotation {
+            if self.l1_provider_args.url.is_none() {
+                return Err("--consensus.exit-on-signer-rotation requires --l1.url".to_string());
+            }
+            if self.consensus_args.authorized_signer.is_some() {
+                return Err("--consensus.exit-on-signer-rotation cannot be used with \
+                     --consensus.authorized-signer because restart would re-pin the same signer"
+                    .to_string());
+            }
+            if self.consensus_args.algorithm != ConsensusAlgorithm::SystemContract {
+                return Err("--consensus.exit-on-signer-rotation requires \
+                     --consensus.algorithm system-contract"
+                    .to_string());
+            }
+        }
+
         if self.consensus_args.algorithm == ConsensusAlgorithm::SystemContract &&
             self.consensus_args.authorized_signer.is_none() &&
             self.l1_provider_args.url.is_none()
@@ -150,6 +167,29 @@ impl ScrollRollupNodeConfig {
         }
 
         Ok(())
+    }
+
+    /// Builds the optional follower signer-rotation watchdog from the node configuration.
+    pub fn signer_rotation_watchdog(
+        &self,
+        chain_spec: &DogeosChainSpec,
+    ) -> eyre::Result<Option<SignerRotationWatchdog>> {
+        if !self.consensus_args.exit_on_signer_rotation {
+            return Ok(None);
+        }
+
+        self.validate().map_err(eyre::Report::msg)?;
+        let l1_url = self
+            .l1_provider_args
+            .url
+            .clone()
+            .expect("validated rotation watchdog configuration must have an L1 URL");
+        let node_config = NodeConfig::from_chainspec(chain_spec)?;
+
+        Ok(Some(SignerRotationWatchdog::new(
+            l1_url,
+            node_config.address_book.system_contract_address,
+        )))
     }
 
     /// Hydrate the config by initializing the database connection.
@@ -550,7 +590,7 @@ pub struct RollupNodeDatabaseArgs {
 }
 
 /// The database arguments.
-#[derive(Debug, Default, Clone, clap::Args)]
+#[derive(Default, Clone, clap::Args)]
 pub struct ConsensusArgs {
     /// The type of consensus to use.
     #[arg(
@@ -563,12 +603,36 @@ pub struct ConsensusArgs {
     /// The optional authorized signer for system contract consensus.
     #[arg(long = "consensus.authorized-signer", value_name = "ADDRESS")]
     pub authorized_signer: Option<Address>,
+
+    /// Exit the process (code 70) when the authorized signer in the L1 system contract rotates
+    /// away from the value loaded at startup. Intended for follower nodes run under a supervisor
+    /// with a restart policy; the restart re-reads the signer. Sequencer rotation remains a manual
+    /// operation.
+    #[arg(long = "consensus.exit-on-signer-rotation", default_value_t = false)]
+    pub exit_on_signer_rotation: bool,
+}
+
+impl fmt::Debug for ConsensusArgs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut debug = f.debug_struct("ConsensusArgs");
+        debug
+            .field("algorithm", &self.algorithm)
+            .field("authorized_signer", &self.authorized_signer);
+        if self.exit_on_signer_rotation {
+            debug.field("exit_on_signer_rotation", &self.exit_on_signer_rotation);
+        }
+        debug.finish()
+    }
 }
 
 impl ConsensusArgs {
     /// Create a new [`ConsensusArgs`] with the no-op consensus algorithm.
     pub const fn noop() -> Self {
-        Self { algorithm: ConsensusAlgorithm::Noop, authorized_signer: None }
+        Self {
+            algorithm: ConsensusAlgorithm::Noop,
+            authorized_signer: None,
+            exit_on_signer_rotation: false,
+        }
     }
 
     /// Creates a consensus instance based on the configured algorithm and authorized signer.
@@ -1011,7 +1075,98 @@ const fn l1_v2_message_queue_start_index(chain: Option<NamedChain>) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
     use std::path::PathBuf;
+
+    #[derive(Debug, Parser)]
+    struct ConsensusCli {
+        #[command(flatten)]
+        consensus: ConsensusArgs,
+    }
+
+    fn rotation_watchdog_config() -> ScrollRollupNodeConfig {
+        ScrollRollupNodeConfig {
+            test_args: TestArgs::default(),
+            consensus_args: ConsensusArgs {
+                algorithm: ConsensusAlgorithm::SystemContract,
+                authorized_signer: None,
+                exit_on_signer_rotation: true,
+            },
+            database_args: RollupNodeDatabaseArgs::default(),
+            chain_orchestrator_args: ChainOrchestratorArgs::default(),
+            engine_driver_args: EngineDriverArgs::default(),
+            blob_provider_args: BlobProviderArgs::default(),
+            l1_provider_args: L1ProviderArgs {
+                url: Some("http://localhost:8545".parse().unwrap()),
+                ..Default::default()
+            },
+            sequencer_args: SequencerArgs::default(),
+            network_args: RollupNodeNetworkArgs::default(),
+            rpc_args: RpcArgs::default(),
+            signer_args: SignerArgs::default(),
+            gas_price_oracle_args: RollupNodeGasPriceOracleArgs::default(),
+            pprof_args: PprofArgs::default(),
+            remote_block_source_args: RemoteBlockSourceArgs::default(),
+            database: None,
+            require_l1_data_fee_buffer: false,
+        }
+    }
+
+    #[test]
+    fn exit_on_signer_rotation_defaults_to_false_when_parsed() {
+        let cli = ConsensusCli::parse_from(["rollup-node"]);
+
+        assert!(!cli.consensus.exit_on_signer_rotation);
+    }
+
+    #[test]
+    fn consensus_debug_omits_disabled_rotation_flag() {
+        assert_eq!(
+            format!("{:#?}", ConsensusArgs::default()),
+            "ConsensusArgs {\n    algorithm: SystemContract,\n    authorized_signer: None,\n}"
+        );
+    }
+
+    #[test]
+    fn consensus_debug_includes_enabled_rotation_flag() {
+        let args = ConsensusArgs { exit_on_signer_rotation: true, ..Default::default() };
+
+        assert!(format!("{args:#?}").contains("exit_on_signer_rotation: true"));
+    }
+
+    #[test]
+    fn exit_on_signer_rotation_requires_l1_url() {
+        let mut config = rotation_watchdog_config();
+        config.l1_provider_args.url = None;
+
+        assert_eq!(
+            config.validate().unwrap_err(),
+            "--consensus.exit-on-signer-rotation requires --l1.url"
+        );
+    }
+
+    #[test]
+    fn exit_on_signer_rotation_conflicts_with_pinned_signer() {
+        let mut config = rotation_watchdog_config();
+        config.consensus_args.authorized_signer = Some(Address::new([0x11; 20]));
+
+        assert_eq!(
+            config.validate().unwrap_err(),
+            "--consensus.exit-on-signer-rotation cannot be used with \
+             --consensus.authorized-signer because restart would re-pin the same signer"
+        );
+    }
+
+    #[test]
+    fn exit_on_signer_rotation_requires_system_contract_consensus() {
+        let mut config = rotation_watchdog_config();
+        config.consensus_args.algorithm = ConsensusAlgorithm::Noop;
+
+        assert_eq!(
+            config.validate().unwrap_err(),
+            "--consensus.exit-on-signer-rotation requires --consensus.algorithm system-contract"
+        );
+    }
 
     #[test]
     fn test_network_args_default_authorized_signer() {
@@ -1073,6 +1228,7 @@ mod tests {
             consensus_args: ConsensusArgs {
                 algorithm: ConsensusAlgorithm::SystemContract,
                 authorized_signer: None,
+                exit_on_signer_rotation: false,
             },
             database: None,
             rpc_args: RpcArgs::default(),
@@ -1141,6 +1297,7 @@ mod tests {
             consensus_args: ConsensusArgs {
                 algorithm: ConsensusAlgorithm::SystemContract,
                 authorized_signer: None,
+                exit_on_signer_rotation: false,
             },
             database: None,
             rpc_args: RpcArgs::default(),

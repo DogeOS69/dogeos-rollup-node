@@ -125,7 +125,7 @@ pub(crate) struct DerivedBatchMetrics {
     pub held: Gauge,
     /// The number of reconciliation attempts started.
     pub attempts: Counter,
-    /// The number of fatal reconciliation attempts.
+    /// The number of held-batch fail-stop events.
     pub fatal: Counter,
 }
 

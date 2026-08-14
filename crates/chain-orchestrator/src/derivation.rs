@@ -131,7 +131,7 @@ impl DerivationDriver {
 
     /// Moves a newly yielded result into the slot before any Engine action is attempted.
     pub(crate) fn hold_batch(&mut self, batch: BatchDerivationResult) {
-        debug_assert!(self.pending.is_none(), "a derived batch is already held");
+        assert!(self.pending.is_none(), "a derived batch is already held");
         let batch_info = batch.batch_info;
         tracing::info!(
             target: "scroll::chain_orchestrator",
@@ -405,6 +405,7 @@ where
 
     let mut block_outcomes = Vec::new();
     let mut reorg_results = Vec::new();
+    let mut l2_head_updated = false;
 
     for action in aggregated.actions {
         let outcome = match action {
@@ -427,6 +428,7 @@ where
                     .await
                     .map_err(engine_request_failure(batch_info, FCU_METHOD))?;
                 classify_checked_fcu(response, batch_info, Some(target.number))?;
+                l2_head_updated |= head.is_some();
                 BlockConsolidationOutcome::UpdateFcs(block_info)
             }
             BlockConsolidationAction::Reorg(attribute_index) => {
@@ -483,6 +485,7 @@ where
                     .await
                     .map_err(engine_request_failure(batch_info, FCU_METHOD))?;
                 classify_checked_fcu(final_fcu, batch_info, Some(block_info.block_info.number))?;
+                l2_head_updated = true;
 
                 reorg_results.push(block_info.clone());
                 BlockConsolidationOutcome::Reorged(block_info)
@@ -492,7 +495,7 @@ where
     }
 
     let batch_outcome = reconciliation
-        .into_batch_consolidation_outcome(reorg_results)
+        .into_batch_consolidation_outcome(reorg_results, l2_head_updated)
         .await
         .map_err(|error| AttemptFailure::fatal("consolidateBatch", "ERROR", error))?;
     let mut persisted = batch_outcome.clone();
@@ -935,6 +938,190 @@ mod tests {
     #[tokio::test]
     async fn checked_final_fcu_syncing_does_not_advance_local_fcs() {
         assert_hold_then_complete(HoldBoundary::FinalFcuSyncing).await;
+    }
+
+    #[tokio::test]
+    async fn final_fcu_syncing_then_canonical_match_advances_database_head() {
+        let database = setup_test_db().await;
+        insert_batch(&database, 1, 1, None).await;
+        let mut derived = batch(1, BatchStatus::Consolidated);
+        derived.attributes[0].attributes.transactions = Some(vec![]);
+
+        let asserter = Asserter::new();
+        push_absent_block(&asserter);
+        let canonical = push_matching_empty_block(&asserter, &derived.attributes[0].attributes);
+        let provider = absent_block_provider(asserter);
+
+        let client = Arc::new(ScriptedEngineClient::new());
+        client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(
+            PayloadStatusEnum::Valid,
+            Some(PayloadId::new([7; 8])),
+        )));
+        let mut built_payload = payload(canonical.number);
+        built_payload.block_hash = canonical.hash;
+        client.push_get_payload(ScriptedResponse::Ok(built_payload));
+        client.push_new_payload(ScriptedResponse::Ok(payload_status(PayloadStatusEnum::Valid)));
+        client
+            .push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Syncing, None)));
+        client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Valid, None)));
+        let mut engine = engine_at_safe(client.clone());
+        let mut driver = DerivationDriver::default();
+        driver.hold_batch(derived);
+
+        driver.wait_for_attempt().await;
+        assert!(matches!(
+            driver.run_attempt(&provider, &mut engine, &database).await,
+            AttemptStep::Held
+        ));
+        assert_eq!(engine.fcs().head_block_info().number, SAFE);
+        assert_eq!(database.get_l2_head_block_number().await.unwrap(), 0);
+
+        make_attempt_due(&mut driver);
+        driver.wait_for_attempt().await;
+        let AttemptStep::Completed(consolidated) =
+            driver.run_attempt(&provider, &mut engine, &database).await
+        else {
+            panic!("canonical retry must complete")
+        };
+        assert!(consolidated.batch_outcome.l2_head_updated);
+        assert_eq!(*engine.fcs().head_block_info(), canonical);
+        assert_eq!(*engine.fcs().safe_block_info(), canonical);
+        assert_eq!(database.get_l2_head_block_number().await.unwrap(), canonical.number);
+        assert_eq!(
+            database.get_batch_status_by_hash(B256::repeat_byte(1)).await.unwrap(),
+            Some(BatchStatus::Consolidated)
+        );
+        assert_eq!(client.fork_choice_updated_calls(), 3);
+        assert_eq!(client.get_payload_calls(), 1);
+        assert_eq!(client.new_payload_calls(), 1);
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum ExpectedClassification {
+        Success,
+        Hold { method: &'static str, status: HoldStatus },
+        Fatal { method: &'static str, outcome: &'static str },
+    }
+
+    fn assert_classification<T>(
+        result: Result<T, AttemptFailure>,
+        expected: ExpectedClassification,
+    ) {
+        match (result, expected) {
+            (Ok(_), ExpectedClassification::Success) => {}
+            (
+                Err(AttemptFailure::Hold(actual)),
+                ExpectedClassification::Hold { method, status },
+            ) => {
+                assert_eq!(actual.method, method);
+                assert_eq!(actual.status, status);
+            }
+            (
+                Err(AttemptFailure::Fatal(actual)),
+                ExpectedClassification::Fatal { method, outcome },
+            ) => {
+                assert_eq!(actual.method, method);
+                assert_eq!(actual.outcome, outcome);
+                match outcome {
+                    "INVALID" => assert!(matches!(
+                        *actual.error,
+                        ChainOrchestratorError::InvalidDerivedPayload { .. }
+                    )),
+                    "ACCEPTED" => assert!(matches!(
+                        *actual.error,
+                        ChainOrchestratorError::UnexpectedDerivedPayloadStatus { .. }
+                    )),
+                    "VALID_MISSING_PAYLOAD_ID" => assert!(matches!(
+                        *actual.error,
+                        ChainOrchestratorError::MissingDerivedPayloadId { .. }
+                    )),
+                    other => panic!("unhandled fatal classification {other}"),
+                }
+            }
+            _ => panic!("classification did not match expected result"),
+        }
+    }
+
+    #[test]
+    fn engine_status_classification_matrix() {
+        let batch_info = BatchInfo::new(1, B256::repeat_byte(1));
+        for (response, expected) in [
+            (
+                fcu(PayloadStatusEnum::Valid, Some(PayloadId::new([7; 8]))),
+                ExpectedClassification::Success,
+            ),
+            (
+                fcu(PayloadStatusEnum::Valid, None),
+                ExpectedClassification::Fatal {
+                    method: BUILD_FCU_METHOD,
+                    outcome: "VALID_MISSING_PAYLOAD_ID",
+                },
+            ),
+            (
+                fcu(PayloadStatusEnum::Syncing, None),
+                ExpectedClassification::Hold {
+                    method: BUILD_FCU_METHOD,
+                    status: HoldStatus::Syncing,
+                },
+            ),
+            (
+                fcu(PayloadStatusEnum::Accepted, None),
+                ExpectedClassification::Fatal { method: BUILD_FCU_METHOD, outcome: "ACCEPTED" },
+            ),
+            (
+                fcu(PayloadStatusEnum::Invalid { validation_error: "invalid build".into() }, None),
+                ExpectedClassification::Fatal { method: BUILD_FCU_METHOD, outcome: "INVALID" },
+            ),
+        ] {
+            assert_classification(classify_build_fcu(response, batch_info), expected);
+        }
+
+        for (response, expected) in [
+            (payload_status(PayloadStatusEnum::Valid), ExpectedClassification::Success),
+            (
+                payload_status(PayloadStatusEnum::Syncing),
+                ExpectedClassification::Hold {
+                    method: NEW_PAYLOAD_METHOD,
+                    status: HoldStatus::Syncing,
+                },
+            ),
+            (
+                payload_status(PayloadStatusEnum::Accepted),
+                ExpectedClassification::Hold {
+                    method: NEW_PAYLOAD_METHOD,
+                    status: HoldStatus::Accepted,
+                },
+            ),
+            (
+                payload_status(PayloadStatusEnum::Invalid {
+                    validation_error: "invalid payload".into(),
+                }),
+                ExpectedClassification::Fatal { method: NEW_PAYLOAD_METHOD, outcome: "INVALID" },
+            ),
+        ] {
+            assert_classification(classify_new_payload(response, batch_info, SAFE + 1), expected);
+        }
+
+        for (response, expected) in [
+            (fcu(PayloadStatusEnum::Valid, None), ExpectedClassification::Success),
+            (
+                fcu(PayloadStatusEnum::Syncing, None),
+                ExpectedClassification::Hold { method: FCU_METHOD, status: HoldStatus::Syncing },
+            ),
+            (
+                fcu(PayloadStatusEnum::Accepted, None),
+                ExpectedClassification::Fatal { method: FCU_METHOD, outcome: "ACCEPTED" },
+            ),
+            (
+                fcu(PayloadStatusEnum::Invalid { validation_error: "invalid fcu".into() }, None),
+                ExpectedClassification::Fatal { method: FCU_METHOD, outcome: "INVALID" },
+            ),
+        ] {
+            assert_classification(
+                classify_checked_fcu(response, batch_info, Some(SAFE + 1)),
+                expected,
+            );
+        }
     }
 
     #[tokio::test]

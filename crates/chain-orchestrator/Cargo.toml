@@ -106,6 +106,7 @@ serde = [
     "alloy-eips/serde",
     "alloy-primitives/serde",
     "alloy-rpc-types-engine/serde",
+    "alloy-rpc-types-eth/serde",
     "parking_lot/serde",
     "rand/serde",
     "reth-eth-wire-types/serde",

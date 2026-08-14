@@ -104,14 +104,10 @@ impl BatchReconciliationResult {
     pub(crate) async fn into_batch_consolidation_outcome(
         self,
         reorg_results: Vec<L2BlockInfoWithL1Messages>,
+        l2_head_updated: bool,
     ) -> Result<BatchConsolidationOutcome, ChainOrchestratorError> {
-        // Create the batch consolidation outcome with the L2 head block number updated if there
-        // were any reorgs.
-        let mut consolidate_chain = BatchConsolidationOutcome::new(
-            self.batch_info,
-            self.target_status,
-            !reorg_results.is_empty(),
-        );
+        let mut consolidate_chain =
+            BatchConsolidationOutcome::new(self.batch_info, self.target_status, l2_head_updated);
 
         // First append all non-reorg results to the consolidated chain.
         self.actions.into_iter().filter(|action| !action.is_reorg()).for_each(|action| {

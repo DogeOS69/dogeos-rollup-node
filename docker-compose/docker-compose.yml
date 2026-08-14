@@ -19,6 +19,8 @@ services:
   rollup-node:
     image: dogeos69/rollup-node:v1.0.5
     container_name: rollup-node
+    # Follower-only example for --consensus.exit-on-signer-rotation:
+    # restart: unless-stopped
     entrypoint: ["bash", "/launch_rollup_node.bash"]
     env_file:
       - .env

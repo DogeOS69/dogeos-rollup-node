@@ -1,9 +1,11 @@
 //! Scroll binary
 
 use reth_node_builder::TreeConfig;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const DEFAULT_PERSISTENCE_THRESHOLD: u64 = 0;
 const DEFAULT_PERSISTENCE_BACKPRESSURE_THRESHOLD: u64 = 16;
+static SIGNER_ROTATION_EXIT_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 #[global_allocator]
 static ALLOC: reth_cli_util::allocator::Allocator = reth_cli_util::allocator::new_allocator();
@@ -23,7 +25,10 @@ fn main() {
     use reth_ethereum_cli::Cli;
     use reth_node_builder::EngineNodeLauncher;
     use reth_node_core::args::DefaultEngineValues;
-    use rollup_node::{DogeosChainSpecParser, ScrollRollupNode, ScrollRollupNodeConfig};
+    use rollup_node::{
+        signer_rotation::EXIT_CODE_SIGNER_ROTATION, DogeosChainSpecParser, ScrollRollupNode,
+        ScrollRollupNodeConfig,
+    };
     use std::sync::Arc;
     use tracing::info;
 
@@ -45,7 +50,7 @@ fn main() {
         std::env::set_var("RUST_BACKTRACE", "1");
     }
 
-    if let Err(err) = Cli::<DogeosChainSpecParser, ScrollRollupNodeConfig>::parse()
+    let result = Cli::<DogeosChainSpecParser, ScrollRollupNodeConfig>::parse()
         .run_with_components::<ScrollRollupNode>(
         |chain_spec| (
             ScrollEvmConfig::dogeos(chain_spec),
@@ -59,6 +64,7 @@ fn main() {
             let mut chain_spec = (*config.chain).clone();
             chain_spec.config.l1_data_fee_buffer_check = args.require_l1_data_fee_buffer;
             let config = config.with_chain(chain_spec);
+            let watchdog = args.signer_rotation_watchdog(config.chain.as_ref())?;
 
             // Launch the node.
             let handle = builder
@@ -89,9 +95,41 @@ fn main() {
                     builder.launch_with(launcher)
                 })
                 .await?;
-            handle.node_exit_future.await
+            match watchdog {
+                None => handle.node_exit_future.await,
+                Some(watchdog) => {
+                    let exit = handle.node_exit_future;
+                    tokio::pin!(exit);
+                    tokio::select! {
+                        res = &mut exit => res,
+                        rotation = watchdog.wait_for_rotation() => {
+                            tracing::warn!(
+                                target: "rollup_node::signer_rotation",
+                                baseline = %rotation.baseline,
+                                observed = %rotation.observed,
+                                exit_code = EXIT_CODE_SIGNER_ROTATION,
+                                "authorized signer rotated on L1; exiting for supervised restart"
+                            );
+                            // Returning lets Reth perform its normal bounded graceful runtime
+                            // shutdown. The marker preserves the distinct process exit code after
+                            // that shutdown completes.
+                            SIGNER_ROTATION_EXIT_REQUESTED.store(true, Ordering::SeqCst);
+                            Ok(())
+                        }
+                    }
+                }
+            }
         },
-    ) {
+    );
+
+    if SIGNER_ROTATION_EXIT_REQUESTED.load(Ordering::SeqCst) {
+        if let Err(err) = &result {
+            eprintln!("Error during signer-rotation shutdown: {err:?}");
+        }
+        std::process::exit(EXIT_CODE_SIGNER_ROTATION);
+    }
+
+    if let Err(err) = result {
         eprintln!("Error: {err:?}");
         std::process::exit(1);
     }

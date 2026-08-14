@@ -967,7 +967,7 @@ pub trait DatabaseReadOperations {
     ) -> Result<Option<BatchCommitData>, DatabaseError>;
 
     /// Get the status of a batch by its hash.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-utils"))]
     async fn get_batch_status_by_hash(
         &self,
         batch_hash: B256,
@@ -1073,7 +1073,7 @@ impl<T: ReadConnectionProvider + Sync + ?Sized> DatabaseReadOperations for T {
             .map(|x| x.map(Into::into))?)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-utils"))]
     async fn get_batch_status_by_hash(
         &self,
         batch_hash: B256,

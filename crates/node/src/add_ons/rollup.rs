@@ -72,11 +72,16 @@ impl RollupManagerAddOn {
                 rpc.rpc_server_handles,
             )
             .await?;
-        ctx.node
-            .task_executor()
-            .spawn_critical_with_graceful_shutdown_signal("rollup_node_manager", |shutdown| {
-                chain_orchestrator.run_until_shutdown(shutdown.ignore_guard())
-            });
+        ctx.node.task_executor().spawn_critical_with_graceful_shutdown_signal(
+            "rollup_node_manager",
+            |shutdown| async move {
+                if let Err(error) =
+                    chain_orchestrator.run_until_shutdown(shutdown.ignore_guard()).await
+                {
+                    panic!("fatal chain orchestrator error: {error}");
+                }
+            },
+        );
         Ok(handle)
     }
 }

@@ -11295,6 +11295,7 @@ dependencies = [
  "scroll-db",
  "scroll-derivation-pipeline",
  "scroll-engine",
+ "scroll-l1",
  "scroll-migration",
  "scroll-network",
  "scroll-wire",

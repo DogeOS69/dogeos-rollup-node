@@ -1,5 +1,5 @@
 use dogeos_reth_primitives::DogeosBlock;
-use metrics::Histogram;
+use metrics::{Counter, Gauge, Histogram};
 use metrics_derive::Metrics;
 use std::{collections::HashMap, time::Instant};
 use strum::{EnumIter, IntoEnumIterator};
@@ -115,6 +115,18 @@ impl Task {
 pub(crate) struct ChainOrchestratorMetrics {
     /// The duration of the task for the chain orchestrator.
     pub task_duration: Histogram,
+}
+
+/// Minimal observability for the fail-stop / Engine-hold derivation state.
+#[derive(Metrics)]
+#[metrics(scope = "chain_orchestrator")]
+pub(crate) struct DerivedBatchMetrics {
+    /// Whether a derived batch currently occupies the held slot.
+    pub held: Gauge,
+    /// The number of reconciliation attempts started.
+    pub attempts: Counter,
+    /// The number of fatal reconciliation attempts.
+    pub fatal: Counter,
 }
 
 /// A block building meter.

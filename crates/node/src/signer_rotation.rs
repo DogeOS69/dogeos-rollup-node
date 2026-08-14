@@ -2,8 +2,8 @@
 //!
 //! The watchdog polls the authorized-signer slot and resolves when a rotation away from its
 //! baseline is confirmed. Its baseline is the first successful watchdog read, so a rotation in
-//! the small window between the node's startup read and that first read will not be detected until
-//! the next rotation. The caller is responsible for shutting down the process; restarting under a
+//! the window between the node's startup read and that first read will not be detected until the
+//! next rotation. The caller is responsible for shutting down the process; restarting under a
 //! supervisor is the signer-refresh mechanism.
 
 use alloy_primitives::Address;
@@ -18,6 +18,7 @@ const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(12);
 /// Number of matching non-baseline reads required to confirm a rotation.
 const DEFAULT_CONFIRMATIONS: u32 = 3;
 
+/// Emit a periodic warning after this many consecutive failed signer reads.
 const FAILURE_WARNING_INTERVAL: u32 = 25;
 const POLL_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -135,6 +136,24 @@ impl SignerRotationWatchdog {
                 }
             }
 
+            if detector.baseline.is_none() {
+                if let Some(baseline) = observation {
+                    tracing::info!(
+                        target: "rollup_node::signer_rotation",
+                        %baseline,
+                        %system_contract,
+                        "authorized-signer watchdog baseline established"
+                    );
+                    if baseline == Address::ZERO {
+                        tracing::warn!(
+                            target: "rollup_node::signer_rotation",
+                            %system_contract,
+                            "authorized-signer watchdog baseline is zero; verify the L1 URL and sync state if unexpected"
+                        );
+                    }
+                }
+            }
+
             if let Some(rotation) = detector.observe(observation) {
                 return rotation;
             }
@@ -150,6 +169,7 @@ mod tests {
 
     const SIGNER_A: Address = Address::new([0x11; 20]);
     const SIGNER_B: Address = Address::new([0x22; 20]);
+    const SIGNER_C: Address = Address::new([0x33; 20]);
 
     #[test]
     fn stable_value_never_confirms_rotation() {
@@ -183,6 +203,21 @@ mod tests {
         assert_eq!(detector.observe(Some(SIGNER_A)), None);
         assert_eq!(detector.observe(Some(SIGNER_B)), None);
         assert_eq!(detector.observe(Some(SIGNER_B)), None);
+    }
+
+    #[test]
+    fn switching_candidate_resets_confirmation_streak() {
+        let mut detector = RotationDetector::new(3);
+
+        assert_eq!(detector.observe(Some(SIGNER_A)), None);
+        assert_eq!(detector.observe(Some(SIGNER_B)), None);
+        assert_eq!(detector.observe(Some(SIGNER_B)), None);
+        assert_eq!(detector.observe(Some(SIGNER_C)), None);
+        assert_eq!(detector.observe(Some(SIGNER_C)), None);
+        assert_eq!(
+            detector.observe(Some(SIGNER_C)),
+            Some(Rotation { baseline: SIGNER_A, observed: SIGNER_C })
+        );
     }
 
     #[test]

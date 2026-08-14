@@ -120,6 +120,12 @@ pub struct ScrollRollupNodeConfig {
 impl ScrollRollupNodeConfig {
     /// Validate that either signer key file or AWS KMS key ID is provided when sequencer is enabled
     pub fn validate(&self) -> Result<(), String> {
+        if self.consensus_args.exit_on_signer_rotation && self.sequencer_args.sequencer_enabled {
+            return Err(
+                "--consensus.exit-on-signer-rotation must not be used on a sequencer".to_string()
+            );
+        }
+
         if self.sequencer_args.sequencer_enabled &
             !matches!(self.consensus_args.algorithm, ConsensusAlgorithm::Noop)
         {
@@ -179,11 +185,10 @@ impl ScrollRollupNodeConfig {
         }
 
         self.validate().map_err(eyre::Report::msg)?;
-        let l1_url = self
-            .l1_provider_args
-            .url
-            .clone()
-            .expect("validated rotation watchdog configuration must have an L1 URL");
+        let l1_url =
+            self.l1_provider_args.url.clone().ok_or_else(|| {
+                eyre::eyre!("--consensus.exit-on-signer-rotation requires --l1.url")
+            })?;
         let node_config = NodeConfig::from_chainspec(chain_spec)?;
 
         Ok(Some(SignerRotationWatchdog::new(
@@ -589,7 +594,7 @@ pub struct RollupNodeDatabaseArgs {
     pub rn_db_path: Option<PathBuf>,
 }
 
-/// The database arguments.
+/// The consensus arguments.
 #[derive(Default, Clone, clap::Args)]
 pub struct ConsensusArgs {
     /// The type of consensus to use.
@@ -605,13 +610,15 @@ pub struct ConsensusArgs {
     pub authorized_signer: Option<Address>,
 
     /// Exit the process (code 70) when the authorized signer in the L1 system contract rotates
-    /// away from the value loaded at startup. Intended for follower nodes run under a supervisor
-    /// with a restart policy; the restart re-reads the signer. Sequencer rotation remains a manual
-    /// operation.
+    /// away from the watchdog's first successful L1 observation after startup. Intended for
+    /// follower nodes run under a supervisor with a restart policy; the restart re-reads the
+    /// signer. Sequencer rotation remains a manual operation.
     #[arg(long = "consensus.exit-on-signer-rotation", default_value_t = false)]
     pub exit_on_signer_rotation: bool,
 }
 
+// Keep the disabled field out of Debug output so default startup config logging remains
+// byte-identical. Enabled configurations include it for observability.
 impl fmt::Debug for ConsensusArgs {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut debug = f.debug_struct("ConsensusArgs");
@@ -1165,6 +1172,17 @@ mod tests {
         assert_eq!(
             config.validate().unwrap_err(),
             "--consensus.exit-on-signer-rotation requires --consensus.algorithm system-contract"
+        );
+    }
+
+    #[test]
+    fn exit_on_signer_rotation_rejects_sequencer() {
+        let mut config = rotation_watchdog_config();
+        config.sequencer_args.sequencer_enabled = true;
+
+        assert_eq!(
+            config.validate().unwrap_err(),
+            "--consensus.exit-on-signer-rotation must not be used on a sequencer"
         );
     }
 

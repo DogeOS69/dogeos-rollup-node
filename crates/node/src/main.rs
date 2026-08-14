@@ -25,7 +25,10 @@ fn main() {
     use reth_ethereum_cli::Cli;
     use reth_node_builder::EngineNodeLauncher;
     use reth_node_core::args::DefaultEngineValues;
-    use rollup_node::{DogeosChainSpecParser, ScrollRollupNode, ScrollRollupNodeConfig};
+    use rollup_node::{
+        signer_rotation::EXIT_CODE_SIGNER_ROTATION, DogeosChainSpecParser, ScrollRollupNode,
+        ScrollRollupNodeConfig,
+    };
     use std::sync::Arc;
     use tracing::info;
 
@@ -104,7 +107,8 @@ fn main() {
                                 target: "rollup_node::signer_rotation",
                                 baseline = %rotation.baseline,
                                 observed = %rotation.observed,
-                                "authorized signer rotated on L1; exiting for supervised restart (code 70)"
+                                exit_code = EXIT_CODE_SIGNER_ROTATION,
+                                "authorized signer rotated on L1; exiting for supervised restart"
                             );
                             // Returning lets Reth perform its normal bounded graceful runtime
                             // shutdown. The marker preserves the distinct process exit code after
@@ -118,13 +122,16 @@ fn main() {
         },
     );
 
+    if SIGNER_ROTATION_EXIT_REQUESTED.load(Ordering::SeqCst) {
+        if let Err(err) = &result {
+            eprintln!("Error during signer-rotation shutdown: {err:?}");
+        }
+        std::process::exit(EXIT_CODE_SIGNER_ROTATION);
+    }
+
     if let Err(err) = result {
         eprintln!("Error: {err:?}");
         std::process::exit(1);
-    }
-
-    if SIGNER_ROTATION_EXIT_REQUESTED.load(Ordering::SeqCst) {
-        std::process::exit(rollup_node::signer_rotation::EXIT_CODE_SIGNER_ROTATION);
     }
 }
 

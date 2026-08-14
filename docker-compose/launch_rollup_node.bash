@@ -9,7 +9,7 @@ wait_for_l1_devnet() {
 }
 
 # Supervised follower example (do not use for a sequencer or with a pinned signer):
-# exec rollup-node node --chain scroll-sepolia --l1.url <L1_URL> \
+# exec rollup-node node --chain dogeos-chikyu --l1.url <L1_URL> \
 #   --consensus.exit-on-signer-rotation
 
 if [ "${ENV:-}" = "dev" ]; then

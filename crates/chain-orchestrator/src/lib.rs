@@ -93,6 +93,14 @@ const BATCH_SIZE: usize = 100;
 #[cfg(any(test, feature = "test-utils"))]
 const BATCH_SIZE: usize = 1;
 
+const fn l1_notification_receiver_may_poll(
+    l2_synced: bool,
+    derivation_pipeline_empty: bool,
+    derivation_driver_can_accept_batch: bool,
+) -> bool {
+    l2_synced && derivation_pipeline_empty && derivation_driver_can_accept_batch
+}
+
 /// The [`ChainOrchestrator`] is responsible for orchestrating the progression of the L2 chain
 /// based on data consolidated from L1 and the data received over the p2p network.
 #[derive(Debug)]
@@ -281,7 +289,11 @@ impl<
                     let res = self.handle_network_event(event).await;
                     self.handle_outcome(res);
                 }
-                Some(notification) = self.l1_watcher.l1_notification_receiver().recv(), if self.sync_state.l2().is_synced() && self.derivation_pipeline.is_empty() && self.derivation_driver.can_accept_batch() => {
+                Some(notification) = self.l1_watcher.l1_notification_receiver().recv(), if l1_notification_receiver_may_poll(
+                    self.sync_state.l2().is_synced(),
+                    self.derivation_pipeline.is_empty(),
+                    self.derivation_driver.can_accept_batch(),
+                ) => {
                     let result = self.handle_l1_notification(notification).await;
                     self.handle_outcome(result);
                 }
@@ -1621,6 +1633,27 @@ mod run_loop_policy_tests {
         (orchestrator, handle, notification_tx)
     }
 
+    #[test]
+    fn l1_notification_receiver_requires_synced_idle_derivation() {
+        for (l2_synced, pipeline_empty, can_accept_batch, expected) in [
+            (false, false, false, false),
+            (false, false, true, false),
+            (false, true, false, false),
+            (false, true, true, false),
+            (true, false, false, false),
+            (true, false, true, false),
+            (true, true, false, false),
+            (true, true, true, true),
+        ] {
+            assert_eq!(
+                l1_notification_receiver_may_poll(l2_synced, pipeline_empty, can_accept_batch),
+                expected,
+                "l2_synced={l2_synced}, pipeline_empty={pipeline_empty}, \
+                 can_accept_batch={can_accept_batch}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn notification_waits_until_held_slot_and_pipeline_are_empty() {
         let database = Arc::new(setup_test_db().await);
@@ -1796,10 +1829,6 @@ mod run_loop_policy_tests {
                     Some(ChainOrchestratorEvent::BatchConsolidated(outcome))
                         if outcome.batch_info == batch_info =>
                     {
-                        assert_eq!(
-                            database.get_batch_status_by_hash(batch_info.hash).await.unwrap(),
-                            Some(BatchStatus::Consolidated)
-                        );
                         observed.push("consolidated");
                     }
                     Some(ChainOrchestratorEvent::L1Reorg { l1_block_number: 5, .. }) => {

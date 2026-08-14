@@ -19,6 +19,7 @@ const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(12);
 const DEFAULT_CONFIRMATIONS: u32 = 3;
 
 const FAILURE_WARNING_INTERVAL: u32 = 25;
+const POLL_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A confirmed signer rotation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,29 +95,45 @@ impl SignerRotationWatchdog {
         let mut consecutive_failures = 0_u32;
 
         loop {
-            let observation = match provider.authorized_signer(system_contract).await {
-                Ok(signer) => {
-                    consecutive_failures = 0;
-                    Some(signer)
-                }
-                Err(err) => {
-                    consecutive_failures = consecutive_failures.saturating_add(1);
+            let observation = match tokio::time::timeout(
+                POLL_READ_TIMEOUT,
+                provider.authorized_signer(system_contract),
+            )
+            .await
+            {
+                Ok(Ok(signer)) => Some(signer),
+                Ok(Err(err)) => {
                     tracing::debug!(
                         target: "rollup_node::signer_rotation",
                         ?err,
                         "signer poll failed; will retry"
                     );
-                    if consecutive_failures == FAILURE_WARNING_INTERVAL {
-                        tracing::warn!(
-                            target: "rollup_node::signer_rotation",
-                            failures = consecutive_failures,
-                            "authorized-signer polling is repeatedly failing; watchdog remains fail-open"
-                        );
-                        consecutive_failures = 0;
-                    }
+                    None
+                }
+                Err(err) => {
+                    tracing::debug!(
+                        target: "rollup_node::signer_rotation",
+                        ?err,
+                        timeout = ?POLL_READ_TIMEOUT,
+                        "signer poll timed out; will retry"
+                    );
                     None
                 }
             };
+
+            if observation.is_some() {
+                consecutive_failures = 0;
+            } else {
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                if consecutive_failures == FAILURE_WARNING_INTERVAL {
+                    tracing::warn!(
+                        target: "rollup_node::signer_rotation",
+                        failures = consecutive_failures,
+                        "authorized-signer polling is repeatedly failing; watchdog remains fail-open"
+                    );
+                    consecutive_failures = 0;
+                }
+            }
 
             if let Some(rotation) = detector.observe(observation) {
                 return rotation;

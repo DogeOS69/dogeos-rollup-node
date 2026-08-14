@@ -42,7 +42,7 @@ elif [ "${ENV:-}" = "sepolia" ]; then
     BLOB_S3_PARAMS="--blob.s3_url https://scroll-sepolia-blob-data.s3.us-west-2.amazonaws.com/"
   fi
 
-  exec rollup-node node --chain scroll-sepolia --datadir=/l2reth --engine.legacy-state-root --metrics=0.0.0.0:6060 --disable-discovery \
+  exec rollup-node node --chain dogeos-chikyu --datadir=/l2reth --engine.legacy-state-root --metrics=0.0.0.0:6060 --disable-discovery \
     --http --http.addr=0.0.0.0 --http.port=8545 --http.corsdomain "*" --http.api admin,debug,eth,net,trace,txpool,web3,rpc,reth,ots,flashbots,miner,mev \
     --ws --ws.addr=0.0.0.0 --ws.port=8546 --ws.api admin,debug,eth,net,trace,txpool,web3,rpc,reth,ots,flashbots,miner,mev \
     --log.stdout.format log-fmt -vvv $URL_PARAMS $BLOB_S3_PARAMS \
@@ -68,7 +68,7 @@ elif [ "${ENV:-}" = "mainnet" ]; then
     BLOB_S3_PARAMS="--blob.s3_url https://scroll-mainnet-blob-data.s3.us-west-2.amazonaws.com/"
   fi
 
-  exec rollup-node node --chain scroll-mainnet --datadir=/l2reth --engine.legacy-state-root --metrics=0.0.0.0:6060 --disable-discovery \
+  exec rollup-node node --chain dogeos-mainnet --datadir=/l2reth --engine.legacy-state-root --metrics=0.0.0.0:6060 --disable-discovery \
     --http --http.addr=0.0.0.0 --http.port=8545 --http.corsdomain "*" --http.api admin,debug,eth,net,trace,txpool,web3,rpc,reth,ots,flashbots,miner,mev \
     --ws --ws.addr=0.0.0.0 --ws.port=8546 --ws.api admin,debug,eth,net,trace,txpool,web3,rpc,reth,ots,flashbots,miner,mev \
     --log.stdout.format log-fmt -vvv $URL_PARAMS $BLOB_S3_PARAMS \

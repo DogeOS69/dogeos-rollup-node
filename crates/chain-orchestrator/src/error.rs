@@ -78,18 +78,6 @@ pub enum ChainOrchestratorError {
     /// The derivation pipeline found an invalid block for the given batch.
     #[error("The derivation pipeline found an invalid block: {0} for batch: {1}")]
     InvalidBatch(BlockInfo, BatchInfo),
-    /// Accepting an L1 notification would exceed the held FIFO's configured capacity.
-    #[error(
-        "held L1 notification FIFO overflow during {method}: attempted depth {depth} exceeds capacity {capacity}"
-    )]
-    HeldL1NotificationBufferOverflow {
-        /// The depth that would have resulted from accepting the rejected notification.
-        depth: usize,
-        /// The FIFO capacity inherited from the L1 watcher channel.
-        capacity: usize,
-        /// The Engine method awaited by the dropped attempt, or the latest method that held it.
-        method: &'static str,
-    },
     /// An Engine request failed before returning a status for a derived batch.
     #[error(
         "Engine request {method} failed while reconciling derived batch {batch_info:?}: {source}"

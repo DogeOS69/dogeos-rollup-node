@@ -87,44 +87,6 @@ const HEADER_FETCH_COUNT: u64 = 100;
 /// The size of the event channel used to broadcast events to listeners.
 const EVENT_CHANNEL_SIZE: usize = 5000;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HeldL1NotificationDisposition {
-    Buffer,
-    PreemptReorg(u64),
-}
-
-const fn held_l1_notification_disposition(
-    notification: &L1Notification,
-) -> HeldL1NotificationDisposition {
-    match notification {
-        L1Notification::Reorg(block_number) => {
-            HeldL1NotificationDisposition::PreemptReorg(*block_number)
-        }
-        _ => HeldL1NotificationDisposition::Buffer,
-    }
-}
-
-const fn ordinary_l1_notifications_may_apply(held_slot: bool, pipeline_empty: bool) -> bool {
-    !held_slot && pipeline_empty
-}
-
-const fn l1_receiver_may_poll(held_slot: bool, pipeline_empty: bool) -> bool {
-    held_slot || pipeline_empty
-}
-
-fn try_buffer_held_l1_notification(
-    buffer: &mut VecDeque<Arc<L1Notification>>,
-    capacity: usize,
-    notification: Arc<L1Notification>,
-) -> Result<(), usize> {
-    let attempted_depth = buffer.len().saturating_add(1);
-    if attempted_depth > capacity {
-        return Err(attempted_depth)
-    }
-    buffer.push_back(notification);
-    Ok(())
-}
-
 /// The batch size for batch validation.
 #[cfg(not(any(test, feature = "test-utils")))]
 const BATCH_SIZE: usize = 100;
@@ -169,10 +131,6 @@ pub struct ChainOrchestrator<
     derivation_pipeline: DerivationPipeline,
     /// Owns the single derived result being reconciled or held for Engine sync.
     derivation_driver: DerivationDriver,
-    /// Ordinary L1 notifications observed while the derived-batch slot is occupied.
-    buffered_l1_notifications: VecDeque<Arc<L1Notification>>,
-    /// Maximum held-notification depth, inherited from the bounded watcher channel.
-    buffered_l1_notification_capacity: usize,
     /// Optional event sender for broadcasting events to listeners.
     event_sender: Option<EventSender<ChainOrchestratorEvent>>,
     /// The metrics handler.
@@ -194,7 +152,7 @@ impl<
         config: ChainOrchestratorConfig<ChainSpec>,
         block_client: Arc<FullBlockClient<<N as BlockDownloaderProvider>::Client>>,
         l2_provider: L2P,
-        mut l1_watcher: L1WatcherHandle,
+        l1_watcher: L1WatcherHandle,
         network: ScrollNetwork<N>,
         consensus: Box<dyn Consensus + 'static>,
         engine: Engine<EC>,
@@ -204,8 +162,6 @@ impl<
     ) -> Result<(Self, ChainOrchestratorHandle<N>), ChainOrchestratorError> {
         let (handle_tx, handle_rx) = mpsc::unbounded_channel();
         let handle = ChainOrchestratorHandle::new(handle_tx);
-        let buffered_l1_notification_capacity =
-            l1_watcher.l1_notification_receiver().max_capacity();
         Ok((
             Self {
                 block_client,
@@ -221,8 +177,6 @@ impl<
                 signer,
                 derivation_pipeline,
                 derivation_driver: DerivationDriver::default(),
-                buffered_l1_notifications: VecDeque::new(),
-                buffered_l1_notification_capacity,
                 handle_rx,
                 event_sender: None,
                 metric_handler: MetricsHandler::default(),
@@ -250,63 +204,26 @@ impl<
                         .expect("metric exists")
                         .clone();
                     let started = Instant::now();
-                    let mut preempting_reorg = None;
-                    let mut shutdown_during_attempt = false;
-                    let mut fifo_overflow_depth = None;
                     let step = {
                         let mut attempt = Box::pin(self.derivation_driver.run_attempt(
                             &*self.l2_client,
                             &mut self.engine,
                             &self.database,
                         ));
-                        loop {
-                            tokio::select! {
-                                biased;
-                                _guard = &mut shutdown => {
-                                    shutdown_during_attempt = true;
-                                    break None
-                                }
-                                Some(notification) = self.l1_watcher.l1_notification_receiver().recv(), if self.sync_state.l2().is_synced() => {
-                                    match held_l1_notification_disposition(&notification) {
-                                        HeldL1NotificationDisposition::PreemptReorg(block_number) => {
-                                            preempting_reorg = Some(block_number);
-                                            break None
-                                        }
-                                        HeldL1NotificationDisposition::Buffer => {
-                                            if let Err(depth) = try_buffer_held_l1_notification(
-                                                &mut self.buffered_l1_notifications,
-                                                self.buffered_l1_notification_capacity,
-                                                notification,
-                                            ) {
-                                                fifo_overflow_depth = Some(depth);
-                                                break None
-                                            }
-                                        }
-                                    }
-                                }
-                                step = &mut attempt => break Some(step),
-                            }
+                        tokio::select! {
+                            biased;
+                            _guard = &mut shutdown => None,
+                            step = &mut attempt => Some(step),
                         }
                     };
                     metric.task_duration.record(started.elapsed().as_secs_f64());
 
-                    if shutdown_during_attempt {
+                    let Some(step) = step else {
                         self.notify(ChainOrchestratorEvent::Shutdown);
                         return Ok(())
-                    }
-                    if let Some(depth) = fifo_overflow_depth {
-                        let method = self.derivation_driver.in_flight_engine_method();
-                        return Err(self.fail_held_l1_notification_overflow(depth, method))
-                    }
-                    if let Some(block_number) = preempting_reorg {
-                        let event = self.handle_held_l1_reorg(block_number).await?;
-                        self.handle_outcome(Ok(event));
-                        continue
-                    }
+                    };
 
-                    match step.expect(
-                        "an attempt only exits early for shutdown, reorg, or FIFO overflow",
-                    ) {
+                    match step {
                         AttemptStep::Completed(consolidated) => {
                             for outcome in consolidated.block_outcomes {
                                 self.notify(ChainOrchestratorEvent::BlockConsolidated(outcome));
@@ -337,10 +254,6 @@ impl<
                         tracing::error!(target: "scroll::chain_orchestrator", ?err, "Error handling command");
                     }
                 }
-                Some(notification) = async { self.buffered_l1_notifications.pop_front() }, if !self.buffered_l1_notifications.is_empty() && ordinary_l1_notifications_may_apply(!self.derivation_driver.can_accept_batch(), self.derivation_pipeline.is_empty()) => {
-                    let result = self.handle_l1_notification(notification).await;
-                    self.handle_outcome(result);
-                }
                 Some(event) = async {
                     if let Some(event) = self.signer.as_mut() {
                         event.next().await
@@ -368,31 +281,9 @@ impl<
                     let res = self.handle_network_event(event).await;
                     self.handle_outcome(res);
                 }
-                Some(notification) = self.l1_watcher.l1_notification_receiver().recv(), if self.sync_state.l2().is_synced() && l1_receiver_may_poll(!self.derivation_driver.can_accept_batch(), self.derivation_pipeline.is_empty()) => {
-                    if self.derivation_driver.can_accept_batch() {
-                        let result = self.handle_l1_notification(notification).await;
-                        self.handle_outcome(result);
-                    } else {
-                        match held_l1_notification_disposition(&notification) {
-                            HeldL1NotificationDisposition::PreemptReorg(block_number) => {
-                                let event = self.handle_held_l1_reorg(block_number).await?;
-                                self.handle_outcome(Ok(event));
-                            }
-                            HeldL1NotificationDisposition::Buffer => {
-                                if let Err(depth) = try_buffer_held_l1_notification(
-                                    &mut self.buffered_l1_notifications,
-                                    self.buffered_l1_notification_capacity,
-                                    notification,
-                                ) {
-                                    let method =
-                                        self.derivation_driver.in_flight_engine_method();
-                                    return Err(
-                                        self.fail_held_l1_notification_overflow(depth, method)
-                                    )
-                                }
-                            }
-                        }
-                    }
+                Some(notification) = self.l1_watcher.l1_notification_receiver().recv(), if self.sync_state.l2().is_synced() && self.derivation_pipeline.is_empty() && self.derivation_driver.can_accept_batch() => {
+                    let result = self.handle_l1_notification(notification).await;
+                    self.handle_outcome(result);
                 }
 
             }
@@ -402,66 +293,6 @@ impl<
     /// Returns whether derivation is queued or one result occupies the held slot.
     const fn has_pending_derivation_work(&self) -> bool {
         !self.derivation_driver.can_accept_batch() || !self.derivation_pipeline.is_empty()
-    }
-
-    /// Applies ordinary L1 notifications that preceded a preempting reorg in receive order.
-    async fn drain_buffered_l1_notifications(&mut self) -> Result<(), ChainOrchestratorError> {
-        while let Some(notification) = self.buffered_l1_notifications.pop_front() {
-            if let Some(event) = self.handle_l1_notification(notification).await? {
-                self.notify(event);
-            }
-        }
-        Ok(())
-    }
-
-    /// Applies notifications ordered before a held-slot reorg, then processes that reorg. Any
-    /// error is fatal because the held batch's post-L1-mutation validity would otherwise be
-    /// unknown.
-    async fn handle_held_l1_reorg(
-        &mut self,
-        block_number: u64,
-    ) -> Result<Option<ChainOrchestratorEvent>, ChainOrchestratorError> {
-        let context =
-            self.derivation_driver.fatal_context().expect("a held-slot reorg has fatal context");
-        if let Err(error) = self.drain_buffered_l1_notifications().await {
-            self.log_fatal_held_operation(context, "buffered L1 notification before reorg", &error);
-            return Err(error)
-        }
-        match self.handle_l1_reorg_and_revalidate(block_number).await {
-            Ok(event) => Ok(event),
-            Err(error) => {
-                self.log_fatal_held_operation(context, "L1 reorg", &error);
-                Err(error)
-            }
-        }
-    }
-
-    /// Cancels held reconciliation and emits its single fatal record when the L1 FIFO overflows.
-    fn fail_held_l1_notification_overflow(
-        &mut self,
-        depth: usize,
-        method: &'static str,
-    ) -> ChainOrchestratorError {
-        self.derivation_driver.cancel_attempt();
-        self.derivation_driver.record_fatal();
-        let capacity = self.buffered_l1_notification_capacity;
-        let (batch_info, attempt, held_ms) =
-            self.derivation_driver.fatal_context().expect("FIFO overflow requires a held batch");
-        let error =
-            ChainOrchestratorError::HeldL1NotificationBufferOverflow { depth, capacity, method };
-        tracing::error!(
-            target: "scroll::chain_orchestrator",
-            batch_index = batch_info.index,
-            batch_hash = ?batch_info.hash,
-            attempt,
-            held_ms,
-            method,
-            fifo_depth = depth,
-            fifo_capacity = capacity,
-            source = %error,
-            "Held L1 notification FIFO overflow; fail-stopping"
-        );
-        error
     }
 
     /// Writes a structured fail-stop record for an operation that made held validity uncertain.
@@ -695,7 +526,6 @@ impl<
 
                 // Revert the L1 watcher to the specified block.
                 self.l1_watcher.revert_to_l1_block(block_number);
-                self.buffered_l1_notifications.clear();
 
                 if matches!(held_outcome, HeldReorgOutcome::Survived { .. }) {
                     self.derivation_driver.schedule_fresh_reconciliation();
@@ -775,7 +605,7 @@ impl<
         Ok((unwind_result, outcome))
     }
 
-    /// Meters L1 reorg handling; held call sites apply their separate fail-stop boundary.
+    /// Meters L1 reorg handling.
     async fn handle_l1_reorg_and_revalidate(
         &mut self,
         block_number: u64,
@@ -1715,6 +1545,21 @@ mod run_loop_policy_tests {
         }
     }
 
+    fn script_syncing_hold_then_success(client: &ScriptedEngineClient) {
+        client
+            .push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Syncing, None)));
+        client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(
+            PayloadStatusEnum::Valid,
+            Some(PayloadId::new([7; 8])),
+        )));
+        client.push_get_payload(ScriptedResponse::Ok(payload(SAFE + 1)));
+        client.push_new_payload(ScriptedResponse::Ok(PayloadStatus {
+            status: PayloadStatusEnum::Valid,
+            latest_valid_hash: None,
+        }));
+        client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Valid, None)));
+    }
+
     async fn test_scroll_network() -> ScrollNetwork<NoopNetwork<DogeosNetworkPrimitives>> {
         let (to_manager_tx, mut from_handle_rx) = mpsc::unbounded_channel();
         let handle =
@@ -1776,245 +1621,8 @@ mod run_loop_policy_tests {
         (orchestrator, handle, notification_tx)
     }
 
-    #[test]
-    fn covering_batch_revert_is_buffered_while_batch_is_held() {
-        let notification = L1Notification::BatchRevert {
-            batch_info: BatchInfo::new(7, B256::repeat_byte(0x77)),
-            block_info: BlockInfo { number: 20, hash: B256::repeat_byte(0x20) },
-        };
-
-        assert_eq!(
-            held_l1_notification_disposition(&notification),
-            HeldL1NotificationDisposition::Buffer
-        );
-        assert!(!ordinary_l1_notifications_may_apply(true, true));
-        assert!(!ordinary_l1_notifications_may_apply(false, false));
-        assert!(ordinary_l1_notifications_may_apply(false, true));
-        assert!(l1_receiver_may_poll(true, false));
-        assert!(!l1_receiver_may_poll(false, false));
-        assert!(l1_receiver_may_poll(false, true));
-    }
-
-    #[test]
-    fn reorg_is_the_only_l1_notification_that_preempts_a_held_attempt() {
-        assert_eq!(
-            held_l1_notification_disposition(&L1Notification::Reorg(42)),
-            HeldL1NotificationDisposition::PreemptReorg(42)
-        );
-        assert_eq!(
-            held_l1_notification_disposition(&L1Notification::Processed(43)),
-            HeldL1NotificationDisposition::Buffer
-        );
-    }
-
     #[tokio::test]
-    async fn covering_batch_revert_runs_only_after_held_batch_completes() {
-        let database = Arc::new(setup_test_db().await);
-        database.insert_genesis_block(B256::ZERO).await.unwrap();
-        let batch_info = BatchInfo::new(1, B256::repeat_byte(1));
-        database
-            .insert_batch(BatchCommitData {
-                hash: batch_info.hash,
-                index: batch_info.index,
-                block_number: 1,
-                block_timestamp: 0,
-                calldata: Arc::new(Bytes::new()),
-                blob_versioned_hash: None,
-                finalized_block_number: None,
-                reverted_block_number: None,
-            })
-            .await
-            .unwrap();
-        database.update_batch_status(batch_info.hash, BatchStatus::Processing).await.unwrap();
-
-        let engine_client = Arc::new(ScriptedEngineClient::new());
-        engine_client
-            .push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Syncing, None)));
-        engine_client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(
-            PayloadStatusEnum::Valid,
-            Some(PayloadId::new([7; 8])),
-        )));
-        engine_client.push_get_payload(ScriptedResponse::Ok(payload(SAFE + 1)));
-        engine_client.push_new_payload(ScriptedResponse::Ok(PayloadStatus {
-            status: PayloadStatusEnum::Valid,
-            latest_valid_hash: None,
-        }));
-        engine_client
-            .push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Valid, None)));
-        engine_client
-            .push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Valid, None)));
-
-        let asserter = Asserter::new();
-        asserter.push_success(&Option::<()>::None);
-        asserter.push_success(&Option::<()>::None);
-        let (orchestrator, handle, notification_tx) = test_orchestrator(
-            database.clone(),
-            engine_client.clone(),
-            asserter,
-            BatchDerivationResult {
-                attributes: vec![DerivedAttributes {
-                    block_number: SAFE + 1,
-                    attributes: ScrollPayloadAttributes::default(),
-                }],
-                batch_info,
-                skipped_l1_messages: vec![],
-                target_status: BatchStatus::Consolidated,
-            },
-        )
-        .await;
-
-        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-        let run_task = tokio::spawn(orchestrator.run_until_shutdown(Box::pin(async move {
-            let _ = shutdown_rx.await;
-        })));
-        let mut events = handle.get_event_listener().await.unwrap();
-
-        time::timeout(Duration::from_secs(2), async {
-            loop {
-                let status = handle.status().await.unwrap();
-                if matches!(
-                    status.derivation,
-                    DerivationStatus::Held(HeldBatchStatus { attempts_started: 1, .. })
-                ) {
-                    break
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("first Engine SYNCING response must hold the batch");
-
-        notification_tx
-            .send(Arc::new(L1Notification::BatchRevert { batch_info, block_info: info(20, 0x20) }))
-            .await
-            .unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(
-            database.get_batch_status_by_hash(batch_info.hash).await.unwrap(),
-            Some(BatchStatus::Processing),
-            "the covering revert must remain buffered while the batch is held"
-        );
-
-        let mut consolidated_before_revert = false;
-        time::timeout(Duration::from_secs(5), async {
-            loop {
-                match events.next().await {
-                    Some(ChainOrchestratorEvent::BatchConsolidated(outcome))
-                        if outcome.batch_info == batch_info =>
-                    {
-                        consolidated_before_revert = true;
-                    }
-                    Some(ChainOrchestratorEvent::BatchReverted { .. }) => break,
-                    _ => {}
-                }
-            }
-        })
-        .await
-        .expect("held completion and the buffered revert must both finish");
-        assert!(consolidated_before_revert);
-        assert_eq!(
-            database.get_batch_status_by_hash(batch_info.hash).await.unwrap(),
-            Some(BatchStatus::Reverted)
-        );
-        assert_eq!(engine_client.fork_choice_updated_calls(), 4);
-
-        let _ = shutdown_tx.send(());
-        assert!(run_task.await.unwrap().is_ok());
-    }
-
-    #[tokio::test]
-    async fn held_l1_notification_fifo_overflow_fail_stops_without_retry() {
-        let database = Arc::new(setup_test_db().await);
-        database.insert_genesis_block(B256::ZERO).await.unwrap();
-        let batch_info = BatchInfo::new(1, B256::repeat_byte(1));
-        database
-            .insert_batch(BatchCommitData {
-                hash: batch_info.hash,
-                index: batch_info.index,
-                block_number: 1,
-                block_timestamp: 0,
-                calldata: Arc::new(Bytes::new()),
-                blob_versioned_hash: None,
-                finalized_block_number: None,
-                reverted_block_number: None,
-            })
-            .await
-            .unwrap();
-        database.update_batch_status(batch_info.hash, BatchStatus::Processing).await.unwrap();
-
-        let engine_client = Arc::new(ScriptedEngineClient::new());
-        engine_client.push_fork_choice_updated(ScriptedResponse::DelayThen(
-            Duration::from_secs(30),
-            Box::new(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Syncing, None))),
-        ));
-        let asserter = Asserter::new();
-        asserter.push_success(&Option::<()>::None);
-        let (orchestrator, _handle, notification_tx) = test_orchestrator(
-            database.clone(),
-            engine_client.clone(),
-            asserter,
-            BatchDerivationResult {
-                attributes: vec![DerivedAttributes {
-                    block_number: SAFE + 1,
-                    attributes: ScrollPayloadAttributes::default(),
-                }],
-                batch_info,
-                skipped_l1_messages: vec![],
-                target_status: BatchStatus::Consolidated,
-            },
-        )
-        .await;
-
-        let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-        let run_task = tokio::spawn(orchestrator.run_until_shutdown(Box::pin(async move {
-            let _ = shutdown_rx.await;
-        })));
-        time::timeout(Duration::from_secs(2), async {
-            while engine_client.fork_choice_updated_calls() == 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("build forkchoiceUpdated must be pending before FIFO overflow");
-
-        for block_number in 0..=TEST_L1_NOTIFICATION_CAPACITY {
-            notification_tx
-                .send(Arc::new(L1Notification::Processed(block_number as u64)))
-                .await
-                .unwrap();
-        }
-
-        let result = time::timeout(Duration::from_secs(2), run_task)
-            .await
-            .expect("capacity + 1 must terminate the run loop")
-            .unwrap();
-        assert!(matches!(
-            result,
-            Err(ChainOrchestratorError::HeldL1NotificationBufferOverflow {
-                depth,
-                capacity: TEST_L1_NOTIFICATION_CAPACITY,
-                method,
-            }) if depth == TEST_L1_NOTIFICATION_CAPACITY + 1 && method == "forkchoiceUpdated(build)"
-        ));
-        assert_eq!(
-            database.get_batch_status_by_hash(batch_info.hash).await.unwrap(),
-            Some(BatchStatus::Processing),
-            "overflow must preserve ownership for restart recovery"
-        );
-        assert_eq!(engine_client.fork_choice_updated_calls(), 1);
-        assert_eq!(engine_client.get_payload_calls(), 0);
-        assert_eq!(engine_client.new_payload_calls(), 0);
-
-        // The delayed response would still be pending, so any additional call here would prove
-        // that overflow failed to drop the attempt and terminate its run loop.
-        time::sleep(Duration::from_millis(100)).await;
-        assert_eq!(engine_client.fork_choice_updated_calls(), 1);
-        assert_eq!(engine_client.get_payload_calls(), 0);
-        assert_eq!(engine_client.new_payload_calls(), 0);
-    }
-
-    #[tokio::test]
-    async fn administrative_revert_discards_buffered_l1_notifications() {
+    async fn notification_waits_until_held_slot_and_pipeline_are_empty() {
         let database = Arc::new(setup_test_db().await);
         database.insert_genesis_block(B256::ZERO).await.unwrap();
         database.set_processed_l1_block_number(5).await.unwrap();
@@ -2023,7 +1631,7 @@ mod run_loop_policy_tests {
             .insert_batch(BatchCommitData {
                 hash: batch_info.hash,
                 index: batch_info.index,
-                block_number: 10,
+                block_number: 1,
                 block_timestamp: 0,
                 calldata: Arc::new(Bytes::new()),
                 blob_versioned_hash: None,
@@ -2035,15 +1643,14 @@ mod run_loop_policy_tests {
         database.update_batch_status(batch_info.hash, BatchStatus::Processing).await.unwrap();
 
         let engine_client = Arc::new(ScriptedEngineClient::new());
-        engine_client
-            .push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Syncing, None)));
-        engine_client
-            .push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Valid, None)));
+        script_syncing_hold_then_success(&engine_client);
+
         let asserter = Asserter::new();
         asserter.push_success(&Option::<()>::None);
-        let (orchestrator, handle, notification_tx) = test_orchestrator(
+        asserter.push_success(&Option::<()>::None);
+        let (mut orchestrator, handle, notification_tx) = test_orchestrator(
             database.clone(),
-            engine_client,
+            engine_client.clone(),
             asserter,
             BatchDerivationResult {
                 attributes: vec![DerivedAttributes {
@@ -2056,11 +1663,13 @@ mod run_loop_policy_tests {
             },
         )
         .await;
+        let mut events = orchestrator.event_listener();
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
         let run_task = tokio::spawn(orchestrator.run_until_shutdown(Box::pin(async move {
             let _ = shutdown_rx.await;
         })));
+
         time::timeout(Duration::from_secs(2), async {
             loop {
                 let status = handle.status().await.unwrap();
@@ -2077,25 +1686,45 @@ mod run_loop_policy_tests {
         .expect("first Engine SYNCING response must hold the batch");
 
         notification_tx.send(Arc::new(L1Notification::Processed(10))).await.unwrap();
+        time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(notification_tx.capacity(), TEST_L1_NOTIFICATION_CAPACITY - 1);
+        assert_eq!(
+            database.get_processed_l1_block_number().await.unwrap(),
+            5,
+            "the watcher channel must retain the notification while derivation is held"
+        );
+
+        time::timeout(Duration::from_secs(5), async {
+            loop {
+                if matches!(
+                    events.next().await,
+                    Some(ChainOrchestratorEvent::BatchConsolidated(outcome))
+                        if outcome.batch_info == batch_info
+                ) {
+                    break
+                }
+            }
+        })
+        .await
+        .expect("the held batch must consolidate");
+
         time::timeout(Duration::from_secs(2), async {
-            while notification_tx.capacity() != TEST_L1_NOTIFICATION_CAPACITY {
+            while database.get_processed_l1_block_number().await.unwrap() != 10 {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("the stale notification must enter the held FIFO before reset");
-
-        assert!(handle.revert_to_l1_block(5).await.unwrap());
-        time::sleep(Duration::from_millis(100)).await;
-        assert_eq!(database.get_processed_l1_block_number().await.unwrap(), 5);
-        assert!(database.get_batch_by_index(batch_info.index).await.unwrap().is_none());
+        .expect("the notification must apply once derivation is idle");
+        assert_eq!(notification_tx.capacity(), TEST_L1_NOTIFICATION_CAPACITY);
+        assert!(matches!(handle.status().await.unwrap().derivation, DerivationStatus::Idle));
+        assert_eq!(engine_client.fork_choice_updated_calls(), 3);
 
         let _ = shutdown_tx.send(());
         assert!(run_task.await.unwrap().is_ok());
     }
 
     #[tokio::test]
-    async fn reorg_preempts_pending_engine_call_after_draining_fifo() {
+    async fn queued_reorg_runs_after_consolidation_then_unwinds_it() {
         let database = Arc::new(setup_test_db().await);
         database.insert_genesis_block(B256::ZERO).await.unwrap();
         let batch_info = BatchInfo::new(1, B256::repeat_byte(1));
@@ -2115,13 +1744,11 @@ mod run_loop_policy_tests {
         database.update_batch_status(batch_info.hash, BatchStatus::Processing).await.unwrap();
 
         let engine_client = Arc::new(ScriptedEngineClient::new());
-        engine_client.push_fork_choice_updated(ScriptedResponse::DelayThen(
-            Duration::from_secs(30),
-            Box::new(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Syncing, None))),
-        ));
+        script_syncing_hold_then_success(&engine_client);
         engine_client
             .push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Valid, None)));
         let asserter = Asserter::new();
+        asserter.push_success(&Option::<()>::None);
         asserter.push_success(&Option::<()>::None);
         let (mut orchestrator, _handle, notification_tx) = test_orchestrator(
             database.clone(),
@@ -2144,22 +1771,37 @@ mod run_loop_policy_tests {
         let run_task = tokio::spawn(orchestrator.run_until_shutdown(Box::pin(async move {
             let _ = shutdown_rx.await;
         })));
+
         time::timeout(Duration::from_secs(2), async {
-            while engine_client.fork_choice_updated_calls() == 0 {
+            while engine_client.fork_choice_updated_calls() < 1 {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("build forkchoiceUpdated must be pending before reorg");
+        .expect("first Engine SYNCING response must hold the batch");
 
-        notification_tx.send(Arc::new(L1Notification::NewBlock(info(10, 0x10)))).await.unwrap();
         notification_tx.send(Arc::new(L1Notification::Reorg(5))).await.unwrap();
+        time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(notification_tx.capacity(), TEST_L1_NOTIFICATION_CAPACITY - 1);
+        assert_eq!(
+            database.get_batch_status_by_hash(batch_info.hash).await.unwrap(),
+            Some(BatchStatus::Processing),
+            "the queued reorg must not preempt the held batch"
+        );
 
-        let observed = time::timeout(Duration::from_secs(2), async {
+        let observed = time::timeout(Duration::from_secs(5), async {
             let mut observed = Vec::new();
             while observed.len() < 2 {
                 match events.next().await {
-                    Some(ChainOrchestratorEvent::NewL1Block(10)) => observed.push("new_block"),
+                    Some(ChainOrchestratorEvent::BatchConsolidated(outcome))
+                        if outcome.batch_info == batch_info =>
+                    {
+                        assert_eq!(
+                            database.get_batch_status_by_hash(batch_info.hash).await.unwrap(),
+                            Some(BatchStatus::Consolidated)
+                        );
+                        observed.push("consolidated");
+                    }
                     Some(ChainOrchestratorEvent::L1Reorg { l1_block_number: 5, .. }) => {
                         observed.push("reorg")
                     }
@@ -2169,20 +1811,20 @@ mod run_loop_policy_tests {
             observed
         })
         .await
-        .expect("buffered notification and reorg must both complete");
-        assert_eq!(observed, ["new_block", "reorg"]);
+        .expect("consolidation and the queued reorg must both complete");
+        assert_eq!(observed, ["consolidated", "reorg"]);
         assert_eq!(database.get_latest_l1_block_number().await.unwrap(), 5);
         assert!(database.get_batch_by_index(batch_info.index).await.unwrap().is_none());
-        assert_eq!(engine_client.fork_choice_updated_calls(), 2);
-        assert_eq!(engine_client.get_payload_calls(), 0);
-        assert_eq!(engine_client.new_payload_calls(), 0);
+        assert_eq!(engine_client.fork_choice_updated_calls(), 4);
+        assert_eq!(engine_client.get_payload_calls(), 1);
+        assert_eq!(engine_client.new_payload_calls(), 1);
 
         let _ = shutdown_tx.send(());
         assert!(run_task.await.unwrap().is_ok());
     }
 
     #[tokio::test]
-    async fn post_unwind_provider_failure_fail_stops_without_retry() {
+    async fn administrative_post_unwind_engine_failure_fail_stops_without_retry() {
         let database = Arc::new(setup_test_db().await);
         database.insert_genesis_block(B256::ZERO).await.unwrap();
         let batch_info = BatchInfo::new(1, B256::repeat_byte(1));
@@ -2201,11 +1843,15 @@ mod run_loop_policy_tests {
             .unwrap();
         database.update_batch_status(batch_info.hash, BatchStatus::Processing).await.unwrap();
         database
-            .insert_l1_message(L1MessageEnvelope {
-                transaction: TxL1Message { queue_index: 0, ..Default::default() },
-                l1_block_number: 10,
-                l2_block_number: Some(SAFE + 1),
-                queue_hash: None,
+            .insert_batch(BatchCommitData {
+                hash: B256::repeat_byte(2),
+                index: 2,
+                block_number: 10,
+                block_timestamp: 0,
+                calldata: Arc::new(Bytes::new()),
+                blob_versioned_hash: None,
+                finalized_block_number: None,
+                reverted_block_number: None,
             })
             .await
             .unwrap();
@@ -2213,10 +1859,10 @@ mod run_loop_policy_tests {
         let engine_client = Arc::new(ScriptedEngineClient::new());
         engine_client
             .push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Syncing, None)));
+        engine_client.push_fork_choice_updated(ScriptedResponse::TransportFailure);
         let asserter = Asserter::new();
         asserter.push_success(&Option::<()>::None);
-        asserter.push_success(&Option::<()>::None);
-        let (orchestrator, handle, notification_tx) = test_orchestrator(
+        let (orchestrator, handle, _notification_tx) = test_orchestrator(
             database.clone(),
             engine_client.clone(),
             asserter,
@@ -2251,18 +1897,19 @@ mod run_loop_policy_tests {
         .await
         .expect("first Engine SYNCING response must hold the batch");
 
-        notification_tx.send(Arc::new(L1Notification::Reorg(5))).await.unwrap();
+        let revert_task = tokio::spawn(async move { handle.revert_to_l1_block(5).await });
         let result = time::timeout(Duration::from_secs(2), run_task)
             .await
-            .expect("post-unwind provider failure must terminate the run loop")
+            .expect("post-unwind Engine failure must terminate the run loop")
             .unwrap();
-        assert!(matches!(result, Err(ChainOrchestratorError::L2BlockNotFoundInL2Client(SAFE))));
-        assert_eq!(engine_client.fork_choice_updated_calls(), 1);
+        assert!(revert_task.await.unwrap().is_err());
+        assert!(matches!(result, Err(ChainOrchestratorError::EngineError(_))));
+        assert_eq!(engine_client.fork_choice_updated_calls(), 2);
         assert_eq!(
             database.get_batch_status_by_hash(batch_info.hash).await.unwrap(),
             Some(BatchStatus::Processing),
             "the surviving held row must remain for restart recovery"
         );
-        assert_eq!(database.get_l2_head_block_number().await.unwrap(), SAFE);
+        assert!(database.get_batch_by_index(2).await.unwrap().is_none());
     }
 }

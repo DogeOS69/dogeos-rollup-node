@@ -26,7 +26,6 @@ const BUILD_FCU_METHOD: &str = "forkchoiceUpdated(build)";
 const GET_PAYLOAD_METHOD: &str = "getPayload";
 const NEW_PAYLOAD_METHOD: &str = "newPayload";
 const FCU_METHOD: &str = "forkchoiceUpdated";
-const RECONCILE_METHOD: &str = "reconcileBatch";
 
 /// The successful result of a reconciliation attempt. Events are emitted by the run loop only
 /// after the database commit performed by the attempt has succeeded.
@@ -92,7 +91,6 @@ struct PendingBatch {
     attempts_started: u64,
     last_hold: Option<HoldReason>,
     current_backoff_ms: Option<u64>,
-    in_flight_engine_method: &'static str,
 }
 
 /// Copyable metadata used to revalidate a held batch after an L1 unwind.
@@ -146,7 +144,6 @@ impl DerivationDriver {
             attempts_started: 0,
             last_hold: None,
             current_backoff_ms: None,
-            in_flight_engine_method: RECONCILE_METHOD,
         });
         self.metrics.held.set(1.0);
         self.schedule_immediate();
@@ -176,7 +173,6 @@ impl DerivationDriver {
         let pending = self.pending.as_mut().expect("attempt requires a held batch");
         pending.attempts_started = pending.attempts_started.saturating_add(1);
         pending.current_backoff_ms = None;
-        pending.in_flight_engine_method = RECONCILE_METHOD;
         let attempt = pending.attempts_started;
         let batch_info = pending.batch.batch_info;
         self.metrics.attempts.increment(1);
@@ -190,15 +186,7 @@ impl DerivationDriver {
             "Attempting derived batch reconciliation"
         );
 
-        match reconcile_and_consolidate(
-            l2_client,
-            engine,
-            database,
-            &pending.batch,
-            &mut pending.in_flight_engine_method,
-        )
-        .await
-        {
+        match reconcile_and_consolidate(l2_client, engine, database, &pending.batch).await {
             Ok(consolidated) => {
                 self.pending = None;
                 self.metrics.held.set(0.0);
@@ -314,7 +302,7 @@ impl DerivationDriver {
         self.attempt_sleep = None;
     }
 
-    /// Schedules a fresh reconciliation after an in-flight attempt was cancelled by an L1 reorg.
+    /// Schedules a fresh reconciliation after a surviving held batch is administratively unwound.
     pub(crate) fn schedule_fresh_reconciliation(&mut self) {
         if self.pending.is_some() {
             self.schedule_immediate();
@@ -352,14 +340,6 @@ impl DerivationDriver {
         })
     }
 
-    /// Returns the Engine method currently awaited by the held attempt, or the latest one reached.
-    pub(crate) fn in_flight_engine_method(&self) -> &'static str {
-        self.pending
-            .as_ref()
-            .map(|pending| pending.in_flight_engine_method)
-            .unwrap_or(RECONCILE_METHOD)
-    }
-
     /// Records a fail-stop discovered outside the Engine attempt itself.
     pub(crate) fn record_fatal(&self) {
         self.metrics.fatal.increment(1);
@@ -390,7 +370,6 @@ async fn reconcile_and_consolidate<L2P, EC>(
     engine: &mut Engine<EC>,
     database: &Database,
     batch: &BatchDerivationResult,
-    in_flight_engine_method: &mut &'static str,
 ) -> Result<ConsolidatedBatch, AttemptFailure>
 where
     L2P: Provider<Scroll>,
@@ -422,7 +401,6 @@ where
                 let head = (current_head.number <= target.number && current_head != target)
                     .then_some(target);
                 let finalized = target_status.is_finalized().then_some(target);
-                *in_flight_engine_method = FCU_METHOD;
                 let response = engine
                     .update_fcs_checked(head, Some(target), finalized)
                     .await
@@ -446,14 +424,12 @@ where
                     ));
                 }
 
-                *in_flight_engine_method = BUILD_FCU_METHOD;
                 let build_response = engine
                     .build_payload(Some(safe), attributes.attributes.clone())
                     .await
                     .map_err(engine_request_failure(batch_info, BUILD_FCU_METHOD))?;
                 let payload_id = classify_build_fcu(build_response, batch_info)?;
 
-                *in_flight_engine_method = GET_PAYLOAD_METHOD;
                 let payload = engine
                     .get_payload(payload_id)
                     .await
@@ -467,7 +443,6 @@ where
                         )
                     })?;
 
-                *in_flight_engine_method = NEW_PAYLOAD_METHOD;
                 let payload_status = engine
                     .new_payload(payload)
                     .await
@@ -475,7 +450,6 @@ where
                 classify_new_payload(payload_status, batch_info, block_info.block_info.number)?;
 
                 let finalized = target_status.is_finalized().then_some(block_info.block_info);
-                *in_flight_engine_method = FCU_METHOD;
                 let final_fcu = engine
                     .update_fcs_checked(
                         Some(block_info.block_info),

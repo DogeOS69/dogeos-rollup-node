@@ -112,6 +112,19 @@ const fn l1_receiver_may_poll(held_slot: bool, pipeline_empty: bool) -> bool {
     held_slot || pipeline_empty
 }
 
+fn try_buffer_held_l1_notification(
+    buffer: &mut VecDeque<Arc<L1Notification>>,
+    capacity: usize,
+    notification: Arc<L1Notification>,
+) -> Result<(), usize> {
+    let attempted_depth = buffer.len().saturating_add(1);
+    if attempted_depth > capacity {
+        return Err(attempted_depth)
+    }
+    buffer.push_back(notification);
+    Ok(())
+}
+
 /// The batch size for batch validation.
 #[cfg(not(any(test, feature = "test-utils")))]
 const BATCH_SIZE: usize = 100;
@@ -158,6 +171,8 @@ pub struct ChainOrchestrator<
     derivation_driver: DerivationDriver,
     /// Ordinary L1 notifications observed while an attempt is in flight.
     buffered_l1_notifications: VecDeque<Arc<L1Notification>>,
+    /// Maximum held-notification depth, inherited from the bounded watcher channel.
+    buffered_l1_notification_capacity: usize,
     /// Optional event sender for broadcasting events to listeners.
     event_sender: Option<EventSender<ChainOrchestratorEvent>>,
     /// The metrics handler.
@@ -179,7 +194,7 @@ impl<
         config: ChainOrchestratorConfig<ChainSpec>,
         block_client: Arc<FullBlockClient<<N as BlockDownloaderProvider>::Client>>,
         l2_provider: L2P,
-        l1_watcher: L1WatcherHandle,
+        mut l1_watcher: L1WatcherHandle,
         network: ScrollNetwork<N>,
         consensus: Box<dyn Consensus + 'static>,
         engine: Engine<EC>,
@@ -189,6 +204,8 @@ impl<
     ) -> Result<(Self, ChainOrchestratorHandle<N>), ChainOrchestratorError> {
         let (handle_tx, handle_rx) = mpsc::unbounded_channel();
         let handle = ChainOrchestratorHandle::new(handle_tx);
+        let buffered_l1_notification_capacity =
+            l1_watcher.l1_notification_receiver().max_capacity();
         Ok((
             Self {
                 block_client,
@@ -204,7 +221,10 @@ impl<
                 signer,
                 derivation_pipeline,
                 derivation_driver: DerivationDriver::default(),
-                buffered_l1_notifications: VecDeque::new(),
+                buffered_l1_notifications: VecDeque::with_capacity(
+                    buffered_l1_notification_capacity,
+                ),
+                buffered_l1_notification_capacity,
                 handle_rx,
                 event_sender: None,
                 metric_handler: MetricsHandler::default(),
@@ -234,6 +254,7 @@ impl<
                     let started = Instant::now();
                     let mut preempting_reorg = None;
                     let mut shutdown_during_attempt = false;
+                    let mut fifo_overflow_depth = None;
                     let step = {
                         let mut attempt = Box::pin(self.derivation_driver.run_attempt(
                             &*self.l2_client,
@@ -254,7 +275,14 @@ impl<
                                             break None
                                         }
                                         HeldL1NotificationDisposition::Buffer => {
-                                            self.buffered_l1_notifications.push_back(notification);
+                                            if let Err(depth) = try_buffer_held_l1_notification(
+                                                &mut self.buffered_l1_notifications,
+                                                self.buffered_l1_notification_capacity,
+                                                notification,
+                                            ) {
+                                                fifo_overflow_depth = Some(depth);
+                                                break None
+                                            }
                                         }
                                     }
                                 }
@@ -268,13 +296,19 @@ impl<
                         self.notify(ChainOrchestratorEvent::Shutdown);
                         return Ok(())
                     }
+                    if let Some(depth) = fifo_overflow_depth {
+                        let method = self.derivation_driver.in_flight_engine_method();
+                        return Err(self.fail_held_l1_notification_overflow(depth, method))
+                    }
                     if let Some(block_number) = preempting_reorg {
                         let event = self.handle_held_l1_reorg(block_number).await?;
                         self.handle_outcome(Ok(event));
                         continue
                     }
 
-                    match step.expect("an attempt only exits early for shutdown or reorg") {
+                    match step.expect(
+                        "an attempt only exits early for shutdown, reorg, or FIFO overflow",
+                    ) {
                         AttemptStep::Completed(consolidated) => {
                             for outcome in consolidated.block_outcomes {
                                 self.notify(ChainOrchestratorEvent::BlockConsolidated(outcome));
@@ -347,7 +381,17 @@ impl<
                                 self.handle_outcome(Ok(event));
                             }
                             HeldL1NotificationDisposition::Buffer => {
-                                self.buffered_l1_notifications.push_back(notification);
+                                if let Err(depth) = try_buffer_held_l1_notification(
+                                    &mut self.buffered_l1_notifications,
+                                    self.buffered_l1_notification_capacity,
+                                    notification,
+                                ) {
+                                    let method =
+                                        self.derivation_driver.in_flight_engine_method();
+                                    return Err(
+                                        self.fail_held_l1_notification_overflow(depth, method)
+                                    )
+                                }
                             }
                         }
                     }
@@ -392,6 +436,34 @@ impl<
                 Err(error)
             }
         }
+    }
+
+    /// Cancels held reconciliation and emits its single fatal record when the L1 FIFO overflows.
+    fn fail_held_l1_notification_overflow(
+        &mut self,
+        depth: usize,
+        method: &'static str,
+    ) -> ChainOrchestratorError {
+        self.derivation_driver.cancel_attempt();
+        self.derivation_driver.record_fatal();
+        let capacity = self.buffered_l1_notification_capacity;
+        let (batch_info, attempt, held_ms) =
+            self.derivation_driver.fatal_context().expect("FIFO overflow requires a held batch");
+        let error =
+            ChainOrchestratorError::HeldL1NotificationBufferOverflow { depth, capacity, method };
+        tracing::error!(
+            target: "scroll::chain_orchestrator",
+            batch_index = batch_info.index,
+            batch_hash = ?batch_info.hash,
+            attempt,
+            held_ms,
+            method,
+            fifo_depth = depth,
+            fifo_capacity = capacity,
+            source = %error,
+            "Held L1 notification FIFO overflow; fail-stopping"
+        );
+        error
     }
 
     /// Writes a structured fail-stop record for an operation that made held validity uncertain.
@@ -1603,6 +1675,7 @@ mod run_loop_policy_tests {
     use tokio::time;
 
     const SAFE: u64 = 100;
+    const TEST_L1_NOTIFICATION_CAPACITY: usize = 16;
 
     type TestNetwork = NoopNetwork<DogeosNetworkPrimitives>;
     type TestL1Provider = MockL1Provider<Arc<Database>>;
@@ -1677,7 +1750,7 @@ mod run_loop_policy_tests {
             DerivationPipeline::new(l1_provider.clone(), database.clone(), 0).await;
 
         let (watcher_command_tx, _watcher_command_rx) = mpsc::unbounded_channel();
-        let (notification_tx, notification_rx) = mpsc::channel(16);
+        let (notification_tx, notification_rx) = mpsc::channel(TEST_L1_NOTIFICATION_CAPACITY);
         let l1_watcher = L1WatcherHandle::new(watcher_command_tx, notification_rx);
         let block_client = Arc::new(FullBlockClient::new(
             NoopFullBlockClient::<DogeosNetworkPrimitives>::default(),
@@ -1849,6 +1922,98 @@ mod run_loop_policy_tests {
 
         let _ = shutdown_tx.send(());
         assert!(run_task.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn held_l1_notification_fifo_overflow_fail_stops_without_retry() {
+        let database = Arc::new(setup_test_db().await);
+        database.insert_genesis_block(B256::ZERO).await.unwrap();
+        let batch_info = BatchInfo::new(1, B256::repeat_byte(1));
+        database
+            .insert_batch(BatchCommitData {
+                hash: batch_info.hash,
+                index: batch_info.index,
+                block_number: 1,
+                block_timestamp: 0,
+                calldata: Arc::new(Bytes::new()),
+                blob_versioned_hash: None,
+                finalized_block_number: None,
+                reverted_block_number: None,
+            })
+            .await
+            .unwrap();
+        database.update_batch_status(batch_info.hash, BatchStatus::Processing).await.unwrap();
+
+        let engine_client = Arc::new(ScriptedEngineClient::new());
+        engine_client
+            .push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Syncing, None)));
+        let asserter = Asserter::new();
+        asserter.push_success(&Option::<()>::None);
+        let (orchestrator, handle, notification_tx) = test_orchestrator(
+            database.clone(),
+            engine_client.clone(),
+            asserter,
+            BatchDerivationResult {
+                attributes: vec![DerivedAttributes {
+                    block_number: SAFE + 1,
+                    attributes: ScrollPayloadAttributes::default(),
+                }],
+                batch_info,
+                skipped_l1_messages: vec![],
+                target_status: BatchStatus::Consolidated,
+            },
+        )
+        .await;
+
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let run_task = tokio::spawn(orchestrator.run_until_shutdown(Box::pin(async move {
+            let _ = shutdown_rx.await;
+        })));
+        time::timeout(Duration::from_secs(2), async {
+            loop {
+                let status = handle.status().await.unwrap();
+                if matches!(
+                    status.derivation,
+                    DerivationStatus::Held(HeldBatchStatus { attempts_started: 1, .. })
+                ) {
+                    break
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first Engine SYNCING response must hold the batch");
+
+        for block_number in 0..=TEST_L1_NOTIFICATION_CAPACITY {
+            notification_tx
+                .send(Arc::new(L1Notification::Processed(block_number as u64)))
+                .await
+                .unwrap();
+        }
+
+        let result = time::timeout(Duration::from_secs(2), run_task)
+            .await
+            .expect("capacity + 1 must terminate the run loop")
+            .unwrap();
+        assert!(matches!(
+            result,
+            Err(ChainOrchestratorError::HeldL1NotificationBufferOverflow {
+                depth,
+                capacity: TEST_L1_NOTIFICATION_CAPACITY,
+                method,
+            }) if depth == TEST_L1_NOTIFICATION_CAPACITY + 1 && method == "forkchoiceUpdated(build)"
+        ));
+        assert_eq!(
+            database.get_batch_status_by_hash(batch_info.hash).await.unwrap(),
+            Some(BatchStatus::Processing),
+            "overflow must preserve ownership for restart recovery"
+        );
+        assert_eq!(engine_client.fork_choice_updated_calls(), 1);
+
+        // Wait beyond the first retry deadline to prove the cancelled run loop cannot call the
+        // Engine again.
+        time::sleep(Duration::from_millis(2_100)).await;
+        assert_eq!(engine_client.fork_choice_updated_calls(), 1);
     }
 
     #[tokio::test]

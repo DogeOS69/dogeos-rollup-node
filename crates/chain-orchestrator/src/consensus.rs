@@ -1,8 +1,8 @@
 use alloy_primitives::{Address, Signature};
+use dogeos_reth_primitives::DogeosBlock;
 use metrics::Counter;
 use metrics_derive::Metrics;
 use reth_primitives_traits::GotExpected;
-use reth_scroll_primitives::ScrollBlock;
 use rollup_node_primitives::{sig_encode_hash, ConsensusUpdate};
 use scroll_network::ConsensusError;
 use std::fmt::Debug;
@@ -14,7 +14,7 @@ pub trait Consensus: Send + Sync + Debug {
     /// Validates a new block with the given signature.
     fn validate_new_block(
         &self,
-        block: &ScrollBlock,
+        block: &DogeosBlock,
         signature: &Signature,
     ) -> Result<(), ConsensusError>;
     /// Returns a boolean indicating whether the sequencer should sequence a block.
@@ -31,7 +31,7 @@ impl Consensus for NoopConsensus {
 
     fn validate_new_block(
         &self,
-        _block: &ScrollBlock,
+        _block: &DogeosBlock,
         _signature: &Signature,
     ) -> Result<(), ConsensusError> {
         Ok(())
@@ -86,7 +86,7 @@ impl Consensus for SystemContractConsensus {
 
     fn validate_new_block(
         &self,
-        block: &ScrollBlock,
+        block: &DogeosBlock,
         signature: &Signature,
     ) -> Result<(), ConsensusError> {
         let hash = sig_encode_hash(&block.header);
@@ -112,8 +112,8 @@ mod tests {
     use super::*;
     use alloy_consensus::{Signed, TxEip1559};
     use alloy_primitives::{address, b256, bloom, bytes, TxKind, B64, U256};
+    use dogeos_reth_primitives::DogeosBlockBody;
     use reth_primitives_traits::Header;
-    use reth_scroll_primitives::ScrollBlockBody;
     use std::{str::FromStr, sync::OnceLock};
 
     #[test]
@@ -127,7 +127,7 @@ mod tests {
             b256!("f257edab88796a76f6d19a9fadad44b2b16c28e7aa70322cc4c6abc857128998")
         });
 
-        let block = ScrollBlock {
+        let block = DogeosBlock {
             header: Header {
                 parent_hash: b256!("3ccf36621e1f75cd1bfd2ac39ff6a00d8a5bec02e52aa7064a4860a0d02d6013"),
                 ommers_hash: b256!("1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347"),
@@ -151,7 +151,7 @@ mod tests {
                 parent_beacon_block_root: None,
                 requests_hash: None,
             },
-            body: ScrollBlockBody {
+            body: DogeosBlockBody {
                 transactions: vec![
                     Signed::new_unhashed(TxEip1559 {
                         chain_id: 534352,

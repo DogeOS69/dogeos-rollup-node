@@ -7,11 +7,11 @@ use crate::{
     UnwindResult,
 };
 use alloy_primitives::{Signature, B256};
+use dogeos_reth_engine::BlockDataHint;
 use rollup_node_primitives::{
     BatchCommitData, BatchConsolidationOutcome, BatchInfo, BlockInfo, L1BlockStartupInfo,
     L1MessageEnvelope, L2BlockInfoWithL1Messages,
 };
-use scroll_alloy_rpc_types_engine::BlockDataHint;
 use sea_orm::{
     sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions},
     DatabaseConnection, SqlxSqliteConnector, TransactionTrait,
@@ -250,6 +250,19 @@ impl DatabaseWriteOperations for Database {
             DatabaseOperation::UpdateBatchStatus,
             self,
             tx_mut(move |tx| async move { tx.update_batch_status(batch_hash, status).await })
+        )
+    }
+
+    async fn transition_batch_status(
+        &self,
+        batch_hash: B256,
+        from: rollup_node_primitives::BatchStatus,
+        to: rollup_node_primitives::BatchStatus,
+    ) -> Result<bool, DatabaseError> {
+        metered!(
+            DatabaseOperation::UpdateBatchStatus,
+            self,
+            tx_mut(move |tx| async move { tx.transition_batch_status(batch_hash, from, to).await })
         )
     }
 
@@ -556,7 +569,7 @@ impl DatabaseReadOperations for Database {
         )
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-utils"))]
     async fn get_batch_status_by_hash(
         &self,
         batch_hash: B256,
@@ -864,12 +877,12 @@ mod test {
     use std::sync::Arc;
 
     use arbitrary::{Arbitrary, Unstructured};
+    use dogeos_protocol_types::TxL1Message;
     use futures::StreamExt;
     use rand::Rng;
     use rollup_node_primitives::{
         BatchCommitData, BatchInfo, BlockInfo, L1MessageEnvelope, L2BlockInfoWithL1Messages,
     };
-    use scroll_alloy_consensus::TxL1Message;
     use sea_orm::EntityTrait;
 
     #[tokio::test]

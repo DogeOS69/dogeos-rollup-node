@@ -20,7 +20,7 @@ reth-network.workspace = true
 reth-network-api.workspace = true
 
 # scroll
-reth-scroll-primitives = { workspace = true }
+dogeos-reth-primitives = { workspace = true }
 rollup-node-signer.workspace = true
 
 # misc
@@ -36,5 +36,5 @@ serde = [
     "reth-eth-wire/serde",
     "reth-network/serde",
     "reth-network-api/serde",
-    "reth-scroll-primitives/serde",
+    "dogeos-reth-primitives/serde",
 ]

@@ -1,8 +1,8 @@
 use alloy_chains::NamedChain;
 use alloy_primitives::{address, Address};
+use dogeos_chainspec::{ChainConfig, ScrollChainConfig};
 use reth_chainspec::EthChainSpec;
 use reth_node_core::primitives::BlockHeader;
-use reth_scroll_chainspec::{ChainConfig, ScrollChainConfig};
 
 /// The address of the Scroll Rollup contract on Mainnet.
 pub const MAINNET_ROLLUP_CONTRACT_ADDRESS: Address =

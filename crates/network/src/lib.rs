@@ -1,6 +1,11 @@
 mod event;
 pub use event::{NewBlockWithPeer, ScrollNetworkManagerEvent};
 
+mod eth_wire;
+pub use eth_wire::{
+    EthWireBlockImport, EthWireBlockWithPeer, EthWirePeerSender, ETH_WIRE_BLOCK_CHANNEL_SIZE,
+};
+
 mod handle;
 pub use handle::{NetworkHandleMessage, ScrollNetworkHandle};
 
@@ -13,10 +18,16 @@ pub use import::{
 mod manager;
 pub use manager::ScrollNetworkManager;
 
+pub use dogeos_chainspec::DOGEOS_MAINNET;
 pub use reth_network::{EthNetworkPrimitives, NetworkConfigBuilder};
-pub use reth_scroll_chainspec::SCROLL_MAINNET;
 use reth_tokio_util::EventStream;
 pub use scroll_wire::ScrollWireConfig;
+
+/// Network primitives shared by the DogeOS Reth 2 node and rollup-owned networking services.
+pub type DogeosNetworkPrimitives = reth_network::primitives::BasicNetworkPrimitives<
+    dogeos_reth_primitives::DogeosPrimitives,
+    dogeos_protocol_types::ScrollPooledTransaction,
+>;
 
 /// The main network struct that encapsulates the network handle and event stream.
 #[derive(Debug)]

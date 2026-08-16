@@ -14,14 +14,14 @@ workspace = true
 alloy-chains.workspace = true
 alloy-eips.workspace = true
 alloy-primitives.workspace = true
-alloy-provider.workspace = true
+alloy-provider = { workspace = true, features = ["engine-api"] }
 alloy-rpc-types-engine.workspace = true
+alloy-transport.workspace = true
 
-# scroll-alloy
-scroll-alloy-hardforks.workspace = true
-scroll-alloy-network.workspace = true
-scroll-alloy-provider.workspace = true
-scroll-alloy-rpc-types-engine.workspace = true
+# DogeOS protocol
+dogeos-hardforks.workspace = true
+dogeos-rpc-types.workspace = true
+dogeos-reth-engine.workspace = true
 
 # reth
 reth-chainspec.workspace = true
@@ -29,16 +29,14 @@ reth-network-api.workspace = true
 reth-payload-primitives.workspace = true
 reth-primitives-traits.workspace = true
 
-# reth-scroll
-reth-scroll-chainspec.workspace = true
-reth-scroll-primitives.workspace = true
-reth-scroll-engine-primitives.workspace = true
+dogeos-chainspec.workspace = true
+dogeos-reth-primitives.workspace = true
 
 # rollup-node
 rollup-node-primitives.workspace = true
 
 # misc
-async-trait = { workspace = true, optional = true }
+async-trait.workspace = true
 eyre.workspace = true
 futures.workspace = true
 metrics.workspace = true
@@ -47,18 +45,18 @@ serde = { workspace = true, optional = true, features = ["derive"] }
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+jsonrpsee = { version = "0.26.0", features = ["client"] }
 
 [dev-dependencies]
 alloy-consensus.workspace = true
 arbitrary.workspace = true
 async-trait.workspace = true
 reth-testing-utils.workspace = true
-scroll-alloy-consensus.workspace = true
-scroll-alloy-rpc-types-engine = { workspace = true, features = ["arbitrary"] }
+dogeos-protocol-types = { workspace = true, features = ["arbitrary"] }
+dogeos-reth-engine.workspace = true
 
 [features]
 test-utils = [
-    "dep:async-trait",
     "reth-chainspec/test-utils",
     "reth-primitives-traits/test-utils",
 ]
@@ -67,13 +65,12 @@ serde = [
     "alloy-eips/serde",
     "alloy-primitives/serde",
     "alloy-rpc-types-engine/serde",
-    "reth-scroll-primitives/serde",
-    "scroll-alloy-rpc-types-engine/serde",
+    "dogeos-reth-primitives/serde",
     "alloy-chains/serde",
     "reth-network-api/serde",
-    "scroll-alloy-hardforks/serde",
+    "dogeos-hardforks/serde",
     "reth-primitives-traits/serde",
     "alloy-consensus/serde",
-    "scroll-alloy-consensus/serde",
+    "dogeos-protocol-types/serde",
     "rollup-node-primitives/serde",
 ]

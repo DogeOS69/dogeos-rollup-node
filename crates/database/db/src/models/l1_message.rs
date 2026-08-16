@@ -1,6 +1,6 @@
 use alloy_primitives::{Address, B256, U256};
+use dogeos_protocol_types::TxL1Message;
 use rollup_node_primitives::L1MessageEnvelope;
-use scroll_alloy_consensus::TxL1Message;
 use sea_orm::{entity::prelude::*, ActiveValue};
 
 /// A database model that represents a L1 message.

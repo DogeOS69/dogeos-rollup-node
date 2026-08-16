@@ -1,7 +1,7 @@
 //! Shared JSON-RPC helpers for debug toolkit REPLs.
 
 use alloy_provider::{Provider, RootProvider};
-use scroll_alloy_network::Scroll;
+use dogeos_rpc_types::Scroll;
 use std::borrow::Cow;
 
 /// Call a typed JSON-RPC method and deserialize into `R`.

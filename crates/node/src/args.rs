@@ -3,6 +3,7 @@ use crate::{
     constants::{self},
     context::RollupNodeContext,
     pprof::PprofConfig,
+    signer_rotation::SignerRotationWatchdog,
 };
 use alloy_chains::NamedChain;
 use alloy_consensus::BlockHeader;
@@ -15,16 +16,15 @@ use alloy_signer_local::PrivateKeySigner;
 use alloy_transport::layers::RetryBackoffLayer;
 use aws_sdk_kms::config::BehaviorVersion;
 use clap::ArgAction;
+use dogeos_chainspec::{ChainConfig, DogeosChainSpec, ScrollChainConfig, SCROLL_FEE_VAULT_ADDRESS};
+use dogeos_hardforks::DogeosHardforks;
+use dogeos_reth_consensus::DogeosConsensus;
+use dogeos_rpc_types::Scroll;
 use reth_chainspec::EthChainSpec;
 use reth_network::NetworkProtocols;
 use reth_network_api::FullNetwork;
 use reth_network_p2p::FullBlockClient;
 use reth_node_builder::{rpc::RethRpcServerHandles, NodeConfig as RethNodeConfig};
-use reth_scroll_chainspec::{
-    ChainConfig, ScrollChainConfig, ScrollChainSpec, SCROLL_FEE_VAULT_ADDRESS,
-};
-use reth_scroll_consensus::ScrollBeaconConsensus;
-use reth_scroll_node::ScrollNetworkPrimitives;
 use rollup_node_chain_orchestrator::{
     ChainOrchestrator, ChainOrchestratorConfig, ChainOrchestratorHandle, Consensus, NoopConsensus,
     SystemContractConsensus,
@@ -37,20 +37,17 @@ use rollup_node_sequencer::{
     L1MessageInclusionMode, PayloadBuildingConfig, Sequencer, SequencerConfig,
 };
 use rollup_node_watcher::{L1Watcher, L1WatcherCommand};
-use scroll_alloy_hardforks::ScrollHardforks;
-use scroll_alloy_network::Scroll;
-use scroll_alloy_provider::{ScrollAuthApiEngineClient, ScrollEngineApi};
 use scroll_db::{
     Database, DatabaseConnectionProvider, DatabaseError, DatabaseMaintenance,
     DatabaseReadOperations, DatabaseWriteOperations,
 };
 use scroll_derivation_pipeline::DerivationPipeline;
-use scroll_engine::{Engine, ForkchoiceState};
+use scroll_engine::{Engine, ForkchoiceState, ScrollAuthApiEngineClient, ScrollEngineApi};
 use scroll_migration::{traits::ScrollMigrator, MigratorTrait};
-use scroll_network::ScrollNetworkManager;
+use scroll_network::{DogeosNetworkPrimitives, EthWireBlockWithPeer, ScrollNetworkManager};
 use scroll_wire::ScrollWireEvent;
-use std::{fs, path::PathBuf, sync::Arc};
-use tokio::sync::mpsc::UnboundedReceiver;
+use std::{fmt, fs, path::PathBuf, sync::Arc};
+use tokio::sync::mpsc::{Receiver, UnboundedReceiver};
 
 /// Test-related configuration arguments.
 #[derive(Debug, Clone, Default, clap::Args)]
@@ -123,6 +120,12 @@ pub struct ScrollRollupNodeConfig {
 impl ScrollRollupNodeConfig {
     /// Validate that either signer key file or AWS KMS key ID is provided when sequencer is enabled
     pub fn validate(&self) -> Result<(), String> {
+        if self.consensus_args.exit_on_signer_rotation && self.sequencer_args.sequencer_enabled {
+            return Err(
+                "--consensus.exit-on-signer-rotation must not be used on a sequencer".to_string()
+            );
+        }
+
         if self.sequencer_args.sequencer_enabled &
             !matches!(self.consensus_args.algorithm, ConsensusAlgorithm::Noop)
         {
@@ -142,6 +145,22 @@ impl ScrollRollupNodeConfig {
             }
         }
 
+        if self.consensus_args.exit_on_signer_rotation {
+            if self.l1_provider_args.url.is_none() {
+                return Err("--consensus.exit-on-signer-rotation requires --l1.url".to_string());
+            }
+            if self.consensus_args.authorized_signer.is_some() {
+                return Err("--consensus.exit-on-signer-rotation cannot be used with \
+                     --consensus.authorized-signer because restart would re-pin the same signer"
+                    .to_string());
+            }
+            if self.consensus_args.algorithm != ConsensusAlgorithm::SystemContract {
+                return Err("--consensus.exit-on-signer-rotation requires \
+                     --consensus.algorithm system-contract"
+                    .to_string());
+            }
+        }
+
         if self.consensus_args.algorithm == ConsensusAlgorithm::SystemContract &&
             self.consensus_args.authorized_signer.is_none() &&
             self.l1_provider_args.url.is_none()
@@ -156,10 +175,32 @@ impl ScrollRollupNodeConfig {
         Ok(())
     }
 
+    /// Builds the optional follower signer-rotation watchdog from the node configuration.
+    pub fn signer_rotation_watchdog(
+        &self,
+        chain_spec: &DogeosChainSpec,
+    ) -> eyre::Result<Option<SignerRotationWatchdog>> {
+        if !self.consensus_args.exit_on_signer_rotation {
+            return Ok(None);
+        }
+
+        self.validate().map_err(eyre::Report::msg)?;
+        let l1_url =
+            self.l1_provider_args.url.clone().ok_or_else(|| {
+                eyre::eyre!("--consensus.exit-on-signer-rotation requires --l1.url")
+            })?;
+        let node_config = NodeConfig::from_chainspec(chain_spec)?;
+
+        Ok(Some(SignerRotationWatchdog::new(
+            l1_url,
+            node_config.address_book.system_contract_address,
+        )))
+    }
+
     /// Hydrate the config by initializing the database connection.
     pub async fn hydrate(
         &mut self,
-        node_config: RethNodeConfig<ScrollChainSpec>,
+        node_config: RethNodeConfig<DogeosChainSpec>,
     ) -> eyre::Result<()> {
         // Instantiate the database
         let db_path = node_config.datadir().db();
@@ -184,11 +225,12 @@ impl ScrollRollupNodeConfig {
         self,
         ctx: RollupNodeContext<N, CS>,
         events: UnboundedReceiver<ScrollWireEvent>,
+        eth_wire_events: Receiver<EthWireBlockWithPeer>,
         rpc_server_handles: RethRpcServerHandles,
     ) -> eyre::Result<(
         ChainOrchestrator<
             N,
-            impl ScrollHardforks + EthChainSpec<Header: BlockHeader> + IsDevChain + Clone + 'static,
+            impl DogeosHardforks + EthChainSpec<Header: BlockHeader> + IsDevChain + Clone + 'static,
             impl L1MessageProvider + Clone,
             impl Provider<Scroll> + Clone,
             impl ScrollEngineApi,
@@ -196,10 +238,12 @@ impl ScrollRollupNodeConfig {
         ChainOrchestratorHandle<N>,
     )>
     where
-        N: FullNetwork<Primitives = ScrollNetworkPrimitives> + NetworkProtocols,
+        N: FullNetwork<Primitives = DogeosNetworkPrimitives>
+            + NetworkProtocols
+            + scroll_network::EthWirePeerSender,
         CS: EthChainSpec<Header: BlockHeader>
             + ChainConfig<Config = ScrollChainConfig>
-            + ScrollHardforks
+            + DogeosHardforks
             + IsDevChain
             + 'static,
     {
@@ -217,7 +261,7 @@ impl ScrollRollupNodeConfig {
                 Ok(handle) => {
                     tracing::info!(target: "rollup_node::pprof", "pprof server started successfully");
                     // Spawn the pprof server task
-                    ctx.task_executor.spawn_critical("pprof_server", async move {
+                    ctx.task_executor.spawn_critical_task("pprof_server", async move {
                         if let Err(e) = handle.await {
                             tracing::error!(target: "rollup_node::pprof", "pprof server error: {:?}", e);
                         }
@@ -281,7 +325,7 @@ impl ScrollRollupNodeConfig {
         // Fetch the database from the hydrated config.
         let db = self.database.clone().expect("should hydrate config before build");
         let db_maintenance = DatabaseMaintenance::new(db.clone());
-        ctx.task_executor.spawn(db_maintenance.run());
+        ctx.task_executor.spawn_task(db_maintenance.run());
 
         // Run the database migrations
         if let Some(named) = chain_spec.chain().named() {
@@ -367,10 +411,8 @@ impl ScrollRollupNodeConfig {
         let chain_spec = Arc::new(chain_spec.clone());
 
         // Instantiate the network manager
-        let eth_wire_listener = self
-            .network_args
-            .enable_eth_scroll_wire_bridge
-            .then_some(ctx.network.eth_wire_block_listener().await?);
+        let eth_wire_listener =
+            self.network_args.enable_eth_scroll_wire_bridge.then_some(eth_wire_events);
 
         // TODO: remove this once we deprecate l2geth.
         let authorized_signer = self.network_args.effective_signer(chain_spec.chain().named());
@@ -383,7 +425,7 @@ impl ScrollRollupNodeConfig {
             td_constant(chain_spec.chain().named()),
             authorized_signer,
         );
-        ctx.task_executor.spawn(scroll_network_manager.run());
+        ctx.task_executor.spawn_task(scroll_network_manager.run());
 
         tracing::info!(target: "scroll::node::args", fcs = ?fcs, payload_building_duration = ?self.sequencer_args.payload_building_duration, "Starting engine driver");
         let engine = Engine::new(Arc::new(engine_api), fcs);
@@ -493,7 +535,7 @@ impl ScrollRollupNodeConfig {
                 .fetch_client()
                 .await
                 .expect("failed to fetch block client"),
-            Arc::new(ScrollBeaconConsensus::new(chain_spec.clone())),
+            Arc::new(DogeosConsensus),
         );
         let l1_v2_message_queue_start_index =
             l1_v2_message_queue_start_index(chain_spec.chain().named());
@@ -552,8 +594,8 @@ pub struct RollupNodeDatabaseArgs {
     pub rn_db_path: Option<PathBuf>,
 }
 
-/// The database arguments.
-#[derive(Debug, Default, Clone, clap::Args)]
+/// The consensus arguments.
+#[derive(Default, Clone, clap::Args)]
 pub struct ConsensusArgs {
     /// The type of consensus to use.
     #[arg(
@@ -566,12 +608,38 @@ pub struct ConsensusArgs {
     /// The optional authorized signer for system contract consensus.
     #[arg(long = "consensus.authorized-signer", value_name = "ADDRESS")]
     pub authorized_signer: Option<Address>,
+
+    /// Exit the process (code 70) when the authorized signer in the L1 system contract rotates
+    /// away from the watchdog's first successful L1 observation after startup. Intended for
+    /// follower nodes run under a supervisor with a restart policy; the restart re-reads the
+    /// signer. Sequencer rotation remains a manual operation.
+    #[arg(long = "consensus.exit-on-signer-rotation", default_value_t = false)]
+    pub exit_on_signer_rotation: bool,
+}
+
+// Keep the disabled field out of Debug output so default startup config logging remains
+// byte-identical. Enabled configurations include it for observability.
+impl fmt::Debug for ConsensusArgs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut debug = f.debug_struct("ConsensusArgs");
+        debug
+            .field("algorithm", &self.algorithm)
+            .field("authorized_signer", &self.authorized_signer);
+        if self.exit_on_signer_rotation {
+            debug.field("exit_on_signer_rotation", &self.exit_on_signer_rotation);
+        }
+        debug.finish()
+    }
 }
 
 impl ConsensusArgs {
     /// Create a new [`ConsensusArgs`] with the no-op consensus algorithm.
     pub const fn noop() -> Self {
-        Self { algorithm: ConsensusAlgorithm::Noop, authorized_signer: None }
+        Self {
+            algorithm: ConsensusAlgorithm::Noop,
+            authorized_signer: None,
+            exit_on_signer_rotation: false,
+        }
     }
 
     /// Creates a consensus instance based on the configured algorithm and authorized signer.
@@ -666,6 +734,16 @@ pub struct RollupNodeNetworkArgs {
     /// The valid signer address for the network.
     #[arg(long = "network.valid_signer", value_name = "VALID_SIGNER")]
     pub signer_address: Option<Address>,
+    /// Temporary: enable the legacy geth-to-Reth downloaded-header transform for the one-way
+    /// Testnet crossover, where a lagging Reth node canonicalizes signed headers downloaded from
+    /// the last l2geth sequencer. Defaults to `false`, is rejected on `DogeOS` Mainnet, and is
+    /// scheduled for removal with the rest of the geth compatibility code.
+    #[arg(
+        long = "network.legacy-geth-header-transform",
+        default_value_t = false,
+        action = ArgAction::Set
+    )]
+    pub legacy_geth_header_transform: bool,
 }
 
 impl Default for RollupNodeNetworkArgs {
@@ -675,6 +753,7 @@ impl Default for RollupNodeNetworkArgs {
             enable_scroll_wire: true,
             sequencer_url: None,
             signer_address: None,
+            legacy_geth_header_transform: false,
         }
     }
 }
@@ -683,8 +762,8 @@ impl RollupNodeNetworkArgs {
     /// Get the default authorized signer address for the given chain.
     pub const fn default_authorized_signer(chain: Option<NamedChain>) -> Option<Address> {
         match chain {
-            Some(NamedChain::Scroll) => Some(constants::SCROLL_MAINNET_SIGNER),
-            Some(NamedChain::ScrollSepolia) => Some(constants::SCROLL_SEPOLIA_SIGNER),
+            Some(NamedChain::Scroll) => Some(constants::DOGEOS_MAINNET_SIGNER),
+            Some(NamedChain::ScrollSepolia) => Some(constants::DOGEOS_CHIKYU_SIGNER),
             _ => None,
         }
     }
@@ -985,8 +1064,8 @@ pub struct RemoteBlockSourceArgs {
 /// Returns the total difficulty constant for the given chain.
 const fn td_constant(chain: Option<NamedChain>) -> U128 {
     match chain {
-        Some(NamedChain::Scroll) => constants::SCROLL_MAINNET_TD_CONSTANT,
-        Some(NamedChain::ScrollSepolia) => constants::SCROLL_SEPOLIA_TD_CONSTANT,
+        Some(NamedChain::Scroll) => constants::DOGEOS_MAINNET_TD_CONSTANT,
+        Some(NamedChain::ScrollSepolia) => constants::DOGEOS_CHIKYU_TD_CONSTANT,
         _ => U128::ZERO, // Default to zero for other chains
     }
 }
@@ -994,8 +1073,8 @@ const fn td_constant(chain: Option<NamedChain>) -> U128 {
 /// The L1 message queue index at which queue hashes should be computed .
 const fn l1_v2_message_queue_start_index(chain: Option<NamedChain>) -> u64 {
     match chain {
-        Some(NamedChain::Scroll) => constants::SCROLL_MAINNET_V2_MESSAGE_QUEUE_START_INDEX,
-        Some(NamedChain::ScrollSepolia) => constants::SCROLL_SEPOLIA_V2_MESSAGE_QUEUE_START_INDEX,
+        Some(NamedChain::Scroll) => constants::DOGEOS_MAINNET_V2_MESSAGE_QUEUE_START_INDEX,
+        Some(NamedChain::ScrollSepolia) => constants::DOGEOS_CHIKYU_V2_MESSAGE_QUEUE_START_INDEX,
         _ => 0,
     }
 }
@@ -1003,19 +1082,121 @@ const fn l1_v2_message_queue_start_index(chain: Option<NamedChain>) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
     use std::path::PathBuf;
+
+    #[derive(Debug, Parser)]
+    struct ConsensusCli {
+        #[command(flatten)]
+        consensus: ConsensusArgs,
+    }
+
+    fn rotation_watchdog_config() -> ScrollRollupNodeConfig {
+        ScrollRollupNodeConfig {
+            test_args: TestArgs::default(),
+            consensus_args: ConsensusArgs {
+                algorithm: ConsensusAlgorithm::SystemContract,
+                authorized_signer: None,
+                exit_on_signer_rotation: true,
+            },
+            database_args: RollupNodeDatabaseArgs::default(),
+            chain_orchestrator_args: ChainOrchestratorArgs::default(),
+            engine_driver_args: EngineDriverArgs::default(),
+            blob_provider_args: BlobProviderArgs::default(),
+            l1_provider_args: L1ProviderArgs {
+                url: Some("http://localhost:8545".parse().unwrap()),
+                ..Default::default()
+            },
+            sequencer_args: SequencerArgs::default(),
+            network_args: RollupNodeNetworkArgs::default(),
+            rpc_args: RpcArgs::default(),
+            signer_args: SignerArgs::default(),
+            gas_price_oracle_args: RollupNodeGasPriceOracleArgs::default(),
+            pprof_args: PprofArgs::default(),
+            remote_block_source_args: RemoteBlockSourceArgs::default(),
+            database: None,
+            require_l1_data_fee_buffer: false,
+        }
+    }
+
+    #[test]
+    fn exit_on_signer_rotation_defaults_to_false_when_parsed() {
+        let cli = ConsensusCli::parse_from(["rollup-node"]);
+
+        assert!(!cli.consensus.exit_on_signer_rotation);
+    }
+
+    #[test]
+    fn consensus_debug_omits_disabled_rotation_flag() {
+        assert_eq!(
+            format!("{:#?}", ConsensusArgs::default()),
+            "ConsensusArgs {\n    algorithm: SystemContract,\n    authorized_signer: None,\n}"
+        );
+    }
+
+    #[test]
+    fn consensus_debug_includes_enabled_rotation_flag() {
+        let args = ConsensusArgs { exit_on_signer_rotation: true, ..Default::default() };
+
+        assert!(format!("{args:#?}").contains("exit_on_signer_rotation: true"));
+    }
+
+    #[test]
+    fn exit_on_signer_rotation_requires_l1_url() {
+        let mut config = rotation_watchdog_config();
+        config.l1_provider_args.url = None;
+
+        assert_eq!(
+            config.validate().unwrap_err(),
+            "--consensus.exit-on-signer-rotation requires --l1.url"
+        );
+    }
+
+    #[test]
+    fn exit_on_signer_rotation_conflicts_with_pinned_signer() {
+        let mut config = rotation_watchdog_config();
+        config.consensus_args.authorized_signer = Some(Address::new([0x11; 20]));
+
+        assert_eq!(
+            config.validate().unwrap_err(),
+            "--consensus.exit-on-signer-rotation cannot be used with \
+             --consensus.authorized-signer because restart would re-pin the same signer"
+        );
+    }
+
+    #[test]
+    fn exit_on_signer_rotation_requires_system_contract_consensus() {
+        let mut config = rotation_watchdog_config();
+        config.consensus_args.algorithm = ConsensusAlgorithm::Noop;
+
+        assert_eq!(
+            config.validate().unwrap_err(),
+            "--consensus.exit-on-signer-rotation requires --consensus.algorithm system-contract"
+        );
+    }
+
+    #[test]
+    fn exit_on_signer_rotation_rejects_sequencer() {
+        let mut config = rotation_watchdog_config();
+        config.sequencer_args.sequencer_enabled = true;
+
+        assert_eq!(
+            config.validate().unwrap_err(),
+            "--consensus.exit-on-signer-rotation must not be used on a sequencer"
+        );
+    }
 
     #[test]
     fn test_network_args_default_authorized_signer() {
         // Test Scroll mainnet
         let mainnet_signer =
             RollupNodeNetworkArgs::default_authorized_signer(Some(NamedChain::Scroll));
-        assert_eq!(mainnet_signer, Some(constants::SCROLL_MAINNET_SIGNER));
+        assert_eq!(mainnet_signer, Some(constants::DOGEOS_MAINNET_SIGNER));
 
         // Test Scroll Sepolia
         let sepolia_signer =
             RollupNodeNetworkArgs::default_authorized_signer(Some(NamedChain::ScrollSepolia));
-        assert_eq!(sepolia_signer, Some(constants::SCROLL_SEPOLIA_SIGNER));
+        assert_eq!(sepolia_signer, Some(constants::DOGEOS_CHIKYU_SIGNER));
 
         // Test other chains
         let other_signer =
@@ -1040,11 +1221,11 @@ mod tests {
         let network_args_default = RollupNodeNetworkArgs::default();
         assert_eq!(
             network_args_default.effective_signer(Some(NamedChain::Scroll)),
-            Some(constants::SCROLL_MAINNET_SIGNER)
+            Some(constants::DOGEOS_MAINNET_SIGNER)
         );
         assert_eq!(
             network_args_default.effective_signer(Some(NamedChain::ScrollSepolia)),
-            Some(constants::SCROLL_SEPOLIA_SIGNER)
+            Some(constants::DOGEOS_CHIKYU_SIGNER)
         );
         assert_eq!(network_args_default.effective_signer(Some(NamedChain::Mainnet)), None);
     }
@@ -1065,6 +1246,7 @@ mod tests {
             consensus_args: ConsensusArgs {
                 algorithm: ConsensusAlgorithm::SystemContract,
                 authorized_signer: None,
+                exit_on_signer_rotation: false,
             },
             database: None,
             rpc_args: RpcArgs::default(),
@@ -1133,6 +1315,7 @@ mod tests {
             consensus_args: ConsensusArgs {
                 algorithm: ConsensusAlgorithm::SystemContract,
                 authorized_signer: None,
+                exit_on_signer_rotation: false,
             },
             database: None,
             rpc_args: RpcArgs::default(),

@@ -5,10 +5,10 @@ use jsonrpsee::{
     types::{error, ErrorObjectOwned},
 };
 use reth_network_api::FullNetwork;
-use reth_scroll_node::ScrollNetworkPrimitives;
 use rollup_node_chain_orchestrator::{ChainOrchestratorHandle, ChainOrchestratorStatus};
 use rollup_node_primitives::L1MessageEnvelope;
 use scroll_db::L1MessageKey;
+use scroll_network::DogeosNetworkPrimitives;
 use tokio::sync::{oneshot, Mutex, OnceCell};
 
 /// RPC extension for rollup node management operations.
@@ -22,7 +22,7 @@ use tokio::sync::{oneshot, Mutex, OnceCell};
 #[derive(Debug)]
 pub struct RollupNodeRpcExt<N>
 where
-    N: FullNetwork<Primitives = ScrollNetworkPrimitives>,
+    N: FullNetwork<Primitives = DogeosNetworkPrimitives>,
 {
     /// Cached rollup manager handle, initialized lazily via `OnceCell`
     handle: tokio::sync::OnceCell<ChainOrchestratorHandle<N>>,
@@ -32,7 +32,7 @@ where
 
 impl<N> RollupNodeRpcExt<N>
 where
-    N: FullNetwork<Primitives = ScrollNetworkPrimitives>,
+    N: FullNetwork<Primitives = DogeosNetworkPrimitives>,
 {
     /// Creates a new RPC extension with a receiver for the rollup manager handle.
     ///
@@ -124,7 +124,7 @@ pub trait RollupNodeAdminApi {
 #[async_trait]
 impl<N> RollupNodeApiServer for RollupNodeRpcExt<N>
 where
-    N: FullNetwork<Primitives = ScrollNetworkPrimitives>,
+    N: FullNetwork<Primitives = DogeosNetworkPrimitives>,
 {
     async fn status(&self) -> RpcResult<ChainOrchestratorStatus> {
         let handle = self.rollup_manager_handle().await.map_err(|e| {
@@ -187,7 +187,7 @@ where
 #[async_trait]
 impl<N> RollupNodeAdminApiServer for RollupNodeRpcExt<N>
 where
-    N: FullNetwork<Primitives = ScrollNetworkPrimitives>,
+    N: FullNetwork<Primitives = DogeosNetworkPrimitives>,
 {
     async fn enable_automatic_sequencing(&self) -> RpcResult<bool> {
         let handle = self.rollup_manager_handle().await.map_err(|e| {
@@ -248,7 +248,7 @@ where
 #[async_trait]
 impl<N> RollupNodeApiServer for std::sync::Arc<RollupNodeRpcExt<N>>
 where
-    N: FullNetwork<Primitives = ScrollNetworkPrimitives>,
+    N: FullNetwork<Primitives = DogeosNetworkPrimitives>,
 {
     async fn status(&self) -> RpcResult<ChainOrchestratorStatus> {
         (**self).status().await
@@ -270,7 +270,7 @@ where
 #[async_trait]
 impl<N> RollupNodeAdminApiServer for std::sync::Arc<RollupNodeRpcExt<N>>
 where
-    N: FullNetwork<Primitives = ScrollNetworkPrimitives>,
+    N: FullNetwork<Primitives = DogeosNetworkPrimitives>,
 {
     async fn enable_automatic_sequencing(&self) -> RpcResult<bool> {
         (**self).enable_automatic_sequencing().await

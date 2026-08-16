@@ -1,5 +1,5 @@
 use alloy_primitives::{b256, B256};
-use reth_scroll_chainspec::{SCROLL_MAINNET_GENESIS_HASH, SCROLL_SEPOLIA_GENESIS_HASH};
+use dogeos_chainspec::{DOGEOS_CHIKYU_GENESIS_HASH, DOGEOS_MAINNET_GENESIS_HASH};
 
 pub enum DataSource {
     Url(String),
@@ -43,7 +43,7 @@ impl MigrationInfo for ScrollMainnetMigrationInfo {
     }
 
     fn genesis_hash() -> B256 {
-        SCROLL_MAINNET_GENESIS_HASH
+        DOGEOS_MAINNET_GENESIS_HASH
     }
 }
 
@@ -59,7 +59,7 @@ impl MigrationInfo for ScrollMainnetTestMigrationInfo {
     }
 
     fn genesis_hash() -> B256 {
-        SCROLL_MAINNET_GENESIS_HASH
+        DOGEOS_MAINNET_GENESIS_HASH
     }
 }
 
@@ -78,6 +78,6 @@ impl MigrationInfo for ScrollSepoliaMigrationInfo {
     }
 
     fn genesis_hash() -> B256 {
-        SCROLL_SEPOLIA_GENESIS_HASH
+        DOGEOS_CHIKYU_GENESIS_HASH
     }
 }

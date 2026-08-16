@@ -89,6 +89,19 @@ rm -rf volumes
 
 ---
 
+## Follower Restart on Signer Rotation
+
+Follower nodes can opt in to `--consensus.exit-on-signer-rotation`. The node confirms a changed
+authorized signer from L1, shuts down, and exits with code `70` so an external supervisor can
+restart it and load the new signer. Configure a restart policy such as Docker Compose
+`restart: unless-stopped`, Kubernetes, or systemd `Restart=on-failure` before enabling the flag.
+
+Do not enable this on sequencer nodes or combine it with
+`--consensus.authorized-signer`; sequencer rotation remains a manual operation, and a pinned
+signer would remain pinned after restart.
+
+---
+
 ## Troubleshooting
 
 - Make sure the ports (8545, 8546, 19090, 13000) are not used by other processes.
@@ -134,4 +147,3 @@ The configuration priority is:
 - See `docker-compose/docker-compose.yml` for all available services and configuration options.
 - For detailed documentation, refer to the project book in `book/src/docker-operations.md`.
 - For advanced usage, refer to the official [Docker Compose documentation](https://docs.docker.com/compose/).
-

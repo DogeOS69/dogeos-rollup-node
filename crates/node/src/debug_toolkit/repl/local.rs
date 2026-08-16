@@ -18,13 +18,13 @@ use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::{sol, SolCall};
 use colored::Colorize;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use dogeos_rpc_types::Scroll;
 use futures::StreamExt;
 use reth_network::PeersInfo;
 use reth_network_api::Peers;
 use reth_network_peers::NodeRecord;
 use reth_rpc_api::EthApiServer;
 use reth_transaction_pool::TransactionPool;
-use scroll_alloy_network::Scroll;
 use std::{io::Write, path::PathBuf, str::FromStr, time::Duration};
 
 // L1 contract addresses

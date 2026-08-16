@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 # alloy
-scroll-alloy-consensus.workspace = true
+dogeos-protocol-types.workspace = true
 alloy-eips.workspace = true
 alloy-primitives.workspace = true
 alloy-rlp = { version = "0.3.10", default-features = false }

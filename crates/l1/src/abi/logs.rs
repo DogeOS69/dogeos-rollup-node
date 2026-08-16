@@ -1,6 +1,6 @@
 use alloy_primitives::Log;
 use alloy_sol_types::{sol, SolEvent};
-use scroll_alloy_consensus::TxL1Message;
+use dogeos_protocol_types::TxL1Message;
 
 sol! {
     #[cfg_attr(feature = "test-utils", derive(arbitrary::Arbitrary))]

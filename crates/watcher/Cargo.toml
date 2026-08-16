@@ -31,7 +31,7 @@ scroll-l1.workspace = true
 reth-tasks.workspace = true
 
 # scroll
-scroll-alloy-consensus.workspace = true
+dogeos-protocol-types.workspace = true
 
 # misc
 arbitrary = { workspace = true, optional = true }
@@ -63,6 +63,7 @@ test-utils = [
     "scroll-l1/test-utils",
     "dep:alloy-rpc-client",
     "rollup-node-providers/test-utils",
+    "reth-tasks/test-utils",
 ]
 arbitrary = [
     "dep:arbitrary",
@@ -70,7 +71,7 @@ arbitrary = [
     "alloy-eips/arbitrary",
     "alloy-primitives/arbitrary",
     "alloy-rpc-types-eth/arbitrary",
-    "scroll-alloy-consensus/arbitrary",
+    "dogeos-protocol-types/arbitrary",
     "alloy-sol-types/arbitrary",
     "rollup-node-primitives/arbitrary",
 ]

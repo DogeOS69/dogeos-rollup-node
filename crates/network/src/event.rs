@@ -1,12 +1,12 @@
 use alloy_primitives::Signature;
+use dogeos_reth_primitives::DogeosBlock;
 use reth_network_api::PeerId;
-use reth_scroll_primitives::ScrollBlock;
 
 /// A new block with the peer id that it was received from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewBlockWithPeer {
     pub peer_id: PeerId,
-    pub block: ScrollBlock,
+    pub block: DogeosBlock,
     pub signature: Signature,
 }
 

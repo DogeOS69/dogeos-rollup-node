@@ -93,7 +93,7 @@ docker buildx install
 After the build is complete, you can check if the image contains multiple architectures:
 
 ```bash
-docker buildx imagetools inspect scrolltech/rollup-node:latest
+docker buildx imagetools inspect dogeos69/rollup-node:latest
 ```
 
 ## Usage Recommendations

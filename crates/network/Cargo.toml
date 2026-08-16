@@ -22,11 +22,11 @@ reth-storage-api.workspace = true
 reth-tokio-util.workspace = true
 
 # scroll
-reth-scroll-chainspec.workspace = true
-reth-scroll-node.workspace = true
-reth-scroll-primitives.workspace = true
+dogeos-chainspec.workspace = true
+dogeos-protocol-types.workspace = true
+dogeos-reth-primitives.workspace = true
 rollup-node-primitives.workspace = true
-scroll-alloy-hardforks.workspace = true
+dogeos-hardforks.workspace = true
 scroll-wire.workspace = true
 
 # misc
@@ -45,17 +45,17 @@ serde = [
     "reth-network/serde",
     "reth-network-api/serde",
     "reth-network-types/serde",
-    "reth-scroll-primitives/serde",
+    "dogeos-reth-primitives/serde",
     "scroll-wire/serde",
     "reth-primitives-traits/serde",
     "reth-storage-api/serde",
-    "scroll-alloy-hardforks/serde",
+    "dogeos-hardforks/serde",
     "rollup-node-primitives/serde",
+    "dogeos-protocol-types/serde",
 ]
 test-utils = [
     "reth-chainspec/test-utils",
     "reth-network/test-utils",
     "reth-network-types/test-utils",
     "reth-primitives-traits/test-utils",
-    "reth-scroll-node/test-utils",
 ]

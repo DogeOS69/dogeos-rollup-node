@@ -30,21 +30,16 @@ impl TestFixture {
         }
 
         tracing::info!("Shutting down node at index {}", node_index);
-        let NodeHandle {
-            node,
-            engine: _,
-            mut chain_orchestrator_rx,
-            rollup_manager_handle: _r_h,
-            typ: _,
-        } = self
-            .nodes
-            .get_mut(node_index)
-            .and_then(|opt| opt.take())
-            .expect("Node existence checked above");
-        let ScrollNodeTestComponents { node, task_manager, exit_future } = node;
+        let NodeHandle { node, mut chain_orchestrator_rx, rollup_manager_handle: _r_h, typ: _ } =
+            self.nodes
+                .get_mut(node_index)
+                .and_then(|opt| opt.take())
+                .expect("Node existence checked above");
+        let ScrollNodeTestComponents { node, task_executor, exit_future, rollup_manager_handle: _ } =
+            node;
 
-        tokio::task::spawn_blocking(|| {
-            if !task_manager.graceful_shutdown_with_timeout(Duration::from_secs(10)) {
+        tokio::task::spawn_blocking(move || {
+            if !task_executor.graceful_shutdown_with_timeout(Duration::from_secs(10)) {
                 return Err(eyre::eyre!("Failed to shutdown tasks within timeout"));
             }
             eyre::Ok(())

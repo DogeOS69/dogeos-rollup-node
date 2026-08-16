@@ -2,10 +2,10 @@
 
 use alloy_consensus::{transaction::TxHashRef, BlockHeader};
 use alloy_primitives::{hex, Address, U256};
+use dogeos_chainspec::DOGEOS_DEV;
+use dogeos_protocol_types::{ScrollTransaction, TxL1Message};
 use futures::stream::StreamExt;
 use reth_e2e_test_utils::transaction::TransactionTestContext;
-use reth_scroll_chainspec::SCROLL_DEV;
-use reth_scroll_node::test_utils::setup;
 use rollup_node::{
     constants::SCROLL_GAS_LIMIT,
     test_utils::{default_test_scroll_rollup_node_config, setup_engine},
@@ -19,10 +19,8 @@ use rollup_node_sequencer::{
     L1MessageInclusionMode, PayloadBuildingConfig, Sequencer, SequencerConfig, SequencerEvent,
 };
 use rollup_node_watcher::L1Notification;
-use scroll_alloy_consensus::{ScrollTransaction, TxL1Message};
-use scroll_alloy_provider::ScrollAuthApiEngineClient;
 use scroll_db::{test_utils::setup_test_db, DatabaseWriteOperations};
-use scroll_engine::{Engine, ForkchoiceState};
+use scroll_engine::{Engine, ForkchoiceState, ScrollAuthApiEngineClient};
 use std::{io::Write, path::PathBuf, sync::Arc};
 use tempfile::NamedTempFile;
 use tokio::{
@@ -34,8 +32,20 @@ use tokio::{
 async fn skip_block_with_no_transactions() {
     reth_tracing::init_test_tracing();
 
+    let chain_spec = DOGEOS_DEV.clone();
+
     // setup a test node
-    let (mut nodes, _tasks, _wallet) = setup(1, false).await.unwrap();
+    let (mut nodes, _dbs, _wallet) = setup_engine(
+        default_test_scroll_rollup_node_config(),
+        1,
+        chain_spec,
+        false,
+        false,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
     let node = nodes.pop().unwrap();
 
     // create a fork choice state
@@ -88,8 +98,20 @@ async fn skip_block_with_no_transactions() {
 async fn can_build_blocks() {
     reth_tracing::init_test_tracing();
 
+    let chain_spec = DOGEOS_DEV.clone();
+
     // setup a test node
-    let (mut nodes, _tasks, wallet) = setup(1, false).await.unwrap();
+    let (mut nodes, _dbs, wallet) = setup_engine(
+        default_test_scroll_rollup_node_config(),
+        1,
+        chain_spec,
+        false,
+        false,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
     let node = nodes.pop().unwrap();
     let wallet = Arc::new(Mutex::new(wallet));
 
@@ -131,7 +153,7 @@ async fn can_build_blocks() {
 
     // add a transaction to the pool
     let mut wallet_lock = wallet.lock().await;
-    let raw_tx = TransactionTestContext::transfer_tx_nonce_bytes(
+    let raw_tx = TransactionTestContext::transfer_tx_bytes_with_nonce(
         wallet_lock.chain_id,
         wallet_lock.inner.clone(),
         wallet_lock.inner_nonce,
@@ -207,7 +229,7 @@ async fn can_build_blocks() {
 async fn can_build_blocks_with_delayed_l1_messages() {
     reth_tracing::init_test_tracing();
 
-    let chain_spec = SCROLL_DEV.clone();
+    let chain_spec = DOGEOS_DEV.clone();
     const L1_MESSAGE_DELAY: u64 = 2;
 
     // setup a test node
@@ -284,7 +306,7 @@ async fn can_build_blocks_with_delayed_l1_messages() {
 
     // add a transaction to the pool
     let mut wallet_lock = wallet.lock().await;
-    let raw_tx = TransactionTestContext::transfer_tx_nonce_bytes(
+    let raw_tx = TransactionTestContext::transfer_tx_bytes_with_nonce(
         wallet_lock.chain_id,
         wallet_lock.inner.clone(),
         wallet_lock.inner_nonce,
@@ -341,7 +363,7 @@ async fn can_build_blocks_with_delayed_l1_messages() {
 async fn can_build_blocks_with_finalized_l1_messages() {
     reth_tracing::init_test_tracing();
 
-    let chain_spec = SCROLL_DEV.clone();
+    let chain_spec = DOGEOS_DEV.clone();
     // setup a test node
     let (mut nodes, _dbs, wallet) = setup_engine(
         default_test_scroll_rollup_node_config(),
@@ -493,7 +515,7 @@ async fn can_sequence_blocks_with_private_key_file() -> eyre::Result<()> {
     let expected_signer = alloy_signer_local::PrivateKeySigner::from_slice(&expected_key_bytes)?;
     let expected_address = expected_signer.address();
 
-    let chain_spec = (*SCROLL_DEV).clone();
+    let chain_spec = (*DOGEOS_DEV).clone();
     let rollup_manager_args = ScrollRollupNodeConfig {
         test_args: TestArgs {
             test: false, // disable test mode to enable real signing
@@ -534,10 +556,9 @@ async fn can_sequence_blocks_with_private_key_file() -> eyre::Result<()> {
         setup_engine(rollup_manager_args, 1, chain_spec, false, false, None, None).await?;
     let wallet = Arc::new(Mutex::new(wallet));
 
-    let sequencer_rnm_handle = nodes[0].inner.add_ons_handle.rollup_manager_handle.clone();
+    let sequencer_rnm_handle = nodes[0].rollup_manager_handle.clone();
     let mut sequencer_events = sequencer_rnm_handle.get_event_listener().await?;
-    let sequencer_l1_watcher_tx =
-        nodes[0].inner.add_ons_handle.rollup_manager_handle.l1_watcher_mock.clone().unwrap();
+    let sequencer_l1_watcher_tx = nodes[0].rollup_manager_handle.l1_watcher_mock.clone().unwrap();
 
     // Send a notification to set the L1 to synced
     sequencer_l1_watcher_tx.notification_tx.send(Arc::new(L1Notification::Synced)).await?;
@@ -548,7 +569,7 @@ async fn can_sequence_blocks_with_private_key_file() -> eyre::Result<()> {
 
     // Generate and inject transaction
     let mut wallet_lock = wallet.lock().await;
-    let raw_tx = TransactionTestContext::transfer_tx_nonce_bytes(
+    let raw_tx = TransactionTestContext::transfer_tx_bytes_with_nonce(
         wallet_lock.chain_id,
         wallet_lock.inner.clone(),
         wallet_lock.inner_nonce,
@@ -600,7 +621,7 @@ async fn can_sequence_blocks_with_hex_key_file_without_prefix() -> eyre::Result<
         alloy_signer_local::PrivateKeySigner::from_slice(&expected_key_bytes).unwrap();
     let expected_address = expected_signer.address();
 
-    let chain_spec = (*SCROLL_DEV).clone();
+    let chain_spec = (*DOGEOS_DEV).clone();
     let rollup_manager_args = ScrollRollupNodeConfig {
         test_args: TestArgs {
             test: false, // disable test mode to enable real signing
@@ -641,10 +662,9 @@ async fn can_sequence_blocks_with_hex_key_file_without_prefix() -> eyre::Result<
         setup_engine(rollup_manager_args, 1, chain_spec, false, false, None, None).await?;
     let wallet = Arc::new(Mutex::new(wallet));
 
-    let sequencer_rnm_handle = nodes[0].inner.add_ons_handle.rollup_manager_handle.clone();
+    let sequencer_rnm_handle = nodes[0].rollup_manager_handle.clone();
     let mut sequencer_events = sequencer_rnm_handle.get_event_listener().await?;
-    let sequencer_l1_watcher_tx =
-        nodes[0].inner.add_ons_handle.rollup_manager_handle.l1_watcher_mock.clone().unwrap();
+    let sequencer_l1_watcher_tx = nodes[0].rollup_manager_handle.l1_watcher_mock.clone().unwrap();
 
     // Send a notification to set the L1 to synced
     sequencer_l1_watcher_tx.notification_tx.send(Arc::new(L1Notification::Synced)).await?;
@@ -655,7 +675,7 @@ async fn can_sequence_blocks_with_hex_key_file_without_prefix() -> eyre::Result<
 
     // Generate and inject transaction
     let mut wallet_lock = wallet.lock().await;
-    let raw_tx = TransactionTestContext::transfer_tx_nonce_bytes(
+    let raw_tx = TransactionTestContext::transfer_tx_bytes_with_nonce(
         wallet_lock.chain_id,
         wallet_lock.inner.clone(),
         wallet_lock.inner_nonce,
@@ -693,7 +713,7 @@ async fn can_sequence_blocks_with_hex_key_file_without_prefix() -> eyre::Result<
 async fn can_build_blocks_and_exit_at_gas_limit() {
     reth_tracing::init_test_tracing();
 
-    let chain_spec = SCROLL_DEV.clone();
+    let chain_spec = DOGEOS_DEV.clone();
     const MIN_TRANSACTION_GAS_COST: u64 = 21_000;
     const TRANSACTIONS_COUNT: usize = 2000;
 
@@ -719,7 +739,7 @@ async fn can_build_blocks_and_exit_at_gas_limit() {
     // add transactions.
     let mut wallet_lock = wallet.lock().await;
     for _ in 0..TRANSACTIONS_COUNT {
-        let raw_tx = TransactionTestContext::transfer_tx_nonce_bytes(
+        let raw_tx = TransactionTestContext::transfer_tx_bytes_with_nonce(
             wallet_lock.chain_id,
             wallet_lock.inner.clone(),
             wallet_lock.inner_nonce,
@@ -780,7 +800,7 @@ async fn can_build_blocks_and_exit_at_gas_limit() {
 async fn can_build_blocks_and_exit_at_time_limit() {
     reth_tracing::init_test_tracing();
 
-    let chain_spec = SCROLL_DEV.clone();
+    let chain_spec = DOGEOS_DEV.clone();
     const MIN_TRANSACTION_GAS_COST: u64 = 21_000;
     const BLOCK_BUILDING_DURATION: Duration = Duration::from_secs(1);
     const TRANSACTIONS_COUNT: usize = 2000;
@@ -807,7 +827,7 @@ async fn can_build_blocks_and_exit_at_time_limit() {
     // add transactions.
     let mut wallet_lock = wallet.lock().await;
     for _ in 0..TRANSACTIONS_COUNT {
-        let raw_tx = TransactionTestContext::transfer_tx_nonce_bytes(
+        let raw_tx = TransactionTestContext::transfer_tx_bytes_with_nonce(
             wallet_lock.chain_id,
             wallet_lock.inner.clone(),
             wallet_lock.inner_nonce,
@@ -876,7 +896,7 @@ async fn should_limit_l1_message_cumulative_gas() {
     reth_tracing::init_test_tracing();
 
     // setup a test node
-    let chain_spec = SCROLL_DEV.clone();
+    let chain_spec = DOGEOS_DEV.clone();
     let (mut nodes, _dbs, wallet) = setup_engine(
         default_test_scroll_rollup_node_config(),
         1,
@@ -1000,7 +1020,7 @@ async fn should_not_add_skipped_messages() {
     reth_tracing::init_test_tracing();
 
     // setup a test node
-    let chain_spec = SCROLL_DEV.clone();
+    let chain_spec = DOGEOS_DEV.clone();
     let (mut nodes, _dbs, wallet) = setup_engine(
         default_test_scroll_rollup_node_config(),
         1,

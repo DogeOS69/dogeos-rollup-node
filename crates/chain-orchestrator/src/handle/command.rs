@@ -1,16 +1,15 @@
 use crate::{ChainOrchestratorEvent, ChainOrchestratorStatus};
 
 use reth_network_api::FullNetwork;
-use reth_scroll_node::ScrollNetworkPrimitives;
 use reth_tokio_util::EventStream;
 use rollup_node_primitives::{BlockInfo, ChainImport, L1MessageEnvelope};
 use scroll_db::L1MessageKey;
-use scroll_network::{NewBlockWithPeer, ScrollNetworkHandle};
+use scroll_network::{DogeosNetworkPrimitives, NewBlockWithPeer, ScrollNetworkHandle};
 use tokio::sync::oneshot;
 
 /// The commands that can be sent to the rollup manager.
 #[derive(Debug)]
-pub enum ChainOrchestratorCommand<N: FullNetwork<Primitives = ScrollNetworkPrimitives>> {
+pub enum ChainOrchestratorCommand<N: FullNetwork<Primitives = DogeosNetworkPrimitives>> {
     /// Command to build a new block.
     BuildBlock,
     /// Returns an event stream for rollup manager events.

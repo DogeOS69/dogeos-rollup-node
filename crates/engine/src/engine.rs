@@ -73,6 +73,35 @@ where
         Ok(result)
     }
 
+    /// Issues a forkchoice update without payload attributes and commits the candidate local
+    /// forkchoice state only when the Engine returns `VALID`.
+    ///
+    /// The existing [`Self::update_fcs`] intentionally advances local state on `SYNCING` for
+    /// optimistic-sync callers. Derived-batch reconciliation needs the stricter behavior here so a
+    /// held batch can retry from the last confirmed local state. The raw response is returned for
+    /// classification by that caller.
+    pub async fn update_fcs_checked(
+        &mut self,
+        head: Option<BlockInfo>,
+        safe: Option<BlockInfo>,
+        finalized: Option<BlockInfo>,
+    ) -> Result<ForkchoiceUpdated, EngineError> {
+        tracing::trace!(target: "scroll::engine", ?head, ?safe, ?finalized, current = ?self.fcs, "Updating fork choice state (checked)");
+        if head.is_none() && safe.is_none() && finalized.is_none() {
+            return Err(EngineError::fcs_no_update_provided());
+        }
+
+        let mut candidate = self.fcs.clone();
+        candidate.update(head, safe, finalized)?;
+
+        let result = self.client.fork_choice_updated_v1(candidate.get_alloy_fcs(), None).await?;
+        if matches!(result.payload_status.status, PayloadStatusEnum::Valid) {
+            self.fcs = candidate;
+        }
+
+        Ok(result)
+    }
+
     /// Optimistically sync to the given block.
     pub async fn optimistic_sync(
         &mut self,

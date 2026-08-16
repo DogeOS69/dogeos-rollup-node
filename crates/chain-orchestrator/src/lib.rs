@@ -15,8 +15,8 @@ use reth_network_api::{BlockDownloaderProvider, FullNetwork};
 use reth_network_p2p::{sync::SyncState as RethSyncState, FullBlockClient};
 use reth_tokio_util::{EventSender, EventStream};
 use rollup_node_primitives::{
-    BatchCommitData, BatchInfo, BatchStatus, BlockConsolidationOutcome, BlockInfo, ChainImport,
-    L1MessageEnvelope, L2BlockInfoWithL1Messages,
+    BatchCommitData, BatchInfo, BatchStatus, BlockInfo, ChainImport, L1MessageEnvelope,
+    L2BlockInfoWithL1Messages,
 };
 use rollup_node_providers::L1MessageProvider;
 use rollup_node_sequencer::{Sequencer, SequencerEvent};
@@ -26,7 +26,7 @@ use scroll_db::{
     Database, DatabaseError, DatabaseReadOperations, DatabaseWriteOperations, L1MessageKey,
     UnwindResult,
 };
-use scroll_derivation_pipeline::{BatchDerivationResult, DerivationPipeline};
+use scroll_derivation_pipeline::DerivationPipeline;
 use scroll_engine::{Engine, ScrollEngineApi};
 use scroll_network::{
     BlockImportOutcome, DogeosNetworkPrimitives, NewBlockWithPeer, ScrollNetwork,
@@ -42,7 +42,9 @@ mod consensus;
 pub use consensus::{Consensus, NoopConsensus, SystemContractConsensus};
 
 mod consolidation;
-use consolidation::{reconcile_batch, BlockConsolidationAction};
+
+mod derivation;
+use derivation::{AttemptStep, DerivationDriver, FatalAttempt, HeldReorgOutcome};
 
 mod event;
 pub use event::ChainOrchestratorEvent;
@@ -60,7 +62,7 @@ mod sync;
 pub use sync::{SyncMode, SyncState};
 
 mod status;
-pub use status::ChainOrchestratorStatus;
+pub use status::{ChainOrchestratorStatus, DerivationStatus, HeldBatchStatus};
 
 /// Wraps a future, metering the completion of it.
 macro_rules! metered {
@@ -90,6 +92,14 @@ const EVENT_CHANNEL_SIZE: usize = 5000;
 const BATCH_SIZE: usize = 100;
 #[cfg(any(test, feature = "test-utils"))]
 const BATCH_SIZE: usize = 1;
+
+const fn l1_notification_receiver_may_poll(
+    l2_synced: bool,
+    derivation_pipeline_empty: bool,
+    derivation_driver_can_accept_batch: bool,
+) -> bool {
+    l2_synced && derivation_pipeline_empty && derivation_driver_can_accept_batch
+}
 
 /// The [`ChainOrchestrator`] is responsible for orchestrating the progression of the L2 chain
 /// based on data consolidated from L1 and the data received over the p2p network.
@@ -127,6 +137,8 @@ pub struct ChainOrchestrator<
     signer: Option<SignerHandle>,
     /// The derivation pipeline used to derive L2 blocks from batches.
     derivation_pipeline: DerivationPipeline,
+    /// Owns the single derived result being reconciled or held for Engine sync.
+    derivation_driver: DerivationDriver,
     /// Optional event sender for broadcasting events to listeners.
     event_sender: Option<EventSender<ChainOrchestratorEvent>>,
     /// The metrics handler.
@@ -172,6 +184,7 @@ impl<
                 sequencer,
                 signer,
                 derivation_pipeline,
+                derivation_driver: DerivationDriver::default(),
                 handle_rx,
                 event_sender: None,
                 metric_handler: MetricsHandler::default(),
@@ -180,21 +193,72 @@ impl<
         ))
     }
 
-    /// Drives the [`ChainOrchestrator`] future until a shutdown signal is received.
+    /// Drives the [`ChainOrchestrator`] until shutdown or any held-derivation fail-stop boundary.
     pub async fn run_until_shutdown(
         mut self,
         mut shutdown: impl std::future::Future<Output = ()> + Unpin,
-    ) {
+    ) -> Result<(), ChainOrchestratorError> {
         loop {
             tokio::select! {
                 biased;
 
                 _guard = &mut shutdown => {
                     self.notify(ChainOrchestratorEvent::Shutdown);
-                    break;
+                    return Ok(())
+                }
+                () = self.derivation_driver.wait_for_attempt(), if self.derivation_driver.is_attempt_scheduled() => {
+                    let metric = self.metric_handler
+                        .get(Task::BatchReconciliation)
+                        .expect("metric exists")
+                        .clone();
+                    let started = Instant::now();
+                    let step = {
+                        let mut attempt = Box::pin(self.derivation_driver.run_attempt(
+                            &*self.l2_client,
+                            &mut self.engine,
+                            &self.database,
+                        ));
+                        tokio::select! {
+                            biased;
+                            _guard = &mut shutdown => None,
+                            step = &mut attempt => Some(step),
+                        }
+                    };
+                    metric.task_duration.record(started.elapsed().as_secs_f64());
+
+                    let Some(step) = step else {
+                        self.notify(ChainOrchestratorEvent::Shutdown);
+                        return Ok(())
+                    };
+
+                    match step {
+                        AttemptStep::Completed(consolidated) => {
+                            for outcome in consolidated.block_outcomes {
+                                self.notify(ChainOrchestratorEvent::BlockConsolidated(outcome));
+                            }
+                            self.notify(ChainOrchestratorEvent::BatchConsolidated(
+                                consolidated.batch_outcome,
+                            ));
+                        }
+                        AttemptStep::Held => {}
+                        AttemptStep::Fatal(fatal) => {
+                            self.log_fatal_attempt(&fatal);
+                            return Err(*fatal.error)
+                        }
+                    }
                 }
                 Some(command) = self.handle_rx.recv() => {
+                    let held_unwind_context = matches!(
+                        &command,
+                        ChainOrchestratorCommand::RevertToL1Block(_)
+                    )
+                    .then(|| self.derivation_driver.fatal_context())
+                    .flatten();
                     if let Err(err) = self.handle_command(command).await {
+                        if let Some(context) = held_unwind_context {
+                            self.log_fatal_held_operation(context, "administrative L1 unwind", &err);
+                            return Err(err)
+                        }
                         tracing::error!(target: "scroll::chain_orchestrator", ?err, "Error handling command");
                     }
                 }
@@ -214,25 +278,70 @@ impl<
                     } else {
                         unreachable!()
                     }
-                }, if self.sequencer.is_some() && self.sync_state.is_synced() => {
+                }, if self.sequencer.is_some() && self.sync_state.is_synced() && !self.has_pending_derivation_work() => {
                     let res = self.handle_sequencer_event(event).await;
                     self.handle_outcome(res);
                 }
-                Some(batch) = self.derivation_pipeline.next() => {
-                    let res = metered!(Task::BatchReconciliation, self, handle_derived_batch(batch));
-                    self.handle_outcome(res);
+                Some(batch) = self.derivation_pipeline.next(), if self.derivation_driver.can_accept_batch() => {
+                    self.derivation_driver.hold_batch(batch);
                 }
                 Some(event) = self.network.events().next() => {
                     let res = self.handle_network_event(event).await;
                     self.handle_outcome(res);
                 }
-                Some(notification) = self.l1_watcher.l1_notification_receiver().recv(), if self.sync_state.l2().is_synced() && self.derivation_pipeline.is_empty() => {
-                    let res = self.handle_l1_notification(notification).await;
-                    self.handle_outcome(res);
+                Some(notification) = self.l1_watcher.l1_notification_receiver().recv(), if l1_notification_receiver_may_poll(
+                    self.sync_state.l2().is_synced(),
+                    self.derivation_pipeline.is_empty(),
+                    self.derivation_driver.can_accept_batch(),
+                ) => {
+                    let result = self.handle_l1_notification(notification).await;
+                    self.handle_outcome(result);
                 }
 
             }
         }
+    }
+
+    /// Returns whether derivation is queued or one result occupies the held slot.
+    const fn has_pending_derivation_work(&self) -> bool {
+        !self.derivation_driver.can_accept_batch() || !self.derivation_pipeline.is_empty()
+    }
+
+    /// Writes a structured fail-stop record for an operation that made held validity uncertain.
+    fn log_fatal_held_operation(
+        &self,
+        (batch_info, attempt, held_ms): (BatchInfo, u64, u64),
+        operation: &'static str,
+        error: &ChainOrchestratorError,
+    ) {
+        self.derivation_driver.record_fatal();
+        tracing::error!(
+            target: "scroll::chain_orchestrator",
+            batch_index = batch_info.index,
+            batch_hash = ?batch_info.hash,
+            attempt,
+            held_ms,
+            operation,
+            source = %error,
+            "Held-batch state is uncertain after L1 mutation; fail-stopping"
+        );
+    }
+
+    /// Writes the single structured fatal record immediately before the run loop returns `Err`.
+    fn log_fatal_attempt(&self, fatal: &FatalAttempt) {
+        let (batch_info, attempt, held_ms) =
+            self.derivation_driver.fatal_context().expect("a fatal attempt retains its held batch");
+        tracing::error!(
+            target: "scroll::chain_orchestrator",
+            batch_index = batch_info.index,
+            batch_hash = ?batch_info.hash,
+            attempt,
+            held_ms,
+            method = fatal.method,
+            outcome = fatal.outcome,
+            source = %fatal.error,
+            "Derived batch reconciliation failed; fail-stopping"
+        );
     }
 
     /// Handles the outcome of an operation, logging errors and notifying event listeners as
@@ -354,6 +463,7 @@ impl<
                     l1_finalized,
                     l1_processed,
                     self.engine.fcs().clone(),
+                    self.derivation_driver.status(self.derivation_pipeline.len()),
                 );
                 let _ = tx.send(status);
             }
@@ -408,7 +518,9 @@ impl<
             },
             ChainOrchestratorCommand::RevertToL1Block((block_number, tx)) => {
                 self.sync_state.l1_mut().set_syncing();
-                let unwind_result = self.database.unwind(block_number).await?;
+                self.derivation_driver.cancel_attempt();
+                let (unwind_result, held_outcome) =
+                    self.unwind_and_revalidate_held_batch(block_number).await?;
 
                 // Check if the unwind impacts the fcs safe head.
                 if let Some(block_info) = unwind_result.l2_safe_block_info {
@@ -426,6 +538,10 @@ impl<
 
                 // Revert the L1 watcher to the specified block.
                 self.l1_watcher.revert_to_l1_block(block_number);
+
+                if matches!(held_outcome, HeldReorgOutcome::Survived { .. }) {
+                    self.derivation_driver.schedule_fresh_reconciliation();
+                }
 
                 self.notify(ChainOrchestratorEvent::UnwoundToL1Block(block_number));
                 let _ = tx.send(true);
@@ -471,96 +587,42 @@ impl<
         }
     }
 
-    /// Handles a derived batch by inserting the derived blocks into the database.
-    async fn handle_derived_batch(
+    /// Atomically unwinds and decides only the owned held result. Pipeline results that have not
+    /// yet yielded remain the separately tracked issue #32 and are outside this branch's scope.
+    async fn unwind_and_revalidate_held_batch(
         &mut self,
-        batch: BatchDerivationResult,
-    ) -> Result<Option<ChainOrchestratorEvent>, ChainOrchestratorError> {
-        let batch_info = batch.batch_info;
-        tracing::info!(target: "scroll::chain_orchestrator", batch_info = ?batch_info, num_blocks = batch.attributes.len(), "Handling derived batch");
-
-        let skipped_l1_messages = batch.skipped_l1_messages.clone();
-        let batch_reconciliation_result =
-            reconcile_batch(&self.l2_client, batch, self.engine.fcs()).await?;
-        let aggregated_actions = batch_reconciliation_result.aggregate_actions();
-
-        let mut reorg_results = vec![];
-        for action in aggregated_actions.actions {
-            let outcome = match action {
-                BlockConsolidationAction::Skip(_) => {
-                    unreachable!("Skip actions have been filtered out in aggregation")
-                }
-                BlockConsolidationAction::UpdateFcs(block_info) => {
-                    tracing::info!(target: "scroll::chain_orchestrator", ?block_info, "Updating safe head to consolidated block");
-                    let finalized_block_info = batch_reconciliation_result
-                        .target_status
-                        .is_finalized()
-                        .then_some(block_info.block_info);
-                    self.engine
-                        .update_fcs(None, Some(block_info.block_info), finalized_block_info)
-                        .await?;
-                    BlockConsolidationOutcome::UpdateFcs(block_info)
-                }
-                BlockConsolidationAction::Reorg(attributes) => {
-                    tracing::info!(target: "scroll::chain_orchestrator", block_number = ?attributes.block_number, "Reorging chain to derived block");
-                    // We reorg the head to the safe block and then build the payload for the
-                    // attributes.
-                    let head = *self.engine.fcs().safe_block_info();
-                    if head.number != attributes.block_number - 1 {
-                        return Err(ChainOrchestratorError::InvalidBatchReorg {
-                            batch_info,
-                            safe_block_number: head.number,
-                            derived_block_number: attributes.block_number,
-                        });
-                    }
-                    let fcu = self.engine.build_payload(Some(head), attributes.attributes).await?;
-                    let payload = self
-                        .engine
-                        .get_payload(fcu.payload_id.expect("payload_id can not be None"))
-                        .await?;
-
-                    let block_info: L2BlockInfoWithL1Messages = (&payload)
-                        .try_into()
-                        .map_err(ChainOrchestratorError::RollupNodePrimitiveError)?;
-                    let result = self.engine.new_payload(payload).await?;
-                    if result.is_invalid() {
-                        return Err(ChainOrchestratorError::InvalidBatch(
-                            block_info.block_info,
-                            batch_info,
-                        ));
-                    }
-
-                    // Update the forkchoice state to the new head.
-                    let finalized_block_info = batch_reconciliation_result
-                        .target_status
-                        .is_finalized()
-                        .then_some(block_info.block_info);
-                    self.engine
-                        .update_fcs(
-                            Some(block_info.block_info),
-                            Some(block_info.block_info),
-                            finalized_block_info,
-                        )
-                        .await?;
-
-                    reorg_results.push(block_info.clone());
-                    BlockConsolidationOutcome::Reorged(block_info)
-                }
-            };
-
-            self.notify(ChainOrchestratorEvent::BlockConsolidated(outcome.clone()));
+        ancestor: u64,
+    ) -> Result<(UnwindResult, HeldReorgOutcome), ChainOrchestratorError> {
+        let (unwind_result, outcome) =
+            self.derivation_driver.unwind_and_revalidate(&self.database, ancestor).await?;
+        match outcome {
+            HeldReorgOutcome::NoHeldBatch => {}
+            HeldReorgOutcome::Invalidated { batch_info, reason } => tracing::info!(
+                target: "scroll::chain_orchestrator",
+                batch_index = batch_info.index,
+                batch_hash = ?batch_info.hash,
+                ancestor,
+                reason,
+                "Invalidated held derived batch after L1 unwind"
+            ),
+            HeldReorgOutcome::Survived { batch_info } => tracing::info!(
+                target: "scroll::chain_orchestrator",
+                batch_index = batch_info.index,
+                batch_hash = ?batch_info.hash,
+                ancestor,
+                "Held derived batch survived L1 unwind; awaiting post-unwind repair"
+            ),
         }
 
-        let batch_consolidation_outcome =
-            batch_reconciliation_result.into_batch_consolidation_outcome(reorg_results).await?;
+        Ok((unwind_result, outcome))
+    }
 
-        // Insert the batch consolidation outcome into the database.
-        let mut consolidation_outcome = batch_consolidation_outcome.clone();
-        consolidation_outcome.with_skipped_l1_messages(skipped_l1_messages);
-
-        self.database.insert_batch_consolidation_outcome(consolidation_outcome).await?;
-
-        Ok(Some(ChainOrchestratorEvent::BatchConsolidated(batch_consolidation_outcome)))
+    /// Meters L1 reorg handling.
+    async fn handle_l1_reorg_and_revalidate(
+        &mut self,
+        block_number: u64,
+    ) -> Result<Option<ChainOrchestratorEvent>, ChainOrchestratorError> {
+        metered!(Task::L1Reorg, self, handle_l1_reorg(block_number))
     }
 
     /// Handles an L1 notification.
@@ -575,7 +637,7 @@ impl<
                 Ok(None)
             }
             L1Notification::Reorg(block_number) => {
-                metered!(Task::L1Reorg, self, handle_l1_reorg(*block_number))
+                self.handle_l1_reorg_and_revalidate(*block_number).await
             }
             L1Notification::Consensus(update) => {
                 self.consensus.update_config(update);
@@ -675,8 +737,11 @@ impl<
         &mut self,
         block_number: u64,
     ) -> Result<Option<ChainOrchestratorEvent>, ChainOrchestratorError> {
+        self.derivation_driver.cancel_attempt();
+        let (unwind_result, held_outcome) =
+            self.unwind_and_revalidate_held_batch(block_number).await?;
         let UnwindResult { l1_block_number, queue_index, l2_head_block_number, l2_safe_block_info } =
-            self.database.unwind(block_number).await?;
+            unwind_result;
 
         let (l2_head_block_info, reverted_transactions) =
             if let Some(block_number) = l2_head_block_number {
@@ -727,6 +792,10 @@ impl<
 
         // Add all reverted transactions to the transaction pool.
         self.reinsert_txs_into_pool(reverted_transactions).await;
+
+        if matches!(held_outcome, HeldReorgOutcome::Survived { .. }) {
+            self.derivation_driver.schedule_fresh_reconciliation();
+        }
 
         let event = ChainOrchestratorEvent::L1Reorg {
             l1_block_number,
@@ -1417,4 +1486,459 @@ async fn compute_l1_message_queue_hash(
         None
     };
     Ok(queue_hash)
+}
+
+#[cfg(test)]
+mod run_loop_policy_tests {
+    use super::*;
+    use alloy_primitives::{Address, Bloom, Bytes, U256};
+    use alloy_provider::ProviderBuilder;
+    use alloy_rpc_types_engine::{
+        ExecutionPayloadV1, ForkchoiceUpdated, PayloadId, PayloadStatus, PayloadStatusEnum,
+    };
+    use alloy_transport::mock::Asserter;
+    use dogeos_chainspec::{DogeosChainSpec, DOGEOS_DEV};
+    use dogeos_reth_consensus::DogeosConsensus;
+    use dogeos_reth_engine::ScrollPayloadAttributes;
+    use reth_network_api::noop::NoopNetwork;
+    use reth_network_p2p::NoopFullBlockClient;
+    use rollup_node_primitives::BatchCommitData;
+    use rollup_node_providers::{test_utils::MockL1Provider, ScrollRootProvider};
+    use scroll_db::test_utils::setup_test_db;
+    use scroll_derivation_pipeline::{BatchDerivationResult, DerivedAttributes};
+    use scroll_engine::{
+        test_utils::{ScriptedEngineClient, ScriptedResponse},
+        ForkchoiceState,
+    };
+    use scroll_network::{NetworkHandleMessage, ScrollNetworkHandle};
+    use std::time::Duration;
+    use tokio::time;
+
+    const SAFE: u64 = 100;
+    const TEST_L1_NOTIFICATION_CAPACITY: usize = 16;
+
+    type TestNetwork = NoopNetwork<DogeosNetworkPrimitives>;
+    type TestL1Provider = MockL1Provider<Arc<Database>>;
+    type TestOrchestrator = ChainOrchestrator<
+        TestNetwork,
+        DogeosChainSpec,
+        TestL1Provider,
+        ScrollRootProvider,
+        ScriptedEngineClient,
+    >;
+
+    fn info(number: u64, tag: u8) -> BlockInfo {
+        BlockInfo { number, hash: B256::repeat_byte(tag) }
+    }
+
+    fn fcu(status: PayloadStatusEnum, payload_id: Option<PayloadId>) -> ForkchoiceUpdated {
+        ForkchoiceUpdated {
+            payload_status: PayloadStatus { status, latest_valid_hash: None },
+            payload_id,
+        }
+    }
+
+    fn payload(number: u64) -> ExecutionPayloadV1 {
+        ExecutionPayloadV1 {
+            parent_hash: B256::ZERO,
+            fee_recipient: Address::ZERO,
+            state_root: B256::ZERO,
+            receipts_root: B256::ZERO,
+            logs_bloom: Bloom::default(),
+            prev_randao: B256::ZERO,
+            block_number: number,
+            gas_limit: 0,
+            gas_used: 0,
+            timestamp: 0,
+            extra_data: Bytes::new(),
+            base_fee_per_gas: U256::ZERO,
+            block_hash: B256::repeat_byte(0x22),
+            transactions: vec![],
+        }
+    }
+
+    fn script_syncing_hold_then_success(client: &ScriptedEngineClient) {
+        client
+            .push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Syncing, None)));
+        client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(
+            PayloadStatusEnum::Valid,
+            Some(PayloadId::new([7; 8])),
+        )));
+        client.push_get_payload(ScriptedResponse::Ok(payload(SAFE + 1)));
+        client.push_new_payload(ScriptedResponse::Ok(PayloadStatus {
+            status: PayloadStatusEnum::Valid,
+            latest_valid_hash: None,
+        }));
+        client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Valid, None)));
+    }
+
+    async fn test_scroll_network() -> ScrollNetwork<NoopNetwork<DogeosNetworkPrimitives>> {
+        let (to_manager_tx, mut from_handle_rx) = mpsc::unbounded_channel();
+        let handle =
+            ScrollNetworkHandle::new(to_manager_tx, NoopNetwork::<DogeosNetworkPrimitives>::new());
+        tokio::spawn(async move {
+            let events = EventSender::new(16);
+            while let Some(message) = from_handle_rx.recv().await {
+                if let NetworkHandleMessage::EventListener(response) = message {
+                    let _ = response.send(events.new_listener());
+                }
+            }
+        });
+        handle.into_scroll_network().await
+    }
+
+    async fn test_orchestrator(
+        database: Arc<Database>,
+        engine_client: Arc<ScriptedEngineClient>,
+        asserter: Asserter,
+        derived: BatchDerivationResult,
+    ) -> (TestOrchestrator, ChainOrchestratorHandle<TestNetwork>, mpsc::Sender<Arc<L1Notification>>)
+    {
+        let engine = Engine::new(
+            engine_client,
+            ForkchoiceState::new(info(SAFE, 0x11), info(SAFE, 0x11), info(0, 0)),
+        );
+        let l2_provider =
+            ProviderBuilder::<_, _, Scroll>::default().connect_mocked_client(asserter);
+        let l1_provider = MockL1Provider { db: database.clone(), blobs: Default::default() };
+        let derivation_pipeline =
+            DerivationPipeline::new(l1_provider.clone(), database.clone(), 0).await;
+
+        let (watcher_command_tx, _watcher_command_rx) = mpsc::unbounded_channel();
+        let (notification_tx, notification_rx) = mpsc::channel(TEST_L1_NOTIFICATION_CAPACITY);
+        let l1_watcher = L1WatcherHandle::new(watcher_command_tx, notification_rx);
+        let block_client = Arc::new(FullBlockClient::new(
+            NoopFullBlockClient::<DogeosNetworkPrimitives>::default(),
+            Arc::new(DogeosConsensus),
+        ));
+        let config = ChainOrchestratorConfig::<DogeosChainSpec>::new(DOGEOS_DEV.clone(), 1, 0);
+        let (mut orchestrator, handle) = ChainOrchestrator::new(
+            database,
+            config,
+            block_client,
+            l2_provider,
+            l1_watcher,
+            test_scroll_network().await,
+            Box::new(NoopConsensus),
+            engine,
+            None::<Sequencer<TestL1Provider, DogeosChainSpec>>,
+            None,
+            derivation_pipeline,
+        )
+        .await
+        .unwrap();
+        orchestrator.sync_state.l1_mut().set_synced();
+        orchestrator.derivation_driver.hold_batch(derived);
+
+        (orchestrator, handle, notification_tx)
+    }
+
+    #[test]
+    fn l1_notification_receiver_requires_synced_idle_derivation() {
+        for (l2_synced, pipeline_empty, can_accept_batch, expected) in [
+            (false, false, false, false),
+            (false, false, true, false),
+            (false, true, false, false),
+            (false, true, true, false),
+            (true, false, false, false),
+            (true, false, true, false),
+            (true, true, false, false),
+            (true, true, true, true),
+        ] {
+            assert_eq!(
+                l1_notification_receiver_may_poll(l2_synced, pipeline_empty, can_accept_batch),
+                expected,
+                "l2_synced={l2_synced}, pipeline_empty={pipeline_empty}, \
+                 can_accept_batch={can_accept_batch}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn notification_waits_until_held_slot_and_pipeline_are_empty() {
+        let database = Arc::new(setup_test_db().await);
+        database.insert_genesis_block(B256::ZERO).await.unwrap();
+        database.set_processed_l1_block_number(5).await.unwrap();
+        let batch_info = BatchInfo::new(1, B256::repeat_byte(1));
+        database
+            .insert_batch(BatchCommitData {
+                hash: batch_info.hash,
+                index: batch_info.index,
+                block_number: 1,
+                block_timestamp: 0,
+                calldata: Arc::new(Bytes::new()),
+                blob_versioned_hash: None,
+                finalized_block_number: None,
+                reverted_block_number: None,
+            })
+            .await
+            .unwrap();
+        database.update_batch_status(batch_info.hash, BatchStatus::Processing).await.unwrap();
+
+        let engine_client = Arc::new(ScriptedEngineClient::new());
+        script_syncing_hold_then_success(&engine_client);
+
+        let asserter = Asserter::new();
+        asserter.push_success(&Option::<()>::None);
+        asserter.push_success(&Option::<()>::None);
+        let (mut orchestrator, handle, notification_tx) = test_orchestrator(
+            database.clone(),
+            engine_client.clone(),
+            asserter,
+            BatchDerivationResult {
+                attributes: vec![DerivedAttributes {
+                    block_number: SAFE + 1,
+                    attributes: ScrollPayloadAttributes::default(),
+                }],
+                batch_info,
+                skipped_l1_messages: vec![],
+                target_status: BatchStatus::Consolidated,
+            },
+        )
+        .await;
+        let mut events = orchestrator.event_listener();
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let run_task = tokio::spawn(orchestrator.run_until_shutdown(Box::pin(async move {
+            let _ = shutdown_rx.await;
+        })));
+
+        time::timeout(Duration::from_secs(2), async {
+            loop {
+                let status = handle.status().await.unwrap();
+                if matches!(
+                    status.derivation,
+                    DerivationStatus::Held(HeldBatchStatus { attempts_started: 1, .. })
+                ) {
+                    break
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first Engine SYNCING response must hold the batch");
+
+        notification_tx.send(Arc::new(L1Notification::Processed(10))).await.unwrap();
+        time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(notification_tx.capacity(), TEST_L1_NOTIFICATION_CAPACITY - 1);
+        assert_eq!(
+            database.get_processed_l1_block_number().await.unwrap(),
+            5,
+            "the watcher channel must retain the notification while derivation is held"
+        );
+
+        time::timeout(Duration::from_secs(5), async {
+            loop {
+                if matches!(
+                    events.next().await,
+                    Some(ChainOrchestratorEvent::BatchConsolidated(outcome))
+                        if outcome.batch_info == batch_info
+                ) {
+                    break
+                }
+            }
+        })
+        .await
+        .expect("the held batch must consolidate");
+
+        time::timeout(Duration::from_secs(2), async {
+            while database.get_processed_l1_block_number().await.unwrap() != 10 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the notification must apply once derivation is idle");
+        assert_eq!(notification_tx.capacity(), TEST_L1_NOTIFICATION_CAPACITY);
+        assert!(matches!(handle.status().await.unwrap().derivation, DerivationStatus::Idle));
+        assert_eq!(engine_client.fork_choice_updated_calls(), 3);
+
+        let _ = shutdown_tx.send(());
+        assert!(run_task.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn queued_reorg_runs_after_consolidation_then_unwinds_it() {
+        let database = Arc::new(setup_test_db().await);
+        database.insert_genesis_block(B256::ZERO).await.unwrap();
+        let batch_info = BatchInfo::new(1, B256::repeat_byte(1));
+        database
+            .insert_batch(BatchCommitData {
+                hash: batch_info.hash,
+                index: batch_info.index,
+                block_number: 10,
+                block_timestamp: 0,
+                calldata: Arc::new(Bytes::new()),
+                blob_versioned_hash: None,
+                finalized_block_number: None,
+                reverted_block_number: None,
+            })
+            .await
+            .unwrap();
+        database.update_batch_status(batch_info.hash, BatchStatus::Processing).await.unwrap();
+
+        let engine_client = Arc::new(ScriptedEngineClient::new());
+        script_syncing_hold_then_success(&engine_client);
+        engine_client
+            .push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Valid, None)));
+        let asserter = Asserter::new();
+        asserter.push_success(&Option::<()>::None);
+        asserter.push_success(&Option::<()>::None);
+        let (mut orchestrator, _handle, notification_tx) = test_orchestrator(
+            database.clone(),
+            engine_client.clone(),
+            asserter,
+            BatchDerivationResult {
+                attributes: vec![DerivedAttributes {
+                    block_number: SAFE + 1,
+                    attributes: ScrollPayloadAttributes::default(),
+                }],
+                batch_info,
+                skipped_l1_messages: vec![],
+                target_status: BatchStatus::Consolidated,
+            },
+        )
+        .await;
+        let mut events = orchestrator.event_listener();
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let run_task = tokio::spawn(orchestrator.run_until_shutdown(Box::pin(async move {
+            let _ = shutdown_rx.await;
+        })));
+
+        time::timeout(Duration::from_secs(2), async {
+            while engine_client.fork_choice_updated_calls() < 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first Engine SYNCING response must hold the batch");
+
+        notification_tx.send(Arc::new(L1Notification::Reorg(5))).await.unwrap();
+        time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(notification_tx.capacity(), TEST_L1_NOTIFICATION_CAPACITY - 1);
+        assert_eq!(
+            database.get_batch_status_by_hash(batch_info.hash).await.unwrap(),
+            Some(BatchStatus::Processing),
+            "the queued reorg must not preempt the held batch"
+        );
+
+        let observed = time::timeout(Duration::from_secs(5), async {
+            let mut observed = Vec::new();
+            while observed.len() < 2 {
+                match events.next().await {
+                    Some(ChainOrchestratorEvent::BatchConsolidated(outcome))
+                        if outcome.batch_info == batch_info =>
+                    {
+                        observed.push("consolidated");
+                    }
+                    Some(ChainOrchestratorEvent::L1Reorg { l1_block_number: 5, .. }) => {
+                        observed.push("reorg")
+                    }
+                    _ => {}
+                }
+            }
+            observed
+        })
+        .await
+        .expect("consolidation and the queued reorg must both complete");
+        assert_eq!(observed, ["consolidated", "reorg"]);
+        assert_eq!(database.get_latest_l1_block_number().await.unwrap(), 5);
+        assert!(database.get_batch_by_index(batch_info.index).await.unwrap().is_none());
+        assert_eq!(engine_client.fork_choice_updated_calls(), 4);
+        assert_eq!(engine_client.get_payload_calls(), 1);
+        assert_eq!(engine_client.new_payload_calls(), 1);
+
+        let _ = shutdown_tx.send(());
+        assert!(run_task.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn administrative_post_unwind_engine_failure_fail_stops_without_retry() {
+        let database = Arc::new(setup_test_db().await);
+        database.insert_genesis_block(B256::ZERO).await.unwrap();
+        let batch_info = BatchInfo::new(1, B256::repeat_byte(1));
+        database
+            .insert_batch(BatchCommitData {
+                hash: batch_info.hash,
+                index: batch_info.index,
+                block_number: 1,
+                block_timestamp: 0,
+                calldata: Arc::new(Bytes::new()),
+                blob_versioned_hash: None,
+                finalized_block_number: None,
+                reverted_block_number: None,
+            })
+            .await
+            .unwrap();
+        database.update_batch_status(batch_info.hash, BatchStatus::Processing).await.unwrap();
+        database
+            .insert_batch(BatchCommitData {
+                hash: B256::repeat_byte(2),
+                index: 2,
+                block_number: 10,
+                block_timestamp: 0,
+                calldata: Arc::new(Bytes::new()),
+                blob_versioned_hash: None,
+                finalized_block_number: None,
+                reverted_block_number: None,
+            })
+            .await
+            .unwrap();
+
+        let engine_client = Arc::new(ScriptedEngineClient::new());
+        engine_client
+            .push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Syncing, None)));
+        engine_client.push_fork_choice_updated(ScriptedResponse::TransportFailure);
+        let asserter = Asserter::new();
+        asserter.push_success(&Option::<()>::None);
+        let (orchestrator, handle, _notification_tx) = test_orchestrator(
+            database.clone(),
+            engine_client.clone(),
+            asserter,
+            BatchDerivationResult {
+                attributes: vec![DerivedAttributes {
+                    block_number: SAFE + 1,
+                    attributes: ScrollPayloadAttributes::default(),
+                }],
+                batch_info,
+                skipped_l1_messages: vec![],
+                target_status: BatchStatus::Consolidated,
+            },
+        )
+        .await;
+
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let run_task = tokio::spawn(orchestrator.run_until_shutdown(Box::pin(async move {
+            let _ = shutdown_rx.await;
+        })));
+        time::timeout(Duration::from_secs(2), async {
+            loop {
+                let status = handle.status().await.unwrap();
+                if matches!(
+                    status.derivation,
+                    DerivationStatus::Held(HeldBatchStatus { attempts_started: 1, .. })
+                ) {
+                    break
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first Engine SYNCING response must hold the batch");
+
+        let revert_task = tokio::spawn(async move { handle.revert_to_l1_block(5).await });
+        let result = time::timeout(Duration::from_secs(2), run_task)
+            .await
+            .expect("post-unwind Engine failure must terminate the run loop")
+            .unwrap();
+        assert!(revert_task.await.unwrap().is_err());
+        assert!(matches!(result, Err(ChainOrchestratorError::EngineError(_))));
+        assert_eq!(engine_client.fork_choice_updated_calls(), 2);
+        assert_eq!(
+            database.get_batch_status_by_hash(batch_info.hash).await.unwrap(),
+            Some(BatchStatus::Processing),
+            "the surviving held row must remain for restart recovery"
+        );
+        assert!(database.get_batch_by_index(2).await.unwrap().is_none());
+    }
 }

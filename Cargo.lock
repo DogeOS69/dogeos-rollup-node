@@ -11207,7 +11207,7 @@ dependencies = [
 
 [[package]]
 name = "rollup-node"
-version = "0.3.0-beta.0"
+version = "0.3.0-beta.1"
 dependencies = [
  "alloy-chains",
  "alloy-consensus",
@@ -11312,7 +11312,7 @@ dependencies = [
 
 [[package]]
 name = "rollup-node-chain-orchestrator"
-version = "0.3.0-beta.0"
+version = "0.3.0-beta.1"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -11366,7 +11366,7 @@ dependencies = [
 
 [[package]]
 name = "rollup-node-primitives"
-version = "0.3.0-beta.0"
+version = "0.3.0-beta.1"
 dependencies = [
  "alloy-chains",
  "alloy-consensus",
@@ -11390,7 +11390,7 @@ dependencies = [
 
 [[package]]
 name = "rollup-node-providers"
-version = "0.3.0-beta.0"
+version = "0.3.0-beta.1"
 dependencies = [
  "alloy-eips",
  "alloy-primitives",
@@ -11417,7 +11417,7 @@ dependencies = [
 
 [[package]]
 name = "rollup-node-sequencer"
-version = "0.3.0-beta.0"
+version = "0.3.0-beta.1"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -11457,7 +11457,7 @@ dependencies = [
 
 [[package]]
 name = "rollup-node-signer"
-version = "0.3.0-beta.0"
+version = "0.3.0-beta.1"
 dependencies = [
  "alloy-primitives",
  "alloy-signer",
@@ -11476,7 +11476,7 @@ dependencies = [
 
 [[package]]
 name = "rollup-node-watcher"
-version = "0.3.0-beta.0"
+version = "0.3.0-beta.1"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -11880,7 +11880,7 @@ dependencies = [
 
 [[package]]
 name = "scroll-db"
-version = "0.3.0-beta.0"
+version = "0.3.0-beta.1"
 dependencies = [
  "alloy-primitives",
  "arbitrary",
@@ -11907,7 +11907,7 @@ dependencies = [
 
 [[package]]
 name = "scroll-derivation-pipeline"
-version = "0.3.0-beta.0"
+version = "0.3.0-beta.1"
 dependencies = [
  "alloy-eips",
  "alloy-primitives",
@@ -11934,7 +11934,7 @@ dependencies = [
 
 [[package]]
 name = "scroll-engine"
-version = "0.3.0-beta.0"
+version = "0.3.0-beta.1"
 dependencies = [
  "alloy-chains",
  "alloy-consensus",
@@ -11970,7 +11970,7 @@ dependencies = [
 
 [[package]]
 name = "scroll-l1"
-version = "0.3.0-beta.0"
+version = "0.3.0-beta.1"
 dependencies = [
  "alloy-primitives",
  "alloy-sol-types",
@@ -12002,7 +12002,7 @@ dependencies = [
 
 [[package]]
 name = "scroll-network"
-version = "0.3.0-beta.0"
+version = "0.3.0-beta.1"
 dependencies = [
  "alloy-primitives",
  "dogeos-chainspec",
@@ -12030,7 +12030,7 @@ dependencies = [
 
 [[package]]
 name = "scroll-wire"
-version = "0.3.0-beta.0"
+version = "0.3.0-beta.1"
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",

@@ -3,9 +3,16 @@ set -e
 
 export RUST_LOG=sqlx=off,scroll=trace,reth=info,rollup=trace,info
 
+legacy_geth_header_transform_args=()
+if [ "${LEGACY_GETH_HEADER_TRANSFORM:-}" = "true" ]; then
+  # Opt-in for docker-compose.test.yml: canonicalize signed l2geth extra_data headers.
+  legacy_geth_header_transform_args+=(--network.legacy-geth-header-transform true)
+fi
+
 exec rollup-node node --chain /l2reth/l2reth-genesis-e2e.json --datadir=/l2reth --metrics=0.0.0.0:6060 \
   --disable-discovery \
   --network.valid_signer "0xb674ff99cca262c99d3eab5b32796a99188543da" \
+  "${legacy_geth_header_transform_args[@]}" \
   --http --http.addr=0.0.0.0 --http.port=8545 --http.corsdomain "*" --http.api admin,debug,eth,net,trace,txpool,web3,rpc,reth,ots,flashbots,miner,mev \
   --ws --ws.addr=0.0.0.0 --ws.port=8546 --ws.api admin,debug,eth,net,trace,txpool,web3,rpc,reth,ots,flashbots,miner,mev \
   --log.stdout.format log-fmt -vvv \

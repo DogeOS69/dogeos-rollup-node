@@ -50,6 +50,9 @@ expect_reject "the obsolete c5198f7 DogeOS component source alongside the good a
 expect_reject "the immediately retired 18adb117 DogeOS component source alongside the good anchors" \
     '.packages += [first(.packages[] | select(.name == "dogeos-chainspec")) | .source = "git+https://github.com/DogeOS69/dogeos-reth.git?rev=18adb1176636b4f3bdc828a15c4622f60d2e5ec7#18adb1176636b4f3bdc828a15c4622f60d2e5ec7"]'
 
+expect_reject "the immediately retired 81c8b33e DogeOS component source alongside the good anchors" \
+    '.packages += [first(.packages[] | select(.name == "dogeos-chainspec")) | .source = "git+https://github.com/DogeOS69/dogeos-reth.git?rev=81c8b33ea958fd03173bc37094b97ddebeed1441#81c8b33ea958fd03173bc37094b97ddebeed1441"]'
+
 expect_reject "the obsolete PR #3 ae160090 clean-Reth source alongside the good anchors" \
     '.packages += [first(.packages[] | select(.name == "reth-node-builder")) | .source = "git+https://github.com/DogeOS69/reth.git?rev=ae160090003d9b04be0521e9e4760558798cdf40#ae160090003d9b04be0521e9e4760558798cdf40"]'
 
@@ -66,10 +69,13 @@ expect_reject "a retired scroll-tech/reth source without the .git suffix" \
     '.packages += [first(.packages[] | select(.name == "reth-node-builder")) | .source = "git+https://github.com/scroll-tech/reth?branch=scroll#0000000000000000000000000000000000000000"]'
 
 expect_reject "a duplicate lowercase-organization DogeOS REVM source" \
-    '.packages += [first(.packages[] | select(.name == "revm-scroll")) | .source = "git+https://github.com/dogeos69/dogeos-revm?branch=dogeos#dcf087684f255131c96c0d20f3291eef9198e990"]'
+    '.packages += [first(.packages[] | select(.name == "revm-scroll")) | .source = "git+https://github.com/dogeos69/dogeos-revm?rev=dcf087684f255131c96c0d20f3291eef9198e990#dcf087684f255131c96c0d20f3291eef9198e990"]'
+
+expect_reject "the immediately retired branch-form DogeOS REVM source alongside the good anchors" \
+    '.packages += [first(.packages[] | select(.name == "revm-scroll")) | .source = "git+https://github.com/DogeOS69/dogeos-revm.git?branch=dogeos#dcf087684f255131c96c0d20f3291eef9198e990"]'
 
 expect_reject "a wrong DogeOS REVM revision" \
-    '.packages |= map(if .name == "revm-scroll" then .source = "git+https://github.com/DogeOS69/dogeos-revm.git?branch=dogeos#1111111111111111111111111111111111111111" else . end)'
+    '.packages |= map(if .name == "revm-scroll" then .source = "git+https://github.com/DogeOS69/dogeos-revm.git?rev=1111111111111111111111111111111111111111#1111111111111111111111111111111111111111" else . end)'
 
 # The reviewed official Reth subtree only ever entered the graph through the
 # removed Foundry/Tempo subtree, so the clean graph no longer contains a

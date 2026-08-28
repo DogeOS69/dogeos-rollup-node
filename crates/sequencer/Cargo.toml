@@ -54,6 +54,7 @@ reth-tasks.workspace = true
 reth-tracing.workspace = true
 
 dogeos-chainspec.workspace = true
+dogeos-reth-evm.workspace = true
 
 # rollup-node
 rollup-node = { workspace = true, features = ["test-utils"] }

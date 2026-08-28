@@ -4,6 +4,7 @@ use alloy_consensus::{transaction::TxHashRef, BlockHeader};
 use alloy_primitives::{hex, Address, U256};
 use dogeos_chainspec::DOGEOS_DEV;
 use dogeos_protocol_types::{ScrollTransaction, TxL1Message};
+use dogeos_reth_evm::DEFAULT_BASE_FEE_OVERHEAD;
 use futures::stream::StreamExt;
 use reth_e2e_test_utils::transaction::TransactionTestContext;
 use rollup_node::{
@@ -182,8 +183,11 @@ async fn can_build_blocks() {
     assert_eq!(block.header.number(), 1);
     assert_eq!(block.header.parent_hash, genesis_hash);
 
-    // check the base fee has been set for the block.
-    assert_eq!(block.header.base_fee_per_gas.unwrap(), 876960000);
+    // DogeOS default base-fee overhead.
+    assert_eq!(
+        block.header.base_fee_per_gas.unwrap(),
+        DEFAULT_BASE_FEE_OVERHEAD.saturating_to::<u64>()
+    );
 
     // now lets add an L1 message to the database
     let wallet_lock = wallet.lock().await;

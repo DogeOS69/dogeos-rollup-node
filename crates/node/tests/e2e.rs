@@ -6,6 +6,7 @@ use alloy_signer::Signer;
 use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::SolCall;
 use dogeos_chainspec::{DogeosChainSpec, DOGEOS_CHIKYU, DOGEOS_DEV, DOGEOS_MAINNET};
+use dogeos_hardforks::{DogeosHardfork, ForkCondition};
 use dogeos_reth_primitives::DogeosBlock;
 use futures::{task::noop_waker_ref, FutureExt, StreamExt};
 use reth_chainspec::EthChainSpec;
@@ -556,8 +557,10 @@ async fn can_sequence_and_gossip_transactions() -> eyre::Result<()> {
 async fn can_bridge_blocks() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    // Create the chain spec for scroll dev with Feynman activated and a test genesis.
-    let chain_spec = (*DOGEOS_DEV).clone();
+    // Signed legacy fixture is pre-Tsuki; retain DOGEOS_DEV genesis and Galileo rules.
+    let mut chain_spec = (**DOGEOS_DEV).clone();
+    chain_spec.inner.hardforks.insert(DogeosHardfork::Tsuki, ForkCondition::Never);
+    let chain_spec = Arc::new(chain_spec);
 
     // Setup the bridge node and a standard node.
     let (mut nodes, _dbs, _wallet) = setup_engine(
@@ -1114,21 +1117,21 @@ async fn graceful_shutdown_sets_fcs_to_latest_signed_block_in_db_on_start_up() -
 async fn can_revert_to_l1_block() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    // Create a follower test fixture using DOGEOS_MAINNET chain spec
     let mut fixture = TestFixture::builder()
         .followers(1)
-        .with_chain_spec(DOGEOS_MAINNET.clone())
+        .with_chain_spec(DOGEOS_DEV.clone())
         .with_memory_db()
         .build()
         .await?;
+    let genesis_timestamp = DOGEOS_DEV.genesis_header().timestamp;
 
-    // Load test batches
+    // In-family empty batches covering L2 1..=4 and 5..=57.
     let batch_0_block_info = BlockInfo { number: 18318207, hash: B256::random() };
-    let raw_calldata_0 = read_to_bytes("./tests/testdata/batch_0_calldata.bin")?;
+    let raw_calldata_0 = empty_batch_calldata(1, 4, genesis_timestamp + 1);
     let batch_0_hash = b256!("5AAEB6101A47FC16866E80D77FFE090B6A7B3CF7D988BE981646AB6AEDFA2C42");
 
     let batch_1_block_info = BlockInfo { number: 18318215, hash: B256::random() };
-    let raw_calldata_1 = read_to_bytes("./tests/testdata/batch_1_calldata.bin")?;
+    let raw_calldata_1 = empty_batch_calldata(5, 53, genesis_timestamp + 2);
     let batch_1_hash = b256!("AA8181F04F8E305328A6117FA6BC13FA2093A3C4C990C5281DF95A1CB85CA18F");
 
     // Send a Synced notification to the chain orchestrator
@@ -1224,22 +1227,22 @@ async fn can_revert_to_l1_block() -> eyre::Result<()> {
 async fn consolidates_committed_batches_after_chain_consolidation() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    // Create a follower test fixture using DOGEOS_MAINNET chain spec
     let mut fixture = TestFixture::builder()
         .followers(1)
-        .with_chain_spec(DOGEOS_MAINNET.clone())
+        .with_chain_spec(DOGEOS_DEV.clone())
         .with_memory_db()
         .build()
         .await?;
+    let genesis_timestamp = DOGEOS_DEV.genesis_header().timestamp;
 
-    // Load test batches
+    // In-family empty batches covering L2 1..=4 and 5..=57.
     let batch_0_block_info = BlockInfo { number: 18318207, hash: B256::random() };
-    let raw_calldata_0 = read_to_bytes("./tests/testdata/batch_0_calldata.bin")?;
+    let raw_calldata_0 = empty_batch_calldata(1, 4, genesis_timestamp + 1);
     let batch_0_hash = b256!("5AAEB6101A47FC16866E80D77FFE090B6A7B3CF7D988BE981646AB6AEDFA2C42");
 
     let batch_0_finalization_block_info = BlockInfo { number: 18318210, hash: B256::random() };
     let batch_1_block_info = BlockInfo { number: 18318215, hash: B256::random() };
-    let raw_calldata_1 = read_to_bytes("./tests/testdata/batch_1_calldata.bin")?;
+    let raw_calldata_1 = empty_batch_calldata(5, 53, genesis_timestamp + 2);
     let batch_1_hash = b256!("AA8181F04F8E305328A6117FA6BC13FA2093A3C4C990C5281DF95A1CB85CA18F");
 
     let batch_1_finalization_block_info = BlockInfo { number: 18318220, hash: B256::random() };
@@ -1320,24 +1323,24 @@ async fn consolidates_committed_batches_after_chain_consolidation() -> eyre::Res
 async fn can_handle_batch_revert_with_reorg() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    // Create a follower test fixture using DOGEOS_MAINNET chain spec
     let mut fixture = TestFixture::builder()
         .followers(1)
-        .with_chain_spec(DOGEOS_MAINNET.clone())
+        .with_chain_spec(DOGEOS_DEV.clone())
         .with_memory_db()
         .build()
         .await?;
+    let genesis_timestamp = DOGEOS_DEV.genesis_header().timestamp;
 
     // Send a Synced notification to the chain orchestrator
     fixture.l1().sync().await?;
 
-    // Load test batches
+    // In-family empty batches covering L2 1..=4 and 5..=57.
     let batch_0_block_info = BlockInfo { number: 18318207, hash: B256::random() };
-    let raw_calldata_0 = read_to_bytes("./tests/testdata/batch_0_calldata.bin")?;
+    let raw_calldata_0 = empty_batch_calldata(1, 4, genesis_timestamp + 1);
     let batch_0_hash = b256!("5AAEB6101A47FC16866E80D77FFE090B6A7B3CF7D988BE981646AB6AEDFA2C42");
 
     let batch_1_block_info = BlockInfo { number: 18318215, hash: B256::random() };
-    let raw_calldata_1 = read_to_bytes("./tests/testdata/batch_1_calldata.bin")?;
+    let raw_calldata_1 = empty_batch_calldata(5, 53, genesis_timestamp + 2);
     let batch_1_hash = b256!("AA8181F04F8E305328A6117FA6BC13FA2093A3C4C990C5281DF95A1CB85CA18F");
 
     let batch_1_revert_block_info = BlockInfo { number: 18318216, hash: B256::random() };

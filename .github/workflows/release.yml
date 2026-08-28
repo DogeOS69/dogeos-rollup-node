@@ -12,8 +12,7 @@ on:
       - main
     paths:
       - ".github/workflows/release.yml"
-      - ".github/scripts/release-*.sh"
-      - ".github/scripts/publish-image-index.sh"
+      - ".github/scripts/**"
       - ".cargo/**"
       - "Cargo.lock"
       - "Cargo.toml"
@@ -61,8 +60,10 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Test release metadata
-        run: .github/scripts/test-release-metadata.sh
+      - name: Test release tooling
+        run: |
+          .github/scripts/test-release-metadata.sh
+          .github/scripts/test-publish-image-index.sh
 
       - name: Prepare build metadata
         id: metadata
@@ -108,20 +109,21 @@ jobs:
           )
 
           jq -e . <<<"$metadata" >/dev/null
-          {
-            echo "matrix=$(jq -c .matrix <<<"$metadata")"
-            echo "matrix_count=$(jq -r .matrix_count <<<"$metadata")"
-            echo "tags=$(jq -c .tags <<<"$metadata")"
-            echo "expected_platforms=$(jq -c .expected_platforms <<<"$metadata")"
-            echo "environment=$(jq -r .environment <<<"$metadata")"
-            echo "workspace_version=$(jq -r .workspace_version <<<"$metadata")"
-            echo "version_major=$(jq -r .version_major <<<"$metadata")"
-            echo "version_minor=$(jq -r .version_minor <<<"$metadata")"
-            echo "version_patch=$(jq -r .version_patch <<<"$metadata")"
-            echo "vcs_ref=$(jq -r .vcs_ref <<<"$metadata")"
-            echo "ref_name=$(jq -r .ref_name <<<"$metadata")"
-            echo "build_date=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-          } >>"$GITHUB_OUTPUT"
+          build_date=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+          jq -er --arg build_date "$build_date" '[
+            "matrix=\(.matrix | tojson)",
+            "matrix_count=\(.matrix_count)",
+            "tags=\(.tags | tojson)",
+            "expected_platforms=\(.expected_platforms | tojson)",
+            "environment=\(.environment)",
+            "workspace_version=\(.workspace_version)",
+            "version_major=\(.version_major)",
+            "version_minor=\(.version_minor)",
+            "version_patch=\(.version_patch)",
+            "vcs_ref=\(.vcs_ref)",
+            "ref_name=\(.ref_name)",
+            "build_date=\($build_date)"
+          ] | .[]' <<<"$metadata" >>"$GITHUB_OUTPUT"
 
   build:
     needs: prepare
@@ -218,9 +220,22 @@ jobs:
             exit 1
           fi
 
-          docker buildx imagetools inspect "${IMAGE_NAME}@${BUILD_DIGEST}" >/dev/null
+          digest_hex=${BASH_REMATCH[1]}
+          resolved=false
+          for _ in {1..5}; do
+            if docker buildx imagetools inspect "${IMAGE_NAME}@${BUILD_DIGEST}" >/dev/null; then
+              resolved=true
+              break
+            fi
+            sleep 2
+          done
+          if [[ "$resolved" != true ]]; then
+            echo "unable to resolve ${IMAGE_NAME}@${BUILD_DIGEST} after 5 attempts" >&2
+            exit 1
+          fi
+
           mkdir -p /tmp/digests
-          touch "/tmp/digests/${BUILD_ARCH}-${BASH_REMATCH[1]}"
+          touch "/tmp/digests/${BUILD_ARCH}-${digest_hex}"
 
       - name: Upload digest
         if: ${{ github.event_name != 'pull_request' }}
@@ -242,6 +257,11 @@ jobs:
     concurrency:
       group: docker-publish-rollup-node
       cancel-in-progress: false
+      # Retain up to 100 pending publishers instead of replacing the oldest.
+      queue: max
+
+    # Single-platform publications intentionally remain OCI indexes so the
+    # provenance attestation is preserved alongside the runtime manifest.
 
     steps:
       - name: Checkout repository

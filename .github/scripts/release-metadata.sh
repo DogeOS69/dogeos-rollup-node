@@ -18,8 +18,8 @@ if [[ ! "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]; then
     exit 1
 fi
 
-if [[ ! "$WORKSPACE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]; then
-    echo "WORKSPACE_VERSION must be one valid single-line semantic version" >&2
+if [[ ! "$WORKSPACE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]; then
+    echo "WORKSPACE_VERSION must be one Docker-tag-compatible semantic version without build metadata" >&2
     exit 1
 fi
 

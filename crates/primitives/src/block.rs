@@ -9,8 +9,8 @@ use core::{
     pin::Pin,
     task::{ready, Context, Poll},
 };
-use reth_scroll_primitives::{ScrollBlock, ScrollTransactionSigned};
-use scroll_alloy_consensus::L1_MESSAGE_TRANSACTION_TYPE;
+use dogeos_protocol_types::L1_MESSAGE_TRANSACTION_TYPE;
+use dogeos_reth_primitives::{DogeosBlock, ScrollTransactionSigned};
 use std::vec::Vec;
 
 /// The default block difficulty for a scroll block.
@@ -81,8 +81,8 @@ impl From<BlockNumHash> for BlockInfo {
     }
 }
 
-impl From<&ScrollBlock> for BlockInfo {
-    fn from(value: &ScrollBlock) -> Self {
+impl From<&DogeosBlock> for BlockInfo {
+    fn from(value: &DogeosBlock) -> Self {
         Self { number: value.number, hash: value.hash_slow() }
     }
 }
@@ -195,8 +195,8 @@ pub struct L2BlockInfoWithL1Messages {
     pub l1_messages: Vec<B256>,
 }
 
-impl From<&ScrollBlock> for L2BlockInfoWithL1Messages {
-    fn from(value: &ScrollBlock) -> Self {
+impl From<&DogeosBlock> for L2BlockInfoWithL1Messages {
+    fn from(value: &DogeosBlock) -> Self {
         let block_number = value.number;
         let block_hash = value.hash_slow();
         let l1_messages = value

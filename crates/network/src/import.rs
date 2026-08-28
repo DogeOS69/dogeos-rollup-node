@@ -1,7 +1,7 @@
 use alloy_primitives::{bytes::Bytes, Address};
+use dogeos_reth_primitives::DogeosBlock;
 use reth_network_peers::PeerId;
 use reth_primitives_traits::{crypto::RecoveryError, GotExpected};
-use reth_scroll_primitives::ScrollBlock;
 use scroll_wire::NewBlock;
 use thiserror::Error;
 
@@ -29,15 +29,15 @@ impl BlockImportOutcome {
 
     /// Creates a new `BlockImportOutcome` instance for a valid block header with the given peer ID
     /// and new block.
-    pub fn valid_block(peer: PeerId, block: ScrollBlock, signature: Bytes) -> Self {
+    pub fn valid_block(peer: PeerId, block: DogeosBlock, signature: Bytes) -> Self {
         Self {
             peer,
             result: Ok(BlockValidation::ValidBlock { new_block: NewBlock { signature, block } }),
         }
     }
 
-    /// Returns an `Option<ScrollBlock>` depending on the `BlockImportOutcome` result.
-    pub fn block(&self) -> Option<ScrollBlock> {
+    /// Returns an `Option<DogeosBlock>` depending on the `BlockImportOutcome` result.
+    pub fn block(&self) -> Option<DogeosBlock> {
         match &self.result {
             Ok(BlockValidation::ValidBlock { new_block }) => Some(new_block.block.clone()),
             _ => None,

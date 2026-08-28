@@ -42,14 +42,14 @@
 //! ```rust,ignore
 //! use rollup_node::test_utils::{TestFixture, NetworkHelpers};
 //! use alloy_primitives::{Signature, U256};
-//! use reth_scroll_primitives::ScrollBlock;
+//! use dogeos_reth_primitives::DogeosBlock;
 //!
 //! #[tokio::test]
 //! async fn test_block_announce() -> eyre::Result<()> {
 //!     let mut fixture = TestFixture::sequencer().with_nodes(2).build().await?;
 //!
 //!     // Create a block
-//!     let block = ScrollBlock::default();
+//!     let block = DogeosBlock::default();
 //!     let signature = Signature::new(U256::from(1), U256::from(1), false);
 //!
 //!     // Announce from node 0
@@ -61,8 +61,8 @@
 
 use super::fixture::{ScrollNetworkHandle, TestFixture};
 use alloy_primitives::Signature;
+use dogeos_reth_primitives::DogeosBlock;
 use reth_network_api::{PeerId, PeerInfo, Peers};
-use reth_scroll_primitives::ScrollBlock;
 use std::time::Duration;
 use tokio::time;
 
@@ -117,7 +117,7 @@ impl<'a> NetworkHelper<'a> {
     /// Announce a block from this node to the network.
     pub async fn announce_block(
         &self,
-        block: ScrollBlock,
+        block: DogeosBlock,
         signature: Signature,
     ) -> eyre::Result<()> {
         let handle = self.network_handle().await?;

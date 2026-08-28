@@ -11,19 +11,20 @@ workspace = true
 
 [dependencies]
 # alloy
+alloy-consensus.workspace = true
 alloy-eips.workspace = true
+alloy-provider = { workspace = true, features = ["engine-api"] }
 alloy-primitives.workspace = true
 alloy-rpc-types-engine.workspace = true
 
 # scroll reth
-reth-scroll-engine-primitives.workspace = true
-reth-scroll-primitives.workspace = true
+dogeos-reth-engine.workspace = true
+dogeos-reth-primitives.workspace = true
 
-# scroll-alloy
-scroll-alloy-consensus.workspace = true
-scroll-alloy-hardforks.workspace = true
-scroll-alloy-provider.workspace = true
-scroll-alloy-rpc-types-engine.workspace = true
+# DogeOS protocol
+dogeos-protocol-types.workspace = true
+dogeos-hardforks.workspace = true
+dogeos-rpc-types.workspace = true
 
 # rollup-node
 scroll-db = { workspace = true }
@@ -42,13 +43,9 @@ eyre.workspace = true
 
 [dev-dependencies]
 # alloy
-alloy-consensus.workspace = true
 alloy-primitives.workspace = true
 
 rollup-node-signer.workspace = true
-
-# scroll-alloy
-scroll-alloy-consensus.workspace = true
 
 # reth
 reth-e2e-test-utils.workspace = true
@@ -56,9 +53,8 @@ reth-node-core.workspace = true
 reth-tasks.workspace = true
 reth-tracing.workspace = true
 
-# reth-scroll
-reth-scroll-chainspec.workspace = true
-reth-scroll-node = { workspace = true, features = ["test-utils"] }
+dogeos-chainspec.workspace = true
+dogeos-reth-evm.workspace = true
 
 # rollup-node
 rollup-node = { workspace = true, features = ["test-utils"] }

@@ -90,20 +90,18 @@ use alloy_primitives::Bytes;
 use reth_chainspec::EthChainSpec;
 use reth_db::test_utils::create_test_rw_db_with_path;
 use reth_e2e_test_utils::{
-    node::NodeTestContext, transaction::TransactionTestContext, wallet::Wallet, Adapter,
-    TmpNodeAddOnsHandle, TmpNodeEthApi,
+    node::NodeTestContext, transaction::TransactionTestContext, wallet::Wallet,
 };
-use reth_engine_local::LocalPayloadAttributesBuilder;
 use reth_node_builder::{
-    rpc::RpcHandleProvider, EngineNodeLauncher, Node, NodeBuilder, NodeConfig,
-    NodeHandle as RethNodeHandle, NodeTypes, PayloadAttributesBuilder, PayloadTypes, TreeConfig,
+    EngineNodeLauncher, Node, NodeBuilder, NodeConfig, NodeHandle as RethNodeHandle, NodeTypes,
+    TreeConfig,
 };
 use reth_node_core::args::{
     DiscoveryArgs, NetworkArgs, PayloadBuilderArgs, RpcServerArgs, TxPoolArgs,
 };
 use reth_provider::providers::BlockchainProvider;
 use reth_rpc_server_types::RpcModuleSelection;
-use reth_tasks::TaskManager;
+use reth_tasks::TaskExecutor;
 use rollup_node_sequencer::L1MessageInclusionMode;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -125,15 +123,7 @@ pub async fn setup_engine(
     Vec<ScrollNodeTestComponents>,
     Vec<Arc<reth_db::test_utils::TempDatabase<reth_db::DatabaseEnv>>>,
     Wallet,
-)>
-where
-    LocalPayloadAttributesBuilder<<ScrollRollupNode as NodeTypes>::ChainSpec>:
-        PayloadAttributesBuilder<
-            <<ScrollRollupNode as NodeTypes>::Payload as PayloadTypes>::PayloadAttributes,
-        >,
-    TmpNodeAddOnsHandle<ScrollRollupNode>:
-        RpcHandleProvider<Adapter<ScrollRollupNode>, TmpNodeEthApi<ScrollRollupNode>>,
-{
+)> {
     let network_config = NetworkArgs {
         discovery: DiscoveryArgs { disable_discovery: true, ..DiscoveryArgs::default() },
         trusted_peers: trusted_peers.clone().unwrap_or_default(),
@@ -166,7 +156,13 @@ where
             .with_rpc(RpcServerArgs::default().with_http().with_http_api(RpcModuleSelection::All))
             .with_unused_ports()
             .set_dev(is_dev)
-            .with_txpool(TxPoolArgs { no_local_transactions_propagation, ..Default::default() });
+            .with_txpool(TxPoolArgs {
+                no_local_transactions_propagation,
+                // Raise the per-account slot limit far above the reth default (16) so tests can
+                // queue many transactions from a single wallet without hitting the pool cap.
+                max_account_slots: 16_384,
+                ..Default::default()
+            });
 
         // Check if we already have provided a database for a node (reboot scenario)
         let db = if let Some((_, provided_db)) = &reboot_info {
@@ -212,16 +208,21 @@ where
 
         let span = span!(Level::INFO, "node", node_index);
         let _enter = span.enter();
-        let task_manager = TaskManager::current();
+        // Use the lightweight test runtime (2-thread tokio/rayon pools) rather than
+        // TaskExecutor::default(), which builds full CPU-sized pools per node. setup_engine
+        // creates one executor per node and the integration suite runs several multi-node
+        // fixtures in parallel, so default pools would allocate hundreds of threads on
+        // high-core CI runners.
+        let task_executor = TaskExecutor::test();
         let testing_node = NodeBuilder::new(node_config.clone())
             .with_database(db.clone())
-            .with_launch_context(task_manager.executor());
+            .with_launch_context(task_executor.clone());
         let testing_config = testing_node.config().clone();
-        let node = ScrollRollupNode::new(scroll_node_config.clone(), testing_config).await;
+        let rollup_node = ScrollRollupNode::new(scroll_node_config.clone(), testing_config).await;
         let RethNodeHandle { node, node_exit_future } = testing_node
             .with_types_and_provider::<ScrollRollupNode, BlockchainProvider<_>>()
-            .with_components(node.components_builder())
-            .with_add_ons(node.add_ons())
+            .with_components(rollup_node.components_builder())
+            .with_add_ons(rollup_node.add_ons())
             .launch_with_fn(|builder| {
                 let tree_config = TreeConfig::default()
                     .with_always_process_payload_attributes_on_canonical_head(true)
@@ -235,6 +236,10 @@ where
                 builder.launch_with(launcher)
             })
             .await?;
+        let rollup_manager_handle = rollup_node
+            .rollup_manager_handle()
+            .cloned()
+            .ok_or_else(|| eyre::eyre!("rollup manager handle was not initialized"))?;
 
         let mut node =
             NodeTestContext::new(node, |_| panic!("should not build payloads using this method"))
@@ -252,7 +257,13 @@ where
             }
         }
 
-        let node = ScrollNodeTestComponents::new(node, task_manager, node_exit_future).await;
+        let node = ScrollNodeTestComponents::new(
+            node,
+            task_executor,
+            node_exit_future,
+            rollup_manager_handle,
+        )
+        .await;
 
         nodes.push(node);
     }
@@ -263,7 +274,7 @@ where
 /// Generate a transfer transaction with the given wallet.
 pub async fn generate_tx(wallet: Arc<Mutex<Wallet>>) -> Bytes {
     let mut wallet = wallet.lock().await;
-    let tx_fut = TransactionTestContext::transfer_tx_nonce_bytes(
+    let tx_fut = TransactionTestContext::transfer_tx_bytes_with_nonce(
         wallet.chain_id,
         wallet.inner.clone(),
         wallet.inner_nonce,

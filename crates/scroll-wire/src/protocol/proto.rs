@@ -27,12 +27,12 @@ pub struct NewBlock {
     /// The signature from the block author.
     pub signature: Bytes,
     /// The block that is being announced.
-    pub block: reth_scroll_primitives::ScrollBlock,
+    pub block: dogeos_reth_primitives::DogeosBlock,
 }
 
 impl NewBlock {
     /// Returns a [`NewBlock`] instance with the provided signature and block.
-    pub fn new(signature: Signature, block: reth_scroll_primitives::ScrollBlock) -> Self {
+    pub fn new(signature: Signature, block: dogeos_reth_primitives::DogeosBlock) -> Self {
         Self { signature: Bytes::copy_from_slice(&signature.sig_as_bytes()), block }
     }
 }

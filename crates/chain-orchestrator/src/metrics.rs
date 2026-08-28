@@ -1,6 +1,6 @@
-use metrics::Histogram;
+use dogeos_reth_primitives::DogeosBlock;
+use metrics::{Counter, Gauge, Histogram};
 use metrics_derive::Metrics;
-use reth_scroll_primitives::ScrollBlock;
 use std::{collections::HashMap, time::Instant};
 use strum::{EnumIter, IntoEnumIterator};
 
@@ -28,7 +28,7 @@ impl MetricsHandler {
     }
 
     /// Finishes tracking the current block building task.
-    pub(crate) fn finish_block_building_recording(&mut self, block: Option<&ScrollBlock>) {
+    pub(crate) fn finish_block_building_recording(&mut self, block: Option<&DogeosBlock>) {
         let now = Instant::now();
         if let Some(t) = self.block_building_meter.block_building_start.take() {
             let elapsed = now.duration_since(t).as_secs_f64();
@@ -115,6 +115,18 @@ impl Task {
 pub(crate) struct ChainOrchestratorMetrics {
     /// The duration of the task for the chain orchestrator.
     pub task_duration: Histogram,
+}
+
+/// Minimal observability for the fail-stop / Engine-hold derivation state.
+#[derive(Metrics)]
+#[metrics(scope = "chain_orchestrator")]
+pub(crate) struct DerivedBatchMetrics {
+    /// Whether a derived batch currently occupies the held slot.
+    pub held: Gauge,
+    /// The number of reconciliation attempts started.
+    pub attempts: Counter,
+    /// The number of held-batch fail-stop events.
+    pub fatal: Counter,
 }
 
 /// A block building meter.

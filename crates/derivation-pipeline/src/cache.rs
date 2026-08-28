@@ -1,5 +1,5 @@
+use dogeos_reth_engine::BlockDataHint;
 use moka::future::Cache;
-use scroll_alloy_rpc_types_engine::BlockDataHint;
 use scroll_db::{Database, DatabaseReadOperations};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::Mutex;

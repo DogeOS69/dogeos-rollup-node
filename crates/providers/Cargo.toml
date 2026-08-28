@@ -20,8 +20,8 @@ alloy-serde = { version = "1.0.37", default-features = false }
 alloy-transport.workspace = true
 
 # scroll
-scroll-alloy-network.workspace = true
-scroll-alloy-rpc-types-engine.workspace = true
+dogeos-rpc-types.workspace = true
+dogeos-reth-engine.workspace = true
 scroll-db.workspace = true
 
 # rollup-node

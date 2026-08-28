@@ -2,7 +2,7 @@
 //! node.
 
 use alloy_provider::RootProvider;
-use scroll_alloy_network::Scroll;
+use dogeos_rpc_types::Scroll;
 
 mod l1;
 pub use l1::{

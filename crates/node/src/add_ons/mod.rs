@@ -2,35 +2,27 @@
 
 use super::args::ScrollRollupNodeConfig;
 use crate::constants;
-
-use reth_evm::{ConfigureEngineEvm, EvmFactory, EvmFactoryFor};
-use reth_network::NetworkProtocols;
-use reth_network_api::FullNetwork;
-use reth_node_api::{AddOnsContext, NodeAddOns, PayloadTypes};
+use dogeos_chainspec::DogeosChainSpec;
+use dogeos_reth_engine::DogeosEngineTypes;
+use dogeos_reth_evm::{ScrollEvmConfig, ScrollTransactionIntoTxEnv};
+use dogeos_reth_node::{DogeosEngineValidatorBuilder, DogeosEthApiBuilder, DogeosStorage};
+use dogeos_reth_primitives::DogeosPrimitives;
+use reth_evm::{EvmFactory, EvmFactoryFor};
+use reth_network::NetworkHandle;
+use reth_node_api::{AddOnsContext, NodeAddOns};
 use reth_node_builder::{
     rpc::{
         BasicEngineApiBuilder, BasicEngineValidatorBuilder, EngineValidatorAddOn, EthApiBuilder,
-        Identity, RethRpcAddOns, RethRpcMiddleware, RpcAddOns,
+        Identity, RethRpcAddOns, RethRpcMiddleware, RpcAddOns, RpcHandle,
     },
     FullNodeComponents,
 };
 use reth_node_types::NodeTypes;
 use reth_revm::context::{BlockEnv, TxEnv};
-use reth_rpc_eth_types::error::FromEvmError;
-use reth_scroll_chainspec::ScrollChainSpec;
-use reth_scroll_engine_primitives::ScrollEngineTypes;
-use reth_scroll_evm::ScrollNextBlockEnvAttributes;
-use reth_scroll_node::{
-    ScrollEngineValidatorBuilder, ScrollNetworkPrimitives, ScrollNodeTypes, ScrollStorage,
-};
-use reth_scroll_primitives::ScrollPrimitives;
-use reth_scroll_rpc::{eth::ScrollEthApiBuilder, ScrollEthApiError};
-use scroll_alloy_evm::ScrollTransactionIntoTxEnv;
+use reth_rpc_builder::RethRpcModule;
+use reth_rpc_eth_types::{error::FromEvmError, EthApiError};
 use scroll_wire::ScrollWireEvent;
-use std::sync::Arc;
-
-mod handle;
-pub use handle::ScrollAddOnsHandle;
+use std::sync::{Arc, OnceLock};
 
 mod remote_block_source;
 pub use remote_block_source::RemoteBlockSourceAddOn;
@@ -44,66 +36,76 @@ pub use rpc::{
 mod rollup;
 pub use rollup::IsDevChain;
 use rollup::RollupManagerAddOn;
-use tokio::sync::mpsc::UnboundedReceiver;
+use scroll_network::{DogeosNetworkPrimitives, EthWireBlockWithPeer};
+use tokio::sync::mpsc::{Receiver, UnboundedReceiver};
+
+pub(crate) type RollupManagerHandle = rollup_node_chain_orchestrator::ChainOrchestratorHandle<
+    reth_network::NetworkHandle<DogeosNetworkPrimitives>,
+>;
 
 /// Add-ons for the Scroll follower node.
 #[derive(Debug)]
 pub struct ScrollRollupNodeAddOns<N, RpcMiddleware = Identity>
 where
-    N: FullNodeComponents<Types: ScrollNodeTypes>,
-    ScrollEthApiBuilder: EthApiBuilder<N>,
+    N: FullNodeComponents<Network = NetworkHandle<DogeosNetworkPrimitives>>,
+    DogeosEthApiBuilder: EthApiBuilder<N>,
 {
     /// Rpc add-ons responsible for launching the RPC servers and instantiating the RPC handlers
     /// and eth-api.
     pub rpc_add_ons: RpcAddOns<
         N,
-        ScrollEthApiBuilder,
-        ScrollEngineValidatorBuilder,
-        BasicEngineApiBuilder<ScrollEngineValidatorBuilder>,
-        BasicEngineValidatorBuilder<ScrollEngineValidatorBuilder>,
+        DogeosEthApiBuilder,
+        DogeosEngineValidatorBuilder,
+        BasicEngineApiBuilder<DogeosEngineValidatorBuilder>,
+        BasicEngineValidatorBuilder<DogeosEngineValidatorBuilder>,
         RpcMiddleware,
     >,
 
     /// Rollup manager addon responsible for managing the components of the rollup node.
     pub rollup_manager_addon: RollupManagerAddOn,
+
+    /// Shared handle populated after the rollup manager launches.
+    rollup_manager_handle: Arc<OnceLock<RollupManagerHandle>>,
 }
 
 impl<N> ScrollRollupNodeAddOns<N>
 where
-    N: FullNodeComponents<Types: ScrollNodeTypes>,
-    ScrollEthApiBuilder: EthApiBuilder<N>,
+    N: FullNodeComponents<Network = NetworkHandle<DogeosNetworkPrimitives>>,
+    DogeosEthApiBuilder: EthApiBuilder<N>,
 {
     /// Create a new instance of [`ScrollRollupNodeAddOns`].
     pub fn new(
         config: ScrollRollupNodeConfig,
         scroll_wire_event: UnboundedReceiver<ScrollWireEvent>,
+        eth_wire_event: Receiver<EthWireBlockWithPeer>,
+        rollup_manager_handle: Arc<OnceLock<RollupManagerHandle>>,
     ) -> Self {
         let rpc_add_ons = RpcAddOns::new(
-            ScrollEthApiBuilder::default()
-                .with_min_suggested_priority_fee(
-                    config.gas_price_oracle_args.default_suggested_priority_fee,
-                )
-                .with_payload_size_limit(constants::DEFAULT_PAYLOAD_SIZE_LIMIT)
-                .with_sequencer(config.network_args.sequencer_url.clone()),
-            ScrollEngineValidatorBuilder::default(),
+            DogeosEthApiBuilder::without_scroll_wire(),
+            DogeosEngineValidatorBuilder::default(),
             BasicEngineApiBuilder::default(),
             BasicEngineValidatorBuilder::default(),
             Identity::new(),
         );
-        let rollup_manager_addon = RollupManagerAddOn::new(config, scroll_wire_event);
-        Self { rpc_add_ons, rollup_manager_addon }
+        let rollup_manager_addon =
+            RollupManagerAddOn::new(config, scroll_wire_event, eth_wire_event);
+        Self { rpc_add_ons, rollup_manager_addon, rollup_manager_handle }
     }
 }
 
 impl<N, RpcMiddleware> ScrollRollupNodeAddOns<N, RpcMiddleware>
 where
-    N: FullNodeComponents<Types: ScrollNodeTypes>,
-    ScrollEthApiBuilder: EthApiBuilder<N>,
+    N: FullNodeComponents<Network = NetworkHandle<DogeosNetworkPrimitives>>,
+    DogeosEthApiBuilder: EthApiBuilder<N>,
 {
     /// Sets the provided middleware for the rollup node addons.
     pub fn with_middleware<T>(self, middleware: T) -> ScrollRollupNodeAddOns<N, T> {
         let rpc_add_ons = self.rpc_add_ons.with_rpc_middleware(middleware);
-        ScrollRollupNodeAddOns { rpc_add_ons, rollup_manager_addon: self.rollup_manager_addon }
+        ScrollRollupNodeAddOns {
+            rpc_add_ons,
+            rollup_manager_addon: self.rollup_manager_addon,
+            rollup_manager_handle: self.rollup_manager_handle,
+        }
     }
 }
 
@@ -111,31 +113,31 @@ impl<N, RpcMiddleware> NodeAddOns<N> for ScrollRollupNodeAddOns<N, RpcMiddleware
 where
     N: FullNodeComponents<
         Types: NodeTypes<
-            ChainSpec = ScrollChainSpec,
-            Primitives = ScrollPrimitives,
-            Storage = ScrollStorage,
-            Payload = ScrollEngineTypes,
+            ChainSpec = DogeosChainSpec,
+            Primitives = DogeosPrimitives,
+            Storage = DogeosStorage,
+            Payload = DogeosEngineTypes,
         >,
-        Evm: ConfigureEngineEvm<
-            <<N::Types as NodeTypes>::Payload as PayloadTypes>::ExecutionData,
-            NextBlockEnvCtx = ScrollNextBlockEnvAttributes,
-        >,
-        Network: FullNetwork<Primitives = ScrollNetworkPrimitives> + NetworkProtocols,
+        Evm = ScrollEvmConfig,
+        Network = NetworkHandle<DogeosNetworkPrimitives>,
     >,
-    ScrollEthApiError: FromEvmError<N::Evm>,
+    EthApiError: FromEvmError<N::Evm>,
     EvmFactoryFor<N::Evm>: EvmFactory<Tx = ScrollTransactionIntoTxEnv<TxEnv>, BlockEnv = BlockEnv>,
     RpcMiddleware: RethRpcMiddleware,
 {
-    type Handle = ScrollAddOnsHandle<N, <ScrollEthApiBuilder as EthApiBuilder<N>>::EthApi>;
+    type Handle = RpcHandle<N, <DogeosEthApiBuilder as EthApiBuilder<N>>::EthApi>;
 
     async fn launch_add_ons(self, ctx: AddOnsContext<'_, N>) -> eyre::Result<Self::Handle> {
-        let Self { mut rpc_add_ons, rollup_manager_addon: rollup_node_manager_addon } = self;
-        rpc_add_ons.eth_api_builder.with_propagate_local_transactions(
-            !ctx.config.txpool.no_local_transactions_propagation,
-        );
-
+        let Self {
+            mut rpc_add_ons,
+            rollup_manager_addon: rollup_node_manager_addon,
+            rollup_manager_handle: shared_rollup_manager_handle,
+        } = self;
         let (tx, rx) = tokio::sync::oneshot::channel();
         let rpc_config = rollup_node_manager_addon.config().rpc_args.clone();
+        let min_suggested_priority_fee =
+            rollup_node_manager_addon.config().gas_price_oracle_args.default_suggested_priority_fee;
+        let sequencer_url = rollup_node_manager_addon.config().network_args.sequencer_url.clone();
         let remote_block_source_config =
             rollup_node_manager_addon.config().remote_block_source_args.clone();
 
@@ -143,6 +145,45 @@ where
         let rollup_node_rpc_ext = Arc::new(RollupNodeRpcExt::<N::Network>::new(rx));
 
         rpc_add_ons = rpc_add_ons.extend_rpc_modules(move |ctx| {
+            let priority_fee_api = dogeos_reth_rpc::DogeosPriorityFeeApi::new(
+                ctx.registry.eth_api().clone(),
+                ctx.registry.eth_api().gas_oracle().config().max_price,
+                min_suggested_priority_fee,
+                constants::DEFAULT_PAYLOAD_SIZE_LIMIT,
+            );
+            ctx.modules.add_or_replace_if_module_configured(
+                RethRpcModule::Eth,
+                priority_fee_api.into_rpc()?,
+            )?;
+
+            let forwarder_url = sequencer_url
+                .as_deref()
+                .map(reqwest::Url::parse)
+                .transpose()?
+                .or_else(|| ctx.config().rpc.rpc_forwarder.clone());
+            if let Some(url) = forwarder_url {
+                let sequencer = dogeos_reth_rpc::SequencerClient::with_http_client(
+                    url.as_str(),
+                    reqwest_13::Client::new(),
+                )?;
+                let forwarder = dogeos_reth_rpc::DogeosRawTransactionForwarder::new(
+                    ctx.registry.eth_api().clone(),
+                    sequencer,
+                    ctx.registry.tasks().clone(),
+                    !ctx.config().txpool.no_local_transactions_propagation,
+                );
+                ctx.modules.add_or_replace_if_module_configured(
+                    RethRpcModule::Eth,
+                    forwarder.into_rpc()?,
+                )?;
+            }
+
+            let witness_api = dogeos_reth_rpc::DogeosDebugWitnessApi::new(ctx.registry.debug_api());
+            ctx.modules.add_or_replace_if_module_configured(
+                RethRpcModule::Debug,
+                witness_api.into_rpc()?,
+            )?;
+
             // Always register rollupNode API (read-only operations)
             if rpc_config.basic_enabled {
                 ctx.modules
@@ -159,6 +200,9 @@ where
         let rpc_handle = rpc_add_ons.launch_add_ons_with(ctx.clone(), |_| Ok(())).await?;
         let rollup_manager_handle =
             rollup_node_manager_addon.launch(ctx.clone(), rpc_handle.clone()).await?;
+        shared_rollup_manager_handle
+            .set(rollup_manager_handle.clone())
+            .map_err(|_| eyre::eyre!("rollup manager handle was already initialized"))?;
 
         // Only send handle if RPC is enabled
         if rpc_config.basic_enabled || rpc_config.admin_enabled {
@@ -176,14 +220,14 @@ where
             .await?;
             ctx.node
                 .task_executor()
-                .spawn_critical_with_shutdown_signal("remote_block_source", |shutdown| async move {
-                    if let Err(e) = remote_source.run_until_shutdown(shutdown).await {
+                .spawn_critical_with_graceful_shutdown_signal("remote_block_source", |shutdown| async move {
+                    if let Err(e) = remote_source.run_until_shutdown(shutdown.ignore_guard()).await {
                         tracing::error!(target: "scroll::remote_source", ?e, "Remote block source failed");
                     }
                 });
         }
 
-        Ok(ScrollAddOnsHandle { rollup_manager_handle, rpc_handle })
+        Ok(rpc_handle)
     }
 }
 
@@ -191,22 +235,19 @@ impl<N, RpcMiddleware> RethRpcAddOns<N> for ScrollRollupNodeAddOns<N, RpcMiddlew
 where
     N: FullNodeComponents<
         Types: NodeTypes<
-            ChainSpec = ScrollChainSpec,
-            Primitives = ScrollPrimitives,
-            Storage = ScrollStorage,
-            Payload = ScrollEngineTypes,
+            ChainSpec = DogeosChainSpec,
+            Primitives = DogeosPrimitives,
+            Storage = DogeosStorage,
+            Payload = DogeosEngineTypes,
         >,
-        Evm: ConfigureEngineEvm<
-            <<N::Types as NodeTypes>::Payload as PayloadTypes>::ExecutionData,
-            NextBlockEnvCtx = ScrollNextBlockEnvAttributes,
-        >,
-        Network: FullNetwork<Primitives = ScrollNetworkPrimitives> + NetworkProtocols,
+        Evm = ScrollEvmConfig,
+        Network = NetworkHandle<DogeosNetworkPrimitives>,
     >,
-    ScrollEthApiError: FromEvmError<N::Evm>,
+    EthApiError: FromEvmError<N::Evm>,
     EvmFactoryFor<N::Evm>: EvmFactory<Tx = ScrollTransactionIntoTxEnv<TxEnv>, BlockEnv = BlockEnv>,
     RpcMiddleware: RethRpcMiddleware,
 {
-    type EthApi = <ScrollEthApiBuilder as EthApiBuilder<N>>::EthApi;
+    type EthApi = <DogeosEthApiBuilder as EthApiBuilder<N>>::EthApi;
 
     fn hooks_mut(&mut self) -> &mut reth_node_builder::rpc::RpcHooks<N, Self::EthApi> {
         self.rpc_add_ons.hooks_mut()
@@ -217,19 +258,16 @@ impl<N> EngineValidatorAddOn<N> for ScrollRollupNodeAddOns<N>
 where
     N: FullNodeComponents<
         Types: NodeTypes<
-            ChainSpec = ScrollChainSpec,
-            Primitives = ScrollPrimitives,
-            Payload = ScrollEngineTypes,
+            ChainSpec = DogeosChainSpec,
+            Primitives = DogeosPrimitives,
+            Payload = DogeosEngineTypes,
         >,
-        Evm: ConfigureEngineEvm<
-            <<N::Types as NodeTypes>::Payload as PayloadTypes>::ExecutionData,
-            NextBlockEnvCtx = ScrollNextBlockEnvAttributes,
-        >,
-        Network: FullNetwork<Primitives = ScrollNetworkPrimitives> + NetworkProtocols,
+        Evm = ScrollEvmConfig,
+        Network = NetworkHandle<DogeosNetworkPrimitives>,
     >,
-    ScrollEthApiBuilder: EthApiBuilder<N>,
+    DogeosEthApiBuilder: EthApiBuilder<N>,
 {
-    type ValidatorBuilder = BasicEngineValidatorBuilder<ScrollEngineValidatorBuilder>;
+    type ValidatorBuilder = BasicEngineValidatorBuilder<DogeosEngineValidatorBuilder>;
 
     fn engine_validator_builder(&self) -> Self::ValidatorBuilder {
         EngineValidatorAddOn::engine_validator_builder(&self.rpc_add_ons)

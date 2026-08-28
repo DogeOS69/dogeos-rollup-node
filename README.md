@@ -101,6 +101,30 @@ To test a specific crate:
 cargo test -p <crate-name>
 ```
 
+### L1 integration tests (external Anvil)
+
+The L1 sync/reorg integration tests in `crates/node/tests/l1_sync.rs` launch an
+external Foundry `anvil` process as a simulated L1. They are pinned to a specific
+Anvil build and refuse to run against any other, so you must install the exact
+binary first. The reviewed build is Foundry `v1.5.0`, commit
+`1c57854462289b2e71ee7654cd6666217ed86ffd`.
+
+Install it with the repository installer (downloads the checksum-pinned release and
+verifies its version and commit), then point `ANVIL_BIN` at the result:
+
+```sh
+ANVIL_BIN="$(.github/assets/install_anvil.sh "$PWD/.anvil-bin" | tail -n1)"
+
+ANVIL_BIN="$ANVIL_BIN" cargo test -p rollup-node --all-features --test l1_sync
+# `make test` includes these L1 integration tests.
+ANVIL_BIN="$ANVIL_BIN" make test
+```
+
+The tests resolve `anvil` from `ANVIL_BIN` if set, otherwise from `PATH`. Any binary
+whose version/commit does not match the pin is rejected with an actionable error, so
+a mutable `foundryup`/`stable` install is only usable if it happens to be that exact
+commit. Unit-only and Docker-compose test selections do not need this host binary.
+
 ## Running Lints
 
 To run all lints across the workspace:

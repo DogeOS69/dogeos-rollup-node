@@ -1,6 +1,6 @@
 use alloy_provider::{Provider, ProviderBuilder};
+use dogeos_rpc_types::Scroll;
 use eyre::Result;
-use scroll_alloy_network::Scroll;
 use std::{fs, ops::Deref, process::Command, time::Duration};
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
@@ -196,7 +196,6 @@ impl DockerComposeEnv {
     /// Get a configured sequencer provider
     pub async fn get_rn_sequencer_provider(&self) -> Result<NamedProvider> {
         let provider = ProviderBuilder::<_, _, Scroll>::default()
-            .with_recommended_fillers()
             .connect(RN_SEQUENCER_RPC_URL)
             .await
             .map_err(|e| eyre::eyre!("Failed to connect to RN sequencer: {}", e))?;
@@ -211,7 +210,6 @@ impl DockerComposeEnv {
     /// Get a configured follower provider
     pub async fn get_rn_follower_provider(&self) -> Result<NamedProvider> {
         let provider = ProviderBuilder::<_, _, Scroll>::default()
-            .with_recommended_fillers()
             .connect(RN_FOLLOWER_RPC_URL)
             .await
             .map_err(|e| eyre::eyre!("Failed to connect to RN follower: {}", e))?;
@@ -226,7 +224,6 @@ impl DockerComposeEnv {
     /// Get a configured remote source provider
     pub async fn get_rn_remote_source_provider(&self) -> Result<NamedProvider> {
         let provider = ProviderBuilder::<_, _, Scroll>::default()
-            .with_recommended_fillers()
             .connect(RN_REMOTE_SOURCE_RPC_URL)
             .await
             .map_err(|e| eyre::eyre!("Failed to connect to RN remote source: {}", e))?;
@@ -241,7 +238,6 @@ impl DockerComposeEnv {
     /// Get a configured l2geth sequencer provider
     pub async fn get_l2geth_sequencer_provider(&self) -> Result<NamedProvider> {
         let provider = ProviderBuilder::<_, _, Scroll>::default()
-            .with_recommended_fillers()
             .connect(L2GETH_SEQUENCER_RPC_URL)
             .await
             .map_err(|e| eyre::eyre!("Failed to connect to l2geth sequencer: {}", e))?;
@@ -256,7 +252,6 @@ impl DockerComposeEnv {
     /// Get a configured l2geth follower provider
     pub async fn get_l2geth_follower_provider(&self) -> Result<NamedProvider> {
         let provider = ProviderBuilder::<_, _, Scroll>::default()
-            .with_recommended_fillers()
             .connect(L2GETH_FOLLOWER_RPC_URL)
             .await
             .map_err(|e| eyre::eyre!("Failed to connect to l2geth follower: {}", e))?;
@@ -271,7 +266,6 @@ impl DockerComposeEnv {
     /// Get a configured l2geth skip signer check provider
     pub async fn get_l2geth_skipsignercheck_provider(&self) -> Result<NamedProvider> {
         let provider = ProviderBuilder::<_, _, Scroll>::default()
-            .with_recommended_fillers()
             .connect(L2GETH_SKIPSIGNERCHECK_RPC_URL)
             .await
             .map_err(|e| eyre::eyre!("Failed to connect to l2geth skip signer check: {}", e))?;
@@ -288,11 +282,7 @@ impl DockerComposeEnv {
     /// Wait for L2 node to be ready
     async fn wait_for_l2_node_ready(provider_url: &str, max_retries: u32) -> Result<()> {
         for i in 0..max_retries {
-            match ProviderBuilder::<_, _, Scroll>::default()
-                .with_recommended_fillers()
-                .connect(provider_url)
-                .await
-            {
+            match ProviderBuilder::<_, _, Scroll>::default().connect(provider_url).await {
                 Ok(provider) => match provider.get_chain_id().await {
                     // TODO: assert chain ID and genesis hash matches expected values (hardcoded
                     // constants)

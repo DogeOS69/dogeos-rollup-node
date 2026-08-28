@@ -4,14 +4,14 @@ use alloy_eips::BlockNumberOrTag;
 use alloy_primitives::{address, b256, Address, Bytes, Signature, B256, U256};
 use alloy_signer::Signer;
 use alloy_signer_local::PrivateKeySigner;
+use alloy_sol_types::SolCall;
+use dogeos_chainspec::{DogeosChainSpec, DOGEOS_CHIKYU, DOGEOS_DEV, DOGEOS_MAINNET};
+use dogeos_hardforks::{DogeosHardfork, ForkCondition};
+use dogeos_reth_primitives::DogeosBlock;
 use futures::{task::noop_waker_ref, FutureExt, StreamExt};
 use reth_chainspec::EthChainSpec;
 use reth_network::{NetworkConfigBuilder, NetworkEventListenerProvider, PeersInfo};
-use reth_network_api::block::EthWireProvider;
 use reth_rpc_api::EthApiServer;
-use reth_scroll_chainspec::{ScrollChainSpec, SCROLL_DEV, SCROLL_MAINNET, SCROLL_SEPOLIA};
-use reth_scroll_node::ScrollNetworkPrimitives;
-use reth_scroll_primitives::ScrollBlock;
 use reth_storage_api::BlockReader;
 use reth_tasks::shutdown::signal as shutdown_signal;
 use reth_tokio_util::EventStream;
@@ -25,10 +25,13 @@ use rollup_node::{
     RollupNodeAdminApiClient, RollupNodeContext,
 };
 use rollup_node_chain_orchestrator::{ChainOrchestratorEvent, SyncMode};
-use rollup_node_primitives::{sig_encode_hash, BatchCommitData, BlockInfo};
+use rollup_node_primitives::{sig_encode_hash, BatchCommitData, BatchStatus, BlockInfo};
 use rollup_node_watcher::L1Notification;
-use scroll_db::{test_utils::setup_test_db, L1MessageKey};
-use scroll_network::NewBlockWithPeer;
+use scroll_db::{
+    test_utils::setup_test_db, DatabaseReadOperations, DatabaseWriteOperations, L1MessageKey,
+};
+use scroll_l1::abi::calls::commitBatchCall;
+use scroll_network::{DogeosNetworkPrimitives, NewBlockWithPeer, ETH_WIRE_BLOCK_CHANNEL_SIZE};
 use scroll_wire::{ScrollWireConfig, ScrollWireProtocolHandler};
 use std::{
     future::Future,
@@ -133,7 +136,7 @@ async fn can_penalize_peer_for_invalid_block() -> eyre::Result<()> {
     fixture.check_reputation_on(1).of_node(0).await?.equals(0).await?;
 
     // Create invalid block
-    let mut block = ScrollBlock::default();
+    let mut block = DogeosBlock::default();
     block.header.number = 1;
     block.header.parent_hash = fixture.chain_spec.genesis_header.hash();
 
@@ -174,7 +177,7 @@ async fn can_penalize_peer_for_invalid_block() -> eyre::Result<()> {
 async fn can_penalize_peer_for_invalid_signature() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    let chain_spec = (*SCROLL_DEV).clone();
+    let chain_spec = (*DOGEOS_DEV).clone();
 
     // Create two signers - one authorized and one unauthorized
     let authorized_signer = PrivateKeySigner::random().with_chain_id(Some(chain_spec.chain().id()));
@@ -389,7 +392,7 @@ async fn can_forward_tx_to_sequencer() -> eyre::Result<()> {
     let mut follower_node_config = default_test_scroll_rollup_node_config();
 
     // Create the chain spec for scroll mainnet with Euclid v2 activated and a test genesis.
-    let chain_spec = (*SCROLL_DEV).clone();
+    let chain_spec = (*DOGEOS_DEV).clone();
     let (mut sequencer_node, _dbs, _wallet) =
         setup_engine(sequencer_node_config, 1, chain_spec.clone(), false, true, None, None)
             .await
@@ -408,24 +411,14 @@ async fn can_forward_tx_to_sequencer() -> eyre::Result<()> {
     sequencer_node[0].network.next_session_established().await;
 
     // generate rollup node manager event streams for each node
-    let sequencer_rnm_handle = sequencer_node[0].inner.add_ons_handle.rollup_manager_handle.clone();
+    let sequencer_rnm_handle = sequencer_node[0].rollup_manager_handle.clone();
     let mut sequencer_events = sequencer_rnm_handle.get_event_listener().await.unwrap();
-    let mut follower_events = follower_node[0]
-        .inner
-        .add_ons_handle
-        .rollup_manager_handle
-        .get_event_listener()
-        .await
-        .unwrap();
+    let mut follower_events =
+        follower_node[0].rollup_manager_handle.get_event_listener().await.unwrap();
 
     // Send a notification to set the L1 to synced
-    let sequencer_l1_watcher_mock = sequencer_node[0]
-        .inner
-        .add_ons_handle
-        .rollup_manager_handle
-        .l1_watcher_mock
-        .clone()
-        .unwrap();
+    let sequencer_l1_watcher_mock =
+        sequencer_node[0].rollup_manager_handle.l1_watcher_mock.clone().unwrap();
     sequencer_l1_watcher_mock.notification_tx.send(Arc::new(L1Notification::Synced)).await.unwrap();
     sequencer_events.next().await;
     sequencer_events.next().await;
@@ -450,7 +443,15 @@ async fn can_forward_tx_to_sequencer() -> eyre::Result<()> {
 
     // inject a transaction into the pool of the follower node
     let tx = generate_tx(wallet).await;
-    follower_node[0].rpc.inject_tx(tx).await.unwrap();
+    if let Err(e) = follower_node[0].rpc.inject_tx(tx).await {
+        // Tolerate the tx already being in the follower pool (it can arrive via gossip from the
+        // sequencer peer); re-raise anything else.
+        let msg = format!("{e:?}");
+        assert!(
+            msg.contains("already known") || msg.contains("AlreadyImported"),
+            "failed to inject tx into follower pool: {msg}"
+        );
+    }
 
     tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
 
@@ -556,8 +557,10 @@ async fn can_sequence_and_gossip_transactions() -> eyre::Result<()> {
 async fn can_bridge_blocks() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    // Create the chain spec for scroll dev with Feynman activated and a test genesis.
-    let chain_spec = (*SCROLL_DEV).clone();
+    // Signed legacy fixture is pre-Tsuki; retain DOGEOS_DEV genesis and Galileo rules.
+    let mut chain_spec = (**DOGEOS_DEV).clone();
+    chain_spec.inner.hardforks.insert(DogeosHardfork::Tsuki, ForkCondition::Never);
+    let chain_spec = Arc::new(chain_spec);
 
     // Setup the bridge node and a standard node.
     let (mut nodes, _dbs, _wallet) = setup_engine(
@@ -573,17 +576,19 @@ async fn can_bridge_blocks() -> eyre::Result<()> {
     let mut bridge_node = nodes.pop().unwrap();
     let bridge_peer_id = bridge_node.network.record().id;
     let bridge_node_l1_watcher_tx =
-        bridge_node.inner.add_ons_handle.rollup_manager_handle.l1_watcher_mock.clone().unwrap();
+        bridge_node.rollup_manager_handle.l1_watcher_mock.clone().unwrap();
 
     // Send a notification to set the L1 to synced
     bridge_node_l1_watcher_tx.notification_tx.send(Arc::new(L1Notification::Synced)).await.unwrap();
 
     // Instantiate the scroll NetworkManager.
-    let network_config = NetworkConfigBuilder::<ScrollNetworkPrimitives>::with_rng_secret_key()
-        .disable_discovery()
-        .with_unused_listener_port()
-        .with_pow()
-        .build_with_noop_provider(chain_spec.clone());
+    let network_config = NetworkConfigBuilder::<DogeosNetworkPrimitives>::with_rng_secret_key(
+        bridge_node.task_executor.clone(),
+    )
+    .disable_discovery()
+    .with_unused_listener_port()
+    .with_pow()
+    .build_with_noop_provider(chain_spec.clone());
     let scroll_wire_config = ScrollWireConfig::new(true);
     let (scroll_network, scroll_network_handle) = scroll_network::ScrollNetworkManager::new(
         chain_spec.clone(),
@@ -602,11 +607,13 @@ async fn can_bridge_blocks() -> eyre::Result<()> {
     bridge_node.network.next_session_established().await;
 
     // Create a standard NetworkManager to send blocks to the bridge node.
-    let network_config = NetworkConfigBuilder::<ScrollNetworkPrimitives>::with_rng_secret_key()
-        .disable_discovery()
-        .with_pow()
-        .with_unused_listener_port()
-        .build_with_noop_provider(chain_spec);
+    let network_config = NetworkConfigBuilder::<DogeosNetworkPrimitives>::with_rng_secret_key(
+        bridge_node.task_executor.clone(),
+    )
+    .disable_discovery()
+    .with_pow()
+    .with_unused_listener_port()
+    .build_with_noop_provider(chain_spec);
 
     // Create the standard NetworkManager.
     let network = reth_network::NetworkManager::new(network_config)
@@ -616,7 +623,7 @@ async fn can_bridge_blocks() -> eyre::Result<()> {
     let mut network_events = network_handle.event_listener();
 
     // Spawn the standard NetworkManager.
-    bridge_node.task_manager.executor().spawn(network);
+    bridge_node.task_executor.spawn_task(network);
 
     // Connect the standard NetworkManager to the bridge node.
     bridge_node.network.add_peer(network_handle.local_node_record()).await;
@@ -624,7 +631,7 @@ async fn can_bridge_blocks() -> eyre::Result<()> {
     let _ = network_events.next().await;
 
     // Send a block from the standard NetworkManager to the bridge node.
-    let mut block_1: reth_scroll_primitives::ScrollBlock =
+    let mut block_1: dogeos_reth_primitives::DogeosBlock =
         serde_json::from_str(include_str!("../assets/block.json")).unwrap();
 
     // Compute the block hash while masking the extra data which isn't used in block hash
@@ -665,7 +672,8 @@ async fn can_bridge_blocks() -> eyre::Result<()> {
 #[tokio::test]
 async fn shutdown_consolidates_most_recent_batch_on_startup() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
-    let chain_spec = (*SCROLL_MAINNET).clone();
+    let chain_spec = (*DOGEOS_DEV).clone();
+    let genesis_timestamp = chain_spec.genesis_header().timestamp;
 
     // Launch a node
     let (mut nodes, _dbs, _wallet) = setup_engine(
@@ -688,8 +696,13 @@ async fn shutdown_consolidates_most_recent_batch_on_startup() -> eyre::Result<()
         .parse()
         .expect("valid url that will not be used as test batches use calldata")]);
     config.hydrate(node.inner.config.clone()).await?;
+    let database = config.database.clone().expect("hydrated config has a database");
 
     let (_, events) = ScrollWireProtocolHandler::new(ScrollWireConfig::new(true));
+    // Hold the ETH-wire block sender for as long as the orchestrator runs; dropping it would
+    // close the receiver the orchestrator polls.
+    let (_eth_wire_block_tx, eth_wire_block_rx) =
+        tokio::sync::mpsc::channel(ETH_WIRE_BLOCK_CHANNEL_SIZE);
     let (chain_orchestrator, handle) = config
         .clone()
         .build(
@@ -701,20 +714,21 @@ async fn shutdown_consolidates_most_recent_batch_on_startup() -> eyre::Result<()
                 node.inner.task_executor.clone(),
             ),
             events,
-            node.inner.add_ons_handle.rpc_handle.rpc_server_handles.clone(),
+            eth_wire_block_rx,
+            node.inner.add_ons_handle.rpc_server_handles.clone(),
         )
         .await?;
 
     // Spawn a task that constantly polls the rnm to make progress.
     let (signal, shutdown) = shutdown_signal();
-    tokio::spawn(async {
+    let orchestrator_task = tokio::spawn(async {
         let (_signal, inner) = shutdown_signal();
         let chain_orchestrator = chain_orchestrator.run_until_shutdown(inner);
         tokio::select! {
             biased;
 
-            _ = shutdown => {},
-            _ = chain_orchestrator => {},
+            _ = shutdown => Ok(()),
+            result = chain_orchestrator => result,
         }
     });
 
@@ -726,7 +740,7 @@ async fn shutdown_consolidates_most_recent_batch_on_startup() -> eyre::Result<()
 
     // Load test batches
     let block_0_info = BlockInfo { number: 18318207, hash: B256::random() };
-    let raw_calldata_0 = read_to_bytes("./tests/testdata/batch_0_calldata.bin")?;
+    let raw_calldata_0 = empty_batch_calldata(1, 4, genesis_timestamp + 1);
     let batch_0_data = BatchCommitData {
         hash: b256!("5AAEB6101A47FC16866E80D77FFE090B6A7B3CF7D988BE981646AB6AEDFA2C42"),
         index: 1,
@@ -738,7 +752,7 @@ async fn shutdown_consolidates_most_recent_batch_on_startup() -> eyre::Result<()
         reverted_block_number: None,
     };
     let block_1_info = BlockInfo { number: 18318215, hash: B256::random() };
-    let raw_calldata_1 = read_to_bytes("./tests/testdata/batch_1_calldata.bin")?;
+    let raw_calldata_1 = empty_batch_calldata(5, 53, genesis_timestamp + 2);
     let batch_1_data = BatchCommitData {
         hash: b256!("AA8181F04F8E305328A6117FA6BC13FA2093A3C4C990C5281DF95A1CB85CA18F"),
         index: 2,
@@ -776,14 +790,21 @@ async fn shutdown_consolidates_most_recent_batch_on_startup() -> eyre::Result<()
     // Lets iterate over all blocks expected to be derived from the first batch commit.
     let consolidation_outcome = loop {
         let event = rnm_events.next().await;
-        println!("Received event: {:?}", event);
         if let Some(ChainOrchestratorEvent::BatchConsolidated(consolidation_outcome)) = event {
             break consolidation_outcome;
         }
     };
     assert_eq!(consolidation_outcome.blocks.len(), 4, "Expected 4 blocks to be consolidated");
 
-    // Now we send the second batch commit and finalize it.
+    l1_notification_tx.notification_tx.send(Arc::new(L1Notification::Synced)).await?;
+    loop {
+        if matches!(rnm_events.next().await, Some(ChainOrchestratorEvent::ChainConsolidated { .. }))
+        {
+            break;
+        }
+    }
+
+    // Start the second batch, then stop while its remote Engine effects are only partially applied.
     l1_notification_tx
         .notification_tx
         .send(Arc::new(L1Notification::BatchCommit {
@@ -791,65 +812,57 @@ async fn shutdown_consolidates_most_recent_batch_on_startup() -> eyre::Result<()
             data: batch_1_data.clone(),
         }))
         .await?;
-    l1_notification_tx
-        .notification_tx
-        .send(Arc::new(L1Notification::BatchFinalization {
-            hash: batch_1_data.hash,
-            index: batch_1_data.index,
-            block_info: block_1_info,
-        }))
-        .await?;
-
-    // Lets finalize the second batch.
-    l1_notification_tx
-        .notification_tx
-        .send(Arc::new(L1Notification::Finalized(block_1_info.number)))
-        .await?;
-
-    // The second batch commit contains 42 blocks (5-57), lets iterate until the rnm has
-    // consolidated up to block 40.
-    let mut i = 5;
-    let hash = loop {
-        let hash = loop {
-            if let Some(ChainOrchestratorEvent::BlockConsolidated(consolidation_outcome)) =
-                rnm_events.next().await
-            {
-                assert_eq!(consolidation_outcome.block_info().block_info.number, i);
-                break consolidation_outcome.block_info().block_info.hash;
-            }
-        };
-        if i == 40 {
-            break hash;
-        }
-        i += 1;
-    };
-
-    // Fetch the safe and head block hashes from the EN.
     let rpc = node.rpc.inner.eth_api();
-    let safe_block_hash =
-        rpc.block_by_number(BlockNumberOrTag::Safe, false).await?.expect("safe block must exist");
-    let head_block_hash =
-        rpc.block_by_number(BlockNumberOrTag::Latest, false).await?.expect("head block must exist");
+    time::timeout(Duration::from_secs(10), async {
+        loop {
+            let latest = rpc
+                .block_by_number(BlockNumberOrTag::Latest, false)
+                .await?
+                .expect("latest block must exist")
+                .header
+                .number;
+            if latest >= 5 {
+                return Ok::<_, eyre::Report>(())
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("batch 2 must start building before shutdown")?;
 
-    // Assert that the safe block hash is the same as the hash of the last consolidated block.
-    assert_eq!(
-        safe_block_hash.header.hash, hash,
-        "Safe block hash does not match expected
-    hash"
-    );
-    assert_eq!(
-        head_block_hash.header.hash, hash,
-        "Head block hash does not match
-    expected hash"
-    );
-
-    // Simulate a shutdown of the rollup node manager by dropping it.
+    // Stop the orchestrator and wait for it to release the database before rebuilding it.
     signal.fire();
     drop(l1_notification_tx);
     drop(rnm_events);
+    orchestrator_task.await??;
+    let partial_head = rpc
+        .block_by_number(BlockNumberOrTag::Latest, false)
+        .await?
+        .expect("latest block must exist after shutdown")
+        .header
+        .number;
+    assert!(
+        (5..57).contains(&partial_head),
+        "shutdown must leave an actual partial batch-2 Engine head, got {partial_head}"
+    );
+    time::timeout(Duration::from_secs(10), async {
+        loop {
+            if rpc.block_by_number(5.into(), false).await.ok().flatten().is_some() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the partial canonical chain must become queryable before restart");
+    database.update_batch_status(batch_1_data.hash, BatchStatus::Processing).await?;
+    assert_eq!(database.get_l2_head_block_number().await?, 4);
 
     // Start the RNM again.
     let (_, events) = ScrollWireProtocolHandler::new(ScrollWireConfig::new(true));
+    // Separately named sender for the restarted orchestrator, held for its lifetime.
+    let (_eth_wire_block_tx_restart, eth_wire_block_rx_restart) =
+        tokio::sync::mpsc::channel(ETH_WIRE_BLOCK_CHANNEL_SIZE);
     let (chain_orchestrator, handle) = config
         .clone()
         .build(
@@ -861,63 +874,79 @@ async fn shutdown_consolidates_most_recent_batch_on_startup() -> eyre::Result<()
                 node.inner.task_executor.clone(),
             ),
             events,
-            node.inner.add_ons_handle.rpc_handle.rpc_server_handles.clone(),
+            eth_wire_block_rx_restart,
+            node.inner.add_ons_handle.rpc_server_handles.clone(),
         )
         .await?;
     let l1_notification_tx = handle.l1_watcher_mock.clone().unwrap();
+    assert_eq!(
+        database.get_batch_status_by_hash(batch_1_data.hash).await?,
+        Some(BatchStatus::Committed),
+        "startup must make the interrupted batch eligible for rediscovery"
+    );
 
     // Spawn a task that constantly polls the rnm to make progress.
-    let (_signal, shutdown) = shutdown_signal();
-    tokio::spawn(async {
+    let (restart_signal, shutdown) = shutdown_signal();
+    let restarted_task = tokio::spawn(async {
         let (_signal, inner) = shutdown_signal();
         let chain_orchestrator = chain_orchestrator.run_until_shutdown(inner);
         tokio::select! {
             biased;
 
-            _ = shutdown => {},
-            _ = chain_orchestrator => {},
+            _ = shutdown => Ok(()),
+            result = chain_orchestrator => result,
         }
     });
 
     // Request an event stream from the rollup node manager.
     let mut rnm_events = handle.get_event_listener().await?;
 
-    // Send the second batch again to mimic the watcher behaviour.
-    let block_1_info = BlockInfo { number: 18318215, hash: B256::random() };
-    l1_notification_tx
-        .notification_tx
-        .send(Arc::new(L1Notification::Finalized(block_1_info.number)))
-        .await?;
-
-    // Lets fetch the first consolidated block event - this should be the first block of the batch.
-    let l2_block = loop {
-        if let Some(ChainOrchestratorEvent::BlockConsolidated(consolidation_outcome)) =
-            rnm_events.next().await
-        {
-            break consolidation_outcome.block_info().clone();
-        }
-    };
-
-    // One issue #273 is completed, we will again have safe blocks != finalized blocks, and this
-    // should be changed to 1. Assert that the consolidated block is the first block that was not
-    // previously processed of the batch.
-    assert_eq!(
-        l2_block.block_info.number, 41,
-        "Consolidated block number does not match expected number"
-    );
-
-    // Lets now iterate over all remaining blocks expected to be derived from the second batch
-    // commit.
-    for i in 42..=57 {
+    let status_database = database.clone();
+    let batch_hash = batch_1_data.hash;
+    let processing_observer = tokio::spawn(async move {
         loop {
-            if let Some(ChainOrchestratorEvent::BlockConsolidated(consolidation_outcome)) =
-                rnm_events.next().await
-            {
-                assert!(consolidation_outcome.block_info().block_info.number == i);
-                break;
+            match status_database.get_batch_status_by_hash(batch_hash).await {
+                Ok(Some(BatchStatus::Processing)) => return true,
+                Ok(Some(BatchStatus::Consolidated)) | Err(_) => return false,
+                Ok(_) => tokio::task::yield_now().await,
             }
         }
-    }
+    });
+
+    l1_notification_tx.notification_tx.send(Arc::new(L1Notification::Synced)).await?;
+
+    let (recovered_blocks, recovered_outcome) = time::timeout(Duration::from_secs(10), async {
+        let mut recovered_blocks = Vec::new();
+        loop {
+            match rnm_events.next().await {
+                Some(ChainOrchestratorEvent::BlockConsolidated(outcome)) => {
+                    recovered_blocks.push(outcome.block_info().block_info.number);
+                }
+                Some(ChainOrchestratorEvent::BatchConsolidated(outcome))
+                    if outcome.batch_info.index == batch_1_data.index =>
+                {
+                    break (recovered_blocks, outcome)
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("restart recovery must consolidate batch 2");
+
+    assert!(processing_observer.await?, "startup catch-up must mark the batch Processing");
+    assert_eq!(
+        recovered_blocks,
+        (partial_head..=57).collect::<Vec<_>>(),
+        "the matching partial head must be reused before building only the missing suffix"
+    );
+    assert_eq!(recovered_outcome.blocks.len(), 53);
+    assert_eq!(recovered_outcome.target_status, BatchStatus::Consolidated);
+    assert_eq!(
+        database.get_batch_status_by_hash(batch_1_data.hash).await?,
+        Some(BatchStatus::Consolidated)
+    );
+    assert_eq!(database.get_l2_head_block_number().await?, 57);
 
     let finalized_block = rpc
         .block_by_number(BlockNumberOrTag::Finalized, false)
@@ -928,8 +957,8 @@ async fn shutdown_consolidates_most_recent_batch_on_startup() -> eyre::Result<()
     let head_block =
         rpc.block_by_number(BlockNumberOrTag::Latest, false).await?.expect("head block must exist");
     assert_eq!(
-        finalized_block.header.number, 57,
-        "Finalized block number should be 57 after all blocks are consolidated"
+        finalized_block.header.number, 4,
+        "restart recovery must not finalize an unfinalized batch"
     );
     assert_eq!(
         safe_block.header.number, 57,
@@ -940,6 +969,9 @@ async fn shutdown_consolidates_most_recent_batch_on_startup() -> eyre::Result<()
         "Head block number should be 57 after all blocks are consolidated"
     );
 
+    restart_signal.fire();
+    restarted_task.await??;
+
     Ok(())
 }
 
@@ -948,7 +980,7 @@ async fn shutdown_consolidates_most_recent_batch_on_startup() -> eyre::Result<()
 #[tokio::test]
 async fn graceful_shutdown_sets_fcs_to_latest_signed_block_in_db_on_start_up() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
-    let chain_spec = (*SCROLL_DEV).clone();
+    let chain_spec = (*DOGEOS_DEV).clone();
 
     // Create a config with a random signer.
     let mut config = default_sequencer_test_scroll_rollup_node_config();
@@ -968,6 +1000,10 @@ async fn graceful_shutdown_sets_fcs_to_latest_signed_block_in_db_on_start_up() -
     config.hydrate(node.inner.config.clone()).await?;
 
     let (_, events) = ScrollWireProtocolHandler::new(ScrollWireConfig::new(true));
+    // Hold the ETH-wire block sender for as long as the orchestrator runs; dropping it would
+    // close the receiver the orchestrator polls.
+    let (_eth_wire_block_tx, eth_wire_block_rx) =
+        tokio::sync::mpsc::channel(ETH_WIRE_BLOCK_CHANNEL_SIZE);
     let (rnm, handle) = config
         .clone()
         .build(
@@ -979,7 +1015,8 @@ async fn graceful_shutdown_sets_fcs_to_latest_signed_block_in_db_on_start_up() -
                 node.inner.task_executor.clone(),
             ),
             events,
-            node.inner.add_ons_handle.rpc_handle.rpc_server_handles.clone(),
+            eth_wire_block_rx,
+            node.inner.add_ons_handle.rpc_server_handles.clone(),
         )
         .await?;
     let (_signal, shutdown) = shutdown_signal();
@@ -1042,6 +1079,9 @@ async fn graceful_shutdown_sets_fcs_to_latest_signed_block_in_db_on_start_up() -
 
     // Start the RNM again.
     let (_, events) = ScrollWireProtocolHandler::new(ScrollWireConfig::new(true));
+    // Separately named sender for the restarted orchestrator, held for its lifetime.
+    let (_eth_wire_block_tx_restart, eth_wire_block_rx_restart) =
+        tokio::sync::mpsc::channel(ETH_WIRE_BLOCK_CHANNEL_SIZE);
     let (rnm, handle) = config
         .clone()
         .build(
@@ -1053,14 +1093,15 @@ async fn graceful_shutdown_sets_fcs_to_latest_signed_block_in_db_on_start_up() -
                 node.inner.task_executor.clone(),
             ),
             events,
-            node.inner.add_ons_handle.rpc_handle.rpc_server_handles.clone(),
+            eth_wire_block_rx_restart,
+            node.inner.add_ons_handle.rpc_server_handles.clone(),
         )
         .await?;
 
     // Launch the rnm in a task.
     tokio::spawn(async {
         let (_signal, inner) = shutdown_signal();
-        rnm.run_until_shutdown(inner).await;
+        rnm.run_until_shutdown(inner).await.expect("restarted orchestrator must keep running");
     });
 
     // Check the fcs.
@@ -1076,21 +1117,21 @@ async fn graceful_shutdown_sets_fcs_to_latest_signed_block_in_db_on_start_up() -
 async fn can_revert_to_l1_block() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    // Create a follower test fixture using SCROLL_MAINNET chain spec
     let mut fixture = TestFixture::builder()
         .followers(1)
-        .with_chain_spec(SCROLL_MAINNET.clone())
+        .with_chain_spec(DOGEOS_DEV.clone())
         .with_memory_db()
         .build()
         .await?;
+    let genesis_timestamp = DOGEOS_DEV.genesis_header().timestamp;
 
-    // Load test batches
+    // In-family empty batches covering L2 1..=4 and 5..=57.
     let batch_0_block_info = BlockInfo { number: 18318207, hash: B256::random() };
-    let raw_calldata_0 = read_to_bytes("./tests/testdata/batch_0_calldata.bin")?;
+    let raw_calldata_0 = empty_batch_calldata(1, 4, genesis_timestamp + 1);
     let batch_0_hash = b256!("5AAEB6101A47FC16866E80D77FFE090B6A7B3CF7D988BE981646AB6AEDFA2C42");
 
     let batch_1_block_info = BlockInfo { number: 18318215, hash: B256::random() };
-    let raw_calldata_1 = read_to_bytes("./tests/testdata/batch_1_calldata.bin")?;
+    let raw_calldata_1 = empty_batch_calldata(5, 53, genesis_timestamp + 2);
     let batch_1_hash = b256!("AA8181F04F8E305328A6117FA6BC13FA2093A3C4C990C5281DF95A1CB85CA18F");
 
     // Send a Synced notification to the chain orchestrator
@@ -1186,22 +1227,22 @@ async fn can_revert_to_l1_block() -> eyre::Result<()> {
 async fn consolidates_committed_batches_after_chain_consolidation() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    // Create a follower test fixture using SCROLL_MAINNET chain spec
     let mut fixture = TestFixture::builder()
         .followers(1)
-        .with_chain_spec(SCROLL_MAINNET.clone())
+        .with_chain_spec(DOGEOS_DEV.clone())
         .with_memory_db()
         .build()
         .await?;
+    let genesis_timestamp = DOGEOS_DEV.genesis_header().timestamp;
 
-    // Load test batches
+    // In-family empty batches covering L2 1..=4 and 5..=57.
     let batch_0_block_info = BlockInfo { number: 18318207, hash: B256::random() };
-    let raw_calldata_0 = read_to_bytes("./tests/testdata/batch_0_calldata.bin")?;
+    let raw_calldata_0 = empty_batch_calldata(1, 4, genesis_timestamp + 1);
     let batch_0_hash = b256!("5AAEB6101A47FC16866E80D77FFE090B6A7B3CF7D988BE981646AB6AEDFA2C42");
 
     let batch_0_finalization_block_info = BlockInfo { number: 18318210, hash: B256::random() };
     let batch_1_block_info = BlockInfo { number: 18318215, hash: B256::random() };
-    let raw_calldata_1 = read_to_bytes("./tests/testdata/batch_1_calldata.bin")?;
+    let raw_calldata_1 = empty_batch_calldata(5, 53, genesis_timestamp + 2);
     let batch_1_hash = b256!("AA8181F04F8E305328A6117FA6BC13FA2093A3C4C990C5281DF95A1CB85CA18F");
 
     let batch_1_finalization_block_info = BlockInfo { number: 18318220, hash: B256::random() };
@@ -1282,24 +1323,24 @@ async fn consolidates_committed_batches_after_chain_consolidation() -> eyre::Res
 async fn can_handle_batch_revert_with_reorg() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    // Create a follower test fixture using SCROLL_MAINNET chain spec
     let mut fixture = TestFixture::builder()
         .followers(1)
-        .with_chain_spec(SCROLL_MAINNET.clone())
+        .with_chain_spec(DOGEOS_DEV.clone())
         .with_memory_db()
         .build()
         .await?;
+    let genesis_timestamp = DOGEOS_DEV.genesis_header().timestamp;
 
     // Send a Synced notification to the chain orchestrator
     fixture.l1().sync().await?;
 
-    // Load test batches
+    // In-family empty batches covering L2 1..=4 and 5..=57.
     let batch_0_block_info = BlockInfo { number: 18318207, hash: B256::random() };
-    let raw_calldata_0 = read_to_bytes("./tests/testdata/batch_0_calldata.bin")?;
+    let raw_calldata_0 = empty_batch_calldata(1, 4, genesis_timestamp + 1);
     let batch_0_hash = b256!("5AAEB6101A47FC16866E80D77FFE090B6A7B3CF7D988BE981646AB6AEDFA2C42");
 
     let batch_1_block_info = BlockInfo { number: 18318215, hash: B256::random() };
-    let raw_calldata_1 = read_to_bytes("./tests/testdata/batch_1_calldata.bin")?;
+    let raw_calldata_1 = empty_batch_calldata(5, 53, genesis_timestamp + 2);
     let batch_1_hash = b256!("AA8181F04F8E305328A6117FA6BC13FA2093A3C4C990C5281DF95A1CB85CA18F");
 
     let batch_1_revert_block_info = BlockInfo { number: 18318216, hash: B256::random() };
@@ -1658,9 +1699,9 @@ async fn test_custom_genesis_block_production_and_propagation() -> eyre::Result<
     let custom_genesis =
         serde_json::from_str(custom_genesis_json).expect("Custom genesis JSON should be valid");
 
-    // Create a custom ScrollChainSpec using the from_custom_genesis method
+    // Create a custom DogeosChainSpec using the from_custom_genesis method
     // This simulates what would happen when using --chain flag with a custom file
-    let custom_chain_spec = Arc::new(ScrollChainSpec::from_custom_genesis(custom_genesis));
+    let custom_chain_spec = Arc::new(DogeosChainSpec::from_custom_genesis(custom_genesis));
 
     // Launch 2 nodes: node0=sequencer and node1=follower.
     let mut fixture = TestFixture::builder()
@@ -1671,9 +1712,9 @@ async fn test_custom_genesis_block_production_and_propagation() -> eyre::Result<
         .await?;
 
     // Verify the genesis hash is different from all predefined networks
-    assert_ne!(custom_chain_spec.genesis_hash(), SCROLL_DEV.genesis_hash());
-    assert_ne!(custom_chain_spec.genesis_hash(), SCROLL_SEPOLIA.genesis_hash());
-    assert_ne!(custom_chain_spec.genesis_hash(), SCROLL_MAINNET.genesis_hash());
+    assert_ne!(custom_chain_spec.genesis_hash(), DOGEOS_DEV.genesis_hash());
+    assert_ne!(custom_chain_spec.genesis_hash(), DOGEOS_CHIKYU.genesis_hash());
+    assert_ne!(custom_chain_spec.genesis_hash(), DOGEOS_MAINNET.genesis_hash());
 
     // Verify both nodes start with the same genesis hash from the custom chain spec
     assert_eq!(
@@ -1736,8 +1777,9 @@ async fn can_rpc_enable_disable_sequencing() -> eyre::Result<()> {
     fixture.l1().sync().await?;
 
     // Test that sequencing is initially enabled (blocks produced automatically)
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert_ne!(fixture.get_sequencer_block().await?.header.number, 0, "Should produce blocks");
+    fixture.expect_event().block_sequenced(1).await?;
+    let block_num = fixture.get_sequencer_block().await?.header.number;
+    assert_ne!(block_num, 0, "Should produce blocks");
 
     // Disable automatic sequencing via RPC
     let client = fixture.sequencer().node.rpc_client().expect("Should have rpc client");
@@ -1906,28 +1948,31 @@ async fn can_reject_l2_block_with_unknown_l1_message() -> eyre::Result<()> {
 async fn can_gossip_over_eth_wire() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    // Create the chain spec for scroll dev with Feynman activated and a test genesis.
+    // Create 2 nodes with scroll-wire disabled so blocks can only propagate over eth-wire.
     let mut fixture = TestFixture::builder()
         .sequencer()
         .followers(1)
-        .with_sequencer_auto_start(true)
-        .block_time(40)
+        .block_time(0)
+        .allow_empty_blocks(true)
         .with_scroll_wire(false)
+        .payload_building_duration(1000)
         .build()
         .await?;
 
-    // Set the L1 synced on the sequencer node to start block production.
+    // Set the L1 to synced on the sequencer node.
     fixture.l1().for_node(0).sync().await?;
-    fixture.expect_event().l1_synced().await?;
+    fixture.expect_event_on(0).l1_synced().await?;
 
-    let mut eth_wire_blocks =
-        fixture.follower(0).node.inner.network.eth_wire_block_listener().await?;
+    // Build a block on the sequencer.
+    let block = fixture.build_block().build_and_await_block().await?;
 
-    if let Some(block) = eth_wire_blocks.next().await {
-        println!("Received block from eth-wire network: {block:?}");
-    } else {
-        panic!("Failed to receive block from eth-wire network");
-    }
+    // The follower must receive the sequenced block over eth-wire and extend its chain.
+    let received = fixture.expect_event_on(1).new_block_received().await?;
+    fixture.expect_event_on(1).chain_extended(block.header.number).await?;
+    assert_eq!(received.header.hash_slow(), block.header.hash_slow());
+
+    // Assert the follower imported exactly the sequenced block.
+    assert_eq!(fixture.get_block(1).await?.header.hash_slow(), block.header.hash_slow());
 
     Ok(())
 }
@@ -1938,7 +1983,7 @@ async fn signer_rotation() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
     // Create the chain spec for scroll dev with Feynman activated and a test genesis.
-    let chain_spec = (*SCROLL_DEV).clone();
+    let chain_spec = (*DOGEOS_DEV).clone();
 
     // Create two signers.
     let signer_1 = PrivateKeySigner::random().with_chain_id(Some(chain_spec.chain().id()));
@@ -2025,6 +2070,37 @@ async fn signer_rotation() -> eyre::Result<()> {
 pub fn read_to_bytes<P: AsRef<std::path::Path>>(path: P) -> eyre::Result<Bytes> {
     use std::str::FromStr;
     Ok(Bytes::from_str(&std::fs::read_to_string(path)?)?)
+}
+
+/// Encodes one V0 calldata batch containing deterministic transaction-free blocks.
+fn empty_batch_calldata(first_block: u64, block_count: u8, timestamp: u64) -> Bytes {
+    let mut parent_batch_header = Vec::with_capacity(89);
+    parent_batch_header.push(0);
+    parent_batch_header.extend_from_slice(&0u64.to_be_bytes());
+    parent_batch_header.extend_from_slice(&0u64.to_be_bytes());
+    parent_batch_header.extend_from_slice(&0u64.to_be_bytes());
+    parent_batch_header.extend_from_slice(B256::ZERO.as_slice());
+    parent_batch_header.extend_from_slice(B256::ZERO.as_slice());
+
+    let mut chunk = Vec::with_capacity(1 + usize::from(block_count) * 60);
+    chunk.push(block_count);
+    for number in first_block..first_block + u64::from(block_count) {
+        chunk.extend_from_slice(&number.to_be_bytes());
+        chunk.extend_from_slice(&timestamp.to_be_bytes());
+        chunk.extend_from_slice(&U256::ZERO.to_be_bytes::<32>());
+        chunk.extend_from_slice(&SCROLL_GAS_LIMIT.to_be_bytes());
+        chunk.extend_from_slice(&0u16.to_be_bytes());
+        chunk.extend_from_slice(&0u16.to_be_bytes());
+    }
+
+    commitBatchCall {
+        version: 0,
+        parent_batch_header: parent_batch_header.into(),
+        chunks: vec![chunk.into()],
+        skipped_l1_message_bitmap: Bytes::new(),
+    }
+    .abi_encode()
+    .into()
 }
 
 /// Waits for n events to be emitted.

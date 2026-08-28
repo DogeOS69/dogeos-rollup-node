@@ -11,16 +11,15 @@ use std::{
 };
 
 use alloy_eips::eip2718::Encodable2718;
+use alloy_primitives::U256;
 use alloy_rpc_types_engine::{ExecutionData, PayloadAttributes, PayloadId};
+use dogeos_hardforks::DogeosHardforks;
+use dogeos_reth_engine::{BlockDataHint, ScrollPayloadAttributes};
+use dogeos_reth_primitives::{DogeosBlock, ScrollTransactionSigned};
 use futures::{task::AtomicWaker, Stream};
-use reth_scroll_engine_primitives::try_into_block;
-use reth_scroll_primitives::ScrollBlock;
 use rollup_node_primitives::{BlockInfo, DEFAULT_BLOCK_DIFFICULTY};
 use rollup_node_providers::{L1MessageProvider, L1ProviderError};
-use scroll_alloy_hardforks::ScrollHardforks;
-use scroll_alloy_provider::ScrollEngineApi;
-use scroll_alloy_rpc_types_engine::{BlockDataHint, ScrollPayloadAttributes};
-use scroll_engine::Engine;
+use scroll_engine::{Engine, ScrollEngineApi};
 use tokio::time::Interval;
 
 mod config;
@@ -57,7 +56,7 @@ pub struct Sequencer<P, CS> {
 impl<P, CS> Sequencer<P, CS>
 where
     P: L1MessageProvider + Unpin + Send + Sync + 'static,
-    CS: ScrollHardforks,
+    CS: DogeosHardforks,
 {
     /// Creates a new sequencer.
     pub fn new(provider: Arc<P>, config: SequencerConfig<CS>) -> Self {
@@ -184,7 +183,7 @@ where
         &mut self,
         payload_id: PayloadId,
         engine: &mut Engine<EC>,
-    ) -> Result<Option<ScrollBlock>, SequencerError> {
+    ) -> Result<Option<DogeosBlock>, SequencerError> {
         let payload = engine.get_payload(payload_id).await?;
 
         if payload.transactions.is_empty() && !self.config.allow_empty_blocks {
@@ -194,11 +193,16 @@ where
             tracing::info!(target: "rollup_node::sequencer", "Built payload with id {payload_id:?}, hash: {:#x}, number: {} containing {} transactions.", payload.block_hash, payload.block_number, payload.transactions.len());
             let block_info = BlockInfo { hash: payload.block_hash, number: payload.block_number };
             engine.update_fcs(Some(block_info), None, None).await?;
-            let block: ScrollBlock = try_into_block(
-                ExecutionData { payload: payload.into(), sidecar: Default::default() },
-                self.config.chain_spec.clone(),
-            )
-            .map_err(|_| SequencerError::PayloadError)?;
+            let expected_hash = payload.block_hash;
+            let ExecutionData { payload, sidecar } =
+                ExecutionData { payload: payload.into(), sidecar: Default::default() };
+            let mut block: DogeosBlock = payload
+                .try_into_block_with_sidecar::<ScrollTransactionSigned>(&sidecar)
+                .map_err(|_| SequencerError::PayloadError)?;
+            block.header.difficulty = U256::ONE;
+            if block.hash_slow() != expected_hash {
+                return Err(SequencerError::PayloadError)
+            }
             Ok(Some(block))
         }
     }

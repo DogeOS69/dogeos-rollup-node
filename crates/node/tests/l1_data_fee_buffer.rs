@@ -5,20 +5,20 @@ use std::str::FromStr;
 use alloy_eips::eip2718::Encodable2718;
 use alloy_primitives::{private::rand::random_iter, Address, Bytes, TxKind, B256, U256};
 use alloy_rpc_types_eth::{TransactionInput, TransactionRequest};
+use dogeos_chainspec::{DogeosChainSpecBuilder, ScrollChainConfig, DOGEOS_DEV};
+use dogeos_reth_evm::gas_price_oracle::L1_GAS_PRICE_ORACLE_ADDRESS;
+use dogeos_rpc_types::ScrollTransactionRequest;
 use reth_chainspec::EthChainSpec;
 use reth_rpc_api::EthApiServer;
 use reth_rpc_eth_api::SignableTxRequest;
-use reth_scroll_chainspec::{ScrollChainConfig, ScrollChainSpecBuilder, SCROLL_DEV};
 use rollup_node::test_utils::TestFixture;
-use scroll_alloy_evm::gas_price_oracle::L1_GAS_PRICE_ORACLE_ADDRESS;
-use scroll_alloy_rpc_types::ScrollTransactionRequest;
 use std::sync::Arc;
 
 #[tokio::test]
 async fn test_l1_data_fee_buffer() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    let mut genesis = SCROLL_DEV.genesis.clone();
+    let mut genesis = DOGEOS_DEV.genesis.clone();
 
     // Fund the genesis signer with a balance that will be:
     // - Sufficient for 1x L1 data fee
@@ -41,13 +41,8 @@ async fn test_l1_data_fee_buffer() -> eyre::Result<()> {
     }
 
     // Build the chain spec with the modified genesis.
-    let chain_spec = Arc::new(
-        ScrollChainSpecBuilder::default()
-            .chain(SCROLL_DEV.chain())
-            .genesis(genesis)
-            .with_forks(SCROLL_DEV.hardforks.clone())
-            .build(ScrollChainConfig::dev()),
-    );
+    let chain_spec =
+        Arc::new(DogeosChainSpecBuilder::dev().genesis(genesis).build(ScrollChainConfig::dev()));
 
     // Base test fixture builder (created twice since .build() consumes it)
     let base_fixture = || {

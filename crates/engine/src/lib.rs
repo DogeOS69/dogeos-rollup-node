@@ -4,6 +4,9 @@
 pub use error::{EngineError, FcsError};
 mod error;
 
+mod api;
+pub use api::{ScrollAuthApiEngineClient, ScrollEngineApi, ScrollEngineApiResult};
+
 pub use fcs::{genesis_hash_from_chain_spec, ForkchoiceState};
 mod fcs;
 

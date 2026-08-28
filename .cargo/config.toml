@@ -1,4 +1,5 @@
 [alias]
 docs = "doc --workspace --all-features --no-deps"
-[build]
-rustflags = ["--cfg", "tokio_unstable"]
+
+[net]
+git-fetch-with-cli = true

@@ -2,11 +2,11 @@ use super::{models, DatabaseError};
 use crate::{ReadConnectionProvider, WriteConnectionProvider};
 
 use alloy_primitives::{Signature, B256};
+use dogeos_reth_engine::BlockDataHint;
 use rollup_node_primitives::{
     BatchCommitData, BatchConsolidationOutcome, BatchInfo, BatchStatus, BlockInfo,
     L1BlockStartupInfo, L1MessageEnvelope, L2BlockInfoWithL1Messages, Metadata,
 };
-use scroll_alloy_rpc_types_engine::BlockDataHint;
 use sea_orm::{
     sea_query::{CaseStatement, Expr, OnConflict},
     ColumnTrait, Condition, DbErr, EntityTrait, QueryFilter, QueryOrder, QuerySelect,
@@ -106,6 +106,14 @@ pub trait DatabaseWriteOperations {
         batch_hash: B256,
         status: BatchStatus,
     ) -> Result<(), DatabaseError>;
+
+    /// Changes a batch status only when its current status matches `from`.
+    async fn transition_batch_status(
+        &self,
+        batch_hash: B256,
+        from: BatchStatus,
+        to: BatchStatus,
+    ) -> Result<bool, DatabaseError>;
 
     /// Delete all [`BatchCommitData`]s with a batch index greater than the provided index.
     async fn delete_batches_gt_batch_index(&self, batch_index: u64) -> Result<u64, DatabaseError>;
@@ -380,6 +388,24 @@ impl<T: WriteConnectionProvider + ?Sized + Sync> DatabaseWriteOperations for T {
             .await?;
 
         Ok(())
+    }
+
+    async fn transition_batch_status(
+        &self,
+        batch_hash: B256,
+        from: BatchStatus,
+        to: BatchStatus,
+    ) -> Result<bool, DatabaseError> {
+        tracing::trace!(target: "scroll::db", ?batch_hash, ?from, ?to, "Conditionally updating batch status in database.");
+
+        let result = models::batch_commit::Entity::update_many()
+            .filter(models::batch_commit::Column::Hash.eq(batch_hash.to_vec()))
+            .filter(models::batch_commit::Column::Status.eq(from.as_str()))
+            .col_expr(models::batch_commit::Column::Status, Expr::value(to.as_str()))
+            .exec(self.get_connection())
+            .await?;
+
+        Ok(result.rows_affected == 1)
     }
 
     async fn finalize_batches_up_to_index(
@@ -967,7 +993,7 @@ pub trait DatabaseReadOperations {
     ) -> Result<Option<BatchCommitData>, DatabaseError>;
 
     /// Get the status of a batch by its hash.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-utils"))]
     async fn get_batch_status_by_hash(
         &self,
         batch_hash: B256,
@@ -1073,7 +1099,7 @@ impl<T: ReadConnectionProvider + Sync + ?Sized> DatabaseReadOperations for T {
             .map(|x| x.map(Into::into))?)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-utils"))]
     async fn get_batch_status_by_hash(
         &self,
         batch_hash: B256,

@@ -4,11 +4,11 @@ use alloy_eips::{BlockId, BlockNumberOrTag};
 use alloy_primitives::{Sealable, B256};
 use alloy_provider::Provider;
 use alloy_rpc_types_engine::ForkchoiceState as AlloyForkchoiceState;
+use dogeos_chainspec::{DOGEOS_CHIKYU_GENESIS_HASH, DOGEOS_MAINNET_GENESIS_HASH};
+use dogeos_rpc_types::Scroll;
 use reth_chainspec::EthChainSpec;
 use reth_primitives_traits::BlockHeader;
-use reth_scroll_chainspec::{SCROLL_MAINNET_GENESIS_HASH, SCROLL_SEPOLIA_GENESIS_HASH};
 use rollup_node_primitives::BlockInfo;
-use scroll_alloy_network::Scroll;
 
 /// The fork choice state.
 ///
@@ -176,8 +176,8 @@ pub fn genesis_hash_from_chain_spec<CS: EthChainSpec<Header: BlockHeader>>(
     chain_spec: CS,
 ) -> Option<B256> {
     match chain_spec.chain().named() {
-        Some(NamedChain::Scroll) => Some(SCROLL_MAINNET_GENESIS_HASH),
-        Some(NamedChain::ScrollSepolia) => Some(SCROLL_SEPOLIA_GENESIS_HASH),
+        Some(NamedChain::Scroll) => Some(DOGEOS_MAINNET_GENESIS_HASH),
+        Some(NamedChain::ScrollSepolia) => Some(DOGEOS_CHIKYU_GENESIS_HASH),
         Some(NamedChain::Dev) | None => Some(chain_spec.genesis_header().hash_slow()),
         _ => None,
     }

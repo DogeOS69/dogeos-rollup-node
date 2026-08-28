@@ -1,6 +1,6 @@
 use crate::BatchInfo;
 
-use scroll_alloy_rpc_types_engine::ScrollPayloadAttributes;
+use dogeos_reth_engine::ScrollPayloadAttributes;
 
 /// The [`ScrollPayloadAttributes`] coupled with the batch information from which they originated.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

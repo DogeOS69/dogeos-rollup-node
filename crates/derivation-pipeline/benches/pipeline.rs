@@ -4,12 +4,12 @@
 
 use alloy_primitives::{Bytes, B256};
 use criterion::{criterion_group, criterion_main, Criterion};
+use dogeos_protocol_types::TxL1Message;
 use futures::StreamExt;
 use rollup_node_primitives::{BatchCommitData, BatchInfo, BatchStatus, L1MessageEnvelope};
 use rollup_node_providers::{
     test_utils::MockL1Provider, FullL1Provider, L1Provider, S3BlobProvider,
 };
-use scroll_alloy_consensus::TxL1Message;
 use scroll_db::{
     test_utils::setup_test_db, Database, DatabaseConnectionProvider, DatabaseWriteOperations,
     EntityTrait,

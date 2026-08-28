@@ -23,7 +23,7 @@ pub enum EngineError {
     FcsError(#[from] FcsError),
     /// An error occurred in the transport layer.
     #[error("Transport error: {0}")]
-    TransportError(#[from] scroll_alloy_provider::ScrollEngineApiError),
+    TransportError(#[from] alloy_transport::TransportError),
 }
 
 impl EngineError {

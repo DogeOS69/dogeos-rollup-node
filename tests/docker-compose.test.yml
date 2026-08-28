@@ -24,6 +24,7 @@ services:
     entrypoint: ["bash", "/launch_rollup_node_sequencer.bash"]
     environment:
       - RUST_LOG=info
+      - LEGACY_GETH_HEADER_TRANSFORM=true
     ports:
       - "8545:8545"   # JSON-RPC
       - "6060:6060"   # Metrics
@@ -44,6 +45,7 @@ services:
     entrypoint: ["bash", "/launch_rollup_node_follower.bash"]
     environment:
       - RUST_LOG=info
+      - LEGACY_GETH_HEADER_TRANSFORM=true
     ports:
       - "8546:8545"   # JSON-RPC
       - "6061:6060"   # Metrics

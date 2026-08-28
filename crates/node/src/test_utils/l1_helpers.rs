@@ -4,9 +4,9 @@ use super::fixture::TestFixture;
 use std::{fmt::Debug, str::FromStr, sync::Arc};
 
 use alloy_primitives::{Address, Bytes, B256, U256};
+use dogeos_protocol_types::TxL1Message;
 use rollup_node_primitives::{BatchCommitData, BlockInfo, ConsensusUpdate};
 use rollup_node_watcher::L1Notification;
-use scroll_alloy_consensus::TxL1Message;
 
 /// Helper for managing L1 interactions in tests.
 #[derive(Debug)]

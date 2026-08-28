@@ -64,6 +64,7 @@ jobs:
         run: |
           .github/scripts/test-release-metadata.sh
           .github/scripts/test-publish-image-index.sh
+          .github/scripts/test-verify-buildx-capabilities.sh
 
       - name: Prepare build metadata
         id: metadata
@@ -125,8 +126,39 @@ jobs:
             "build_date=\($build_date)"
           ] | .[]' <<<"$metadata" >>"$GITHUB_OUTPUT"
 
-  build:
+  verify-buildx:
     needs: prepare
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: blacksmith-8vcpu-ubuntu-2404
+          - arch: arm64
+            runner: blacksmith-8vcpu-ubuntu-2404-arm
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+        with:
+          version: v0.36.1
+          cache-binary: false
+
+      - name: Verify Buildx release capabilities
+        run: .github/scripts/verify-buildx-capabilities.sh
+
+  build:
+    needs:
+      - prepare
+      - verify-buildx
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -143,7 +175,11 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
         with:
+          version: v0.36.1
           cache-binary: false
+
+      - name: Verify Buildx release capabilities
+        run: .github/scripts/verify-buildx-capabilities.sh
 
       - name: Login to Docker Hub
         if: ${{ github.event_name != 'pull_request' }}
@@ -279,7 +315,11 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
         with:
+          version: v0.36.1
           cache-binary: false
+
+      - name: Verify Buildx release capabilities
+        run: .github/scripts/verify-buildx-capabilities.sh
 
       - name: Login to Docker Hub
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0

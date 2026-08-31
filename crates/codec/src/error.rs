@@ -26,6 +26,10 @@ pub enum DecodingError {
     InvalidCalldataFormat,
     #[error("invalid parent header format")]
     InvalidParentHeaderFormat,
+    #[error("unsupported transaction type {0:#x} in batch data")]
+    UnsupportedTransactionType(u8),
+    #[error("invalid typed transaction encoding in batch data")]
+    InvalidTypedTransactionEncoding,
     #[error(transparent)]
     InvalidCommitBatchCall(#[from] InvalidCommitBatchCall),
     #[error("end of file")]

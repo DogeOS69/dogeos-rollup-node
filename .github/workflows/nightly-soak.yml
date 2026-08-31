@@ -1,0 +1,97 @@
+name: nightly-soak
+
+# Recurrence guard for the CI races fixed in issue #38. Soaks the previously
+# flaky spots off the merge path (same tier idea as dogeos-core's tiered CI):
+#   - test_should_consolidate_after_optimistic_sync, plain and under deliberate
+#     CPU contention (the original race only fired on contended runners), and
+#   - the docker remote-source startup pair, repeated serially.
+# Any failure here is a regression of a fixed race — treat it as a bug, not as
+# noise to re-run.
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      iterations:
+        description: "Iterations for the in-process soak (default 25)"
+        required: false
+        default: "25"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  soak-integration:
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 90
+    env:
+      RUST_BACKTRACE: 1
+    steps:
+      - uses: actions/checkout@v6
+      - uses: rui314/setup-mold@v1
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: 'nightly-2026-01-05'
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - uses: taiki-e/install-action@nextest
+      - name: Build test binaries
+        run: |
+          cargo nextest run --all-features --workspace --locked --no-run \
+            -E 'test(test_should_consolidate_after_optimistic_sync)'
+      - name: Soak optimistic-sync consolidation test (idle)
+        run: |
+          set -euo pipefail
+          ITERS="${{ github.event.inputs.iterations || '25' }}"
+          for i in $(seq "$ITERS"); do
+            echo "::group::idle iteration $i/$ITERS"
+            cargo nextest run --all-features --workspace --locked \
+              -E 'test(test_should_consolidate_after_optimistic_sync)'
+            echo "::endgroup::"
+          done
+      - name: Soak optimistic-sync consolidation test (under CPU contention)
+        run: |
+          set -euo pipefail
+          # Saturate most cores to mimic a contended runner — the condition
+          # under which the original race fired.
+          for c in $(seq 6); do yes > /dev/null & done
+          trap 'jobs -p | xargs -r kill 2>/dev/null || true' EXIT
+          ITERS="${{ github.event.inputs.iterations || '25' }}"
+          for i in $(seq "$ITERS"); do
+            echo "::group::loaded iteration $i/$ITERS"
+            cargo nextest run --all-features --workspace --locked \
+              -E 'test(test_should_consolidate_after_optimistic_sync)'
+            echo "::endgroup::"
+          done
+
+  soak-docker-remote-source:
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 90
+    env:
+      RUST_BACKTRACE: 1
+    steps:
+      - uses: actions/checkout@v6
+      - uses: rui314/setup-mold@v1
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - uses: taiki-e/install-action@nextest
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Soak docker remote-source tests
+        run: |
+          set -euo pipefail
+          for i in 1 2 3; do
+            echo "::group::docker iteration $i/3"
+            cargo nextest run --all-features --workspace --locked \
+              --no-tests=pass -E 'test(docker_test_remote_block_source)' \
+              --test-threads=1 --failure-output immediate --success-output never
+            echo "::endgroup::"
+          done

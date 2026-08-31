@@ -894,6 +894,51 @@ async fn test_chain_import_cancels_inflight_payload_job() -> eyre::Result<()> {
     Ok(())
 }
 
+/// An administrative FCS head update must cancel an in-flight payload
+/// building job (its parent may no longer be the head) and emit
+/// `PayloadBuildingJobCancelled` — otherwise finalizing the stale job would
+/// silently undo the update (issue #38 review).
+#[allow(clippy::large_stack_frames)]
+#[tokio::test]
+async fn test_update_fcs_head_cancels_inflight_payload_job() -> eyre::Result<()> {
+    reth_tracing::init_test_tracing();
+
+    let mut fixture = TestFixture::builder()
+        .sequencer()
+        .with_memory_db()
+        .payload_building_duration(3000)
+        .allow_empty_blocks(true)
+        .build()
+        .await?;
+
+    fixture.l1().sync().await?;
+
+    let genesis = fixture.get_block(0).await?;
+    let genesis_info = BlockInfo { number: genesis.header.number, hash: genesis.header.hash };
+
+    // Start a 3s build, then move the head administratively while it is in
+    // flight.
+    fixture.sequencer().rollup_manager_handle.build_block();
+    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+    fixture
+        .sequencer()
+        .rollup_manager_handle
+        .update_fcs_head(genesis_info)
+        .await
+        .expect("update_fcs_head should succeed");
+
+    // The head update must have cancelled the in-flight job.
+    fixture
+        .expect_event()
+        .where_event(|e| matches!(e, ChainOrchestratorEvent::PayloadBuildingJobCancelled))
+        .await?;
+
+    // A follow-up build proceeds cleanly from the updated head.
+    fixture.build_block().expect_block_number(1).build_and_await_block().await?;
+
+    Ok(())
+}
+
 /// Waits for n events to be emitted.
 ///
 /// Bounded: panics with a diagnosis after 60s instead of hanging the test

@@ -44,21 +44,39 @@ where
     /// while the remote is unreachable.
     consecutive_failures: u64,
     /// Whether a requested build is still owed its outcome. Set before a
-    /// `BuildBlock` command and cleared once the outcome arrives; if the
-    /// awaited job is cancelled (its outcome never arrives), the build is
-    /// re-issued on the next poll tick instead of being lost — the import
-    /// that requested it has already advanced `last_imported_block`.
+    /// `BuildBlock` command and cleared once the outcome arrives (or the
+    /// settlement gives up). While set, `settle_owed_build` runs before any
+    /// import: it re-issues the build once its cancellation has been
+    /// *observed* (`pending_build_cancelled`), keeps waiting while the job
+    /// may still be in flight, and gives up after
+    /// [`MAX_PENDING_BUILD_RETRIES`] settlement attempts.
     pending_build: bool,
-    /// Consecutive failed re-issues of an owed build. Bounded so an owed
-    /// build whose outcome can never arrive does not head-of-line-block
-    /// imports forever.
+    /// Whether the owed build's cancellation has been observed
+    /// (`PayloadBuildingJobCancelled` consumed). Only then is re-issuing
+    /// race-free — the job is provably gone and, with a single build
+    /// requester, nothing else can have started one.
+    pending_build_cancelled: bool,
+    /// Consecutive settlement attempts for the owed build. Bounded so an
+    /// outcome that never arrives does not head-of-line-block imports
+    /// forever.
     pending_build_retries: u8,
+    /// Number of owed builds that were given up after
+    /// [`MAX_PENDING_BUILD_RETRIES`] settlement attempts, kept for the error
+    /// logs (this add-on currently exports no metrics).
+    builds_abandoned: u64,
+    /// When the last "Sync error" line was logged and what it said, used to
+    /// rate-limit repeated identical errors by elapsed time while always
+    /// logging a *changed* error immediately.
+    last_error_log: Option<(std::time::Instant, String)>,
 }
 
 /// After this many consecutive failed settlement attempts for an owed build,
 /// give it up and resume importing: a build outcome that never arrives must
 /// not stall the import loop indefinitely.
 const MAX_PENDING_BUILD_RETRIES: u8 = 5;
+
+/// Minimum interval between repeated identical "Sync error" log lines.
+const ERROR_LOG_INTERVAL: Duration = Duration::from_secs(10);
 
 /// The outcome of waiting for a requested build.
 enum BuildOutcome {
@@ -67,6 +85,25 @@ enum BuildOutcome {
     Landed,
     /// The payload building job was cancelled; no outcome will arrive.
     Cancelled,
+}
+
+/// Marker for errors that cannot resolve on their own: retrying the poll loop
+/// after one of these is pointless (the orchestrator is gone or shutting
+/// down), so `run_until_shutdown` surfaces them instead of spinning.
+#[derive(Debug)]
+struct TerminalSyncError;
+
+impl std::fmt::Display for TerminalSyncError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "terminal remote block source error")
+    }
+}
+
+impl std::error::Error for TerminalSyncError {}
+
+/// Returns an error that `run_until_shutdown` treats as fatal.
+fn terminal_error(msg: &'static str) -> eyre::Report {
+    eyre::Report::new(TerminalSyncError).wrap_err(msg)
 }
 
 impl<N, P> RemoteBlockSourceAddOn<N, P>
@@ -111,8 +148,19 @@ where
             last_imported_block: None,
             consecutive_failures: 0,
             pending_build: false,
+            pending_build_cancelled: false,
             pending_build_retries: 0,
+            builds_abandoned: 0,
+            last_error_log: None,
         })
+    }
+
+    /// Clears all owed-build bookkeeping (outcome arrived or settlement gave
+    /// up).
+    const fn clear_pending_build(&mut self) {
+        self.pending_build = false;
+        self.pending_build_cancelled = false;
+        self.pending_build_retries = 0;
     }
 
     /// Determines the last imported block by finding the highest common block
@@ -167,23 +215,44 @@ where
                 _guard = &mut shutdown => break,
                 _ = poll_interval.tick() => {
                     match self.follow_and_build().await {
-                        Ok(()) => self.consecutive_failures = 0,
+                        Ok(()) => {
+                            self.consecutive_failures = 0;
+                            self.last_error_log = None;
+                        }
                         Err(e) => {
+                            // Errors that cannot resolve on their own (the
+                            // orchestrator is gone or shutting down) must not
+                            // be retried at poll cadence forever.
+                            if e.chain().any(|c| c.downcast_ref::<TerminalSyncError>().is_some()) {
+                                tracing::error!(target: "scroll::remote_source", ?e, "Terminal sync error; stopping remote block source");
+                                return Err(e);
+                            }
                             self.consecutive_failures += 1;
-                            // Log the first failure and then every 50th: at the
-                            // default 100ms poll interval an unreachable remote
-                            // would otherwise emit ~10 identical lines/second.
-                            if self.consecutive_failures == 1 ||
-                                self.consecutive_failures.is_multiple_of(50)
-                            {
+                            // Rate-limit identical errors by elapsed time (at
+                            // the default 100ms poll interval an unreachable
+                            // remote would otherwise emit ~10 identical
+                            // lines/second), but always log a changed error
+                            // immediately.
+                            let msg = format!("{e:#}");
+                            let now = std::time::Instant::now();
+                            let should_log = match &self.last_error_log {
+                                Some((at, prev)) => {
+                                    *prev != msg ||
+                                        now.duration_since(*at) >= ERROR_LOG_INTERVAL
+                                }
+                                None => true,
+                            };
+                            if should_log {
                                 tracing::error!(
                                     target: "scroll::remote_source",
                                     ?e,
                                     consecutive_failures = self.consecutive_failures,
+                                    builds_abandoned = self.builds_abandoned,
                                     initialized = self.last_imported_block.is_some(),
                                     url = ?self.config.url,
                                     "Sync error"
                                 );
+                                self.last_error_log = Some((now, msg));
                             }
                         }
                     }
@@ -201,14 +270,19 @@ where
     /// (stale outcomes are strictly lower-numbered), so an outcome from a
     /// previous build cannot be attributed to this request.
     /// `BlockBuildingSkipped` carries no number and is accepted as landed;
-    /// this relies on the remote-source node being the only build requester
-    /// (it runs with `auto_start = false`, as in the shipped launch script).
+    /// this relies on the remote-source node being the only build requester.
+    /// Config-level violations are rejected by `validate()` (no
+    /// `sequencer.auto-start` with `remote-source.build`), but the
+    /// `rollupNodeAdmin_enableAutomaticSequencing` RPC can still start the
+    /// timer at runtime and break the assumption — do not enable it on a
+    /// remote-source node.
     async fn await_build_outcome(&mut self, expected_number: u64) -> eyre::Result<BuildOutcome> {
         tracing::debug!(target: "scroll::remote_source", expected_number, "Waiting for block to be built...");
-        // The wait covers a payload building job (default duration 800ms), so
-        // it must not shrink below that when the poll interval is tuned low.
+        // The wait covers a payload building job (default duration 800ms) and
+        // must not shrink below that when the poll interval is tuned low, nor
+        // balloon the worst-case stall when it is tuned high.
         let wait_budget = Duration::from_millis(self.config.poll_interval_ms.saturating_mul(100))
-            .max(Duration::from_secs(30));
+            .clamp(Duration::from_secs(30), Duration::from_secs(120));
         let events = &mut self.events;
         tokio::time::timeout(wait_budget, async {
             loop {
@@ -230,13 +304,13 @@ where
                         break Ok(BuildOutcome::Cancelled);
                     }
                     Some(ChainOrchestratorEvent::Shutdown) => {
-                        break Err(eyre::eyre!("Chain orchestrator is shutting down"));
+                        break Err(terminal_error("Chain orchestrator is shutting down"));
                     }
                     Some(_) => {
                         // Ignore other events, keep waiting
                     }
                     None => {
-                        break Err(eyre::eyre!("Event stream ended unexpectedly"));
+                        break Err(terminal_error("Event stream ended unexpectedly"));
                     }
                 }
             }
@@ -263,23 +337,26 @@ where
         while let Some(event) = self.events.next().now_or_never() {
             match event {
                 Some(ChainOrchestratorEvent::Shutdown) => {
-                    return Err(eyre::eyre!("Chain orchestrator is shutting down"));
+                    return Err(terminal_error("Chain orchestrator is shutting down"));
                 }
                 Some(_) => {}
-                None => return Err(eyre::eyre!("Event stream ended unexpectedly")),
+                None => return Err(terminal_error("Event stream ended unexpectedly")),
             }
         }
 
         self.pending_build = true;
+        self.pending_build_cancelled = false;
         self.orchestrator_handle.build_block();
 
         match self.await_build_outcome(expected_number).await? {
             BuildOutcome::Landed => {
-                self.pending_build = false;
-                self.pending_build_retries = 0;
+                self.clear_pending_build();
                 Ok(())
             }
             BuildOutcome::Cancelled => {
+                // Record the observation: it is what licenses the next
+                // settlement to re-issue this build race-free.
+                self.pending_build_cancelled = true;
                 Err(eyre::eyre!("The payload building job was cancelled before completing"))
             }
         }
@@ -291,39 +368,49 @@ where
     /// so once it returns, the owed command has been processed: the job either
     /// landed (head advanced past the imported block), was cancelled, or is
     /// still in flight. Only an *observed* `PayloadBuildingJobCancelled`
+    /// (recorded in `pending_build_cancelled` by whichever wait consumed it)
     /// proves no outcome will ever arrive — re-issuing is limited to that
     /// case, which (with a single build requester) is race-free. On a plain
     /// timeout the job may still be running, so we keep waiting on later
-    /// ticks rather than risk building the same height twice.
+    /// ticks — bounded by [`MAX_PENDING_BUILD_RETRIES`], after which the
+    /// build is abandoned and imports resume — rather than risk building the
+    /// same height twice.
     async fn settle_owed_build(&mut self) -> eyre::Result<()> {
         let last_imported = self.last_imported_block.expect("initialized above");
         let head = self.orchestrator_handle.status().await?.l2.fcs.head_block_info().number;
         if head > last_imported {
             // The build landed after its wait timed out.
-            self.pending_build = false;
-            self.pending_build_retries = 0;
+            self.clear_pending_build();
             return Ok(());
         }
 
+        let expected = last_imported + 1;
+
+        // The cancellation was already observed (by the wait that set
+        // pending_build_cancelled): the job is provably gone, so re-issuing
+        // now cannot double-build.
+        if std::mem::take(&mut self.pending_build_cancelled) {
+            return self.trigger_build_and_await(expected).await;
+        }
+
         if self.pending_build_retries >= MAX_PENDING_BUILD_RETRIES {
+            self.builds_abandoned += 1;
             tracing::error!(
                 target: "scroll::remote_source",
                 retries = self.pending_build_retries,
+                builds_abandoned = self.builds_abandoned,
                 last_imported,
                 head,
                 "Giving up on settling an owed build; resuming imports"
             );
-            self.pending_build = false;
-            self.pending_build_retries = 0;
+            self.clear_pending_build();
             return Ok(());
         }
         self.pending_build_retries += 1;
 
-        let expected = last_imported + 1;
         match self.await_build_outcome(expected).await? {
             BuildOutcome::Landed => {
-                self.pending_build = false;
-                self.pending_build_retries = 0;
+                self.clear_pending_build();
                 Ok(())
             }
             BuildOutcome::Cancelled => self.trigger_build_and_await(expected).await,

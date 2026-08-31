@@ -185,6 +185,20 @@ impl ScrollRollupNodeConfig {
             );
         }
 
+        if self.remote_block_source_args.enabled &&
+            self.remote_block_source_args.build &&
+            self.sequencer_args.auto_start
+        {
+            // The remote source attributes build outcomes to its own requests
+            // (see RemoteBlockSourceAddOn::await_build_outcome), which is only
+            // sound when it is the sole build requester.
+            return Err(
+                "remote-source.build conflicts with sequencer.auto-start: the remote block \
+                 source must be the only build requester"
+                    .to_string(),
+            );
+        }
+
         Ok(())
     }
 
@@ -1306,6 +1320,74 @@ mod tests {
         assert!(result
             .unwrap_err()
             .contains("Remote source URL required when remote source is enabled"));
+    }
+
+    #[test]
+    fn test_validate_remote_source_build_without_sequencer_fails() {
+        let config = ScrollRollupNodeConfig {
+            test_args: TestArgs::default(),
+            sequencer_args: SequencerArgs { sequencer_enabled: false, ..Default::default() },
+            signer_args: SignerArgs::default(),
+            database_args: RollupNodeDatabaseArgs::default(),
+            engine_driver_args: EngineDriverArgs::default(),
+            chain_orchestrator_args: ChainOrchestratorArgs::default(),
+            l1_provider_args: L1ProviderArgs::default(),
+            blob_provider_args: BlobProviderArgs::default(),
+            network_args: RollupNodeNetworkArgs::default(),
+            gas_price_oracle_args: RollupNodeGasPriceOracleArgs::default(),
+            consensus_args: ConsensusArgs::noop(),
+            database: None,
+            rpc_args: RpcArgs::default(),
+            pprof_args: PprofArgs::default(),
+            remote_block_source_args: RemoteBlockSourceArgs {
+                enabled: true,
+                url: Some("http://localhost:8545".parse().unwrap()),
+                poll_interval_ms: 100,
+                build: true,
+            },
+            require_l1_data_fee_buffer: false,
+        };
+
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("remote-source.build requires sequencer.enabled"));
+    }
+
+    #[test]
+    fn test_validate_remote_source_build_with_auto_start_fails() {
+        let config = ScrollRollupNodeConfig {
+            test_args: TestArgs::default(),
+            sequencer_args: SequencerArgs {
+                sequencer_enabled: true,
+                auto_start: true,
+                ..Default::default()
+            },
+            signer_args: SignerArgs::default(),
+            database_args: RollupNodeDatabaseArgs::default(),
+            engine_driver_args: EngineDriverArgs::default(),
+            chain_orchestrator_args: ChainOrchestratorArgs::default(),
+            l1_provider_args: L1ProviderArgs::default(),
+            blob_provider_args: BlobProviderArgs::default(),
+            network_args: RollupNodeNetworkArgs::default(),
+            gas_price_oracle_args: RollupNodeGasPriceOracleArgs::default(),
+            consensus_args: ConsensusArgs::noop(),
+            database: None,
+            rpc_args: RpcArgs::default(),
+            pprof_args: PprofArgs::default(),
+            remote_block_source_args: RemoteBlockSourceArgs {
+                enabled: true,
+                url: Some("http://localhost:8545".parse().unwrap()),
+                poll_interval_ms: 100,
+                build: true,
+            },
+            require_l1_data_fee_buffer: false,
+        };
+
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("remote-source.build conflicts with sequencer.auto-start"));
     }
 
     #[test]

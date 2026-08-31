@@ -61,6 +61,13 @@ jobs:
               -E 'test(test_should_consolidate_after_optimistic_sync)'
             echo "::endgroup::"
           done
+      - name: Report failure on the tracking issue
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue comment 38 --repo "$GITHUB_REPOSITORY" --body \
+            "nightly-soak job **${{ github.job }}** failed: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} — a failure here is a regression of a race fixed in #45."
 
   soak-integration-loaded:
     runs-on: blacksmith-8vcpu-ubuntu-2404
@@ -93,10 +100,19 @@ jobs:
           trap 'jobs -p | xargs -r kill 2>/dev/null || true' EXIT
           for i in $(seq "$ITERATIONS"); do
             echo "::group::loaded iteration $i/$ITERATIONS"
+            # Also soak the wall-clock-sensitive tests this fix introduced:
+            # the two coalescing tests and the import-cancellation test.
             cargo nextest run --all-features --workspace --locked \
-              -E 'test(test_should_consolidate_after_optimistic_sync)'
+              -E 'test(test_should_consolidate_after_optimistic_sync) or test(coalesces_with) or test(test_chain_import_cancels_inflight_payload_job)'
             echo "::endgroup::"
           done
+      - name: Report failure on the tracking issue
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue comment 38 --repo "$GITHUB_REPOSITORY" --body \
+            "nightly-soak job **${{ github.job }}** failed: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} — a failure here is a regression of a race fixed in #45."
 
   soak-docker-remote-source:
     runs-on: blacksmith-8vcpu-ubuntu-2404
@@ -135,3 +151,10 @@ jobs:
               --test-threads=1 --failure-output immediate --success-output never
             echo "::endgroup::"
           done
+      - name: Report failure on the tracking issue
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue comment 38 --repo "$GITHUB_REPOSITORY" --body \
+            "nightly-soak job **${{ github.job }}** failed: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} — a failure here is a regression of a race fixed in #45."

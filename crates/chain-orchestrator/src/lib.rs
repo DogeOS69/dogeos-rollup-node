@@ -442,11 +442,13 @@ impl<
                     // Coalesce with an in-flight job instead of silently
                     // replacing it: a replaced job discards engine work and
                     // makes block numbering timing-dependent when the build
-                    // timer and manual triggers race (issue #38). The in-flight
-                    // job usually emits BlockSequenced/BlockBuildingSkipped,
-                    // but it can also be cancelled (L1 reorg, chain import,
-                    // sequencing disabled) and then emits nothing — waiters
-                    // must bound their wait (the remote block source does).
+                    // timer and manual triggers race (issue #38). The
+                    // in-flight job normally emits BlockSequenced or
+                    // BlockBuildingSkipped; if it is cancelled instead (L1
+                    // reorg, chain import, administrative FCS head update, or
+                    // sequencing disabled), PayloadBuildingJobCancelled is
+                    // emitted so waiters can fail fast — they should still
+                    // bound their wait (the remote block source does).
                     if sequencer.payload_building_job().is_some() {
                         tracing::debug!(
                             target: "scroll::chain_orchestrator",
@@ -455,11 +457,19 @@ impl<
                             "BuildBlock requested while a payload building job is in flight; coalescing with the in-flight job"
                         );
                         self.notify(ChainOrchestratorEvent::BuildBlockCoalesced);
-                    } else {
-                        sequencer.start_payload_building(&mut self.engine).await?;
+                    } else if let Err(err) =
+                        sequencer.start_payload_building(&mut self.engine).await
+                    {
+                        // A failed start leaves no job and would otherwise
+                        // emit nothing, so waiters would burn their full
+                        // timeout with the real cause in a different log
+                        // target. Notify before propagating.
+                        self.notify(ChainOrchestratorEvent::PayloadBuildingJobCancelled);
+                        return Err(err.into());
                     }
                 } else {
                     tracing::error!(target: "scroll::chain_orchestrator", "Received BuildBlock command but sequencer is not configured");
+                    self.notify(ChainOrchestratorEvent::PayloadBuildingJobCancelled);
                 }
             }
             ChainOrchestratorCommand::EventListener(tx) => {
@@ -498,9 +508,9 @@ impl<
                     .await?;
                 self.engine.update_fcs(Some(head), None, None).await?;
 
-                // The head was rewound: an in-flight payload building job
-                // still targets the pre-rewind head and finalizing it would
-                // silently undo the rewind.
+                // The head was moved administratively: an in-flight payload
+                // building job still targets the previous head and finalizing
+                // it would silently undo the update.
                 self.cancel_payload_building_job("administrative FCS head update");
 
                 self.database
@@ -615,11 +625,13 @@ impl<
         }
     }
 
-    /// Cancels the in-flight payload building job, if any: closes its metrics
-    /// recording (otherwise the next slot logs "already ongoing" and loses its
-    /// sample) and notifies waiters so they can fail fast instead of burning
-    /// their full wait timeout. Call wherever the head moves (or has moved)
-    /// out from under the job's parent.
+    /// Cancels the in-flight payload building job, if any: discards its
+    /// metrics recording (a cancelled job's elapsed time is not a build
+    /// latency and must not pollute the duration histograms), counts the
+    /// cancellation, and notifies waiters so they can fail fast instead of
+    /// burning their full wait timeout. Call wherever the job's inputs are
+    /// invalidated — a head move, an L1 unwind past its origin, or sequencing
+    /// being disabled.
     fn cancel_payload_building_job(&mut self, reason: &'static str) {
         let Some(sequencer) = self.sequencer.as_mut() else { return };
         let Some(job) = sequencer.payload_building_job() else { return };
@@ -631,7 +643,7 @@ impl<
             ?l1_origin,
             "Cancelled in-flight payload building job"
         );
-        self.metric_handler.finish_block_building_recording(None);
+        self.metric_handler.discard_block_building_recording();
         self.notify(ChainOrchestratorEvent::PayloadBuildingJobCancelled);
     }
 
@@ -1108,6 +1120,11 @@ impl<
                 number: received_block_number,
                 hash: block_with_peer.block.header.hash_slow(),
             };
+            // No payload-job cancellation is needed here even though the head
+            // jumps: set_syncing() below closes the sequencer select arm's
+            // is_synced() gate, so a parked job cannot be polled to
+            // completion, and the only path back to synced (import_chain's
+            // sync completion) cancels the job before setting synced.
             self.engine.optimistic_sync(block_info).await?;
             self.sync_state.l2_mut().set_syncing();
 
@@ -1320,8 +1337,9 @@ impl<
         // now would reorg the imported chain back out via a stale side chain
         // (mirrors the cancellation in handle_l1_reorg). Done after the
         // validity check so a rejected import does not discard a valid job;
-        // the orchestrator is a single task, so the job cannot complete in
-        // between.
+        // that is safe because the job future is polled only by the
+        // run_until_shutdown select arm, which is blocked while this handler
+        // runs — the job cannot complete in between.
         self.cancel_payload_building_job("chain import moved the head");
 
         // If we were previously in L2 syncing mode and the FCS update resulted in a valid state, we

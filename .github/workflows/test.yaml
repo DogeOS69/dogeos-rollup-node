@@ -52,7 +52,7 @@ jobs:
           echo "ANVIL_BIN=$ANVIL_BIN" >> "$GITHUB_ENV"
       - name: Run integration tests
         run: |
-          cargo nextest run --all-features --workspace --locked \
+          cargo nextest run --all-features --workspace --locked --no-fail-fast \
             --no-tests=pass -E 'kind(test) and not test(docker)' \
             -- --skip test_should_consolidate_to_block_15k
 
@@ -83,7 +83,7 @@ jobs:
           fi
       - name: Run Docker Compose integration tests
         run: |
-          cargo nextest run --all-features --workspace --locked \
+          cargo nextest run --all-features --workspace --locked --no-fail-fast \
             --no-tests=pass -E 'test(docker)' --test-threads=1 \
             --failure-output immediate \
             --success-output never \

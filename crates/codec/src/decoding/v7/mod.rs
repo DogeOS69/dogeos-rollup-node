@@ -111,6 +111,27 @@ pub(crate) fn decode_v7_payload(blob: &[u8]) -> Result<PayloadData, DecodingErro
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_should_reject_l1_message_transaction_after_valid_transaction() {
+        let mut payload = vec![0; 64];
+        payload.extend_from_slice(&0u64.to_be_bytes());
+        payload.extend_from_slice(&1u16.to_be_bytes());
+
+        payload.extend_from_slice(&0u64.to_be_bytes());
+        payload.extend_from_slice(&[0; 32]);
+        payload.extend_from_slice(&0u64.to_be_bytes());
+        payload.extend_from_slice(&2u16.to_be_bytes());
+        payload.extend_from_slice(&0u16.to_be_bytes());
+
+        payload.push(0xc0);
+        payload.extend_from_slice(&[0x7e, 0xc0]);
+
+        assert!(matches!(
+            super::decode_v7_payload(&payload),
+            Err(crate::DecodingError::UnsupportedTransactionType(0x7e))
+        ));
+    }
+
     use super::*;
     use crate::{decoding::test_utils::read_to_bytes, BlockContext};
 

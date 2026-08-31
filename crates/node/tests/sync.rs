@@ -1,6 +1,6 @@
 //! Contains tests related to RN and EN sync.
 
-use alloy_primitives::{b256, Address, B256, U256};
+use alloy_primitives::{b256, Address, Signature, B256, U256};
 use dogeos_chainspec::{DOGEOS_CHIKYU, DOGEOS_DEV};
 use dogeos_protocol_types::TxL1Message;
 use futures::StreamExt;
@@ -795,6 +795,101 @@ async fn test_manual_build_block_coalesces_with_inflight_job() -> eyre::Result<(
     // A follow-up build produces number 2 — numbering is contiguous, so the
     // coalesced command did not spawn a phantom second job.
     fixture.build_block().expect_block_number(2).build_and_await_block().await?;
+
+    Ok(())
+}
+
+/// The coalescing guard's original target: a manual build request arriving
+/// while a TIMER-triggered job is in flight must coalesce with it instead of
+/// replacing it (issue #38 — the replace made numbering timing-dependent).
+#[allow(clippy::large_stack_frames)]
+#[tokio::test]
+async fn test_manual_build_block_coalesces_with_timer_job() -> eyre::Result<()> {
+    reth_tracing::init_test_tracing();
+
+    let mut fixture = TestFixture::builder()
+        .sequencer()
+        .with_memory_db()
+        .auto_start(true)
+        .block_time(500)
+        .payload_building_duration(2000)
+        .allow_empty_blocks(true)
+        .build()
+        .await?;
+
+    fixture.l1().sync().await?;
+
+    // The timer's first slot fires once L1 sync lands and its job runs for
+    // 2s; with a 500ms slot interval a job is in flight essentially
+    // continuously, so a manual request at t=1s lands mid-job.
+    tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+    fixture.sequencer().rollup_manager_handle.build_block();
+
+    // The manual request coalesced with the timer's in-flight job.
+    fixture
+        .expect_event()
+        .where_event(|e| matches!(e, ChainOrchestratorEvent::BuildBlockCoalesced))
+        .await?;
+
+    // That slot still produces its block.
+    fixture.expect_event().block_sequenced(1).await?;
+
+    Ok(())
+}
+
+/// The head-move invariant: importing a chain must cancel an in-flight
+/// payload building job — its attributes were fixed against the pre-import
+/// head, and finalizing it later would reorg the imported block back out
+/// (issue #38 review). The cancellation is observable as
+/// `PayloadBuildingJobCancelled`.
+#[allow(clippy::large_stack_frames)]
+#[tokio::test]
+async fn test_chain_import_cancels_inflight_payload_job() -> eyre::Result<()> {
+    reth_tracing::init_test_tracing();
+
+    // Node under test: a long payload building job will be in flight.
+    let mut node_a = TestFixture::builder()
+        .sequencer()
+        .with_memory_db()
+        .payload_building_duration(3000)
+        .allow_empty_blocks(true)
+        .build()
+        .await?;
+    // Same genesis; provides a valid block 1 to import.
+    let mut node_b = TestFixture::builder()
+        .sequencer()
+        .with_memory_db()
+        .allow_empty_blocks(true)
+        .build()
+        .await?;
+
+    node_a.l1().sync().await?;
+    node_b.l1().sync().await?;
+
+    // Start a 3s build on A, then import B's block 1 while it is in flight.
+    node_a.sequencer().rollup_manager_handle.build_block();
+    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+    let block = node_b.build_block().expect_block_number(1).build_and_await_block().await?;
+    node_a
+        .sequencer()
+        .rollup_manager_handle
+        .import_block(scroll_network::NewBlockWithPeer {
+            peer_id: Default::default(),
+            block,
+            signature: Signature::new(Default::default(), Default::default(), false),
+        })
+        .await?
+        .map_err(|e| eyre::eyre!("import failed: {e}"))?;
+
+    // The import moved the head and must have cancelled the in-flight job.
+    node_a
+        .expect_event()
+        .where_event(|e| matches!(e, ChainOrchestratorEvent::PayloadBuildingJobCancelled))
+        .await?;
+
+    // A follow-up build proceeds cleanly on top of the imported block.
+    node_a.build_block().expect_block_number(2).build_and_await_block().await?;
 
     Ok(())
 }

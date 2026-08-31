@@ -497,6 +497,12 @@ impl<
                     )
                     .await?;
                 self.engine.update_fcs(Some(head), None, None).await?;
+
+                // The head was rewound: an in-flight payload building job
+                // still targets the pre-rewind head and finalizing it would
+                // silently undo the rewind.
+                self.cancel_payload_building_job("administrative FCS head update");
+
                 self.database
                     .tx_mut(move |tx| async move {
                         tx.purge_l1_message_to_l2_block_mappings(Some(head.number + 1)).await?;
@@ -603,6 +609,26 @@ impl<
         if let Some(s) = self.event_sender.as_ref() {
             s.notify(event);
         }
+    }
+
+    /// Cancels the in-flight payload building job, if any: closes its metrics
+    /// recording (otherwise the next slot logs "already ongoing" and loses its
+    /// sample) and notifies waiters so they can fail fast instead of burning
+    /// their full wait timeout. Call wherever the head moves (or has moved)
+    /// out from under the job's parent.
+    fn cancel_payload_building_job(&mut self, reason: &'static str) {
+        let Some(sequencer) = self.sequencer.as_mut() else { return };
+        let Some(job) = sequencer.payload_building_job() else { return };
+        let l1_origin = job.l1_origin();
+        sequencer.cancel_payload_building_job();
+        tracing::warn!(
+            target: "scroll::chain_orchestrator",
+            reason,
+            ?l1_origin,
+            "Cancelled in-flight payload building job"
+        );
+        self.metric_handler.finish_block_building_recording(None);
+        self.notify(ChainOrchestratorEvent::PayloadBuildingJobCancelled);
     }
 
     /// Atomically unwinds and decides only the owned held result. Pipeline results that have not
@@ -774,9 +800,7 @@ impl<
                     .hash_slow();
 
                 // Cancel the inflight payload building job if the head has changed.
-                if let Some(s) = self.sequencer.as_mut() {
-                    s.cancel_payload_building_job();
-                };
+                self.cancel_payload_building_job("L1 reorg moved the L2 head");
 
                 // Collect transactions of reverted blocks from l2 client.
                 let reverted_transactions = self
@@ -798,9 +822,7 @@ impl<
                 .and_then(|s| s.payload_building_job().map(|p| p.l1_origin()))
                 .flatten()
         {
-            if let Some(s) = self.sequencer.as_mut() {
-                s.cancel_payload_building_job();
-            };
+            self.cancel_payload_building_job("L1 reorg before the job's L1 origin");
         }
 
         // TODO: Add retry logic
@@ -1275,14 +1297,6 @@ impl<
             }
         }
 
-        // Cancel any in-flight payload building job before advancing the head:
-        // its attributes were fixed against the pre-import head, and finalizing
-        // it after this FCS update would reorg the imported chain back out via
-        // a stale side chain (mirrors the cancellation in handle_l1_reorg).
-        if let Some(s) = self.sequencer.as_mut() {
-            s.cancel_payload_building_job();
-        }
-
         // Update the FCS to the new head.
         let head = BlockInfo { number: chain_head_number, hash: chain_head_hash };
         let result = if self.sync_state.l2().is_syncing() {
@@ -1296,6 +1310,15 @@ impl<
             tracing::warn!(target: "scroll::chain_orchestrator", ?chain_head_hash, ?chain_head_number, ?result, "Failed to update FCS after importing new chain from peer");
             return Err(ChainOrchestratorError::InvalidBlock);
         }
+
+        // The head has moved: cancel any in-flight payload building job. Its
+        // attributes were fixed against the pre-import head, and finalizing it
+        // now would reorg the imported chain back out via a stale side chain
+        // (mirrors the cancellation in handle_l1_reorg). Done after the
+        // validity check so a rejected import does not discard a valid job;
+        // the orchestrator is a single task, so the job cannot complete in
+        // between.
+        self.cancel_payload_building_job("chain import moved the head");
 
         // If we were previously in L2 syncing mode and the FCS update resulted in a valid state, we
         // transition the L2 sync state to synced and consolidate the chain.

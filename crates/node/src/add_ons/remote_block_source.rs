@@ -49,7 +49,16 @@ where
     /// re-issued on the next poll tick instead of being lost — the import
     /// that requested it has already advanced `last_imported_block`.
     pending_build: bool,
+    /// Consecutive failed re-issues of an owed build. Bounded so an owed
+    /// build whose outcome can never arrive does not head-of-line-block
+    /// imports forever.
+    pending_build_retries: u8,
 }
+
+/// After this many consecutive failed re-issues of an owed build, give it up
+/// and resume importing: a build outcome that never arrives must not stall
+/// the import loop indefinitely.
+const MAX_PENDING_BUILD_RETRIES: u8 = 5;
 
 impl<N, P> RemoteBlockSourceAddOn<N, P>
 where
@@ -93,6 +102,7 @@ where
             last_imported_block: None,
             consecutive_failures: 0,
             pending_build: false,
+            pending_build_retries: 0,
         })
     }
 
@@ -179,18 +189,24 @@ where
     /// for the outcome.
     ///
     /// Stale outcomes queued by earlier requests are drained first, and a
-    /// `BlockSequenced` is only accepted for `expected_number`, so an outcome
-    /// from a previous build cannot be attributed to this request. The wait is
-    /// bounded because the job the command attaches to can be cancelled
-    /// without any event (L1 reorg, chain import, sequencing disabled);
-    /// `pending_build` stays set in that case so the build is re-issued on the
-    /// next poll tick.
+    /// `BlockSequenced` is only accepted at or above `expected_number` (stale
+    /// outcomes are strictly lower-numbered), so an outcome from a previous
+    /// build cannot be attributed to this request. `BlockBuildingSkipped`
+    /// carries no number and is accepted post-drain; this relies on the
+    /// remote-source node being the only build requester (it runs with
+    /// `auto_start = false`, as in the shipped launch script). The wait is
+    /// bounded and fails fast on `PayloadBuildingJobCancelled`; `pending_build`
+    /// stays set on failure so the build is re-issued on the next poll tick.
     async fn trigger_build_and_await(&mut self, expected_number: u64) -> eyre::Result<()> {
         // Drop build outcomes left over from earlier requests (e.g. a build
         // that completed after its wait timed out).
         while let Some(event) = self.events.next().now_or_never() {
-            if event.is_none() {
-                return Err(eyre::eyre!("Event stream ended unexpectedly"));
+            match event {
+                Some(ChainOrchestratorEvent::Shutdown) => {
+                    return Err(eyre::eyre!("Chain orchestrator is shutting down"));
+                }
+                Some(_) => {}
+                None => return Err(eyre::eyre!("Event stream ended unexpectedly")),
             }
         }
 
@@ -198,13 +214,16 @@ where
         self.orchestrator_handle.build_block();
 
         tracing::debug!(target: "scroll::remote_source", expected_number, "Waiting for block to be built...");
-        let wait_budget = Duration::from_millis(self.config.poll_interval_ms.saturating_mul(100));
+        // The wait covers a payload building job (default duration 800ms), so
+        // it must not shrink below that when the poll interval is tuned low.
+        let wait_budget = Duration::from_millis(self.config.poll_interval_ms.saturating_mul(100))
+            .max(Duration::from_secs(30));
         let events = &mut self.events;
         tokio::time::timeout(wait_budget, async {
             loop {
                 match events.next().await {
                     Some(ChainOrchestratorEvent::BlockSequenced(block))
-                        if block.header.number == expected_number =>
+                        if block.header.number >= expected_number =>
                     {
                         tracing::info!(target: "scroll::remote_source",
                             block_number = block.header.number,
@@ -215,6 +234,14 @@ where
                     Some(ChainOrchestratorEvent::BlockBuildingSkipped) => {
                         tracing::debug!(target: "scroll::remote_source", "Block building skipped (empty block)");
                         break Ok(());
+                    }
+                    Some(ChainOrchestratorEvent::PayloadBuildingJobCancelled) => {
+                        break Err(eyre::eyre!(
+                            "The payload building job was cancelled before completing"
+                        ));
+                    }
+                    Some(ChainOrchestratorEvent::Shutdown) => {
+                        break Err(eyre::eyre!("Chain orchestrator is shutting down"));
                     }
                     Some(_) => {
                         // Ignore other events, keep waiting
@@ -229,11 +256,12 @@ where
         .map_err(|_| {
             eyre::eyre!(
                 "Timed out after {wait_budget:?} waiting for the build outcome of block \
-                 {expected_number}; the payload building job was likely cancelled"
+                 {expected_number}"
             )
         })??;
 
         self.pending_build = false;
+        self.pending_build_retries = 0;
         Ok(())
     }
 
@@ -245,16 +273,35 @@ where
             self.last_imported_block = Some(resume);
         }
 
-        // A build owed from a previous tick is re-issued before importing
+        // A build owed from a previous tick is settled before importing
         // anything else: its import already advanced `last_imported_block`,
         // so without this the head comparison below would report "synced" and
-        // the requested block would be lost. The expected number is derived
-        // from the current head — the cancellation that voided the previous
-        // attempt may itself have moved it.
+        // the requested block would be lost. The head answers whether the
+        // build actually landed after its wait timed out (a completed build
+        // puts the head one above the imported block); only a genuinely lost
+        // build is re-issued, and only a bounded number of times so an
+        // outcome that can never arrive does not stall imports forever.
         if self.pending_build {
-            let expected =
-                self.orchestrator_handle.status().await?.l2.fcs.head_block_info().number + 1;
-            self.trigger_build_and_await(expected).await?;
+            let last_imported = self.last_imported_block.expect("initialized above");
+            let head = self.orchestrator_handle.status().await?.l2.fcs.head_block_info().number;
+            if head > last_imported {
+                // The build landed after its wait timed out.
+                self.pending_build = false;
+                self.pending_build_retries = 0;
+            } else if self.pending_build_retries >= MAX_PENDING_BUILD_RETRIES {
+                tracing::error!(
+                    target: "scroll::remote_source",
+                    retries = self.pending_build_retries,
+                    last_imported,
+                    head,
+                    "Giving up on re-issuing an owed build; resuming imports"
+                );
+                self.pending_build = false;
+                self.pending_build_retries = 0;
+            } else {
+                self.pending_build_retries += 1;
+                self.trigger_build_and_await(head + 1).await?;
+            }
         }
 
         loop {

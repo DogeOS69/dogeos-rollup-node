@@ -172,6 +172,19 @@ impl ScrollRollupNodeConfig {
             return Err("Remote source URL required when remote source is enabled".to_string());
         }
 
+        if self.remote_block_source_args.enabled &&
+            self.remote_block_source_args.build &&
+            !self.sequencer_args.sequencer_enabled
+        {
+            // Without a sequencer no build outcome can ever arrive, and every
+            // remote-source build request would time out.
+            return Err(
+                "remote-source.build requires sequencer.enabled: building on top of imported \
+                 blocks needs a configured sequencer"
+                    .to_string(),
+            );
+        }
+
         Ok(())
     }
 

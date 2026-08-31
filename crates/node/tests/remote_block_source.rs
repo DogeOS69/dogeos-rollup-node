@@ -51,8 +51,10 @@ async fn test_remote_source_node_launches_when_remote_unreachable() -> eyre::Res
                 Ok((inbound, _)) => inbound,
                 Err(e) => {
                     // A transient accept error (e.g. EMFILE under a parallel
-                    // run) must not take the fake remote down permanently.
+                    // run) must not take the fake remote down permanently; the
+                    // sleep keeps a persistent error from busy-spinning.
                     eprintln!("test proxy accept error: {e}");
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                     continue;
                 }
             };

@@ -6,7 +6,9 @@ name: nightly-soak
 #     CPU contention (the original race only fired on contended runners), and
 #   - the docker remote-source startup pair, repeated serially.
 # Any failure here is a regression of a fixed race — treat it as a bug, not as
-# noise to re-run.
+# noise to re-run. (A job hitting its own timeout is a capacity problem, not a
+# race regression — the idle and contended soaks run as separate jobs so each
+# gets its own budget.)
 
 on:
   schedule:
@@ -14,7 +16,7 @@ on:
   workflow_dispatch:
     inputs:
       iterations:
-        description: "Iterations for the in-process soak (default 25)"
+        description: "Iterations per in-process soak job (default 25)"
         required: false
         default: "25"
 
@@ -26,7 +28,7 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  soak-integration:
+  soak-integration-idle:
     runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 90
     env:
@@ -52,19 +54,39 @@ jobs:
           ITERATIONS: ${{ inputs.iterations || '25' }}
         run: |
           set -euo pipefail
-          [[ "$ITERATIONS" =~ ^[0-9]+$ ]] || { echo "::error::iterations must be numeric"; exit 1; }
+          [[ "$ITERATIONS" =~ ^[1-9][0-9]*$ ]] || { echo "::error::iterations must be a positive integer"; exit 1; }
           for i in $(seq "$ITERATIONS"); do
             echo "::group::idle iteration $i/$ITERATIONS"
             cargo nextest run --all-features --workspace --locked \
               -E 'test(test_should_consolidate_after_optimistic_sync)'
             echo "::endgroup::"
           done
+
+  soak-integration-loaded:
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 90
+    env:
+      RUST_BACKTRACE: 1
+    steps:
+      - uses: actions/checkout@v6
+      - uses: rui314/setup-mold@v1
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: 'nightly-2026-01-05'
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - uses: taiki-e/install-action@nextest
+      - name: Build test binaries
+        run: |
+          cargo nextest run --all-features --workspace --locked --no-run \
+            -E 'test(test_should_consolidate_after_optimistic_sync)'
       - name: Soak optimistic-sync consolidation test (under CPU contention)
         env:
           ITERATIONS: ${{ inputs.iterations || '25' }}
         run: |
           set -euo pipefail
-          [[ "$ITERATIONS" =~ ^[0-9]+$ ]] || { echo "::error::iterations must be numeric"; exit 1; }
+          [[ "$ITERATIONS" =~ ^[1-9][0-9]*$ ]] || { echo "::error::iterations must be a positive integer"; exit 1; }
           # Saturate most cores to mimic a contended runner — the condition
           # under which the original race fired.
           for c in $(seq 6); do yes > /dev/null & done
@@ -91,6 +113,16 @@ jobs:
       - uses: taiki-e/install-action@nextest
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+      - name: Verify Docker test disk capacity
+        run: |
+          set -euo pipefail
+          df -h /
+          available_kib=$(df --output=avail / | tail -n 1 | tr -d ' ')
+          minimum_kib=$((32 * 1024 * 1024))
+          if (( available_kib < minimum_kib )); then
+            echo "Docker Compose tests require at least 32 GiB free; available_kib=$available_kib" >&2
+            exit 1
+          fi
       - name: Soak docker remote-source tests
         run: |
           set -euo pipefail

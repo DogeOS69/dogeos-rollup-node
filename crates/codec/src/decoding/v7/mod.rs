@@ -95,7 +95,7 @@ pub(crate) fn decode_v7_payload(blob: &[u8]) -> Result<PayloadData, DecodingErro
         let transactions_count = context.transactions_count();
         let mut transactions = Vec::with_capacity(transactions_count);
         for _ in 0..transactions_count {
-            let tx = Transaction::try_from_buf(buf).ok_or(DecodingError::Eof)?;
+            let tx = Transaction::try_from_buf(buf)?;
             transactions.push(tx.0);
         }
         l2_blocks

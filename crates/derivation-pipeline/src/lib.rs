@@ -3,9 +3,10 @@
 //! This crate provides a simple implementation of a derivation pipeline that transforms a batch
 //! into payload attributes for block building.
 
-use alloy_primitives::{Address, B256};
+use alloy_primitives::{Address, Bytes, B256};
 use alloy_rpc_types_engine::PayloadAttributes;
 use core::{fmt::Debug, future::Future, pin::Pin, task::Poll};
+use dogeos_protocol_types::L1_MESSAGE_TX_TYPE_ID;
 use dogeos_reth_engine::ScrollPayloadAttributes;
 use futures::{stream::FuturesOrdered, Stream, StreamExt};
 use rollup_node_primitives::{BatchCommitData, BatchInfo, BatchStatus, L1MessageEnvelope};
@@ -336,6 +337,8 @@ pub async fn derive<L1P: L1Provider + Sync + Send>(
     let mut attributes = Vec::with_capacity(blocks.len());
 
     for mut block in blocks {
+        ensure_batch_contains_only_l2_transactions(&block.transactions)?;
+
         // query the appropriate amount of l1 messages.
         let mut txs = Vec::with_capacity(block.context.num_transactions as usize);
         for _ in 0..block.context.num_l1_messages {
@@ -387,6 +390,17 @@ pub async fn derive<L1P: L1Provider + Sync + Send>(
         skipped_l1_messages,
         target_status,
     })
+}
+
+/// Ensures batch-provided transactions cannot impersonate messages from the canonical L1 queue.
+fn ensure_batch_contains_only_l2_transactions(
+    transactions: &[Bytes],
+) -> Result<(), DerivationPipelineError> {
+    if transactions.iter().any(|transaction| transaction.first() == Some(&L1_MESSAGE_TX_TYPE_ID)) {
+        return Err(DerivationPipelineError::L1MessageTransactionInBatch)
+    }
+
+    Ok(())
 }
 
 /// Returns an iterator over L1 messages from the `PayloadData`. If the `PayloadData` returns a
@@ -498,6 +512,16 @@ mod tests {
             input: bytes!("8ef1332e0000000000000000000000007f2b8c31f88b6006c382775eea88297ec1e3e9050000000000000000000000006ea73e05adc79974b931123675ea8f78ffdacdf000000000000000000000000000000000000000000000000000470de4df820000000000000000000000000000000000000000000000000000000000000000002200000000000000000000000000000000000000000000000000000000000000a000000000000000000000000000000000000000000000000000000000000000a4232e8748000000000000000000000000982fe4a7cbd74bb3422ebe46333c3e8046c12c7f000000000000000000000000982fe4a7cbd74bb3422ebe46333c3e8046c12c7f00000000000000000000000000000000000000000000000000470de4df8200000000000000000000000000000000000000000000000000000000000000000080000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"),
         },
     };
+
+    #[test]
+    fn test_should_reject_l1_message_transaction_from_batch_data() {
+        let transactions = vec![Bytes::from_static(&[L1_MESSAGE_TX_TYPE_ID, 0xc0])];
+
+        assert!(matches!(
+            ensure_batch_contains_only_l2_transactions(&transactions),
+            Err(DerivationPipelineError::L1MessageTransactionInBatch)
+        ));
+    }
 
     #[tokio::test]
     async fn test_should_retry_on_derivation_error() -> eyre::Result<()> {

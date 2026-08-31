@@ -51,7 +51,7 @@ pub fn decode_v0(calldata: &[u8]) -> Result<Batch, DecodingError> {
             for _ in 0..transactions_count {
                 // skip the 4 bytes representing the transaction length.
                 buf.advance(4);
-                let tx = Transaction::try_from_buf(buf).ok_or(DecodingError::Eof)?;
+                let tx = Transaction::try_from_buf(buf)?;
                 transactions.push(tx.0);
             }
             l2_blocks.push(L2Block::new(transactions, context.into()))

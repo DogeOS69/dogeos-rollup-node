@@ -98,7 +98,7 @@ pub(crate) fn decode_v1_chunk(
             let transactions_count = context.transactions_count();
             let mut transactions = Vec::with_capacity(transactions_count);
             for _ in 0..transactions_count {
-                let tx = Transaction::try_from_buf(blob).ok_or(DecodingError::Eof)?;
+                let tx = Transaction::try_from_buf(blob)?;
                 transactions.push(tx.0);
             }
 

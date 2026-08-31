@@ -5,6 +5,9 @@ use scroll_db::DatabaseError;
 /// An error occurred during the derivation process.
 #[derive(Debug, thiserror::Error)]
 pub enum DerivationPipelineError {
+    /// Batch data unexpectedly contains an L1-message transaction.
+    #[error("batch data contains an L1-message transaction")]
+    L1MessageTransactionInBatch,
     /// Missing L1 messages cursor.
     #[error("missing l1 message queue cursor")]
     MissingL1MessageQueueCursor,

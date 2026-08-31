@@ -55,6 +55,7 @@ pub(crate) enum AttemptStep {
 enum HoldStatus {
     Syncing,
     Accepted,
+    Invalid,
 }
 
 impl HoldStatus {
@@ -62,14 +63,16 @@ impl HoldStatus {
         match self {
             Self::Syncing => "SYNCING",
             Self::Accepted => "ACCEPTED",
+            Self::Invalid => "INVALID",
         }
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct HoldReason {
     method: &'static str,
     status: HoldStatus,
+    detail: Option<String>,
 }
 
 #[derive(Debug)]
@@ -196,7 +199,7 @@ impl DerivationDriver {
                 let backoff = hold_backoff(attempt);
                 let backoff_ms = saturating_millis(backoff);
                 let pending = self.pending.as_mut().expect("held batch remains owned");
-                pending.last_hold = Some(reason);
+                pending.last_hold = Some(reason.clone());
                 pending.current_backoff_ms = Some(backoff_ms);
                 self.attempt_sleep =
                     Some(Box::pin(tokio::time::sleep_until(Instant::now() + backoff)));
@@ -209,6 +212,7 @@ impl DerivationDriver {
                     backoff_ms,
                     method = reason.method,
                     status = reason.status.as_str(),
+                    detail = reason.detail.as_deref(),
                     "Engine is not ready for derived batch; holding in place"
                 );
                 AttemptStep::Held
@@ -317,10 +321,18 @@ impl DerivationDriver {
                 batch_hash: pending.batch.batch_info.hash,
                 attempts_started: pending.attempts_started,
                 held_duration_ms: saturating_millis(pending.held_since.elapsed()),
-                last_engine_method: pending.last_hold.map(|reason| reason.method.to_string()),
+                last_engine_method: pending
+                    .last_hold
+                    .as_ref()
+                    .map(|reason| reason.method.to_string()),
                 last_engine_status: pending
                     .last_hold
+                    .as_ref()
                     .map(|reason| reason.status.as_str().to_string()),
+                last_engine_error: pending
+                    .last_hold
+                    .as_ref()
+                    .and_then(|reason| reason.detail.clone()),
                 current_backoff_ms: pending.current_backoff_ms,
                 queued_behind: queued,
             }),
@@ -447,7 +459,7 @@ where
                     .new_payload(payload)
                     .await
                     .map_err(engine_request_failure(batch_info, NEW_PAYLOAD_METHOD))?;
-                classify_new_payload(payload_status, batch_info, block_info.block_info.number)?;
+                classify_new_payload(payload_status, block_info.block_info.number)?;
 
                 let finalized = target_status.is_finalized().then_some(block_info.block_info);
                 let final_fcu = engine
@@ -514,37 +526,31 @@ fn classify_build_fcu(
         PayloadStatusEnum::Syncing => Err(AttemptFailure::Hold(HoldReason {
             method: BUILD_FCU_METHOD,
             status: HoldStatus::Syncing,
+            detail: None,
         })),
         PayloadStatusEnum::Accepted => {
             Err(unexpected_status(batch_info, BUILD_FCU_METHOD, "ACCEPTED"))
         }
-        PayloadStatusEnum::Invalid { validation_error } => Err(invalid_status(
-            batch_info,
-            BUILD_FCU_METHOD,
-            None,
-            latest_valid_hash,
-            validation_error,
-        )),
+        PayloadStatusEnum::Invalid { validation_error } => {
+            Err(hold_invalid_status(BUILD_FCU_METHOD, None, latest_valid_hash, validation_error))
+        }
     }
 }
 
-fn classify_new_payload(
-    response: PayloadStatus,
-    batch_info: BatchInfo,
-    block_number: u64,
-) -> Result<(), AttemptFailure> {
+fn classify_new_payload(response: PayloadStatus, block_number: u64) -> Result<(), AttemptFailure> {
     match response.status {
         PayloadStatusEnum::Valid => Ok(()),
         PayloadStatusEnum::Syncing => Err(AttemptFailure::Hold(HoldReason {
             method: NEW_PAYLOAD_METHOD,
             status: HoldStatus::Syncing,
+            detail: None,
         })),
         PayloadStatusEnum::Accepted => Err(AttemptFailure::Hold(HoldReason {
             method: NEW_PAYLOAD_METHOD,
             status: HoldStatus::Accepted,
+            detail: None,
         })),
-        PayloadStatusEnum::Invalid { validation_error } => Err(invalid_status(
-            batch_info,
+        PayloadStatusEnum::Invalid { validation_error } => Err(hold_invalid_status(
             NEW_PAYLOAD_METHOD,
             Some(block_number),
             response.latest_valid_hash,
@@ -563,10 +569,10 @@ fn classify_checked_fcu(
         PayloadStatusEnum::Syncing => Err(AttemptFailure::Hold(HoldReason {
             method: FCU_METHOD,
             status: HoldStatus::Syncing,
+            detail: None,
         })),
         PayloadStatusEnum::Accepted => Err(unexpected_status(batch_info, FCU_METHOD, "ACCEPTED")),
-        PayloadStatusEnum::Invalid { validation_error } => Err(invalid_status(
-            batch_info,
+        PayloadStatusEnum::Invalid { validation_error } => Err(hold_invalid_status(
             FCU_METHOD,
             block_number,
             response.payload_status.latest_valid_hash,
@@ -587,24 +593,16 @@ fn unexpected_status(
     )
 }
 
-fn invalid_status(
-    batch_info: BatchInfo,
+fn hold_invalid_status(
     method: &'static str,
     block_number: Option<u64>,
     latest_valid_hash: Option<alloy_primitives::B256>,
     validation_error: String,
 ) -> AttemptFailure {
-    AttemptFailure::fatal(
-        method,
-        "INVALID",
-        ChainOrchestratorError::InvalidDerivedPayload {
-            batch_info,
-            method,
-            block_number,
-            latest_valid_hash,
-            validation_error,
-        },
-    )
+    let detail = format!(
+        "block_number={block_number:?}, latest_valid_hash={latest_valid_hash:?}, validation_error={validation_error}"
+    );
+    AttemptFailure::Hold(HoldReason { method, status: HoldStatus::Invalid, detail: Some(detail) })
 }
 
 #[cfg(test)]
@@ -633,6 +631,7 @@ mod tests {
     #[derive(Clone, Copy)]
     enum HoldBoundary {
         BuildFcuSyncing,
+        BuildFcuInvalid,
         NewPayloadSyncing,
         NewPayloadAccepted,
         FinalFcuSyncing,
@@ -746,11 +745,13 @@ mod tests {
         let valid_fcu = || fcu(PayloadStatusEnum::Valid, None);
 
         match boundary {
-            HoldBoundary::BuildFcuSyncing => {
-                client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(
-                    PayloadStatusEnum::Syncing,
-                    None,
-                )));
+            HoldBoundary::BuildFcuSyncing | HoldBoundary::BuildFcuInvalid => {
+                let status = if matches!(boundary, HoldBoundary::BuildFcuSyncing) {
+                    PayloadStatusEnum::Syncing
+                } else {
+                    PayloadStatusEnum::Invalid { validation_error: "invalid timestamp".to_string() }
+                };
+                client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(status, None)));
                 client.push_fork_choice_updated(ScriptedResponse::Ok(valid_build()));
                 client.push_get_payload(ScriptedResponse::Ok(payload(SAFE + 1)));
                 client.push_new_payload(ScriptedResponse::Ok(payload_status(
@@ -820,6 +821,18 @@ mod tests {
             Some(BatchStatus::Committed),
             "a hold must not commit a partial consolidation outcome"
         );
+        if matches!(boundary, HoldBoundary::BuildFcuInvalid) {
+            let DerivationStatus::Held(status) = driver.status(0) else {
+                panic!("invalid Engine response must remain observable as a held batch")
+            };
+            assert_eq!(status.last_engine_method.as_deref(), Some(BUILD_FCU_METHOD));
+            assert_eq!(status.last_engine_status.as_deref(), Some("INVALID"));
+            assert!(status
+                .last_engine_error
+                .as_deref()
+                .is_some_and(|detail| detail.contains("invalid timestamp")));
+            assert_eq!(status.current_backoff_ms, Some(INITIAL_HOLD_BACKOFF_MS));
+        }
 
         make_attempt_due(&mut driver);
         driver.wait_for_attempt().await;
@@ -854,6 +867,11 @@ mod tests {
     #[tokio::test]
     async fn build_fcu_syncing_holds_then_completes_once() {
         assert_hold_then_complete(HoldBoundary::BuildFcuSyncing).await;
+    }
+
+    #[tokio::test]
+    async fn build_fcu_invalid_holds_then_completes_once() {
+        assert_hold_then_complete(HoldBoundary::BuildFcuInvalid).await;
     }
 
     #[tokio::test]
@@ -997,10 +1015,6 @@ mod tests {
                 assert_eq!(actual.method, method);
                 assert_eq!(actual.outcome, outcome);
                 match outcome {
-                    "INVALID" => assert!(matches!(
-                        *actual.error,
-                        ChainOrchestratorError::InvalidDerivedPayload { .. }
-                    )),
                     "ACCEPTED" => assert!(matches!(
                         *actual.error,
                         ChainOrchestratorError::UnexpectedDerivedPayloadStatus { .. }
@@ -1044,7 +1058,10 @@ mod tests {
             ),
             (
                 fcu(PayloadStatusEnum::Invalid { validation_error: "invalid build".into() }, None),
-                ExpectedClassification::Fatal { method: BUILD_FCU_METHOD, outcome: "INVALID" },
+                ExpectedClassification::Hold {
+                    method: BUILD_FCU_METHOD,
+                    status: HoldStatus::Invalid,
+                },
             ),
         ] {
             assert_classification(classify_build_fcu(response, batch_info), expected);
@@ -1070,10 +1087,13 @@ mod tests {
                 payload_status(PayloadStatusEnum::Invalid {
                     validation_error: "invalid payload".into(),
                 }),
-                ExpectedClassification::Fatal { method: NEW_PAYLOAD_METHOD, outcome: "INVALID" },
+                ExpectedClassification::Hold {
+                    method: NEW_PAYLOAD_METHOD,
+                    status: HoldStatus::Invalid,
+                },
             ),
         ] {
-            assert_classification(classify_new_payload(response, batch_info, SAFE + 1), expected);
+            assert_classification(classify_new_payload(response, SAFE + 1), expected);
         }
 
         for (response, expected) in [
@@ -1088,7 +1108,7 @@ mod tests {
             ),
             (
                 fcu(PayloadStatusEnum::Invalid { validation_error: "invalid fcu".into() }, None),
-                ExpectedClassification::Fatal { method: FCU_METHOD, outcome: "INVALID" },
+                ExpectedClassification::Hold { method: FCU_METHOD, status: HoldStatus::Invalid },
             ),
         ] {
             assert_classification(
@@ -1100,16 +1120,7 @@ mod tests {
 
     #[tokio::test]
     async fn terminal_build_fcu_outcomes_fail_stop() {
-        let cases = [
-            fcu(
-                PayloadStatusEnum::Invalid {
-                    validation_error: "invalid derived payload".to_string(),
-                },
-                None,
-            ),
-            fcu(PayloadStatusEnum::Valid, None),
-            fcu(PayloadStatusEnum::Accepted, None),
-        ];
+        let cases = [fcu(PayloadStatusEnum::Valid, None), fcu(PayloadStatusEnum::Accepted, None)];
 
         for (offset, response) in cases.into_iter().enumerate() {
             let index = offset as u64 + 1;

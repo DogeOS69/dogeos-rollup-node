@@ -81,8 +81,10 @@ pub struct HeldBatchStatus {
     pub held_duration_ms: u64,
     /// The Engine method that most recently caused a hold, if an attempt has reached one.
     pub last_engine_method: Option<String>,
-    /// The most recently received hold status (`SYNCING` or `ACCEPTED`).
+    /// The most recently received hold status (`SYNCING`, `ACCEPTED`, or `INVALID`).
     pub last_engine_status: Option<String>,
+    /// Validation details supplied by the Engine for an `INVALID` response.
+    pub last_engine_error: Option<String>,
     /// The full delay scheduled before the next attempt, when backing off.
     pub current_backoff_ms: Option<u64>,
     /// The number of pipeline batches queued behind the held batch.
@@ -135,6 +137,7 @@ mod tests {
                 held_duration_ms: 9_000,
                 last_engine_method: Some("newPayload".to_string()),
                 last_engine_status: Some("ACCEPTED".to_string()),
+                last_engine_error: None,
                 current_backoff_ms: Some(8_000),
                 queued_behind: 2,
             }),

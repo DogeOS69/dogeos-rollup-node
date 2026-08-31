@@ -111,22 +111,6 @@ pub enum ChainOrchestratorError {
         /// The terminal Engine status.
         status: &'static str,
     },
-    /// The Engine rejected a derived payload or forkchoice update as invalid.
-    #[error(
-        "Engine returned INVALID during {method} for derived batch {batch_info:?} at block {block_number:?}: latest_valid_hash={latest_valid_hash:?}, validation_error={validation_error}"
-    )]
-    InvalidDerivedPayload {
-        /// The batch being reconciled.
-        batch_info: BatchInfo,
-        /// The Engine method that returned `INVALID`.
-        method: &'static str,
-        /// The affected block number, when already known.
-        block_number: Option<u64>,
-        /// The latest hash the Engine considers valid.
-        latest_valid_hash: Option<B256>,
-        /// The Engine validation detail.
-        validation_error: String,
-    },
     /// Attempted to reorg a batch but the safe block number does not match the derived
     /// block number - 1.
     #[error("Attempted to reorg batch {batch_info:?} for derived block number {derived_block_number} but expected safe block number is {safe_block_number} - we expect `safe block number = derived block number - 1`")]

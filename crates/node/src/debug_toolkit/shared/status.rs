@@ -26,6 +26,9 @@ pub(crate) fn print_derivation_status(status: &ChainOrchestratorStatus) {
             {
                 println!("  Engine:    {method} -> {engine_status}");
             }
+            if let Some(error) = &batch.last_engine_error {
+                println!("  Error:     {error}");
+            }
             if let Some(backoff_ms) = batch.current_backoff_ms {
                 println!("  Backoff:   {backoff_ms}ms");
             }

@@ -525,8 +525,12 @@ impl<
                 }
             }
             ChainOrchestratorCommand::DisableAutomaticSequencing(tx) => {
-                if let Some(sequencer) = self.sequencer.as_mut() {
-                    sequencer.disable();
+                if self.sequencer.is_some() {
+                    // Route the job cancellation through the observable path
+                    // (event + metric closure) before disabling; disable()'s
+                    // own cancel is then a no-op.
+                    self.cancel_payload_building_job("automatic sequencing disabled");
+                    self.sequencer.as_mut().expect("checked above").disable();
                     let _ = tx.send(true);
                 } else {
                     tracing::error!(target: "scroll::chain_orchestrator", "Received DisableAutomaticSequencing command but sequencer is not configured");

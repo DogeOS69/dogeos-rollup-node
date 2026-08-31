@@ -439,7 +439,17 @@ impl<
         match command {
             ChainOrchestratorCommand::BuildBlock => {
                 if let Some(sequencer) = self.sequencer.as_mut() {
-                    sequencer.start_payload_building(&mut self.engine).await?;
+                    // Coalesce with an in-flight job instead of silently
+                    // replacing it: a replaced job discards engine work and
+                    // makes block numbering timing-dependent when the build
+                    // timer and manual triggers race (issue #38). Callers wait
+                    // on BlockSequenced/BlockBuildingSkipped, which the
+                    // in-flight job will emit.
+                    if sequencer.payload_building_job().is_some() {
+                        tracing::debug!(target: "scroll::chain_orchestrator", "BuildBlock requested while a payload building job is in flight; coalescing with the in-flight job");
+                    } else {
+                        sequencer.start_payload_building(&mut self.engine).await?;
+                    }
                 } else {
                     tracing::error!(target: "scroll::chain_orchestrator", "Received BuildBlock command but sequencer is not configured");
                 }

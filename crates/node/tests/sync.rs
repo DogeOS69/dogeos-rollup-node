@@ -752,6 +752,39 @@ async fn test_chain_orchestrator_l1_reorg() -> eyre::Result<()> {
     Ok(())
 }
 
+/// Contract: a manual build request while a payload building job is in flight
+/// coalesces with it — two rapid `build_block()` commands yield exactly one new
+/// block and numbering stays contiguous (issue #38).
+#[allow(clippy::large_stack_frames)]
+#[tokio::test]
+async fn test_manual_build_block_coalesces_with_inflight_job() -> eyre::Result<()> {
+    reth_tracing::init_test_tracing();
+
+    let mut fixture = TestFixture::builder()
+        .sequencer()
+        .with_memory_db()
+        .payload_building_duration(500) // long job so the second command lands mid-flight
+        .allow_empty_blocks(true)
+        .build()
+        .await?;
+
+    fixture.l1().sync().await?;
+
+    // Fire two build commands back-to-back; the second arrives while the
+    // 500ms job from the first is still in flight.
+    fixture.sequencer().rollup_manager_handle.build_block();
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    fixture.sequencer().rollup_manager_handle.build_block();
+
+    // Exactly one block results: number 1.
+    fixture.expect_event().block_sequenced(1).await?;
+
+    // A follow-up build produces number 2 — numbering is contiguous.
+    fixture.build_block().expect_block_number(2).build_and_await_block().await?;
+
+    Ok(())
+}
+
 /// Waits for n events to be emitted.
 ///
 /// Bounded: panics with a diagnosis after 60s instead of hanging the test

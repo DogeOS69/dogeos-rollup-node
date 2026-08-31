@@ -46,25 +46,31 @@ jobs:
           cargo nextest run --all-features --workspace --locked --no-run \
             -E 'test(test_should_consolidate_after_optimistic_sync)'
       - name: Soak optimistic-sync consolidation test (idle)
+        env:
+          # Passed through env, never interpolated into the script body: a
+          # workflow_dispatch input is attacker-influencable text.
+          ITERATIONS: ${{ inputs.iterations || '25' }}
         run: |
           set -euo pipefail
-          ITERS="${{ github.event.inputs.iterations || '25' }}"
-          for i in $(seq "$ITERS"); do
-            echo "::group::idle iteration $i/$ITERS"
+          [[ "$ITERATIONS" =~ ^[0-9]+$ ]] || { echo "::error::iterations must be numeric"; exit 1; }
+          for i in $(seq "$ITERATIONS"); do
+            echo "::group::idle iteration $i/$ITERATIONS"
             cargo nextest run --all-features --workspace --locked \
               -E 'test(test_should_consolidate_after_optimistic_sync)'
             echo "::endgroup::"
           done
       - name: Soak optimistic-sync consolidation test (under CPU contention)
+        env:
+          ITERATIONS: ${{ inputs.iterations || '25' }}
         run: |
           set -euo pipefail
+          [[ "$ITERATIONS" =~ ^[0-9]+$ ]] || { echo "::error::iterations must be numeric"; exit 1; }
           # Saturate most cores to mimic a contended runner — the condition
           # under which the original race fired.
           for c in $(seq 6); do yes > /dev/null & done
           trap 'jobs -p | xargs -r kill 2>/dev/null || true' EXIT
-          ITERS="${{ github.event.inputs.iterations || '25' }}"
-          for i in $(seq "$ITERS"); do
-            echo "::group::loaded iteration $i/$ITERS"
+          for i in $(seq "$ITERATIONS"); do
+            echo "::group::loaded iteration $i/$ITERATIONS"
             cargo nextest run --all-features --workspace --locked \
               -E 'test(test_should_consolidate_after_optimistic_sync)'
             echo "::endgroup::"
@@ -88,10 +94,12 @@ jobs:
       - name: Soak docker remote-source tests
         run: |
           set -euo pipefail
+          # Deliberately NO --no-tests=pass: if a rename ever empties the
+          # filter, this guard must fail loudly instead of soaking nothing.
           for i in 1 2 3; do
             echo "::group::docker iteration $i/3"
             cargo nextest run --all-features --workspace --locked \
-              --no-tests=pass -E 'test(docker_test_remote_block_source)' \
+              -E 'test(docker_test_remote_block_source)' \
               --test-threads=1 --failure-output immediate --success-output never
             echo "::endgroup::"
           done

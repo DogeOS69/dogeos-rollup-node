@@ -93,6 +93,9 @@ pub enum ChainOrchestratorEvent {
     /// Block building was skipped because the built payload was empty and empty blocks are
     /// disabled.
     BlockBuildingSkipped,
+    /// A manual `BuildBlock` command arrived while a payload building job was already in
+    /// flight and was coalesced with it instead of replacing it.
+    BuildBlockCoalesced,
     /// A new block has been signed by the signer.
     SignedBlock {
         /// The signed block.

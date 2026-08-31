@@ -262,8 +262,12 @@ async fn test_should_consolidate_after_optimistic_sync() -> eyre::Result<()> {
     // The exact-number assertions are done; from here the test needs a
     // continuous stream of sequenced blocks (to trigger the follower's
     // optimistic sync and later its consolidation), so enable the automatic
-    // build timer now.
-    sequencer.sequencer().rollup_manager_handle.enable_automatic_sequencing().await?;
+    // build timer now. The command returns false when no sequencer is
+    // configured, which would surface much later as an unrelated timeout.
+    eyre::ensure!(
+        sequencer.sequencer().rollup_manager_handle.enable_automatic_sequencing().await?,
+        "automatic sequencing was not enabled"
+    );
 
     // Connect the nodes together.
     sequencer.sequencer().node.connect(&mut follower.follower(0).node).await;
@@ -753,8 +757,9 @@ async fn test_chain_orchestrator_l1_reorg() -> eyre::Result<()> {
 }
 
 /// Contract: a manual build request while a payload building job is in flight
-/// coalesces with it — two rapid `build_block()` commands yield exactly one new
-/// block and numbering stays contiguous (issue #38).
+/// coalesces with it — observable via the `BuildBlockCoalesced` event, which
+/// the pre-fix replace semantics never emit — and numbering stays contiguous
+/// (issue #38).
 #[allow(clippy::large_stack_frames)]
 #[tokio::test]
 async fn test_manual_build_block_coalesces_with_inflight_job() -> eyre::Result<()> {
@@ -763,23 +768,32 @@ async fn test_manual_build_block_coalesces_with_inflight_job() -> eyre::Result<(
     let mut fixture = TestFixture::builder()
         .sequencer()
         .with_memory_db()
-        .payload_building_duration(500) // long job so the second command lands mid-flight
+        .payload_building_duration(2000) // long job so the second command lands mid-flight
         .allow_empty_blocks(true)
         .build()
         .await?;
 
     fixture.l1().sync().await?;
 
-    // Fire two build commands back-to-back; the second arrives while the
-    // 500ms job from the first is still in flight.
+    // Fire two build commands; the second arrives while the 2s job from the
+    // first is still in flight.
     fixture.sequencer().rollup_manager_handle.build_block();
-    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     fixture.sequencer().rollup_manager_handle.build_block();
+
+    // The second command coalesced with the in-flight job. This event is
+    // emitted before the job completes, so it must arrive ahead of the
+    // BlockSequenced below and the waiter cannot discard that one.
+    fixture
+        .expect_event()
+        .where_event(|e| matches!(e, ChainOrchestratorEvent::BuildBlockCoalesced))
+        .await?;
 
     // Exactly one block results: number 1.
     fixture.expect_event().block_sequenced(1).await?;
 
-    // A follow-up build produces number 2 — numbering is contiguous.
+    // A follow-up build produces number 2 — numbering is contiguous, so the
+    // coalesced command did not spawn a phantom second job.
     fixture.build_block().expect_block_number(2).build_and_await_block().await?;
 
     Ok(())
@@ -810,4 +824,7 @@ async fn wait_n_events(
     .unwrap_or_else(|_| {
         panic!("Timeout (60s) waiting for {total} matching events ({n} still missing)")
     });
+    // The stream ending early falls out of the while-let without the timeout
+    // firing; that must not pass silently either.
+    assert_eq!(n, 0, "event stream ended with {n}/{total} matching events still missing");
 }

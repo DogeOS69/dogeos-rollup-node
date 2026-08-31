@@ -40,6 +40,9 @@ where
     /// block determined — construction must not depend on the remote being up
     /// (issue #38): a connection error at startup used to abort the whole node.
     last_imported_block: Option<u64>,
+    /// Number of consecutive failed poll ticks, used to rate-limit error logs
+    /// while the remote is unreachable.
+    consecutive_failures: u64,
 }
 
 impl<N, P> RemoteBlockSourceAddOn<N, P>
@@ -82,6 +85,7 @@ where
             remote,
             provider,
             last_imported_block: None,
+            consecutive_failures: 0,
         })
     }
 
@@ -136,8 +140,26 @@ where
                 biased;
                 _guard = &mut shutdown => break,
                 _ = poll_interval.tick() => {
-                    if let Err(e) = self.follow_and_build().await {
-                        tracing::error!(target: "scroll::remote_source", ?e, "Sync error");
+                    match self.follow_and_build().await {
+                        Ok(()) => self.consecutive_failures = 0,
+                        Err(e) => {
+                            self.consecutive_failures += 1;
+                            // Log the first failure and then every 50th: at the
+                            // default 100ms poll interval an unreachable remote
+                            // would otherwise emit ~10 identical lines/second.
+                            if self.consecutive_failures == 1 ||
+                                self.consecutive_failures.is_multiple_of(50)
+                            {
+                                tracing::error!(
+                                    target: "scroll::remote_source",
+                                    ?e,
+                                    consecutive_failures = self.consecutive_failures,
+                                    initialized = self.last_imported_block.is_some(),
+                                    url = ?self.config.url,
+                                    "Sync error"
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -236,29 +258,45 @@ where
             // Trigger block building on top of the imported block
             self.orchestrator_handle.build_block();
 
-            // Wait for BlockSequenced event
+            // Wait for the build outcome, bounded: the job we attached to can
+            // be cancelled without any event (L1 reorg, chain import,
+            // sequencing disabled), and an unbounded wait here would stall the
+            // add-on forever. On elapse we bail out of this tick; the poll
+            // loop retries and `last_imported_block` keeps the resume point.
             tracing::debug!(target: "scroll::remote_source", "Waiting for block to be built...");
-            loop {
-                match self.events.next().await {
-                    Some(ChainOrchestratorEvent::BlockSequenced(block)) => {
-                        tracing::info!(target: "scroll::remote_source",
-                            block_number = block.header.number,
-                            block_hash = ?block.hash_slow(),
-                            "Block built successfully, proceeding to next");
-                        break;
-                    }
-                    Some(ChainOrchestratorEvent::BlockBuildingSkipped) => {
-                        tracing::debug!(target: "scroll::remote_source", "Block building skipped (empty block)");
-                        break;
-                    }
-                    Some(_) => {
-                        // Ignore other events, keep waiting
-                    }
-                    None => {
-                        return Err(eyre::eyre!("Event stream ended unexpectedly"));
+            let wait_budget =
+                Duration::from_millis(self.config.poll_interval_ms.saturating_mul(100));
+            let events = &mut self.events;
+            tokio::time::timeout(wait_budget, async {
+                loop {
+                    match events.next().await {
+                        Some(ChainOrchestratorEvent::BlockSequenced(block)) => {
+                            tracing::info!(target: "scroll::remote_source",
+                                block_number = block.header.number,
+                                block_hash = ?block.hash_slow(),
+                                "Block built successfully, proceeding to next");
+                            break Ok(());
+                        }
+                        Some(ChainOrchestratorEvent::BlockBuildingSkipped) => {
+                            tracing::debug!(target: "scroll::remote_source", "Block building skipped (empty block)");
+                            break Ok(());
+                        }
+                        Some(_) => {
+                            // Ignore other events, keep waiting
+                        }
+                        None => {
+                            break Err(eyre::eyre!("Event stream ended unexpectedly"));
+                        }
                     }
                 }
-            }
+            })
+            .await
+            .map_err(|_| {
+                eyre::eyre!(
+                    "Timed out after {wait_budget:?} waiting for the build outcome; \
+                     the payload building job was likely cancelled"
+                )
+            })??;
 
             // Loop continues to process next block
         }

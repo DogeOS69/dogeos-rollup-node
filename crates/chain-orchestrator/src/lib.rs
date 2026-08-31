@@ -442,11 +442,19 @@ impl<
                     // Coalesce with an in-flight job instead of silently
                     // replacing it: a replaced job discards engine work and
                     // makes block numbering timing-dependent when the build
-                    // timer and manual triggers race (issue #38). Callers wait
-                    // on BlockSequenced/BlockBuildingSkipped, which the
-                    // in-flight job will emit.
+                    // timer and manual triggers race (issue #38). The in-flight
+                    // job usually emits BlockSequenced/BlockBuildingSkipped,
+                    // but it can also be cancelled (L1 reorg, chain import,
+                    // sequencing disabled) and then emits nothing — waiters
+                    // must bound their wait (the remote block source does).
                     if sequencer.payload_building_job().is_some() {
-                        tracing::debug!(target: "scroll::chain_orchestrator", "BuildBlock requested while a payload building job is in flight; coalescing with the in-flight job");
+                        tracing::debug!(
+                            target: "scroll::chain_orchestrator",
+                            synced = self.sync_state.is_synced(),
+                            pending_derivation = self.has_pending_derivation_work(),
+                            "BuildBlock requested while a payload building job is in flight; coalescing with the in-flight job"
+                        );
+                        self.notify(ChainOrchestratorEvent::BuildBlockCoalesced);
                     } else {
                         sequencer.start_payload_building(&mut self.engine).await?;
                     }
@@ -1265,6 +1273,14 @@ impl<
                 ));
                 return Err(ChainOrchestratorError::InvalidBlock);
             }
+        }
+
+        // Cancel any in-flight payload building job before advancing the head:
+        // its attributes were fixed against the pre-import head, and finalizing
+        // it after this FCS update would reorg the imported chain back out via
+        // a stale side chain (mirrors the cancellation in handle_l1_reorg).
+        if let Some(s) = self.sequencer.as_mut() {
+            s.cancel_payload_building_job();
         }
 
         // Update the FCS to the new head.

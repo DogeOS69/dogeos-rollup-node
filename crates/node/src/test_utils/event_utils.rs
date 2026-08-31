@@ -50,14 +50,22 @@ impl<'a> EventWaiter<'a> {
                 }
             })
             .await;
-        let seen = overshoot.load(std::sync::atomic::Ordering::Relaxed);
-        if result.is_err() && seen > target {
-            return Err(eyre::eyre!(
-                "Waited for BlockSequenced({target}) but observed BlockSequenced({seen}); \
-                 block numbers are monotone so the target can no longer arrive"
-            ));
-        }
-        result.map(|v| v.first().expect("should have block sequenced").clone())
+        // Wrap (never replace) the underlying error: the wait can also fail
+        // for unrelated reasons (node shutdown, stream ended), and in a
+        // multi-node wait the overshoot may have been seen on a different
+        // node than the one that failed.
+        result.map(|v| v.first().expect("should have block sequenced").clone()).map_err(|e| {
+            let seen = overshoot.load(std::sync::atomic::Ordering::Relaxed);
+            if seen > target {
+                e.wrap_err(format!(
+                    "while waiting for BlockSequenced({target}), BlockSequenced({seen}) was \
+                     observed on one of the waited nodes; numbers are monotone per node, so if \
+                     that node is the incomplete one the target can no longer arrive"
+                ))
+            } else {
+                e
+            }
+        })
     }
 
     /// Wait for chain consolidated event on all specified nodes.
@@ -349,8 +357,12 @@ impl<'a> EventWaiter<'a> {
                     }
                 }
 
-                // Only sleep when nothing was immediately available.
-                if !drained_any {
+                // Only sleep when nothing was immediately available; still
+                // yield after a busy pass so the enclosing timeout can fire
+                // even under a continuous event stream.
+                if drained_any {
+                    tokio::task::yield_now().await;
+                } else {
                     tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
                 }
             }

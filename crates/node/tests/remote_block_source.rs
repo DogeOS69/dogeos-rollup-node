@@ -37,15 +37,40 @@ async fn test_remote_block_source() -> eyre::Result<()> {
 async fn test_remote_source_node_launches_when_remote_unreachable() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    // Reserve a port and free it again: connections to it are now refused.
-    // (Small inherent race: another process could grab the port before the
-    // proxy below binds it; acceptable for a test.)
-    let placeholder = std::net::TcpListener::bind("127.0.0.1:0")?;
-    let proxy_port = placeholder.local_addr()?.port();
-    drop(placeholder);
+    // Bind the "remote" port up-front and hold it for the whole test — no
+    // reserve-then-rebind port race. Until the gate carries the sequencer's
+    // port, every accepted connection is dropped immediately: the client sees
+    // a connection reset, the same non-retryable transport error class as
+    // connection-refused, which aborted node launch pre-fix.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let proxy_port = listener.local_addr()?.port();
+    let (gate_tx, gate_rx) = tokio::sync::watch::channel(None::<u16>);
+    tokio::spawn(async move {
+        loop {
+            let mut inbound = match listener.accept().await {
+                Ok((inbound, _)) => inbound,
+                Err(e) => {
+                    // A transient accept error (e.g. EMFILE under a parallel
+                    // run) must not take the fake remote down permanently.
+                    eprintln!("test proxy accept error: {e}");
+                    continue;
+                }
+            };
+            let Some(port) = *gate_rx.borrow() else {
+                drop(inbound); // remote "not up yet"
+                continue;
+            };
+            let Ok(mut outbound) = tokio::net::TcpStream::connect(("127.0.0.1", port)).await else {
+                continue;
+            };
+            tokio::spawn(async move {
+                let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+            });
+        }
+    });
 
     // Build sequencer + remote-source fixture with the remote URL pointed at
-    // the dead port. Pre-fix this call failed inside launch_add_ons.
+    // the gated port. Pre-fix this call failed inside launch_add_ons.
     let mut fixture = TestFixture::builder()
         .sequencer()
         .remote_source_node()
@@ -61,23 +86,10 @@ async fn test_remote_source_node_launches_when_remote_unreachable() -> eyre::Res
         fixture.build_block().expect_block_number(i).build_and_await_block().await?;
     }
 
-    // Bring the "remote" up: forward the reserved port to the sequencer RPC.
+    // Bring the "remote" up: open the gate to the sequencer RPC.
     let sequencer_port =
         fixture.sequencer().node.rpc_url().port().expect("sequencer rpc url has a port");
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", proxy_port)).await?;
-    tokio::spawn(async move {
-        loop {
-            let Ok((mut inbound, _)) = listener.accept().await else { break };
-            let Ok(mut outbound) =
-                tokio::net::TcpStream::connect(("127.0.0.1", sequencer_port)).await
-            else {
-                continue;
-            };
-            tokio::spawn(async move {
-                let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
-            });
-        }
-    });
+    gate_tx.send(Some(sequencer_port))?;
 
     // Remote source recovers: imports blocks 1-2 and ends up building block 3
     // on top (same event pattern as test_remote_block_source).

@@ -275,8 +275,13 @@ impl std::fmt::Display for BlockConsolidationAction {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_consensus::{Header as ConsensusHeader, Sealable};
     use alloy_primitives::B256;
+    use alloy_provider::ProviderBuilder;
+    use alloy_rpc_types_eth::{Block as RpcBlock, Header as RpcHeader};
+    use alloy_transport::mock::Asserter;
     use dogeos_reth_engine::ScrollPayloadAttributes;
+    use dogeos_rpc_types::ScrollRpcTransaction;
     use scroll_derivation_pipeline::DerivedAttributes;
 
     fn batch(numbers: &[u64]) -> BatchDerivationResult {
@@ -325,5 +330,63 @@ mod tests {
                     actual_block_number == actual
             ));
         }
+    }
+
+    #[tokio::test]
+    async fn parent_mismatch_reorgs_the_remaining_suffix() {
+        let frontier = BlockInfo::new(100, B256::repeat_byte(0x10));
+        let mut batch = batch(&[101, 102, 103]);
+        for attributes in &mut batch.attributes {
+            attributes.attributes.transactions = Some(vec![]);
+        }
+
+        let first_header =
+            ConsensusHeader { parent_hash: frontier.hash, number: 101, ..Default::default() };
+        let first_sealed = first_header.seal_slow();
+        let first_info = BlockInfo::new(101, first_sealed.hash());
+        let first = RpcBlock::<ScrollRpcTransaction, _>::empty(RpcHeader::from_consensus(
+            first_sealed,
+            None,
+            None,
+        ));
+
+        let wrong_parent_header =
+            ConsensusHeader { parent_hash: frontier.hash, number: 102, ..Default::default() };
+        let wrong_parent = RpcBlock::<ScrollRpcTransaction, _>::empty(RpcHeader::from_consensus(
+            wrong_parent_header.seal_slow(),
+            None,
+            None,
+        ));
+
+        // This block would match the last verified parent if considered independently. Once the
+        // previous block mismatches, however, it remains part of the suffix to rebuild.
+        let suffix_header =
+            ConsensusHeader { parent_hash: first_info.hash, number: 103, ..Default::default() };
+        let suffix = RpcBlock::<ScrollRpcTransaction, _>::empty(RpcHeader::from_consensus(
+            suffix_header.seal_slow(),
+            None,
+            None,
+        ));
+
+        let asserter = Asserter::new();
+        asserter.push_success(&Some(first));
+        asserter.push_success(&Some(wrong_parent));
+        asserter.push_success(&Some(suffix));
+        let provider = ProviderBuilder::<_, _, Scroll>::default().connect_mocked_client(asserter);
+        let fcs = ForkchoiceState::new(frontier, frontier, BlockInfo::default());
+
+        let result = reconcile_batch(provider, &batch, &fcs, frontier).await.unwrap();
+        assert_eq!(result.actions.len(), 2);
+        assert!(matches!(
+            &result.actions[0],
+            BlockConsolidationAction::UpdateFcs(block) if block.block_info == first_info
+        ));
+        assert!(matches!(
+            result.actions[1],
+            BlockConsolidationAction::ReorgSuffix {
+                first_attribute_index: 1,
+                expected_parent,
+            } if expected_parent == first_info
+        ));
     }
 }

@@ -85,6 +85,21 @@ RUST_LOG=rollup_node::sequencer=trace,scroll::chain_orchestrator=info \
 
 Expected: a nonzero count — the 20 ms timer is live and colliding with manual builds even in passing runs.
 
+> **Execution finding (2026-08-31):** removing the timer alone (the original
+> Task A2) exposed a second, hidden role it played: its continuous block stream
+> also acted as delivery retries for two one-shot gossips — triggering the
+> follower's optimistic sync right after `connect()`, and landing the
+> consolidation-triggering block while the follower's sync pipeline is busy.
+> With the timer gone those became single-shot and the test timed out on a
+> unit-typed wait. A2 as implemented therefore pairs the timer removal with
+> bounded build-and-check retry loops at both one-shot points (30 × 2 s;
+> assertions unchanged — `chain_extended` already uses >=). Additionally,
+> `wait_n_events` (used by the chain-orchestrator tests in the same file) got a
+> 60 s timeout so an unmet expectation fails with a diagnosis instead of
+> hanging the binary; `test_chain_orchestrator_l1_reorg` was observed hanging
+> exactly that way under parallel-run contention on an unrelated pre-existing
+> race (tracked separately from #38).
+
 ### Task A2: Remove the auto-sequencer from the exact-numbering test
 
 **Files:**

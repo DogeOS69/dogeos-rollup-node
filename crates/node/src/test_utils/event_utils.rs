@@ -34,15 +34,30 @@ impl<'a> EventWaiter<'a> {
 
     /// Wait for block sequenced event on all specified nodes.
     pub async fn block_sequenced(self, target: u64) -> eyre::Result<DogeosBlock> {
-        self.wait_for_event_on_all(|e| {
-            if let ChainOrchestratorEvent::BlockSequenced(block) = e {
-                (block.header.number == target).then(|| block.clone())
-            } else {
-                None
-            }
-        })
-        .await
-        .map(|v| v.first().expect("should have block sequenced").clone())
+        // Block numbers are monotone per node: once a higher number is seen,
+        // the target can never arrive. Record any overshoot so a doomed wait
+        // fails with a diagnosis instead of a silent timeout (issue #38).
+        let overshoot = std::sync::atomic::AtomicU64::new(0);
+        let result = self
+            .wait_for_event_on_all(|e| {
+                if let ChainOrchestratorEvent::BlockSequenced(block) = e {
+                    if block.header.number > target {
+                        overshoot.store(block.header.number, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    (block.header.number == target).then(|| block.clone())
+                } else {
+                    None
+                }
+            })
+            .await;
+        let seen = overshoot.load(std::sync::atomic::Ordering::Relaxed);
+        if result.is_err() && seen > target {
+            return Err(eyre::eyre!(
+                "Waited for BlockSequenced({target}) but observed BlockSequenced({seen}); \
+                 block numbers are monotone so the target can no longer arrive"
+            ));
+        }
+        result.map(|v| v.first().expect("should have block sequenced").clone())
     }
 
     /// Wait for chain consolidated event on all specified nodes.
@@ -287,6 +302,8 @@ impl<'a> EventWaiter<'a> {
 
         let result = timeout(timeout_duration, async {
             loop {
+                let mut drained_any = false;
+
                 // Poll each node's event stream
                 for (idx, &node_index) in node_indices.iter().enumerate() {
                     // Skip nodes that already found their event
@@ -299,8 +316,12 @@ impl<'a> EventWaiter<'a> {
                     })?;
                     let events = &mut node_handle.chain_orchestrator_rx;
 
-                    // Try to get the next event (non-blocking with try_next)
-                    if let Some(event) = events.next().now_or_never() {
+                    // Drain every event that is already available on this node.
+                    // Consuming only one event per sleep cycle (~100 events/s)
+                    // let the lossy broadcast event channel back up and drop
+                    // events under load (issue #38).
+                    while let Some(event) = events.next().now_or_never() {
+                        drained_any = true;
                         match event {
                             Some(event) => {
                                 if let Some(value) = extractor(&event) {
@@ -314,6 +335,8 @@ impl<'a> EventWaiter<'a> {
                                             .map(|r| r.unwrap())
                                             .collect::<Vec<T>>());
                                     }
+                                    // This node is done; move to the next node.
+                                    break;
                                 }
                             }
                             None => {
@@ -326,8 +349,10 @@ impl<'a> EventWaiter<'a> {
                     }
                 }
 
-                // Small delay to avoid busy waiting
-                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                // Only sleep when nothing was immediately available.
+                if !drained_any {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                }
             }
         })
         .await;

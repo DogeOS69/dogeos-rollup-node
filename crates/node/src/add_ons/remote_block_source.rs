@@ -7,7 +7,7 @@ use alloy_provider::{Provider, ProviderBuilder, RootProvider};
 use alloy_rpc_client::RpcClient;
 use alloy_transport::layers::RetryBackoffLayer;
 use dogeos_rpc_types::Scroll;
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use reth_network_api::{FullNetwork, PeerId};
 use reth_provider::BlockReader;
 use reth_tokio_util::EventStream;
@@ -43,6 +43,12 @@ where
     /// Number of consecutive failed poll ticks, used to rate-limit error logs
     /// while the remote is unreachable.
     consecutive_failures: u64,
+    /// Whether a requested build is still owed its outcome. Set before a
+    /// `BuildBlock` command and cleared once the outcome arrives; if the
+    /// awaited job is cancelled (its outcome never arrives), the build is
+    /// re-issued on the next poll tick instead of being lost — the import
+    /// that requested it has already advanced `last_imported_block`.
+    pending_build: bool,
 }
 
 impl<N, P> RemoteBlockSourceAddOn<N, P>
@@ -86,6 +92,7 @@ where
             provider,
             last_imported_block: None,
             consecutive_failures: 0,
+            pending_build: false,
         })
     }
 
@@ -168,12 +175,86 @@ where
         Ok(())
     }
 
+    /// Triggers block building on top of the current head and waits (bounded)
+    /// for the outcome.
+    ///
+    /// Stale outcomes queued by earlier requests are drained first, and a
+    /// `BlockSequenced` is only accepted for `expected_number`, so an outcome
+    /// from a previous build cannot be attributed to this request. The wait is
+    /// bounded because the job the command attaches to can be cancelled
+    /// without any event (L1 reorg, chain import, sequencing disabled);
+    /// `pending_build` stays set in that case so the build is re-issued on the
+    /// next poll tick.
+    async fn trigger_build_and_await(&mut self, expected_number: u64) -> eyre::Result<()> {
+        // Drop build outcomes left over from earlier requests (e.g. a build
+        // that completed after its wait timed out).
+        while let Some(event) = self.events.next().now_or_never() {
+            if event.is_none() {
+                return Err(eyre::eyre!("Event stream ended unexpectedly"));
+            }
+        }
+
+        self.pending_build = true;
+        self.orchestrator_handle.build_block();
+
+        tracing::debug!(target: "scroll::remote_source", expected_number, "Waiting for block to be built...");
+        let wait_budget = Duration::from_millis(self.config.poll_interval_ms.saturating_mul(100));
+        let events = &mut self.events;
+        tokio::time::timeout(wait_budget, async {
+            loop {
+                match events.next().await {
+                    Some(ChainOrchestratorEvent::BlockSequenced(block))
+                        if block.header.number == expected_number =>
+                    {
+                        tracing::info!(target: "scroll::remote_source",
+                            block_number = block.header.number,
+                            block_hash = ?block.hash_slow(),
+                            "Block built successfully, proceeding to next");
+                        break Ok(());
+                    }
+                    Some(ChainOrchestratorEvent::BlockBuildingSkipped) => {
+                        tracing::debug!(target: "scroll::remote_source", "Block building skipped (empty block)");
+                        break Ok(());
+                    }
+                    Some(_) => {
+                        // Ignore other events, keep waiting
+                    }
+                    None => {
+                        break Err(eyre::eyre!("Event stream ended unexpectedly"));
+                    }
+                }
+            }
+        })
+        .await
+        .map_err(|_| {
+            eyre::eyre!(
+                "Timed out after {wait_budget:?} waiting for the build outcome of block \
+                 {expected_number}; the payload building job was likely cancelled"
+            )
+        })??;
+
+        self.pending_build = false;
+        Ok(())
+    }
+
     /// Follows the remote node and builds blocks on top of imported blocks.
     async fn follow_and_build(&mut self) -> eyre::Result<()> {
         // First successful contact with the remote determines the resume point.
         if self.last_imported_block.is_none() {
             let resume = self.init_last_imported_block().await?;
             self.last_imported_block = Some(resume);
+        }
+
+        // A build owed from a previous tick is re-issued before importing
+        // anything else: its import already advanced `last_imported_block`,
+        // so without this the head comparison below would report "synced" and
+        // the requested block would be lost. The expected number is derived
+        // from the current head — the cancellation that voided the previous
+        // attempt may itself have moved it.
+        if self.pending_build {
+            let expected =
+                self.orchestrator_handle.status().await?.l2.fcs.head_block_info().number + 1;
+            self.trigger_build_and_await(expected).await?;
         }
 
         loop {
@@ -255,48 +336,9 @@ where
                 continue;
             }
 
-            // Trigger block building on top of the imported block
-            self.orchestrator_handle.build_block();
-
-            // Wait for the build outcome, bounded: the job we attached to can
-            // be cancelled without any event (L1 reorg, chain import,
-            // sequencing disabled), and an unbounded wait here would stall the
-            // add-on forever. On elapse we bail out of this tick; the poll
-            // loop retries and `last_imported_block` keeps the resume point.
-            tracing::debug!(target: "scroll::remote_source", "Waiting for block to be built...");
-            let wait_budget =
-                Duration::from_millis(self.config.poll_interval_ms.saturating_mul(100));
-            let events = &mut self.events;
-            tokio::time::timeout(wait_budget, async {
-                loop {
-                    match events.next().await {
-                        Some(ChainOrchestratorEvent::BlockSequenced(block)) => {
-                            tracing::info!(target: "scroll::remote_source",
-                                block_number = block.header.number,
-                                block_hash = ?block.hash_slow(),
-                                "Block built successfully, proceeding to next");
-                            break Ok(());
-                        }
-                        Some(ChainOrchestratorEvent::BlockBuildingSkipped) => {
-                            tracing::debug!(target: "scroll::remote_source", "Block building skipped (empty block)");
-                            break Ok(());
-                        }
-                        Some(_) => {
-                            // Ignore other events, keep waiting
-                        }
-                        None => {
-                            break Err(eyre::eyre!("Event stream ended unexpectedly"));
-                        }
-                    }
-                }
-            })
-            .await
-            .map_err(|_| {
-                eyre::eyre!(
-                    "Timed out after {wait_budget:?} waiting for the build outcome; \
-                     the payload building job was likely cancelled"
-                )
-            })??;
+            // Trigger block building on top of the imported block and wait
+            // (bounded, identity-matched) for the outcome.
+            self.trigger_build_and_await(next_block_num + 1).await?;
 
             // Loop continues to process next block
         }

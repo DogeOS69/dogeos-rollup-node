@@ -829,6 +829,6 @@ and 10 serial iterations of the two `docker_test_remote_block_source_*` tests in
 
 ## Self-review notes
 
-- Spec coverage: defect 1 → A1-A5; defect 2 → B1-B3; defect 3 → C1-C3; acceptance-evidence criterion → D1; "no timeout-only workaround" → no timeout was raised anywhere; assertions untouched (A2 removes an incidental config, not an assertion).
+- Spec coverage: defect 1 → A1-A5; defect 2 → B1-B3; defect 3 → C1-C3; acceptance-evidence criterion → D1; "no timeout-only workaround" → no existing timeout was raised or loosened anywhere. (The implementation did *add* bounded waits where waits could previously hang forever — `wait_n_events` and, after review, the remote block source's build-outcome wait with a pending-build retry — these convert silent hangs into diagnosed failures/retries rather than masking a root cause.) Assertions untouched (A2 removes an incidental config, not an assertion).
 - The one acceptance criterion this plan reads narrowly is "Sync workflow validates required configuration before the expensive Rust build": C1 satisfies it literally, and C3 goes further because the investigation showed the workflow still cannot pass with the secret present; if the team prefers to keep the push trigger red instead of gating, drop C3 Step 1 and keep Steps 2-3.
 - Type consistency: `last_imported_block: Option<u64>` is introduced in B2 and only read there; `remote_source_url` builder method is introduced in B1 Step 1 and consumed in B1 Step 2.

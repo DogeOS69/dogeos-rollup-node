@@ -414,9 +414,16 @@ where
             ChainOrchestratorError::DatabaseError(error),
         )
     })?;
-    let reconciliation = reconcile_batch(l2_client, batch, engine.fcs(), frontier)
-        .await
-        .map_err(|error| AttemptFailure::fatal("reconcileBatch", "ERROR", error))?;
+    let reconciliation =
+        reconcile_batch(l2_client, batch, engine.fcs(), frontier).await.map_err(|error| {
+            let outcome =
+                if matches!(error, ChainOrchestratorError::InvalidDerivedBlockSequence { .. }) {
+                    "INVALID_BLOCK_SEQUENCE"
+                } else {
+                    "ERROR"
+                };
+            AttemptFailure::fatal("reconcileBatch", outcome, error)
+        })?;
     let target_status = reconciliation.target_status;
     let aggregated = reconciliation.aggregate_actions();
 
@@ -1506,6 +1513,46 @@ mod tests {
                 Some(BatchStatus::Committed)
             );
         }
+    }
+
+    #[tokio::test]
+    async fn gapped_batch_fails_before_l2_or_engine_requests() {
+        let database = setup_database().await;
+        insert_batch(&database, 1, 1, None).await;
+        let client = Arc::new(ScriptedEngineClient::new());
+        let mut engine = engine_at_safe(client.clone());
+        let asserter = Asserter::new();
+        let provider = absent_block_provider(asserter);
+        let mut derived = batch(1, BatchStatus::Consolidated);
+        derived.attributes[0].block_number = SAFE + 51;
+        let mut driver = DerivationDriver::default();
+        driver.hold_batch(derived);
+        driver.wait_for_attempt().await;
+
+        let AttemptStep::Fatal(fatal) = driver.run_attempt(&provider, &mut engine, &database).await
+        else {
+            panic!("a gap after the persisted consolidation frontier must fail-stop")
+        };
+        assert_eq!(fatal.method, "reconcileBatch");
+        assert_eq!(fatal.outcome, "INVALID_BLOCK_SEQUENCE");
+        assert!(matches!(
+            *fatal.error,
+            ChainOrchestratorError::InvalidDerivedBlockSequence {
+                attribute_index: 0,
+                previous_block_number: SAFE,
+                actual_block_number,
+                ..
+            } if actual_block_number == SAFE + 51
+        ));
+        assert_eq!(client.fork_choice_updated_calls(), 0);
+        assert_eq!(client.get_payload_calls(), 0);
+        assert_eq!(client.new_payload_calls(), 0);
+        assert_eq!(*engine.fcs().safe_block_info(), info(SAFE, 0x11));
+        assert!(!driver.can_accept_batch(), "later batches must remain blocked");
+        assert_eq!(
+            database.get_batch_status_by_hash(B256::repeat_byte(1)).await.unwrap(),
+            Some(BatchStatus::Committed)
+        );
     }
 
     #[tokio::test]

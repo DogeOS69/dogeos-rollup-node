@@ -19,6 +19,8 @@ pub(crate) async fn reconcile_batch<L2P: Provider<Scroll>>(
     fcs: &ForkchoiceState,
     frontier: BlockInfo,
 ) -> Result<BatchReconciliationResult, ChainOrchestratorError> {
+    validate_block_sequence(batch, frontier.number)?;
+
     let mut futures = FuturesOrdered::new();
     for attributes in &batch.attributes {
         let l2_provider = &l2_provider;
@@ -38,34 +40,10 @@ pub(crate) async fn reconcile_batch<L2P: Provider<Scroll>>(
     let current_blocks: Vec<_> = futures.try_collect().await?;
     let mut actions = Vec::with_capacity(batch.attributes.len());
     let mut expected_parent = frontier;
-    let mut previous_derived_number: Option<u64> = None;
 
     for (index, (attributes, current_block)) in
         batch.attributes.iter().zip(current_blocks).enumerate()
     {
-        let expected_number = match previous_derived_number {
-            Some(number) => Some(number.saturating_add(1)),
-            None if attributes.block_number > frontier.number => {
-                Some(frontier.number.saturating_add(1))
-            }
-            None => None,
-        };
-        let sequence_is_invalid = match previous_derived_number {
-            Some(number) => number.checked_add(1) != Some(attributes.block_number),
-            None if attributes.block_number > frontier.number => {
-                frontier.number.checked_add(1) != Some(attributes.block_number)
-            }
-            None => false,
-        };
-        if sequence_is_invalid {
-            return Err(ChainOrchestratorError::InvalidDerivedBlockSequence {
-                batch_info: batch.batch_info,
-                expected_block_number: expected_number.expect("invalid sequence has an anchor"),
-                actual_block_number: attributes.block_number,
-            })
-        }
-        previous_derived_number = Some(attributes.block_number);
-
         // A duplicate delivery may replay a batch whose blocks are already covered by the
         // database-backed safe frontier. Verify that prefix against the canonical provider and
         // treat it as idempotently complete; safe history must never be rebuilt.
@@ -135,6 +113,41 @@ pub(crate) async fn reconcile_batch<L2P: Provider<Scroll>>(
         actions,
         target_status: batch.target_status,
     })
+}
+
+/// Validates a derived batch's block-number sequence before issuing any L2 RPCs.
+///
+/// A fresh suffix must start immediately after the database frontier. A replay may start at or
+/// below the frontier, but every subsequent attribute must still be contiguous. This preserves
+/// idempotent reboot/re-delivery while rejecting gaps and duplicates before external work begins.
+fn validate_block_sequence(
+    batch: &BatchDerivationResult,
+    frontier_block_number: u64,
+) -> Result<(), ChainOrchestratorError> {
+    let mut previous_block_number = None;
+
+    for (attribute_index, attributes) in batch.attributes.iter().enumerate() {
+        let anchor = previous_block_number.unwrap_or(frontier_block_number);
+        let invalid = match previous_block_number {
+            Some(previous) => previous.checked_add(1) != Some(attributes.block_number),
+            None if attributes.block_number > frontier_block_number => {
+                frontier_block_number.checked_add(1) != Some(attributes.block_number)
+            }
+            None => false,
+        };
+
+        if invalid {
+            return Err(ChainOrchestratorError::InvalidDerivedBlockSequence {
+                batch_info: batch.batch_info,
+                attribute_index,
+                previous_block_number: anchor,
+                actual_block_number: attributes.block_number,
+            })
+        }
+        previous_block_number = Some(attributes.block_number);
+    }
+
+    Ok(())
 }
 
 /// The result of reconciling a batch with the L2 chain.
@@ -255,6 +268,62 @@ impl std::fmt::Display for BlockConsolidationAction {
                 f,
                 "Reorg derived suffix at index {first_attribute_index} on parent {expected_parent}"
             ),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_primitives::B256;
+    use dogeos_reth_engine::ScrollPayloadAttributes;
+    use scroll_derivation_pipeline::DerivedAttributes;
+
+    fn batch(numbers: &[u64]) -> BatchDerivationResult {
+        BatchDerivationResult {
+            attributes: numbers
+                .iter()
+                .copied()
+                .map(|block_number| DerivedAttributes {
+                    block_number,
+                    attributes: ScrollPayloadAttributes::default(),
+                })
+                .collect(),
+            batch_info: BatchInfo::new(7, B256::repeat_byte(7)),
+            skipped_l1_messages: vec![],
+            target_status: BatchStatus::Consolidated,
+        }
+    }
+
+    #[test]
+    fn block_sequence_accepts_fresh_and_replayed_ranges() {
+        assert!(validate_block_sequence(&batch(&[101, 102, 103]), 100).is_ok());
+        assert!(validate_block_sequence(&batch(&[101, 102]), 102).is_ok());
+        assert!(validate_block_sequence(&batch(&[101, 102, 103]), 102).is_ok());
+        assert!(validate_block_sequence(&batch(&[u64::MAX]), u64::MAX).is_ok());
+        assert!(validate_block_sequence(&batch(&[]), 100).is_ok());
+    }
+
+    #[test]
+    fn block_sequence_rejects_gaps_duplicates_and_overflow() {
+        for (numbers, frontier, attribute_index, previous, actual) in [
+            (vec![102], 100, 0, 100, 102),
+            (vec![101, 103], 100, 1, 101, 103),
+            (vec![101, 101], 100, 1, 101, 101),
+            (vec![u64::MAX, u64::MAX], u64::MAX - 1, 1, u64::MAX, u64::MAX),
+        ] {
+            let error = validate_block_sequence(&batch(&numbers), frontier).unwrap_err();
+            assert!(matches!(
+                error,
+                ChainOrchestratorError::InvalidDerivedBlockSequence {
+                    attribute_index: actual_index,
+                    previous_block_number,
+                    actual_block_number,
+                    ..
+                } if actual_index == attribute_index &&
+                    previous_block_number == previous &&
+                    actual_block_number == actual
+            ));
         }
     }
 }

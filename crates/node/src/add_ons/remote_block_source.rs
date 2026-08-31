@@ -384,15 +384,10 @@ where
             return Ok(());
         }
 
-        let expected = last_imported + 1;
-
-        // The cancellation was already observed (by the wait that set
-        // pending_build_cancelled): the job is provably gone, so re-issuing
-        // now cannot double-build.
-        if std::mem::take(&mut self.pending_build_cancelled) {
-            return self.trigger_build_and_await(expected).await;
-        }
-
+        // Every settlement attempt — a plain wait OR a cancellation-driven
+        // re-issue — consumes the same bounded budget: repeated cancellations
+        // (e.g. payload creation failing every time) must not re-issue
+        // forever and stall imports.
         if self.pending_build_retries >= MAX_PENDING_BUILD_RETRIES {
             self.builds_abandoned += 1;
             tracing::error!(
@@ -407,6 +402,15 @@ where
             return Ok(());
         }
         self.pending_build_retries += 1;
+
+        let expected = last_imported + 1;
+
+        // The cancellation was already observed (by the wait that set
+        // pending_build_cancelled): the job is provably gone, so re-issuing
+        // now cannot double-build.
+        if std::mem::take(&mut self.pending_build_cancelled) {
+            return self.trigger_build_and_await(expected).await;
+        }
 
         match self.await_build_outcome(expected).await? {
             BuildOutcome::Landed => {

@@ -90,7 +90,7 @@ where
     ///
     /// Called on the first successful contact with the remote; a failure here
     /// (e.g. the remote is not up yet) is retried on the next poll tick.
-    async fn init_last_imported_block(&mut self) -> eyre::Result<u64> {
+    async fn init_last_imported_block(&self) -> eyre::Result<u64> {
         let local_head = self.orchestrator_handle.status().await?.l2.fcs.head_block_info().number;
         let remote_head = self.remote.get_block_number().await?;
 

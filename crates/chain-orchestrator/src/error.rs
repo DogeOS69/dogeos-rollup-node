@@ -24,11 +24,11 @@ pub enum ChainOrchestratorError {
     /// on would keep serving from divergent state.
     #[error("fatal state divergence: {0}")]
     FatalStateDivergence(&'static str),
-    /// The engine did not apply a forkchoice update (INVALID, or — for the
-    /// head updates that require VALID — SYNCING) and the command was
-    /// refused. At the `UpdateFcsHead` site nothing has been mutated; at the
-    /// `RevertToL1Block` safe-head site the unwind has already run and the
-    /// run loop escalates this to a fail-stop.
+    /// The engine did not apply a forkchoice update (INVALID or SYNCING —
+    /// both construction sites require VALID) and the command was refused.
+    /// At the `UpdateFcsHead` site nothing has been mutated; at the
+    /// `RevertToL1Block` combined head+safe site the unwind has already run
+    /// and the run loop escalates this to a fail-stop.
     #[error("forkchoice update rejected by the engine: {0}")]
     FcuRejected(&'static str),
     /// An error occurred while trying to fetch the L2 block from the database.

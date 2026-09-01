@@ -135,7 +135,7 @@ jobs:
     # still burn a long job and comment on the fork's own issue #38).
     if: ${{ github.repository == 'DogeOS69/dogeos-rollup-node' }}
     runs-on: blacksmith-8vcpu-ubuntu-2404
-    # Must exceed the SUM of the step budgets (45-minute build + 80-minute
+    # Must exceed the SUM of the step budgets (45-minute build + 100-minute
     # soak) plus checkout/toolchain/cache/Anvil setup, or the job-level cap
     # fires first, cancels the job, and skips the reporter the step-level
     # timeouts exist to protect.
@@ -211,7 +211,7 @@ jobs:
         # always()) keeps a manual RUN cancellation from posting a bogus
         # hang report: it is false only when the job itself is cancelled,
         # while a step-level timeout leaves the job running this reporter.
-        # The job-level 150-minute backstop is NOT reportable from inside
+        # The job-level 170-minute backstop is NOT reportable from inside
         # the job (it cancels every remaining step); it only exists for a
         # hang in a non-soak step. Setup/toolchain failures still must not
         # be reported as regressions.
@@ -251,16 +251,6 @@ jobs:
       - uses: taiki-e/install-action@nextest
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
-      - name: Build test binaries
-        # Step-level: a hung cold build (25-40 min normally) must fail this
-        # step, not ride into the job-level cancel that skips the reporter.
-        # Without this step the full workspace compile would run inside the
-        # soak step's 80-minute cap and a cold-cache night would cap out and
-        # auto-file a FALSE regression report.
-        timeout-minutes: 45
-        run: |
-          cargo nextest run --all-features --workspace --locked --no-run \
-            -E 'test(docker_test_remote_block_source)'
       - name: Verify Docker test disk capacity
         run: |
           set -euo pipefail
@@ -271,6 +261,16 @@ jobs:
             echo "Docker Compose tests require at least 32 GiB free; available_kib=$available_kib" >&2
             exit 1
           fi
+      - name: Build test binaries
+        # Step-level: a hung cold build (25-40 min normally) must fail this
+        # step, not ride into the job-level cancel that skips the reporter.
+        # Without this step the full workspace compile would run inside the
+        # soak step's 80-minute cap and a cold-cache night would cap out and
+        # auto-file a FALSE regression report.
+        timeout-minutes: 45
+        run: |
+          cargo nextest run --all-features --workspace --locked --no-run \
+            -E 'test(docker_test_remote_block_source)'
       - name: Soak docker remote-source tests
         id: soak
         # Step-level timeout: see the idle job's soak step.

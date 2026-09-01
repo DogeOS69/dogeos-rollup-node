@@ -239,11 +239,15 @@ from every pass is either fixed in the PR or recorded here.
     FatalStateDivergence has only definition/raise sites in the tree: the
     forward non-VALID refusal, the rollback three-way outcome (VALID commits
     / SYNCING and INVALID do not / transport error), the post-unwind
-    reorg-FCU INVALID and transport arms, the three post-finalization
-    divergence sites, and the four `handle_outcome(...)?` propagation points
-    have no tests — dropping a single `?` leaves the suite green. The
-    `administrative_post_unwind_engine_failure_fail_stops_without_retry`
-    test is a working `ScriptedEngineClient` template, so these are cheap. The PR's own settlement_decision pattern applies directly:
+    reorg-FCU arms, the remaining post-finalization divergence sites, the
+    pass-28 combined head+safe unwind FCU (assert safe == head in the
+    recorded argument and exactly ONE fork_choice_updated call), and the
+    four `handle_outcome(...)?` propagation points have no tests — dropping
+    a single `?` leaves the suite green. Pass 29 recipe: script a SYNCING
+    FCU via ScriptedEngineClient, drive update_fcs_head, assert the reply is
+    Err, the task alive, and fork_choice_updated_calls() == 1. Extracting
+    settle_owed_build's head fetch into a parameter would likewise make its
+    130-line decision-to-mutation mapping a fixture-free table test. The PR's own settlement_decision pattern applies directly:
     extract the outcome classification into a pure function and table-test
     it.
   - First/most-recent pass: Claude pass 21 (2026-09-01T11:50Z).
@@ -381,6 +385,10 @@ from every pass is either fixed in the PR or recorded here.
   - Why unaddressed: needs a decision between a CLI `--slow-timeout` (version
     -sensitive syntax) and introducing `.config/nextest.toml` (affects local
     runs too); period must comfortably exceed the ~4-minute recovery test.
+    Pass 29 sketch: a four-line `[profile.default] slow-timeout = { period =
+    "60s", terminate-after = 8 }` would also convert every remaining
+    unbounded fixture await (builder().build(), start_node(),
+    node.connect()) into a named test failure with a stack.
   - Suggested Linear title: "ci: bound docker-lane test hangs with a nextest slow-timeout"
 
 - **Confirm `sync` is not a required status check** (repo settings)

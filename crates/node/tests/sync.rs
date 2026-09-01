@@ -824,6 +824,12 @@ async fn test_manual_build_block_coalesces_with_inflight_job() -> eyre::Result<(
         phantom.is_err(),
         "a second job sequenced a block after the coalesced command: {phantom:?}"
     );
+    // Behavioural anchor (the is_err above would also trip on a shut-down
+    // node or closed stream): the chain must still sit exactly at block 1.
+    eyre::ensure!(
+        fixture.get_block(0).await?.header.number == 1,
+        "unexpected head after the coalesced build"
+    );
 
     // A follow-up build produces number 2. (`BuildBlockCoalesced` above is
     // what distinguishes coalescing from the old replace-semantics; a phantom
@@ -954,6 +960,21 @@ async fn test_chain_import_cancels_inflight_payload_job() -> eyre::Result<()> {
         .label("PayloadBuildingJobCancelled promptly after chain import")
         .where_event(|e| matches!(e, ChainOrchestratorEvent::PayloadBuildingJobCancelled))
         .await?;
+
+    // Vacuous-pass guard (this test cannot pre-build — node_a must stay at
+    // genesis for the import to be a clean extension): if the build never
+    // started, the start-failure emission satisfies the wait above, so also
+    // require that the cancelled job sequences NOTHING.
+    let phantom = node_a
+        .expect_event()
+        .timeout(std::time::Duration::from_secs(2))
+        .label("no BlockSequenced after the import-cancelled job")
+        .where_event(|e| matches!(e, ChainOrchestratorEvent::BlockSequenced(_)))
+        .await;
+    eyre::ensure!(
+        phantom.is_err(),
+        "the import-cancelled job still sequenced a block: {phantom:?}"
+    );
 
     // A follow-up build proceeds cleanly on top of the imported block.
     node_a.build_block().expect_block_number(2).build_and_await_block().await?;

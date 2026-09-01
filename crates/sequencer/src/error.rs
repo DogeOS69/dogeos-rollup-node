@@ -22,11 +22,6 @@ pub enum SequencerError {
     /// The engine did not adopt the forkchoice update for the block it itself built.
     #[error("Forkchoice update for the built payload was not VALID")]
     FcuNotValid,
-    /// The payload was committed as the engine head but then failed
-    /// conversion or its hash check — the head has already moved, so this is
-    /// not recoverable by rebuilding.
-    #[error("Built payload committed as the engine head but is unusable")]
-    PayloadCommittedButUnusable,
     /// The sequencer encountered an error when interacting with the L1 message provider.
     #[error("Encountered an error interacting with the L1 message provider: {0}")]
     L1MessageProviderError(#[from] L1ProviderError),

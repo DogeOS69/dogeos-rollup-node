@@ -111,9 +111,8 @@ pub enum ChainOrchestratorEvent {
     /// cancellation); payload
     /// finalization failed; or post-finalization persistence/signing failed. CAUTION for
     /// consumers: on the two post-finalization sites the block WAS built and the FCS head
-    /// has already advanced — and even a finalization-failure emission can follow a
-    /// committed head, because `finalize_payload_building` commits the head via
-    /// `update_fcs_checked` and only then converts and validates the payload. Re-check the head
+    /// has already advanced (a finalization-failure emission is always pre-commit — the
+    /// sequencer converts and validates the payload before its FCU). Re-check the head
     /// before re-issuing a build, or a duplicate block one height up may be produced (the
     /// remote block source's settlement does its head check first for exactly this
     /// reason).

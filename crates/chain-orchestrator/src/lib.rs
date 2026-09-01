@@ -19,7 +19,7 @@ use rollup_node_primitives::{
     L2BlockInfoWithL1Messages,
 };
 use rollup_node_providers::L1MessageProvider;
-use rollup_node_sequencer::{Sequencer, SequencerError, SequencerEvent};
+use rollup_node_sequencer::{Sequencer, SequencerEvent};
 use rollup_node_signer::{SignatureAsBytes, SignerEvent, SignerHandle};
 use rollup_node_watcher::{L1Notification, L1WatcherHandle};
 use scroll_db::{
@@ -417,16 +417,38 @@ impl<
         match event {
             SignerEvent::SignedBlock { block, signature } => {
                 let hash = block.hash_slow();
-                // A stale signer result — the block was imported over or
-                // reorged out while signing ran — must be dropped entirely:
-                // persisting it would rewind the restart anchor, and
-                // announcing it would gossip a non-canonical block.
-                if self.engine.fcs().head_block_info().hash != hash {
+                // Signing is fully asynchronous, so a result can arrive a
+                // slot (or more) late while its block is still canonical —
+                // that must NOT drop the signature, freeze the persisted
+                // head anchor, or stop gossip. Only a block that is no
+                // longer on the canonical chain (reorged out) is demoted to
+                // a signature-only write (hash-keyed, harmless).
+                let head = *self.engine.fcs().head_block_info();
+                let canonical = if hash == head.hash {
+                    true
+                } else if block.header.number < head.number {
+                    matches!(
+                        self.l2_client.get_block_by_number(block.header.number.into()).full().await,
+                        Ok(Some(canonical_block)) if canonical_block.header.hash_slow() == hash
+                    )
+                } else {
+                    false
+                };
+                if !canonical {
                     tracing::warn!(
                         target: "scroll::chain_orchestrator",
                         block_number = block.header.number,
-                        "Dropping a stale signer result (no longer the engine head)"
+                        "Signed block is no longer canonical; keeping its signature, skipping \
+                         the head anchor and the announcement"
                     );
+                    if let Err(err) = self.database.insert_signature(hash, signature).await {
+                        tracing::warn!(
+                            target: "scroll::chain_orchestrator",
+                            block_number = block.header.number,
+                            %err,
+                            "Failed to persist the signature of a non-canonical signed block"
+                        );
+                    }
                     return Ok(None);
                 }
                 if let Err(err) = self
@@ -437,11 +459,11 @@ impl<
                     })
                     .await
                 {
-                    // The signed block sits at the engine head but its head
-                    // number and signature could not be persisted — a restart
-                    // would rewind past it and peers would never see it
-                    // (announce below never runs). Unlike UpdateFcsHead there is
-                    // no compensation available here, so it is fatal directly.
+                    // The signed block is canonical but its head number and
+                    // signature could not be persisted — a restart would
+                    // rewind past it and peers would never see it (announce
+                    // below never runs). Unlike UpdateFcsHead there is no
+                    // compensation available here, so it is fatal directly.
                     tracing::error!(
                         target: "scroll::chain_orchestrator",
                         block_number = block.header.number,
@@ -511,23 +533,10 @@ impl<
                     Err(err) => {
                         self.metric_handler.discard_block_building_recording();
                         self.notify(ChainOrchestratorEvent::PayloadBuildingJobCancelled);
-                        // Pre-commit failures (get_payload, FcuNotValid) are
-                        // recoverable — the head never moved. The dedicated
-                        // post-commit variant is not: the head already
-                        // advanced to a block that will never be signed or
-                        // persisted, the exact divergence the fatal sites
-                        // below name.
-                        if matches!(err, SequencerError::PayloadCommittedButUnusable) {
-                            tracing::error!(
-                                target: "scroll::chain_orchestrator",
-                                %err,
-                                "Payload finalization failed AFTER the engine head moved"
-                            );
-                            return Err(ChainOrchestratorError::FatalStateDivergence(
-                                "built payload committed as the engine head but is unusable; \
-                                 restart re-converges from the persisted state",
-                            ));
-                        }
+                        // Every finalization failure is pre-commit (the
+                        // sequencer converts and validates the payload BEFORE
+                        // its FCU): the head never moved, so this is
+                        // recoverable and the next slot rebuilds.
                         return Err(err.into());
                     }
                 };
@@ -797,14 +806,45 @@ impl<
                 }
             },
             ChainOrchestratorCommand::RevertToL1Block((block_number, tx)) => {
-                // No numeric pre-validation: a target above everything known
-                // is a harmless no-op unwind (and the latest-L1 marker is
-                // only advanced by NewBlock notifications, so comparing
-                // against it refuses legitimate reverts between known batch
-                // blocks — e2e can_revert_to_l1_block). Errors after the
-                // latch below deliberately fail-stop: the L1 index may be
-                // half-unwound and the sync gate can only be reopened by the
-                // watcher reset at the end.
+                // Pre-latch validation: refuse a target below the FINALIZED
+                // L1 block — finalized state is irreversible, and the
+                // combined FCU below would otherwise rewind the head below
+                // the finalized head (SafeBelowFinalized) and fail-stop
+                // AFTER the destructive unwind committed. No UPPER bound is
+                // checked: the latest-L1 marker is not advanced by batch
+                // commits, so it would refuse legitimate reverts (and the
+                // unwind itself moves the marker to the target). Errors
+                // after the latch below deliberately fail-stop: the L1 index
+                // may be half-unwound and the sync gate can only be reopened
+                // by the watcher reset at the end.
+                let finalized_l1 = match self
+                    .database
+                    .tx(|tx| async move { tx.get_finalized_l1_block_number().await })
+                    .await
+                {
+                    Ok(finalized) => finalized,
+                    Err(err) => {
+                        tracing::warn!(
+                            target: "scroll::chain_orchestrator",
+                            block_number,
+                            %err,
+                            "Refusing administrative L1 unwind: could not read the \
+                             finalized L1 block"
+                        );
+                        let _ = tx.send(false);
+                        return Ok(());
+                    }
+                };
+                if block_number < finalized_l1 {
+                    tracing::warn!(
+                        target: "scroll::chain_orchestrator",
+                        block_number,
+                        finalized_l1,
+                        "Refusing administrative L1 unwind below the finalized L1 block"
+                    );
+                    let _ = tx.send(false);
+                    return Ok(());
+                }
                 self.sync_state.l1_mut().set_syncing();
                 // The gate is now closed for the whole administrative re-scan:
                 // a parked job could not be polled to completion, later
@@ -1159,10 +1199,11 @@ impl<
                 (None, Vec::new())
             };
 
-        // If the inflight payload building job carries any L1 messages, cancel it: the unwind
-        // may have deleted messages the job depends on, and `l1_origin` records only the FIRST
-        // included message's L1 block, so a range comparison against it can miss messages from
-        // later L1 blocks in the same payload.
+        // If the inflight payload building job MAY carry L1 messages, cancel it: the unwind
+        // may have deleted messages the job depends on. `l1_origin` is set from the first
+        // CANDIDATE message before the gas filter (so this can fire for a job that included
+        // none — conservative), and it records only the first message's L1 block, so a range
+        // comparison against it could miss messages from later L1 blocks in the same payload.
         if self
             .sequencer
             .as_ref()
@@ -1170,7 +1211,7 @@ impl<
             .flatten()
             .is_some()
         {
-            self.cancel_payload_building_job("L1 reorg while the job carries L1 messages");
+            self.cancel_payload_building_job("L1 reorg while the job may carry L1 messages");
         }
 
         // TODO: Add retry logic
@@ -1267,7 +1308,17 @@ impl<
 
         if finalized_block_info.is_some() {
             tracing::info!(target: "scroll::chain_orchestrator", ?finalized_block_info, "Updating FCS with new finalized block info from L1 finalization");
-            self.engine.update_fcs(None, None, finalized_block_info).await?;
+            let result = self.engine.update_fcs_checked(None, None, finalized_block_info).await?;
+            if !result.is_valid() {
+                // Mirror left unchanged (checked commits only on VALID);
+                // self-heals on the next full FCU — but status must not
+                // advertise a finalized head the EL never adopted.
+                tracing::warn!(
+                    target: "scroll::chain_orchestrator",
+                    ?finalized_block_info,
+                    "Finalized-head FCU was not applied by the engine"
+                );
+            }
         }
 
         for batch in &triggered_batches {
@@ -1382,7 +1433,16 @@ impl<
         // Update the forkchoice state to the new safe block.
         if self.sync_state.is_synced() {
             tracing::info!(target: "scroll::chain_orchestrator", ?safe_block_info, "Updating safe head to block after batch revert");
-            self.engine.update_fcs(None, Some(safe_block_info), None).await?;
+            let result = self.engine.update_fcs_checked(None, Some(safe_block_info), None).await?;
+            if !result.is_valid() {
+                // See the finalized-head FCU above: honest mirror over an
+                // optimistic one.
+                tracing::warn!(
+                    target: "scroll::chain_orchestrator",
+                    ?safe_block_info,
+                    "Post-batch-revert safe-head FCU was not applied by the engine"
+                );
+            }
         }
 
         Ok(Some(ChainOrchestratorEvent::BatchReverted { batch_info, safe_head: safe_block_info }))

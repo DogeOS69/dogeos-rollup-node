@@ -192,6 +192,22 @@ where
         } else {
             tracing::info!(target: "rollup_node::sequencer", "Built payload with id {payload_id:?}, hash: {:#x}, number: {} containing {} transactions.", payload.block_hash, payload.block_number, payload.transactions.len());
             let block_info = BlockInfo { hash: payload.block_hash, number: payload.block_number };
+            let expected_hash = payload.block_hash;
+            // Convert and validate BEFORE committing the head: both are pure
+            // functions of the payload, so a failure here is recoverable
+            // (nothing moved). Ordered the other way, a DETERMINISTIC
+            // conversion failure (e.g. an unmodeled header field after an EL
+            // upgrade) would land after the head commit and crash-loop the
+            // node as an unrecoverable divergence.
+            let ExecutionData { payload, sidecar } =
+                ExecutionData { payload: payload.into(), sidecar: Default::default() };
+            let mut block: DogeosBlock = payload
+                .try_into_block_with_sidecar::<ScrollTransactionSigned>(&sidecar)
+                .map_err(|_| SequencerError::PayloadError)?;
+            block.header.difficulty = U256::ONE;
+            if block.hash_slow() != expected_hash {
+                return Err(SequencerError::PayloadError)
+            }
             // update_fcs_checked commits the FCS mirror only on VALID —
             // plain update_fcs would advance it on SYNCING too, leaving
             // status and every subsequent build based on a block the EL
@@ -203,21 +219,6 @@ where
                 // unchanged. Proceeding would sign and gossip a block the EL
                 // rejected and mark its L1 messages consumed.
                 return Err(SequencerError::FcuNotValid);
-            }
-            let expected_hash = payload.block_hash;
-            let ExecutionData { payload, sidecar } =
-                ExecutionData { payload: payload.into(), sidecar: Default::default() };
-            // POST-COMMIT failures from here down: the head already moved,
-            // so these must carry the dedicated variant the orchestrator
-            // escalates to a fatal divergence (a plain PayloadError reads as
-            // recoverable and would leave the node building on an unsigned,
-            // unpersisted head).
-            let mut block: DogeosBlock = payload
-                .try_into_block_with_sidecar::<ScrollTransactionSigned>(&sidecar)
-                .map_err(|_| SequencerError::PayloadCommittedButUnusable)?;
-            block.header.difficulty = U256::ONE;
-            if block.hash_slow() != expected_hash {
-                return Err(SequencerError::PayloadCommittedButUnusable)
             }
             Ok(Some(block))
         }

@@ -65,6 +65,10 @@ where
     /// keeps one transient rejection from triggering the (potentially long)
     /// ancestor re-walk.
     consecutive_import_rejections: u32,
+    /// Consecutive builds skipped because the orchestrator reported
+    /// not-synced. A latched gate means the node imports but never
+    /// sequences; surfaced with a periodic warning.
+    consecutive_gate_skips: u64,
     /// Number of consecutive failed poll ticks, reported in the error logs.
     consecutive_failures: u64,
     /// Whether a requested build is still owed its outcome. Set before a
@@ -103,6 +107,15 @@ where
 
 /// Consecutive import rejections tolerated before the resume pointer is
 /// re-derived (see `consecutive_import_rejections`).
+/// Upper bound on one poll tick. The remote HTTP client has no request
+/// timeout, so a black-holed connection (NAT/LB idle drop) would otherwise
+/// hang `follow_and_build` forever with ZERO log output — the run loop would
+/// reach neither arm and the poll timer (Delay behavior) would never fire
+/// again. Aborting a tick is safe: the state machine is tick-resumable by
+/// design (imports advance the pointer one by one; an owed build settles on
+/// the next tick).
+const TICK_STALL_BUDGET: Duration = Duration::from_secs(600);
+
 const MAX_IMPORT_REJECTIONS: u32 = 3;
 
 /// After this many consecutive failed settlement attempts for an owed build,
@@ -277,6 +290,7 @@ where
             payload_building_duration_ms,
             last_imported_block: None,
             initialized_once: false,
+            consecutive_gate_skips: 0,
             consecutive_import_rejections: 0,
             consecutive_failures: 0,
             pending_build: false,
@@ -319,7 +333,7 @@ where
     /// retried on the next tick.
     async fn init_last_imported_block(
         &self,
-    ) -> eyre::Result<(u64, alloy_primitives::B256, u64, u64)> {
+    ) -> eyre::Result<(u64, alloy_primitives::B256, u64, u64, bool)> {
         let status =
             self.orchestrator_handle.status().await.map_err(|e| self.classify_recv_error(e))?;
         let local_head = status.l2.fcs.head_block_info().number;
@@ -330,6 +344,10 @@ where
         let floor = start.saturating_sub(MAX_ANCESTOR_LOOKBACK);
         let last_imported_block;
         let resume_hash;
+        // True only when the walk stepped past at least one PRESENT pair of
+        // differing hashes — the one observation that proves a real fork
+        // (a merely lagging remote matches on its first probe).
+        let mut diverged = false;
         let mut search = start;
         loop {
             if search == 0 {
@@ -403,6 +421,7 @@ where
                 (Some(_), Some(_)) => {
                     // Both present, hashes differ: genuinely divergent at this
                     // height — walk down.
+                    diverged = true;
                     if search.is_multiple_of(256) {
                         tracing::info!(
                             target: "scroll::remote_source",
@@ -432,7 +451,7 @@ where
             remote_head,
             "Determined highest common block with remote"
         );
-        Ok((last_imported_block, resume_hash, local_head, local_safe))
+        Ok((last_imported_block, resume_hash, local_head, local_safe, diverged))
     }
 
     /// Runs the remote block source until shutdown.
@@ -458,7 +477,14 @@ where
                     let result = tokio::select! {
                         biased;
                         _guard = &mut shutdown => break,
-                        r = self.follow_and_build() => r,
+                        r = tokio::time::timeout(TICK_STALL_BUDGET, self.follow_and_build()) => {
+                            r.unwrap_or_else(|_| {
+                                Err(eyre::eyre!(
+                                    "poll tick stalled for {TICK_STALL_BUDGET:?} (remote \
+                                     connection black-holed?); retrying"
+                                ))
+                            })
+                        }
                     };
                     match result {
                         Ok(()) => {
@@ -634,8 +660,16 @@ where
                 // and drops events, so the awaited outcome may already be
                 // gone. Re-subscribe so the NEXT wait starts on a fresh,
                 // unlagged stream before surfacing the timeout.
-                if let Ok(fresh) = self.orchestrator_handle.get_event_listener().await {
-                    self.events = fresh;
+                match self.orchestrator_handle.get_event_listener().await {
+                    Ok(fresh) => self.events = fresh,
+                    Err(err) => {
+                        tracing::warn!(
+                            target: "scroll::remote_source",
+                            ?err,
+                            "Failed to re-subscribe the event listener after a wait timeout; \
+                             the next wait may run on a lagged stream"
+                        );
+                    }
                 }
                 Err(eyre::eyre!(
                     "Timed out after {wait_budget:?} waiting for the build outcome of block \
@@ -884,9 +918,21 @@ where
     async fn follow_and_build(&mut self) -> eyre::Result<()> {
         // First successful contact with the remote determines the resume point.
         if self.last_imported_block.is_none() {
-            let (resume, resume_hash, local_head, local_safe) =
+            let (resume, resume_hash, local_head, local_safe, diverged) =
                 self.init_last_imported_block().await?;
             if local_head > resume.saturating_add(1) {
+                if !diverged {
+                    // No present-but-different hash pair was observed: the
+                    // remote is merely BEHIND the local chain (lagging
+                    // replica, resyncing backend), not on another fork.
+                    // Rewinding our own head to follow it would throw away
+                    // canonical blocks — wait for it to catch up instead.
+                    return Err(eyre::eyre!(
+                        "remote head trails the local chain (common ancestor {resume}, local \
+                         head {local_head}) with no divergence observed; waiting for the \
+                         remote to catch up"
+                    ));
+                }
                 if resume < local_safe {
                     // A common ancestor below the local SAFE head means the
                     // remote lags behind derivation-finalized state (e.g. a
@@ -932,21 +978,22 @@ where
         // the requested block would be lost.
         if self.pending_build {
             self.settle_owed_build().await?;
-            // Resync/Abandon clear the resume pointer to force a fresh
-            // common-ancestor walk; hand control back so the next tick's
-            // lazy-init guard performs it before any import.
+            // DEFENSIVE: every current pointer-clearing settlement path
+            // returns Err out of the tick first, so this should be
+            // unreachable — but a cleared pointer must always mean
+            // "re-derive next tick", never an unwrap. (Do not "simplify"
+            // settlement arms to Ok: their Err keeps consecutive_failures
+            // honest.)
             if self.last_imported_block.is_none() {
                 return Ok(());
             }
         }
 
         loop {
-            // Never unwrap here. Of the pointer-clearing paths only
-            // Superseded settles with Ok and reaches this guard (Resync/
-            // Abandon and the unapplied-import/rejected-import paths error
-            // out of the tick first) — but a None always means "re-derive on
-            // the next tick", never an invariant violation worth killing the
-            // node over.
+            // DEFENSIVE (see the settlement guard above): all current
+            // pointer-clearing paths error out of the tick first, but a None
+            // always means "re-derive on the next tick", never an invariant
+            // violation worth killing the node over.
             let Some(last_imported) = self.last_imported_block else {
                 return Ok(());
             };
@@ -1068,9 +1115,23 @@ where
                 .map_err(|e| self.classify_recv_error(e))?
                 .is_synced()
             {
-                tracing::debug!(target: "scroll::remote_source", "Imported block is valid, but orchestrator is not synced, skipping build");
+                self.consecutive_gate_skips += 1;
+                if self.consecutive_gate_skips.is_multiple_of(100) {
+                    // A latched gate means this node imports but never
+                    // sequences — that must not hide at debug forever.
+                    tracing::warn!(
+                        target: "scroll::remote_source",
+                        consecutive_gate_skips = self.consecutive_gate_skips,
+                        "Builds keep being skipped because the orchestrator reports \
+                         not-synced"
+                    );
+                } else {
+                    tracing::debug!(target: "scroll::remote_source", "Imported block is valid, but orchestrator is not synced, skipping build");
+                }
                 continue;
             }
+
+            self.consecutive_gate_skips = 0;
 
             // Trigger block building on top of the imported block and wait
             // (bounded, identity-matched) for the outcome.

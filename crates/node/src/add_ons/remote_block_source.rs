@@ -40,8 +40,10 @@ where
     /// block determined — construction must not depend on the remote being up
     /// (issue #38): a connection error at startup used to abort the whole node.
     last_imported_block: Option<u64>,
-    /// Number of consecutive failed poll ticks, used to rate-limit error logs
-    /// while the remote is unreachable.
+    /// The sequencer's payload building duration (milliseconds), used to size
+    /// the build-outcome wait budget.
+    payload_building_duration_ms: u64,
+    /// Number of consecutive failed poll ticks, reported in the error logs.
     consecutive_failures: u64,
     /// Whether a requested build is still owed its outcome. Set before a
     /// `BuildBlock` command and cleared once the outcome arrives (or the
@@ -106,6 +108,13 @@ fn terminal_error(msg: &'static str) -> eyre::Report {
     eyre::Report::new(TerminalSyncError).wrap_err(msg)
 }
 
+/// A closed command channel means the orchestrator is gone — terminal, not
+/// retryable.
+fn orchestrator_gone(e: tokio::sync::oneshot::error::RecvError) -> eyre::Report {
+    eyre::Report::new(TerminalSyncError)
+        .wrap_err(format!("chain orchestrator command channel closed: {e}"))
+}
+
 impl<N, P> RemoteBlockSourceAddOn<N, P>
 where
     N: FullNetwork<Primitives = DogeosNetworkPrimitives> + Send + Sync + 'static,
@@ -118,6 +127,7 @@ where
     /// cadence instead of failing node launch.
     pub async fn new(
         config: RemoteBlockSourceArgs,
+        payload_building_duration_ms: u64,
         handle: ChainOrchestratorHandle<N>,
         provider: P,
     ) -> eyre::Result<Self> {
@@ -145,6 +155,7 @@ where
             events,
             remote,
             provider,
+            payload_building_duration_ms,
             last_imported_block: None,
             consecutive_failures: 0,
             pending_build: false,
@@ -166,10 +177,19 @@ where
     /// Determines the last imported block by finding the highest common block
     /// between the local chain and the remote node.
     ///
-    /// Called on the first successful contact with the remote; a failure here
-    /// (e.g. the remote is not up yet) is retried on the next poll tick.
+    /// Called every poll tick until it succeeds — this call *is* the first
+    /// contact with the remote; a failure (e.g. the remote is not up yet) is
+    /// retried on the next tick.
     async fn init_last_imported_block(&self) -> eyre::Result<u64> {
-        let local_head = self.orchestrator_handle.status().await?.l2.fcs.head_block_info().number;
+        let local_head = self
+            .orchestrator_handle
+            .status()
+            .await
+            .map_err(orchestrator_gone)?
+            .l2
+            .fcs
+            .head_block_info()
+            .number;
         let remote_head = self.remote.get_block_number().await?;
 
         let last_imported_block;
@@ -269,20 +289,25 @@ where
     /// A `BlockSequenced` is only accepted at or above `expected_number`
     /// (stale outcomes are strictly lower-numbered), so an outcome from a
     /// previous build cannot be attributed to this request.
-    /// `BlockBuildingSkipped` carries no number and is accepted as landed;
-    /// this relies on the remote-source node being the only build requester.
-    /// Config-level violations are rejected by `validate()` (no
-    /// `sequencer.auto-start` with `remote-source.build`), but the
+    /// `BlockBuildingSkipped` carries no number and is accepted as landed.
+    /// What makes attribution sound is the single-build-requester assumption
+    /// *plus* `import_chain` cancelling any in-flight job before each import:
+    /// together they mean any outcome observed here belongs to this request.
+    /// Config-level violations of the assumption are rejected by `validate()`
+    /// (no `sequencer.auto-start` with `remote-source.build`), but the
     /// `rollupNodeAdmin_enableAutomaticSequencing` RPC can still start the
-    /// timer at runtime and break the assumption — do not enable it on a
-    /// remote-source node.
+    /// timer at runtime and break it — do not enable it on a remote-source
+    /// node.
     async fn await_build_outcome(&mut self, expected_number: u64) -> eyre::Result<BuildOutcome> {
         tracing::debug!(target: "scroll::remote_source", expected_number, "Waiting for block to be built...");
-        // The wait covers a payload building job (default duration 800ms) and
-        // must not shrink below that when the poll interval is tuned low, nor
-        // balloon the worst-case stall when it is tuned high.
-        let wait_budget = Duration::from_millis(self.config.poll_interval_ms.saturating_mul(100))
-            .clamp(Duration::from_secs(30), Duration::from_secs(120));
+        // The wait covers a payload building job, so size it from the
+        // configured payload building duration (with generous margin) rather
+        // than the unrelated poll interval; the clamp bounds the worst-case
+        // import stall a missed outcome can cause across the settlement
+        // budget.
+        let wait_budget =
+            Duration::from_millis(self.payload_building_duration_ms.saturating_mul(5))
+                .clamp(Duration::from_secs(5), Duration::from_secs(60));
         let events = &mut self.events;
         tokio::time::timeout(wait_budget, async {
             loop {
@@ -324,8 +349,10 @@ where
         })?
     }
 
-    /// Triggers block building on top of the current head and waits (bounded)
-    /// for the outcome.
+    /// Requests block building and waits (bounded) for the outcome. The
+    /// command may coalesce with an already in-flight job; for the remote
+    /// source that job is never stale, because `import_chain` cancels the job
+    /// slot before every import.
     ///
     /// Stale outcomes queued by earlier, given-up requests are drained first
     /// so they cannot be attributed to this request. `pending_build` stays set
@@ -346,7 +373,9 @@ where
 
         self.pending_build = true;
         self.pending_build_cancelled = false;
-        self.orchestrator_handle.build_block();
+        self.orchestrator_handle.try_build_block().map_err(|e| {
+            eyre::Report::new(TerminalSyncError).wrap_err(format!("failed to send BuildBlock: {e}"))
+        })?;
 
         match self.await_build_outcome(expected_number).await? {
             BuildOutcome::Landed => {
@@ -366,10 +395,11 @@ where
     ///
     /// `status()` flows through the same FIFO command channel as `BuildBlock`,
     /// so once it returns, the owed command has been processed: the job either
-    /// landed (head advanced past the imported block), was cancelled, or is
-    /// still in flight. Only an *observed* `PayloadBuildingJobCancelled`
-    /// (recorded in `pending_build_cancelled` by whichever wait consumed it)
-    /// proves no outcome will ever arrive — re-issuing is limited to that
+    /// landed (head advanced past the imported block), completed as a skipped
+    /// empty build (head unchanged — only re-observing the event settles
+    /// this case), was cancelled, or is still in flight. Only an *observed*
+    /// `PayloadBuildingJobCancelled` (recorded in `pending_build_cancelled` by whichever wait
+    /// consumed it) proves no outcome will ever arrive — re-issuing is limited to that
     /// case, which (with a single build requester) is race-free. On a plain
     /// timeout the job may still be running, so we keep waiting on later
     /// ticks — bounded by [`MAX_PENDING_BUILD_RETRIES`], after which the
@@ -377,7 +407,15 @@ where
     /// same height twice.
     async fn settle_owed_build(&mut self) -> eyre::Result<()> {
         let last_imported = self.last_imported_block.expect("initialized above");
-        let head = self.orchestrator_handle.status().await?.l2.fcs.head_block_info().number;
+        let head = self
+            .orchestrator_handle
+            .status()
+            .await
+            .map_err(orchestrator_gone)?
+            .l2
+            .fcs
+            .head_block_info()
+            .number;
         if head > last_imported {
             // The build landed after its wait timed out.
             self.clear_pending_build();
@@ -495,7 +533,7 @@ where
                     return Err(eyre::eyre!("Import block failed: {}", e));
                 }
                 Err(e) => {
-                    return Err(eyre::eyre!("chain orchestrator command channel error: {}", e));
+                    return Err(orchestrator_gone(e));
                 }
             };
 
@@ -511,7 +549,7 @@ where
                 continue;
             }
 
-            if !self.orchestrator_handle.status().await?.is_synced() {
+            if !self.orchestrator_handle.status().await.map_err(orchestrator_gone)?.is_synced() {
                 tracing::debug!(target: "scroll::remote_source", "Imported block is valid, but orchestrator is not synced, skipping build");
                 continue;
             }

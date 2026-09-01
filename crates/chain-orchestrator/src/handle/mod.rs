@@ -16,6 +16,19 @@ pub use command::{ChainOrchestratorCommand, DatabaseQuery};
 mod metrics;
 use metrics::ChainOrchestratorHandleMetrics;
 
+/// The command channel to the rollup manager is closed (the orchestrator is
+/// gone), so the command could not be delivered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChainOrchestratorCommandSendError;
+
+impl std::fmt::Display for ChainOrchestratorCommandSendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "chain orchestrator command channel closed")
+    }
+}
+
+impl std::error::Error for ChainOrchestratorCommandSendError {}
+
 /// The handle used to send commands to the rollup manager.
 #[derive(Debug, Clone)]
 pub struct ChainOrchestratorHandle<N: FullNetwork<Primitives = DogeosNetworkPrimitives>> {
@@ -60,6 +73,18 @@ impl<N: FullNetwork<Primitives = DogeosNetworkPrimitives>> ChainOrchestratorHand
     /// Sends a command to the rollup manager to build a block.
     pub fn build_block(&self) {
         self.send_command(ChainOrchestratorCommand::BuildBlock);
+    }
+
+    /// Sends a command to the rollup manager to build a block, reporting
+    /// whether the command could be delivered. Callers that wait for a build
+    /// outcome should use this: on a closed channel the infallible
+    /// `build_block` only logs, and the wait would burn its full budget for a
+    /// request that was never sent.
+    pub fn try_build_block(&self) -> Result<(), ChainOrchestratorCommandSendError> {
+        self.to_manager_tx.send(ChainOrchestratorCommand::BuildBlock).map_err(|_| {
+            self.handle_metrics.handle_send_command_failed.increment(1);
+            ChainOrchestratorCommandSendError
+        })
     }
 
     /// Sends a command to the rollup manager to get the network handle.

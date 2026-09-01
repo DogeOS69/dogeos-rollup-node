@@ -140,6 +140,8 @@ where
         let sequencer_url = rollup_node_manager_addon.config().network_args.sequencer_url.clone();
         let remote_block_source_config =
             rollup_node_manager_addon.config().remote_block_source_args.clone();
+        let payload_building_duration =
+            rollup_node_manager_addon.config().sequencer_args.payload_building_duration;
 
         // Register rollupNode API and rollupNodeAdmin API if enabled
         let rollup_node_rpc_ext = Arc::new(RollupNodeRpcExt::<N::Network>::new(rx));
@@ -214,17 +216,24 @@ where
         if remote_block_source_config.enabled {
             let remote_source = RemoteBlockSourceAddOn::new(
                 remote_block_source_config,
+                payload_building_duration,
                 rollup_manager_handle.clone(),
                 rpc_handle.provider().clone(),
             )
             .await?;
-            ctx.node
-                .task_executor()
-                .spawn_critical_with_graceful_shutdown_signal("remote_block_source", |shutdown| async move {
-                    if let Err(e) = remote_source.run_until_shutdown(shutdown.ignore_guard()).await {
-                        tracing::error!(target: "scroll::remote_source", ?e, "Remote block source failed");
+            ctx.node.task_executor().spawn_critical_with_graceful_shutdown_signal(
+                "remote_block_source",
+                |shutdown| async move {
+                    if let Err(e) = remote_source.run_until_shutdown(shutdown.ignore_guard()).await
+                    {
+                        // run_until_shutdown only returns Err on terminal
+                        // failures; spawn_critical fail-stops on panic, so a
+                        // plain log would leave a healthy-looking node that
+                        // silently never imports or builds again.
+                        panic!("fatal remote block source error: {e:#}");
                     }
-                });
+                },
+            );
         }
 
         Ok(rpc_handle)

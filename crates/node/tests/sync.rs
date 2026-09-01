@@ -847,11 +847,16 @@ async fn test_manual_build_block_coalesces_with_timer_job() -> eyre::Result<()> 
 async fn test_chain_import_cancels_inflight_payload_job() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    // Node under test: a long payload building job will be in flight.
+    // Node under test: a long payload building job will be in flight. The
+    // duration must outlast the import below (the cancelled job never
+    // completes) with generous margin for loaded runners, but stay inside
+    // the engine's payload-job TTL (~12s) — the follow-up build at the end
+    // shares this duration and its payload must still be retrievable when
+    // finalized.
     let mut node_a = TestFixture::builder()
         .sequencer()
         .with_memory_db()
-        .payload_building_duration(3000)
+        .payload_building_duration(8000)
         .allow_empty_blocks(true)
         .build()
         .await?;
@@ -866,9 +871,10 @@ async fn test_chain_import_cancels_inflight_payload_job() -> eyre::Result<()> {
     node_a.l1().sync().await?;
     node_b.l1().sync().await?;
 
-    // Start a 3s build on A, then import B's block 1 while it is in flight.
+    // Start a long build on A, then import B's block 1 while it is in
+    // flight. No sleep is needed: the command channel is FIFO, so the import
+    // is processed after the build command.
     node_a.sequencer().rollup_manager_handle.build_block();
-    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 
     let block = node_b.build_block().expect_block_number(1).build_and_await_block().await?;
     node_a
@@ -906,7 +912,10 @@ async fn test_update_fcs_head_cancels_inflight_payload_job() -> eyre::Result<()>
     let mut fixture = TestFixture::builder()
         .sequencer()
         .with_memory_db()
-        .payload_building_duration(3000)
+        // Long enough to be mid-flight at the head update under load, short
+        // enough that the follow-up build's payload survives the engine's
+        // payload-job TTL (~12s).
+        .payload_building_duration(8000)
         .allow_empty_blocks(true)
         .build()
         .await?;
@@ -916,10 +925,10 @@ async fn test_update_fcs_head_cancels_inflight_payload_job() -> eyre::Result<()>
     let genesis = fixture.get_block(0).await?;
     let genesis_info = BlockInfo { number: genesis.header.number, hash: genesis.header.hash };
 
-    // Start a 3s build, then move the head administratively while it is in
-    // flight.
+    // Start a long build, then move the head administratively while it is in
+    // flight. No sleep is needed: the command channel is FIFO, so the head
+    // update is processed after the build command.
     fixture.sequencer().rollup_manager_handle.build_block();
-    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
     fixture
         .sequencer()
         .rollup_manager_handle
@@ -949,6 +958,7 @@ async fn wait_n_events(
     mut matches: impl FnMut(ChainOrchestratorEvent) -> bool,
     mut n: u64,
 ) {
+    assert!(n > 0, "wait_n_events requires n > 0");
     let total = n;
     tokio::time::timeout(tokio::time::Duration::from_secs(60), async {
         while let Some(event) = events.next().await {

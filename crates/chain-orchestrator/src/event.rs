@@ -96,12 +96,15 @@ pub enum ChainOrchestratorEvent {
     /// A manual `BuildBlock` command arrived while a payload building job was already in
     /// flight and was coalesced with it instead of replacing it.
     BuildBlockCoalesced,
-    /// The in-flight payload building job was cancelled before completion. Causes: the head
-    /// moved under it (chain import, administrative FCS head update, or an L1 reorg that
-    /// rewound the L2 head), an L1 reorg before the job's L1-message origin invalidated its
-    /// inputs, or automatic sequencing was disabled. Also emitted when a `BuildBlock` command
-    /// fails to start a job at all. Waiters on a build outcome should treat this as their
-    /// job failing.
+    /// The in-flight payload building job was cancelled, failed, or could not be created —
+    /// in every case no `BlockSequenced`/`BlockBuildingSkipped` will follow, and waiters on
+    /// a build outcome should treat it as their request failing. Emission sites: the head
+    /// moved under the job (chain import, batch consolidation, administrative FCS head
+    /// update, optimistic sync, or an L1 reorg that rewound the L2 head); an L1 unwind
+    /// (reorg or administrative revert) before the job's L1-message origin invalidated its
+    /// inputs; automatic sequencing was disabled; a `BuildBlock` command failed to start a
+    /// job (including when no sequencer is configured — a permanent misconfiguration, not a
+    /// transient cancellation); or payload finalization failed after the job completed.
     PayloadBuildingJobCancelled,
     /// A new block has been signed by the signer.
     SignedBlock {

@@ -34,8 +34,8 @@ impl<'a> EventWaiter<'a> {
 
     /// Wait for block sequenced event on all specified nodes.
     pub async fn block_sequenced(self, target: u64) -> eyre::Result<DogeosBlock> {
-        // Block numbers are monotone per node: once a higher number is seen,
-        // the target can never arrive. Record any overshoot so a doomed wait
+        // Block numbers are normally monotone per node (absent a reorg): once a higher number is
+        // seen, the target can never arrive. Record any overshoot so a doomed wait
         // fails with a diagnosis instead of a silent timeout (issue #38).
         let overshoot = std::sync::atomic::AtomicU64::new(0);
         let result = self

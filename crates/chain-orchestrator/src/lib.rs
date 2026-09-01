@@ -233,6 +233,16 @@ impl<
 
                     match step {
                         AttemptStep::Completed(consolidated) => {
+                            // Consolidation may have moved the L2 head; an
+                            // in-flight payload building job (parked while the
+                            // sequencer arm was gated on derivation work)
+                            // would finalize against the pre-consolidation
+                            // head and reorg the derived chain back out.
+                            if consolidated.batch_outcome.l2_head_updated {
+                                self.cancel_payload_building_job(
+                                    "batch consolidation moved the L2 head",
+                                );
+                            }
                             for outcome in consolidated.block_outcomes {
                                 self.notify(ChainOrchestratorEvent::BlockConsolidated(outcome));
                             }
@@ -395,20 +405,40 @@ impl<
                         .expect("signer must be set if sequencer is present"),
                 ) {
                     self.metric_handler.start_block_building_recording();
-                    self.sequencer
+                    if let Err(err) = self
+                        .sequencer
                         .as_mut()
                         .expect("sequencer must be present")
                         .start_payload_building(&mut self.engine)
-                        .await?;
+                        .await
+                    {
+                        // Close the recording so the failed attempt does not
+                        // pollute the next slot's duration sample.
+                        self.metric_handler.discard_block_building_recording();
+                        return Err(err.into());
+                    }
                 }
             }
             SequencerEvent::PayloadReady(payload_id) => {
-                let block = self
+                // The job slot is already cleared by the time PayloadReady is
+                // yielded, so no later cancel_payload_building_job can notify
+                // for a finalization failure — do it here, or waiters would
+                // burn their full timeout with the cause in another log
+                // target.
+                let block = match self
                     .sequencer
                     .as_mut()
                     .expect("sequencer must be present")
                     .finalize_payload_building(payload_id, &mut self.engine)
-                    .await?;
+                    .await
+                {
+                    Ok(block) => block,
+                    Err(err) => {
+                        self.metric_handler.discard_block_building_recording();
+                        self.notify(ChainOrchestratorEvent::PayloadBuildingJobCancelled);
+                        return Err(err.into());
+                    }
+                };
 
                 self.metric_handler.finish_block_building_recording(block.as_ref());
 
@@ -457,15 +487,17 @@ impl<
                             "BuildBlock requested while a payload building job is in flight; coalescing with the in-flight job"
                         );
                         self.notify(ChainOrchestratorEvent::BuildBlockCoalesced);
-                    } else if let Err(err) =
-                        sequencer.start_payload_building(&mut self.engine).await
-                    {
-                        // A failed start leaves no job and would otherwise
-                        // emit nothing, so waiters would burn their full
-                        // timeout with the real cause in a different log
-                        // target. Notify before propagating.
-                        self.notify(ChainOrchestratorEvent::PayloadBuildingJobCancelled);
-                        return Err(err.into());
+                    } else {
+                        self.metric_handler.start_block_building_recording();
+                        if let Err(err) = sequencer.start_payload_building(&mut self.engine).await {
+                            // A failed start leaves no job and would otherwise
+                            // emit nothing, so waiters would burn their full
+                            // timeout with the real cause in a different log
+                            // target. Notify before propagating.
+                            self.metric_handler.discard_block_building_recording();
+                            self.notify(ChainOrchestratorEvent::PayloadBuildingJobCancelled);
+                            return Err(err.into());
+                        }
                     }
                 } else {
                     tracing::error!(target: "scroll::chain_orchestrator", "Received BuildBlock command but sequencer is not configured");
@@ -559,6 +591,21 @@ impl<
                 self.derivation_driver.cancel_attempt();
                 let (unwind_result, held_outcome) =
                     self.unwind_and_revalidate_held_batch(block_number).await?;
+
+                // The unwind deletes L1 messages above the ancestor; a parked
+                // payload building job whose L1 origin lies above the unwind
+                // point would finalize with messages that no longer exist
+                // (mirrors handle_l1_reorg's guard).
+                if Some(block_number) <
+                    self.sequencer
+                        .as_ref()
+                        .and_then(|s| s.payload_building_job().map(|p| p.l1_origin()))
+                        .flatten()
+                {
+                    self.cancel_payload_building_job(
+                        "administrative L1 unwind before the job's L1 origin",
+                    );
+                }
 
                 // Check if the unwind impacts the fcs safe head.
                 if let Some(block_info) = unwind_result.l2_safe_block_info {
@@ -1120,11 +1167,13 @@ impl<
                 number: received_block_number,
                 hash: block_with_peer.block.header.hash_slow(),
             };
-            // No payload-job cancellation is needed here even though the head
-            // jumps: set_syncing() below closes the sequencer select arm's
-            // is_synced() gate, so a parked job cannot be polled to
-            // completion, and the only path back to synced (import_chain's
-            // sync completion) cancels the job before setting synced.
+            // Cancel any in-flight payload building job: the head is about to
+            // jump far ahead. (A parked job could not complete anyway —
+            // set_syncing() closes the sequencer arm's gate, and the path back
+            // to synced cancels first — but leaving it in the slot would make
+            // every BuildBlock during the sync window coalesce into a job that
+            // can never emit an outcome.)
+            self.cancel_payload_building_job("optimistic sync moved the head");
             self.engine.optimistic_sync(block_info).await?;
             self.sync_state.l2_mut().set_syncing();
 

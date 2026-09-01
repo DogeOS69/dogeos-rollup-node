@@ -24,6 +24,11 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# The failure-report steps comment on an issue; everything else is read-only.
+permissions:
+  contents: read
+  issues: write
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -57,8 +62,10 @@ jobs:
           [[ "$ITERATIONS" =~ ^[1-9][0-9]*$ ]] || { echo "::error::iterations must be a positive integer"; exit 1; }
           for i in $(seq "$ITERATIONS"); do
             echo "::group::idle iteration $i/$ITERATIONS"
+            # Same filter as the loaded job so a loaded-only failure is
+            # distinguishable from a plain regression.
             cargo nextest run --all-features --workspace --locked \
-              -E 'test(test_should_consolidate_after_optimistic_sync)'
+              -E 'test(test_should_consolidate_after_optimistic_sync) or test(coalesces_with) or test(cancels_inflight_payload_job)'
             echo "::endgroup::"
           done
       - name: Report failure on the tracking issue
@@ -101,9 +108,9 @@ jobs:
           for i in $(seq "$ITERATIONS"); do
             echo "::group::loaded iteration $i/$ITERATIONS"
             # Also soak the wall-clock-sensitive tests this fix introduced:
-            # the two coalescing tests and the import-cancellation test.
+            # the coalescing tests and both cancellation tests.
             cargo nextest run --all-features --workspace --locked \
-              -E 'test(test_should_consolidate_after_optimistic_sync) or test(coalesces_with) or test(test_chain_import_cancels_inflight_payload_job)'
+              -E 'test(test_should_consolidate_after_optimistic_sync) or test(coalesces_with) or test(cancels_inflight_payload_job)'
             echo "::endgroup::"
           done
       - name: Report failure on the tracking issue

@@ -176,8 +176,9 @@ impl ScrollRollupNodeConfig {
             self.remote_block_source_args.build &&
             !self.sequencer_args.sequencer_enabled
         {
-            // Without a sequencer no build outcome can ever arrive, and every
-            // remote-source build request would time out.
+            // Without a sequencer no job can ever start; every remote-source
+            // build request would fail (PayloadBuildingJobCancelled) until
+            // the settlement budget is exhausted and the build abandoned.
             return Err(
                 "remote-source.build requires sequencer.enabled: building on top of imported \
                  blocks needs a configured sequencer"

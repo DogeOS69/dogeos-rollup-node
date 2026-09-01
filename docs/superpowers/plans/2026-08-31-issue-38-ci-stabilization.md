@@ -1,18 +1,22 @@
 # Issue #38 CI Stabilization Implementation Plan
 
 > **Historical plan-of-record — superseded by the shipped code.** This document
-> guided the initial implementation; the shipped design then evolved through
-> four adversarial review passes (commits `31f2742`, `bd7f303`, `98ff292`,
-> `e86177f` and successors on PR #45), which added mechanisms this plan never
-> describes: `PayloadBuildingJobCancelled` and the shared
-> `cancel_payload_building_job` helper at every head-moving site,
-> `BuildBlockCoalesced` and its contract tests, the remote source's owed-build
-> settlement (`pending_build` / `settle_owed_build` / retry cap), config
-> validation tying `remote-source.build` to the sequencer flags, the
-> `--no-fail-fast` lanes, and the L1 fee-estimation fix in the docker test
-> utils. Where this document and the code disagree, the code and the PR #45
-> description are authoritative. Checkboxes were deliberately left unticked;
-> execution was tracked in the PR itself.
+> guided the initial implementation; the shipped design then evolved through a
+> multi-pass adversarial review cycle on PR #45 (commits `31f2742`, `bd7f303`,
+> `98ff292`, `e86177f`, `61e927d`, `64d38d2` and successors), which added
+> mechanisms this plan never describes: `PayloadBuildingJobCancelled` and the
+> shared `cancel_payload_building_job` helper at every head-moving and
+> input-invalidating site, `BuildBlockCoalesced` and its contract tests, the
+> remote source's owed-build settlement (`pending_build`, the
+> observed-cancellation re-issue gate, `settle_owed_build`, the shared retry
+> budget), terminal-error classification that fail-stops the add-on, config
+> validation tying `remote-source.build` to the sequencer flags, cancellation
+> metrics, the `--no-fail-fast` lanes, and the L1 fee-estimation fix in the
+> docker test utils. Some code snippets below are stale (e.g.
+> `init_last_imported_block` now takes `&self`, the struct has more fields,
+> the soak workflow shipped permanently). Where this document and the code
+> disagree, the code and the PR #45 description are authoritative. Checkboxes
+> were deliberately left unticked; execution was tracked in the PR itself.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 

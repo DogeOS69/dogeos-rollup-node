@@ -19,6 +19,9 @@ pub enum SequencerError {
     /// The sequencer encountered an error when converting a payload into a scroll block.
     #[error("Encountered an error converting a payload into a scroll block")]
     PayloadError,
+    /// The engine did not adopt the forkchoice update for the block it itself built.
+    #[error("Forkchoice update for the built payload was not VALID")]
+    FcuNotValid,
     /// The sequencer encountered an error when interacting with the L1 message provider.
     #[error("Encountered an error interacting with the L1 message provider: {0}")]
     L1MessageProviderError(#[from] L1ProviderError),

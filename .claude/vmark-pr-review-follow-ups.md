@@ -123,7 +123,11 @@ from every pass is either fixed in the PR or recorded here.
     an event none of the existing fixtures drive concurrently (a batch
     commit, an L1 reorg rewinding the L2 head, a peer block beyond the
     optimistic-sync threshold); building that scaffolding risks adding new
-    flaky tests to a stabilization PR. The sites share
+    flaky tests to a stabilization PR. Pass 23 T2 sketch for the L1-reorg
+    pair: the raw two-node reorg fixture in sync.rs could issue a
+    long-duration build_block immediately before the Reorg notification and
+    assert the cancellation — but that fixture's payload duration is shared
+    by its ~70 sequential builds, so the duration/interleaving needs care. The sites share
     `cancel_payload_building_job` with the four tested ones.
   - Suggested Linear title: "rollup-node: integration tests for payload-job cancellation on the consensus paths (batch reconciliation, L1 reorg, optimistic sync)"
 
@@ -168,7 +172,11 @@ from every pass is either fixed in the PR or recorded here.
   - Why unaddressed: pre-existing test structure outside the PR's own edits;
     replacing the sleeps needs an observable "L1 messages drained" signal the
     fixture does not currently expose, and this test was already soaked
-    60/60 as-is.
+    60/60 as-is. Optional nicety from pass 23: disabling automatic
+    sequencing after the final build phase would stop the 20ms timer for the
+    test's tail (residual-risk shrink only — the tail assertions self-heal
+    via the continuous stream, so this was deliberately not changed late in
+    the cycle).
   - Suggested Linear title: "rollup-node: replace blind sleeps in the optimistic-sync consolidation test with observable preconditions"
 
 - **`PayloadBuildingJobStarted` event to make the coalescing tests' precondition observable**
@@ -185,27 +193,10 @@ from every pass is either fixed in the PR or recorded here.
     the false-report path.
   - Suggested Linear title: "chain-orchestrator: emit PayloadBuildingJobStarted so coalescing tests can await an in-flight job"
 
-- **Fail-stop or bounded retry for a post-unwind FCU failure in `handle_l1_reorg`**
-  (`crates/chain-orchestrator/src/lib.rs`, L1-reorg handler)
-  - Impact/evidence: Claude pass 19 M2 (pre-existing) — when the FCU after the
-    L1 database unwind fails, the engine still points at the reorged-out chain
-    while the database is unwound; no L1Reorg event is emitted and the
-    reverted transactions are not reinserted. The PR now logs an explicit
-    divergence error at the site, and an FCU the engine rejects as INVALID
-    fail-stops via FatalStateDivergence (propagated through handle_outcome
-    from every select arm). What remains open is the transport-Err path:
-    it propagates and is logged, but the retry-vs-fail-stop policy (the
-    `// TODO: Add retry logic` predates this PR) is undecided.
-  - First/most-recent pass: Claude pass 19 (2026-09-01T10:30Z).
-  - Why unaddressed: choosing fail-stop vs bounded retry on an event-driven
-    reorg path is a node-lifecycle policy decision (an L1 reorg can arrive at
-    any time, unlike the administrative unwind this PR now fail-stops).
-  - Suggested Linear title: "chain-orchestrator: fail-stop or retry when the post-unwind L1-reorg FCU fails"
-
 - **Non-panicking config validation at launch**
   (`crates/node/src/node.rs` `ScrollRollupNode::new`, `crates/node/src/args.rs`)
-  - Impact/evidence: Claude pass 19 M4 — the three new validate() rules are a
-    breaking config change, and `.expect("Configuration validation failed")`
+  - Impact/evidence: Claude pass 19 M4 — the five new validate() rules are a
+    breaking config change (a sixth check warns without erroring), and `.expect("Configuration validation failed")`
     turns a stale deployment manifest into a launch panic/crash-loop under a
     supervisor. The rules themselves are correct and the PR description now
     calls out the breaking change; the panic-vs-clean-exit shape predates
@@ -219,7 +210,8 @@ from every pass is either fixed in the PR or recorded here.
 - **`reason` discriminant on `PayloadBuildingJobCancelled`**
   (`crates/chain-orchestrator/src/event.rs`, `cancel_payload_building_job`)
   - Impact/evidence: Claude pass 19 L2 + coverage-gap note — the event is a
-    unit variant with eight emission sites, so tests can only assert "some
+    unit variant emitted from 13 documented logical paths (6 direct notify
+    sites plus the shared cancel helper's callers), so tests can only assert "some
     cancellation happened" (the chain-import test is now time-bounded as a
     partial mitigation), and consumers cannot tell a head-move cancel from a
     start failure. `cancel_payload_building_job` already carries a
@@ -235,11 +227,15 @@ from every pass is either fixed in the PR or recorded here.
 
 - **Table-test the head-update fatal paths as a pure function**
   (`crates/chain-orchestrator/src/lib.rs` UpdateFcsHead arm and rollback)
-  - Impact/evidence: Claude pass 21 coverage note — FatalStateDivergence has
-    only definition/raise sites in the tree: the forward-INVALID refusal, the
-    rollback three-way outcome (VALID commits / SYNCING and INVALID do not /
-    transport error), and the post-unwind reorg-FCU INVALID case have no
-    tests. The PR's own settlement_decision pattern applies directly:
+  - Impact/evidence: Claude pass 21 coverage note, expanded by pass 23 T1 —
+    FatalStateDivergence has only definition/raise sites in the tree: the
+    forward non-VALID refusal, the rollback three-way outcome (VALID commits
+    / SYNCING and INVALID do not / transport error), the post-unwind
+    reorg-FCU INVALID and transport arms, the three post-finalization
+    divergence sites, and the four `handle_outcome(...)?` propagation points
+    have no tests — dropping a single `?` leaves the suite green. The
+    `administrative_post_unwind_engine_failure_fail_stops_without_retry`
+    test is a working `ScriptedEngineClient` template, so these are cheap. The PR's own settlement_decision pattern applies directly:
     extract the outcome classification into a pure function and table-test
     it.
   - First/most-recent pass: Claude pass 21 (2026-09-01T11:50Z).

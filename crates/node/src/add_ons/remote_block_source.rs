@@ -40,8 +40,9 @@ where
     /// block determined — construction must not depend on the remote being up
     /// (issue #38): a connection error at startup used to abort the whole node.
     /// Also reset to `None` whenever it can no longer be trusted (settlement's
-    /// `Resync`/`Abandon` outcomes, and an import the engine did not apply),
-    /// forcing a fresh common-ancestor walk on the next tick.
+    /// `Superseded`/`Resync`/`Abandon` outcomes, an import the engine did not
+    /// apply, and repeated import rejections), forcing a fresh
+    /// common-ancestor walk on the next tick.
     last_imported_block: Option<u64>,
     /// Whether `init_last_imported_block` has ever succeeded. Terminal
     /// (node-killing) escalation of the walk's divergence verdicts is
@@ -54,6 +55,14 @@ where
     /// The sequencer's payload building duration (milliseconds), used to size
     /// the build-outcome wait budget.
     payload_building_duration_ms: u64,
+    /// Consecutive rejected imports of the same next block. Bounded by
+    /// [`MAX_IMPORT_REJECTIONS`]: repeated rejections mean the resume pointer
+    /// no longer matches the canonical chain (the remote reorged below it, or
+    /// the derived block does not connect), and re-requesting the identical
+    /// block at poll cadence forever would livelock the source. The bound
+    /// keeps one transient rejection from triggering the (potentially long)
+    /// ancestor re-walk.
+    consecutive_import_rejections: u32,
     /// Number of consecutive failed poll ticks, reported in the error logs.
     consecutive_failures: u64,
     /// Whether a requested build is still owed its outcome. Set before a
@@ -93,6 +102,10 @@ where
 /// After this many consecutive failed settlement attempts for an owed build,
 /// give it up and resume importing: a build outcome that never arrives must
 /// not stall the import loop indefinitely.
+/// Consecutive import rejections tolerated before the resume pointer is
+/// re-derived (see `consecutive_import_rejections`).
+const MAX_IMPORT_REJECTIONS: u32 = 3;
+
 const MAX_PENDING_BUILD_RETRIES: u8 = 5;
 
 /// Minimum interval between repeated identical "Sync error" log lines.
@@ -221,8 +234,11 @@ where
     /// Creates a new remote block source add-on.
     ///
     /// Performs no remote I/O: the resume point is determined lazily on the
-    /// first successful poll, where errors are logged and retried at poll
-    /// cadence instead of failing node launch.
+    /// first successful poll, where transient errors are logged and retried
+    /// at poll cadence instead of failing node launch. (The first
+    /// initialization's divergence verdicts — genesis mismatch, exhausted
+    /// lookback — stay terminal and fail-stop the node via the spawn
+    /// wrapper.)
     pub async fn new(
         config: RemoteBlockSourceArgs,
         payload_building_duration_ms: u64,
@@ -256,6 +272,7 @@ where
             payload_building_duration_ms,
             last_imported_block: None,
             initialized_once: false,
+            consecutive_import_rejections: 0,
             consecutive_failures: 0,
             pending_build: false,
             pending_build_cancelled: false,
@@ -782,10 +799,12 @@ where
         }
 
         loop {
-            // Never unwrap here: the pointer is cleared by settlement above
-            // and by unapplied imports below (which error out). A None means
-            // "re-derive on the next tick", not an invariant violation worth
-            // killing the node over.
+            // Never unwrap here. Of the pointer-clearing paths only
+            // Superseded settles with Ok and reaches this guard (Resync/
+            // Abandon and the unapplied-import/rejected-import paths error
+            // out of the tick first) — but a None always means "re-derive on
+            // the next tick", never an invariant violation worth killing the
+            // node over.
             let Some(last_imported) = self.last_imported_block else {
                 return Ok(());
             };
@@ -833,6 +852,15 @@ where
             let chain_import = match self.orchestrator_handle.import_block(block_with_peer).await {
                 Ok(Ok(chain_import)) => chain_import,
                 Ok(Err(e)) => {
+                    self.consecutive_import_rejections += 1;
+                    if self.consecutive_import_rejections >= MAX_IMPORT_REJECTIONS {
+                        self.consecutive_import_rejections = 0;
+                        self.last_imported_block = None;
+                        return Err(eyre::eyre!(
+                            "import rejected {MAX_IMPORT_REJECTIONS} times in a row (last: \
+                             {e}); re-deriving the resume point"
+                        ));
+                    }
                     return Err(eyre::eyre!("Import block failed: {}", e));
                 }
                 Err(e) => {
@@ -858,6 +886,7 @@ where
                 ));
             }
             self.last_imported_block = Some(next_block_num);
+            self.consecutive_import_rejections = 0;
 
             if !self.config.build {
                 tracing::debug!(target: "scroll::remote_source", "Imported block is valid, but build is disabled, skipping build");

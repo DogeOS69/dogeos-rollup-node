@@ -28,7 +28,10 @@ async fn test_should_consolidate_to_block_15k() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
     // Prepare the config for a L1 consolidation. GitHub Actions passes a
-    // missing secret as an EMPTY string, so treat empty as unset.
+    // missing secret as an EMPTY string, so treat empty as unset. NOTE: with
+    // sync.yaml dispatch-gated and test.yaml skipping this test, no CI lane
+    // reaches this guard today — it protects local runs until issue #43
+    // re-points the test at chikyu infrastructure.
     let alchemy_key = match std::env::var("ALCHEMY_KEY") {
         Ok(key) if !key.trim().is_empty() => key,
         _ => {
@@ -807,6 +810,21 @@ async fn test_manual_build_block_coalesces_with_inflight_job() -> eyre::Result<(
     // Exactly one block results: number 1.
     fixture.expect_event().block_sequenced(1).await?;
 
+    // Bite against a PARTIAL regression (emit the event but still spawn a
+    // second job): the sequencer is quiescent here — no auto-start, no
+    // outstanding command — so nothing may sequence within 2x the payload
+    // duration unless the coalesced command leaked a phantom job.
+    let phantom = fixture
+        .expect_event()
+        .timeout(std::time::Duration::from_secs(4))
+        .label("no phantom second BlockSequenced after coalescing")
+        .where_event(|e| matches!(e, ChainOrchestratorEvent::BlockSequenced(_)))
+        .await;
+    eyre::ensure!(
+        phantom.is_err(),
+        "a second job sequenced a block after the coalesced command: {phantom:?}"
+    );
+
     // A follow-up build produces number 2. (`BuildBlockCoalesced` above is
     // what distinguishes coalescing from the old replace-semantics; a phantom
     // second job would also sequence 1 then 2, so contiguous numbering alone
@@ -844,16 +862,29 @@ async fn test_manual_build_block_coalesces_with_timer_job() -> eyre::Result<()> 
     // From gate-open, slots fire every 100ms and each job runs 3s
     // (comfortably inside the engine's ~12s payload-job deadline), so a job
     // is in flight essentially continuously and a manual request at t=500ms
-    // lands mid-job with seconds of margin on both sides.
+    // lands mid-job with seconds of margin.
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-    fixture.sequencer().rollup_manager_handle.build_block();
 
-    // The manual request coalesced with the timer's in-flight job.
-    fixture
+    // Bounded retry instead of a single blind request: this test also runs
+    // in the merge-gating lane at full parallelism, where a starved
+    // orchestrator could let one request start the job itself. Every ping
+    // either coalesces with an in-flight job (emitting the event) or starts
+    // a job for the next ping to coalesce with — the contract under test is
+    // coalesce-not-replace, whichever job is in flight.
+    let pinger_handle = fixture.sequencer().rollup_manager_handle.clone();
+    let pinger = tokio::spawn(async move {
+        loop {
+            pinger_handle.build_block();
+            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+        }
+    });
+    let coalesced = fixture
         .expect_event()
         .label("BuildBlockCoalesced with the in-flight timer job")
         .where_event(|e| matches!(e, ChainOrchestratorEvent::BuildBlockCoalesced))
-        .await?;
+        .await;
+    pinger.abort();
+    coalesced?;
 
     // That slot still produces its block.
     fixture.expect_event().block_sequenced(1).await?;

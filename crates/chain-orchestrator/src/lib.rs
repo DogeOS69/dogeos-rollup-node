@@ -417,12 +417,30 @@ impl<
         match event {
             SignerEvent::SignedBlock { block, signature } => {
                 let hash = block.hash_slow();
-                self.database
+                if let Err(err) = self
+                    .database
                     .tx_mut(move |tx| async move {
                         tx.set_l2_head_block_number(block.header.number).await?;
                         tx.insert_signature(hash, signature).await
                     })
-                    .await?;
+                    .await
+                {
+                    // The signed block sits at the engine head but its head
+                    // number and signature could not be persisted — a restart
+                    // would rewind past it and peers would never see it
+                    // (announce below never runs). Same condition
+                    // UpdateFcsHead treats as fatal.
+                    tracing::error!(
+                        target: "scroll::chain_orchestrator",
+                        block_number = block.header.number,
+                        %err,
+                        "Signed-block persistence failed after the engine head advanced"
+                    );
+                    return Err(ChainOrchestratorError::FatalStateDivergence(
+                        "signed block could not be persisted after the engine head advanced; \
+                         restart re-converges from the persisted state",
+                    ));
+                }
                 self.network.handle().announce_block(block.clone(), signature);
                 Ok(Some(ChainOrchestratorEvent::SignedBlock { block, signature }))
             }
@@ -496,7 +514,24 @@ impl<
                         .await
                     {
                         self.notify(ChainOrchestratorEvent::PayloadBuildingJobCancelled);
-                        return Err(err.into());
+                        // The head is committed but the consumed L1 messages
+                        // are not marked: they would be re-selected for the
+                        // next block (selection filters on a null L2 block
+                        // number) — duplicate L1 messages across consecutive
+                        // blocks. Same condition UpdateFcsHead treats as
+                        // fatal.
+                        tracing::error!(
+                            target: "scroll::chain_orchestrator",
+                            block_number = block_info.block_info.number,
+                            %err,
+                            "L1-message consumption could not be persisted after the engine \
+                             head advanced"
+                        );
+                        return Err(ChainOrchestratorError::FatalStateDivergence(
+                            "built block committed to the engine but its L1-message \
+                             consumption could not be persisted; restart re-converges from \
+                             the persisted state",
+                        ));
                     }
                     if let Err(err) = self
                         .signer
@@ -505,7 +540,19 @@ impl<
                         .sign_block(block.clone())
                     {
                         self.notify(ChainOrchestratorEvent::PayloadBuildingJobCancelled);
-                        return Err(err.into());
+                        // The block is at the engine head but will never be
+                        // signed, persisted, or announced; sequencing on top
+                        // of it silently forks this node from its peers.
+                        tracing::error!(
+                            target: "scroll::chain_orchestrator",
+                            block_number = block_info.block_info.number,
+                            %err,
+                            "Signing failed after the engine head advanced"
+                        );
+                        return Err(ChainOrchestratorError::FatalStateDivergence(
+                            "built block committed to the engine but could not be handed to \
+                             the signer; restart re-converges from the persisted state",
+                        ));
                     }
                     return Ok(Some(ChainOrchestratorEvent::BlockSequenced(block)));
                 }
@@ -610,14 +657,17 @@ impl<
                     )
                     .await?;
                 let previous_head = *self.engine.fcs().head_block_info();
-                let forward = self.engine.update_fcs(Some(head), None, None).await?;
-                if forward.is_invalid() {
-                    // The engine rejected the head and update_fcs did not
-                    // commit its mirror — nothing has been mutated, so refuse
-                    // the command before purging mappings, persisting the
-                    // unapplied head, or cancelling a valid job.
+                let forward = self.engine.update_fcs_checked(Some(head), None, None).await?;
+                if !forward.is_valid() {
+                    // update_fcs_checked commits its mirror only on VALID, so
+                    // nothing has been mutated — refuse before purging
+                    // mappings, persisting the unapplied head, or cancelling
+                    // a valid job. SYNCING (the EL has not adopted the head)
+                    // must not proceed either: the rollback below refuses it
+                    // for the same reason.
                     return Err(ChainOrchestratorError::FcuRejected(
-                        "administrative FCS head update rejected as INVALID by the engine",
+                        "administrative FCS head update was not applied by the engine \
+                         (INVALID or SYNCING)",
                     ));
                 }
 
@@ -733,14 +783,22 @@ impl<
                 // Check if the unwind impacts the fcs safe head.
                 if let Some(block_info) = unwind_result.l2_safe_block_info {
                     // If the new safe head is above the current finalized head, update the fcs safe
-                    // head to the new safe head.
-                    if block_info.number >= self.engine.fcs().finalized_block_info().number {
-                        self.engine.update_fcs(None, Some(block_info), None).await?;
-                    } else {
-                        // Otherwise, update the fcs safe head to the finalized head.
-                        self.engine
-                            .update_fcs(None, Some(*self.engine.fcs().finalized_block_info()), None)
-                            .await?;
+                    // head to the new safe head; otherwise move it to the finalized head.
+                    let target =
+                        if block_info.number >= self.engine.fcs().finalized_block_info().number {
+                            block_info
+                        } else {
+                            *self.engine.fcs().finalized_block_info()
+                        };
+                    let result = self.engine.update_fcs(None, Some(target), None).await?;
+                    if result.is_invalid() {
+                        // Replying success while the engine refused the safe
+                        // head would misreport the unwind; the run loop
+                        // fail-stops on any error from this command.
+                        return Err(ChainOrchestratorError::FcuRejected(
+                            "administrative unwind safe-head update rejected as INVALID by \
+                             the engine",
+                        ));
                     }
                 }
 
@@ -1036,6 +1094,10 @@ impl<
                     ));
                 }
                 Err(err) => {
+                    // Same divergence as the INVALID arm above — the L1 unwind
+                    // is already committed — and a transport error (engine
+                    // restart, socket reset) is the more common shape in
+                    // production. One policy for both.
                     tracing::error!(
                         target: "scroll::chain_orchestrator",
                         ?l2_head_block_info,
@@ -1044,7 +1106,10 @@ impl<
                         "L1-reorg FCU failed AFTER the L1 database unwind; engine and \
                          database now diverge"
                     );
-                    return Err(err.into());
+                    return Err(ChainOrchestratorError::FatalStateDivergence(
+                        "post-unwind L1-reorg forkchoice update failed; restart \
+                         re-converges from the persisted state",
+                    ));
                 }
             }
         }

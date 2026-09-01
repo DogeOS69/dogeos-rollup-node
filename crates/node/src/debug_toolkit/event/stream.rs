@@ -173,9 +173,10 @@ pub fn event_type_name(event: &ChainOrchestratorEvent) -> String {
         ChainOrchestratorEvent::L2FinalizedBlockReceived(_, _) => {
             "L2FinalizedBlockReceived".to_string()
         }
-        ChainOrchestratorEvent::BlockBuildingSkipped { head_block_number } => {
-            format!("BlockBuildingSkipped {{ head: {head_block_number} }}")
-        }
+        // Bare name only: this feeds the REPL's anchored ^pattern$ filter —
+        // appending the head would make the type unmatchable (the display
+        // formatter renders the head).
+        ChainOrchestratorEvent::BlockBuildingSkipped { .. } => "BlockBuildingSkipped".to_string(),
         ChainOrchestratorEvent::BuildBlockCoalesced => "BuildBlockCoalesced".to_string(),
         ChainOrchestratorEvent::PayloadBuildingJobCancelled => {
             "PayloadBuildingJobCancelled".to_string()

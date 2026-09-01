@@ -181,17 +181,25 @@ impl ScrollRollupNodeConfig {
             // the settlement budget is exhausted and the build abandoned.
             return Err(
                 "remote-source.build requires sequencer.enabled: building on top of imported \
-                 blocks needs a configured sequencer (which itself requires a signer key source)"
+                 blocks needs a configured sequencer (which itself requires a signer key \
+                 source under non-noop consensus)"
                     .to_string(),
             );
         }
 
-        if !self.remote_block_source_args.enabled &&
-            (self.remote_block_source_args.build || self.remote_block_source_args.url.is_some())
-        {
-            return Err("remote-source.build/remote-source.url have no effect without \
-                 remote-source.enabled"
-                .to_string());
+        if !self.remote_block_source_args.enabled && self.remote_block_source_args.build {
+            return Err(
+                "remote-source.build has no effect without remote-source.enabled".to_string()
+            );
+        }
+        if !self.remote_block_source_args.enabled && self.remote_block_source_args.url.is_some() {
+            // A URL templated into every node role with only `enabled`
+            // toggled per role is a common, harmless deployment shape —
+            // warn, never break the launch.
+            tracing::warn!(
+                target: "scroll::node::args",
+                "remote-source.url is set but remote-source.enabled is off; the URL is ignored"
+            );
         }
 
         if self.remote_block_source_args.enabled &&

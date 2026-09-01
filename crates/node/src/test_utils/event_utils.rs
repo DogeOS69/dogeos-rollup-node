@@ -249,11 +249,16 @@ impl<'a> EventWaiter<'a> {
     }
 
     /// Wait for N events matching a predicate.
+    ///
+    /// NOTE: the timeout applies PER NODE (each node in turn gets the full
+    /// budget), unlike `wait_for_event_on_all`, which shares one budget
+    /// across nodes.
     pub async fn where_n_events(
         self,
         count: usize,
         mut predicate: impl FnMut(&ChainOrchestratorEvent) -> bool,
     ) -> eyre::Result<Vec<ChainOrchestratorEvent>> {
+        eyre::ensure!(count > 0, "where_n_events requires count > 0");
         let mut matched_events = Vec::new();
         for node in self.node_indices {
             let Some(node_handle) = &mut self.fixture.nodes[node] else {
@@ -270,8 +275,9 @@ impl<'a> EventWaiter<'a> {
                         node_matched_events.push(event.clone());
                         if node_matched_events.len() >= count {
                             // The events live in node_matched_events; the
-                            // match arm below assigns them. Returning a value
-                            // here would hand back the previous node's list.
+                            // match arm below extends the accumulator with
+                            // them. Returning a value here would hand back
+                            // the previous node's list.
                             return Ok(());
                         }
                     }

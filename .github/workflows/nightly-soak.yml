@@ -3,16 +3,15 @@ name: nightly-soak
 # Recurrence guard for the CI races fixed in issue #38. Soaks the previously
 # flaky spots off the merge path (same tier idea as dogeos-core's tiered CI):
 #   - the in-process timing-sensitive suite — the optimistic-sync
-#     consolidation test, the four payload-job cancellation tests, the
-#     remote-source launch test, and the skip-identity test — (the resume
-#     test is deliberately NOT soaked: its shutdown/restart fixture has a
-#     known teardown race — a blind 1s cleanup sleep vs the rocksdb lock —
-#     that would file false regression reports; see the follow-ups ledger) —
-#     plain and under deliberate CPU contention (the original race only fired
-#     on contended runners); the two build-coalescing tests soak in the idle
-#     lane only (contention can legitimately defeat their in-flight-job
-#     precondition), and
-#   - the docker remote-source startup pair, repeated serially.
+#     consolidation test, both build-coalescing tests, the four payload-job
+#     cancellation tests, the remote-source launch test, and the
+#     skip-identity test — plain and under deliberate CPU contention (the
+#     original race only fired on contended runners). The resume test is
+#     deliberately NOT soaked: its shutdown/restart fixture has a known
+#     teardown race (a blind 1s cleanup sleep vs the rocksdb lock) that
+#     would file false regression reports; see the follow-ups ledger. And
+#   - the docker remote-source pair (follow/import parity, and recovery
+#     across a sequencer restart), repeated serially.
 # Any failure here is a regression of a fixed race — treat it as a bug, not as
 # noise to re-run. (A job hitting its own timeout is a capacity problem, not a
 # race regression — the idle and contended soaks run as separate jobs so each
@@ -45,6 +44,9 @@ env:
 
 jobs:
   soak-integration-idle:
+    # Forks with schedules enabled must not burn three 130-minute jobs
+    # nightly and comment on the fork's own issue #38.
+    if: ${{ github.repository == 'DogeOS69/dogeos-rollup-node' || github.event_name == 'workflow_dispatch' }}
     runs-on: blacksmith-8vcpu-ubuntu-2404
     # Must exceed the soak step's 80-minute step-level timeout by enough to
     # cover setup and a cold --all-features workspace test build (25-40 min),
@@ -63,7 +65,17 @@ jobs:
         with:
           cache-on-failure: true
       - uses: taiki-e/install-action@nextest
+      - name: Install pinned Anvil
+        # None of the currently-soaked tests use the Anvil fixture, but the
+        # filters are substring matches — a future match that does must not
+        # fail on a missing binary and be auto-filed as a race regression.
+        run: |
+          ANVIL_BIN="$(.github/assets/install_anvil.sh "$RUNNER_TEMP/anvil" | tail -n1)"
+          echo "ANVIL_BIN=$ANVIL_BIN" >> "$GITHUB_ENV"
       - name: Build test binaries
+        # Step-level: a hung cold build (25-40 min normally) must fail this
+        # step, not ride into the job-level cancel that skips the reporter.
+        timeout-minutes: 45
         run: |
           cargo nextest run --all-features --workspace --locked --no-run \
             -E 'test(test_should_consolidate_after_optimistic_sync) or test(coalesces_with) or test(cancels_inflight_payload_job) or test(remote_source_node_launches_when_remote_unreachable) or test(block_building_skipped_carries_head_number)'
@@ -83,9 +95,7 @@ jobs:
           [[ "$ITERATIONS" =~ ^[1-9][0-9]*$ ]] || { echo "::error::iterations must be a positive integer"; exit 1; }
           for i in $(seq "$ITERATIONS"); do
             echo "::group::idle iteration $i/$ITERATIONS"
-            # Superset of the loaded job's filter (this lane also soaks the
-            # coalescing tests, whose in-flight-job precondition deliberate
-            # contention can defeat), so a loaded-only failure is still
+            # Same filter as the loaded job, so a loaded-only failure is
             # distinguishable from a plain regression. Single-threaded so the
             # tests' internal timing budgets are not compounded by peer load.
             cargo nextest run --all-features --workspace --locked --test-threads=1 \
@@ -96,12 +106,15 @@ jobs:
         # A soak failure is a race regression; a soak step killed by its
         # step-level timeout (the likeliest shape of a reintroduced
         # hang/livelock — reported as 'failure' or 'cancelled' depending on
-        # runner version) must also leave a signal. always() is required
-        # because the job is failing at this point. The job-level 130-minute
-        # backstop is NOT reportable from inside the job (it cancels every
-        # remaining step); it only exists for a hang in a non-soak step.
-        # Setup/toolchain failures still must not be reported as regressions.
-        if: always() && (steps.soak.outcome == 'failure' || steps.soak.outcome == 'cancelled')
+        # runner version) must also leave a signal. !cancelled() (rather than
+        # always()) keeps a manual RUN cancellation from posting a bogus
+        # hang report: it is false only when the job itself is cancelled,
+        # while a step-level timeout leaves the job running this reporter.
+        # The job-level 130-minute backstop is NOT reportable from inside
+        # the job (it cancels every remaining step); it only exists for a
+        # hang in a non-soak step. Setup/toolchain failures still must not
+        # be reported as regressions.
+        if: ${{ !cancelled() && (steps.soak.outcome == 'failure' || steps.soak.outcome == 'cancelled') }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -116,6 +129,9 @@ jobs:
           gh issue comment 38 --repo "$GITHUB_REPOSITORY" --body "$body"
 
   soak-integration-loaded:
+    # Forks with schedules enabled must not burn three 130-minute jobs
+    # nightly and comment on the fork's own issue #38.
+    if: ${{ github.repository == 'DogeOS69/dogeos-rollup-node' || github.event_name == 'workflow_dispatch' }}
     runs-on: blacksmith-8vcpu-ubuntu-2404
     # Must exceed the soak step's 80-minute step-level timeout by enough to
     # cover setup and a cold --all-features workspace test build (25-40 min),
@@ -134,7 +150,17 @@ jobs:
         with:
           cache-on-failure: true
       - uses: taiki-e/install-action@nextest
+      - name: Install pinned Anvil
+        # None of the currently-soaked tests use the Anvil fixture, but the
+        # filters are substring matches — a future match that does must not
+        # fail on a missing binary and be auto-filed as a race regression.
+        run: |
+          ANVIL_BIN="$(.github/assets/install_anvil.sh "$RUNNER_TEMP/anvil" | tail -n1)"
+          echo "ANVIL_BIN=$ANVIL_BIN" >> "$GITHUB_ENV"
       - name: Build test binaries
+        # Step-level: a hung cold build (25-40 min normally) must fail this
+        # step, not ride into the job-level cancel that skips the reporter.
+        timeout-minutes: 45
         run: |
           cargo nextest run --all-features --workspace --locked --no-run \
             -E 'test(test_should_consolidate_after_optimistic_sync) or test(coalesces_with) or test(cancels_inflight_payload_job) or test(remote_source_node_launches_when_remote_unreachable) or test(block_building_skipped_carries_head_number)'
@@ -159,25 +185,27 @@ jobs:
           for c in $(seq 4); do yes > /dev/null & done
           for i in $(seq "$ITERATIONS"); do
             echo "::group::loaded iteration $i/$ITERATIONS"
-            # Also soak the wall-clock-sensitive tests this fix introduced —
-            # except the coalescing tests: their "a timer job is already in
-            # flight" precondition is a capacity assumption that four CPU
-            # spinners can legitimately defeat, and a false failure here would
-            # be auto-reported as a race regression. The idle job soaks them.
+            # Also soak the wall-clock-sensitive tests this fix introduced,
+            # coalescing tests included: the timer test issues bounded
+            # retries until one provably lands mid-job, so contention cannot
+            # manufacture a false regression report.
             cargo nextest run --all-features --workspace --locked --test-threads=1 \
-              --no-tests=fail -E 'test(test_should_consolidate_after_optimistic_sync) or test(cancels_inflight_payload_job) or test(remote_source_node_launches_when_remote_unreachable) or test(block_building_skipped_carries_head_number)'
+              --no-tests=fail -E 'test(test_should_consolidate_after_optimistic_sync) or test(coalesces_with) or test(cancels_inflight_payload_job) or test(remote_source_node_launches_when_remote_unreachable) or test(block_building_skipped_carries_head_number)'
             echo "::endgroup::"
           done
       - name: Report failure on the tracking issue
         # A soak failure is a race regression; a soak step killed by its
         # step-level timeout (the likeliest shape of a reintroduced
         # hang/livelock — reported as 'failure' or 'cancelled' depending on
-        # runner version) must also leave a signal. always() is required
-        # because the job is failing at this point. The job-level 130-minute
-        # backstop is NOT reportable from inside the job (it cancels every
-        # remaining step); it only exists for a hang in a non-soak step.
-        # Setup/toolchain failures still must not be reported as regressions.
-        if: always() && (steps.soak.outcome == 'failure' || steps.soak.outcome == 'cancelled')
+        # runner version) must also leave a signal. !cancelled() (rather than
+        # always()) keeps a manual RUN cancellation from posting a bogus
+        # hang report: it is false only when the job itself is cancelled,
+        # while a step-level timeout leaves the job running this reporter.
+        # The job-level 130-minute backstop is NOT reportable from inside
+        # the job (it cancels every remaining step); it only exists for a
+        # hang in a non-soak step. Setup/toolchain failures still must not
+        # be reported as regressions.
+        if: ${{ !cancelled() && (steps.soak.outcome == 'failure' || steps.soak.outcome == 'cancelled') }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -192,6 +220,9 @@ jobs:
           gh issue comment 38 --repo "$GITHUB_REPOSITORY" --body "$body"
 
   soak-docker-remote-source:
+    # Forks with schedules enabled must not burn three 130-minute jobs
+    # nightly and comment on the fork's own issue #38.
+    if: ${{ github.repository == 'DogeOS69/dogeos-rollup-node' || github.event_name == 'workflow_dispatch' }}
     runs-on: blacksmith-8vcpu-ubuntu-2404
     # Must exceed the soak step's 80-minute step-level timeout by enough to
     # cover setup and a cold --all-features workspace test build (25-40 min),
@@ -240,12 +271,15 @@ jobs:
         # A soak failure is a race regression; a soak step killed by its
         # step-level timeout (the likeliest shape of a reintroduced
         # hang/livelock — reported as 'failure' or 'cancelled' depending on
-        # runner version) must also leave a signal. always() is required
-        # because the job is failing at this point. The job-level 130-minute
-        # backstop is NOT reportable from inside the job (it cancels every
-        # remaining step); it only exists for a hang in a non-soak step.
-        # Setup/toolchain failures still must not be reported as regressions.
-        if: always() && (steps.soak.outcome == 'failure' || steps.soak.outcome == 'cancelled')
+        # runner version) must also leave a signal. !cancelled() (rather than
+        # always()) keeps a manual RUN cancellation from posting a bogus
+        # hang report: it is false only when the job itself is cancelled,
+        # while a step-level timeout leaves the job running this reporter.
+        # The job-level 130-minute backstop is NOT reportable from inside
+        # the job (it cancels every remaining step); it only exists for a
+        # hang in a non-soak step. Setup/toolchain failures still must not
+        # be reported as regressions.
+        if: ${{ !cancelled() && (steps.soak.outcome == 'failure' || steps.soak.outcome == 'cancelled') }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

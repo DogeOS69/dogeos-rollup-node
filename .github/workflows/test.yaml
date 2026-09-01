@@ -51,6 +51,10 @@ jobs:
           ANVIL_BIN="$(.github/assets/install_anvil.sh "$RUNNER_TEMP/anvil" | tail -n1)"
           echo "ANVIL_BIN=$ANVIL_BIN" >> "$GITHUB_ENV"
       - name: Run integration tests
+        # Step-level: with --no-fail-fast a broadly-broken build burns the
+        # full budget, and only a step timeout preserves the step's output
+        # (a job-level cancel discards it).
+        timeout-minutes: 50
         run: |
           # --no-tests=fail (nextest's default, pinned explicitly since the
           # install action is unpinned): a rename emptying the filter must
@@ -85,6 +89,8 @@ jobs:
             exit 1
           fi
       - name: Run Docker Compose integration tests
+        # Step-level: see the integration lane's rationale.
+        timeout-minutes: 75
         run: |
           # --no-tests=fail (nextest's default, pinned explicitly since the
           # install action is unpinned): a rename emptying the filter must

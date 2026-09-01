@@ -196,6 +196,9 @@ async fn test_should_trigger_pipeline_sync_for_execution_node() -> eyre::Result<
 async fn test_should_consolidate_after_optimistic_sync() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
+    const OPTIMISTIC_SYNC_TRIGGER: u64 = 10;
+    const L1_MESSAGES_COUNT: usize = 20;
+
     let mut sequencer = TestFixture::builder()
         .sequencer()
         .with_memory_db()
@@ -205,16 +208,21 @@ async fn test_should_consolidate_after_optimistic_sync() -> eyre::Result<()> {
         .block_time(20)
         .with_l1_message_delay(0)
         .allow_empty_blocks(true)
+        .optimistic_sync_trigger(OPTIMISTIC_SYNC_TRIGGER)
         .build()
         .await?;
 
-    let mut follower = TestFixture::builder().followers(1).with_memory_db().build().await?;
+    let mut follower = TestFixture::builder()
+        .followers(1)
+        .with_memory_db()
+        .optimistic_sync_trigger(OPTIMISTIC_SYNC_TRIGGER)
+        .build()
+        .await?;
 
     // Send a notification to the sequencer node that the L1 watcher is synced.
     sequencer.l1().sync().await?;
 
     // Create a sequence of L1 messages to be added to the sequencer node.
-    const L1_MESSAGES_COUNT: usize = 200;
     let mut l1_messages = Vec::with_capacity(L1_MESSAGES_COUNT);
     for i in 0..L1_MESSAGES_COUNT as u64 {
         let l1_message = TxL1Message {
@@ -298,15 +306,15 @@ async fn test_should_consolidate_after_optimistic_sync() -> eyre::Result<()> {
     sequencer
         .l1()
         .add_message()
-        .queue_index(200)
+        .queue_index(L1_MESSAGES_COUNT as u64)
         .sender(Address::random())
         .value(1)
-        .at_block(200)
+        .at_block(L1_MESSAGES_COUNT as u64)
         .send()
         .await?;
     sequencer.expect_event().l1_message_committed().await?;
 
-    sequencer.l1().new_block(201).await?;
+    sequencer.l1().new_block((L1_MESSAGES_COUNT + 1) as u64).await?;
     sequencer.expect_event().new_l1_block().await?;
 
     sequencer.build_block().build_and_await_block().await?;

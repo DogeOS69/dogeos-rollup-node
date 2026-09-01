@@ -431,3 +431,67 @@ from every pass is either fixed in the PR or recorded here.
   - First/most-recent pass: Claude (Opus, high thinking), 2026-08-31T20:58Z.
   - Why unaddressed: requires repo-admin visibility.
   - Suggested Linear title: "repo settings: verify no required status check references the sync workflow"
+
+## Pass 35 findings — RECORDED UNFIXED (review loop paused by the user)
+
+Claude pass 35 (2026-09-01T18:27Z, HEAD 0e9b6ff) reported 5 major, 8 minor,
+3 informational findings; the user paused the loop before a fix round. Full
+report: ~/.claude/plans/pr-45-in-dogeos-rollup-node-swirling-pebble.md. None
+of these are fixed in the tree; they are the first work item if the loop
+resumes.
+
+- **P35-M1** `chain-orchestrator/src/lib.rs:1318-1333` — the FcsError arm of
+  the post-unwind reorg FCU (added pass 33) is wrongly non-fatal: the DB
+  unwind is already committed, so a locally-refused FCU IS engine<->database
+  divergence; and handle_l1_reorg lacks the finalized floor / head>=safe
+  clamp RevertToL1Block has, so it is the one unwind path that can construct
+  the order-violating triple. Fix: clamp like RevertToL1Block, then make any
+  remaining FcsError fatal.
+- **P35-M2** `lib.rs:1240-1261`, `:946-954` — the reverted-tx collection
+  (best-effort pool refill, consumed only by a warn-on-failure reinsert) is
+  fatal on a single transport blip, one RPC per rewound block. Fix: warn +
+  continue with an empty/partial list; keep the ordering.
+- **P35-M3** `remote_block_source.rs:985` — initialized_once is set after
+  the post-walk guards, so a benign lagging-remote/below-safe condition
+  keeps a healthy node in first-init mode where a misrouted backend's
+  genesis mismatch fail-stops the whole node. Fix: set the flag immediately
+  after a successful walk.
+- **P35-M4** `tests/sync.rs:317/:329` — the pass-32 chain_consolidated wait
+  is order-dependent (two consolidate sites with opposite event orderings);
+  under contention it can drain L1Synced and strand the :329 wait — a new
+  flake in the flagship test. Fix: delete the redundant :329 l1_synced wait.
+- **P35-M5** `nightly-soak.yml:96/:117` — the idle lane soaks the resume
+  test whose own comment says the race is not fixed, contradicting
+  test.yaml's skip rationale and this ledger's earlier entry; a flake
+  auto-files "regression of a fixed race" on issue 38. Fix: drop it from
+  the idle filters (or give it a distinct known-flaky reporter body).
+- **P35-m1** `lib.rs:719-724` — UpdateFcsHead's reverted-tx collection error
+  drops the responder without a String reply (breaks the pass-33 contract).
+- **P35-m2** `lib.rs:1915-1929` — import_chain's FcuRejected path is the one
+  set_syncing() site that does not cancel the in-flight job first
+  (self-heals at gate reopen; policy-uniformity fix only).
+- **P35-m3** `nightly-soak.yml:174-176/:302-307` — a soak-step timeout is
+  conclusion 'failure', so the reporter's cancelled arm is effectively dead
+  and a hang is filed as a race regression; widen the failure body's text.
+- **P35-m4** `remote_block_source.rs:490-496` — TICK_STALL_BUDGET fires on
+  every tick of a legitimate deep catch-up (~500+ blocks behind with build
+  on), logging "black-holed?" while importing fine; reword + count progress.
+- **P35-m5** `remote_block_source.rs:108-119` — MAX_IMPORT_REJECTIONS doc
+  sits on TICK_STALL_BUDGET (again), and the budget doc's "no request
+  timeout" premise was falsified by the pass-33 30s client timeout.
+- **P35-m6** `remote_block_source.rs:141` — dangling fragment on
+  BuildOutcome::Landed ("sequenced, or building was skipped...").
+- **P35-m7** `error.rs:29-33` — FcuRejected doc misses that the ImportBlock
+  command path stringifies the error into the reply where it counts toward
+  consecutive_import_rejections.
+- **P35-m8** `args.rs:174-256` + book — the four hard validate() rules are
+  documented nowhere in the book (no --remote-source.* page), and the PR
+  body lists three of four (missing the http/https scheme rule).
+- **P35-i1** nightly-soak.yml gets zero pre-merge validation (schedule/
+  dispatch only) — manually dispatch with iterations=1 right after merge.
+- **P35-i2** the ancestor walk is linear and non-resumable (tail risk;
+  binary search or a lower MAX_ANCESTOR_LOOKBACK are the options) — also
+  covered by the liveness entry above.
+- **P35-i3** pre-existing config gap: noop consensus + sequencer.enabled
+  with no signer panics at the "signer must be present" expect once a build
+  finalizes; the new rules do not close it.

@@ -115,7 +115,7 @@ pub fn payload_matches_attributes(
         return false
     }
 
-    if !attributes.transactions.as_ref().is_some_and(|txs| txs == &payload.transactions) {
+    if attributes.transactions.as_ref().is_none_or(|txs| txs != &payload.transactions) {
         debug!(
             target: "scroll::engine::driver",
             expected = ?attributes.transactions,

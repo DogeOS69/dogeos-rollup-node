@@ -44,9 +44,9 @@ env:
 
 jobs:
   soak-integration-idle:
-    # Forks with schedules enabled must not burn three 150-minute jobs
-    # nightly and comment on the fork's own issue #38.
-    if: ${{ github.repository == 'DogeOS69/dogeos-rollup-node' || github.event_name == 'workflow_dispatch' }}
+    # Forks must not run these jobs at all (a dispatched fork run would
+    # still burn a long job and comment on the fork's own issue #38).
+    if: ${{ github.repository == 'DogeOS69/dogeos-rollup-node' }}
     runs-on: blacksmith-8vcpu-ubuntu-2404
     # Must exceed the SUM of the step budgets (45-minute build + 80-minute
     # soak) plus checkout/toolchain/cache/Anvil setup, or the job-level cap
@@ -70,7 +70,9 @@ jobs:
         # filters are substring matches — a future match that does must not
         # fail on a missing binary and be auto-filed as a race regression.
         run: |
+          set -euo pipefail
           ANVIL_BIN="$(.github/assets/install_anvil.sh "$RUNNER_TEMP/anvil" | tail -n1)"
+          [ -x "$ANVIL_BIN" ] || { echo "::error::Anvil install produced no executable at '$ANVIL_BIN'"; exit 1; }
           echo "ANVIL_BIN=$ANVIL_BIN" >> "$GITHUB_ENV"
       - name: Build test binaries
         # Step-level: a hung cold build (25-40 min normally) must fail this
@@ -129,15 +131,15 @@ jobs:
           gh issue comment 38 --repo "$GITHUB_REPOSITORY" --body "$body"
 
   soak-integration-loaded:
-    # Forks with schedules enabled must not burn three 150-minute jobs
-    # nightly and comment on the fork's own issue #38.
-    if: ${{ github.repository == 'DogeOS69/dogeos-rollup-node' || github.event_name == 'workflow_dispatch' }}
+    # Forks must not run these jobs at all (a dispatched fork run would
+    # still burn a long job and comment on the fork's own issue #38).
+    if: ${{ github.repository == 'DogeOS69/dogeos-rollup-node' }}
     runs-on: blacksmith-8vcpu-ubuntu-2404
     # Must exceed the SUM of the step budgets (45-minute build + 80-minute
     # soak) plus checkout/toolchain/cache/Anvil setup, or the job-level cap
     # fires first, cancels the job, and skips the reporter the step-level
     # timeouts exist to protect.
-    timeout-minutes: 150
+    timeout-minutes: 170
     env:
       RUST_BACKTRACE: 1
     steps:
@@ -155,7 +157,9 @@ jobs:
         # filters are substring matches — a future match that does must not
         # fail on a missing binary and be auto-filed as a race regression.
         run: |
+          set -euo pipefail
           ANVIL_BIN="$(.github/assets/install_anvil.sh "$RUNNER_TEMP/anvil" | tail -n1)"
+          [ -x "$ANVIL_BIN" ] || { echo "::error::Anvil install produced no executable at '$ANVIL_BIN'"; exit 1; }
           echo "ANVIL_BIN=$ANVIL_BIN" >> "$GITHUB_ENV"
       - name: Build test binaries
         # Step-level: a hung cold build (25-40 min normally) must fail this
@@ -166,8 +170,11 @@ jobs:
             -E 'test(test_should_consolidate_after_optimistic_sync) or test(coalesces_with) or test(cancels_inflight_payload_job) or test(remote_source_node_launches_when_remote_unreachable) or test(block_building_skipped_carries_head_number)'
       - name: Soak timing-sensitive integration tests (under CPU contention)
         id: soak
-        # Step-level timeout: see the idle job's soak step.
-        timeout-minutes: 80
+        # Step-level timeout: see the idle job's soak step. Larger than the
+        # idle lane's 80 because four of eight vCPUs are pinned by the
+        # spinners — this is the lane most likely to time out, and a timeout
+        # posts a hang report.
+        timeout-minutes: 100
         env:
           ITERATIONS: ${{ inputs.iterations || '12' }}
         run: |
@@ -182,7 +189,10 @@ jobs:
           # INT/TERM must actually stop the job (a bare cleanup trap would
           # resume the loop after handling the signal).
           trap 'cleanup; exit 130' INT TERM
-          for c in $(seq 4); do yes > /dev/null & done
+          # timeout: the spinners must die on their own even if the step is
+          # killed hard and the cleanup trap never runs (6600s > the 100-min
+          # step cap).
+          for c in $(seq 4); do timeout 6600 yes > /dev/null & done
           for i in $(seq "$ITERATIONS"); do
             echo "::group::loaded iteration $i/$ITERATIONS"
             # Also soak the wall-clock-sensitive tests this fix introduced,
@@ -220,9 +230,9 @@ jobs:
           gh issue comment 38 --repo "$GITHUB_REPOSITORY" --body "$body"
 
   soak-docker-remote-source:
-    # Forks with schedules enabled must not burn three 150-minute jobs
-    # nightly and comment on the fork's own issue #38.
-    if: ${{ github.repository == 'DogeOS69/dogeos-rollup-node' || github.event_name == 'workflow_dispatch' }}
+    # Forks must not run these jobs at all (a dispatched fork run would
+    # still burn a long job and comment on the fork's own issue #38).
+    if: ${{ github.repository == 'DogeOS69/dogeos-rollup-node' }}
     runs-on: blacksmith-8vcpu-ubuntu-2404
     # Must exceed the SUM of the step budgets (45-minute build + 80-minute
     # soak) plus checkout/toolchain/cache/Anvil setup, or the job-level cap

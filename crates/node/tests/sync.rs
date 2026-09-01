@@ -1053,8 +1053,10 @@ async fn test_disable_sequencing_cancels_inflight_payload_job() -> eyre::Result<
         "disable_automatic_sequencing should report success"
     );
 
+    // Bounded like the sibling tests: only a prompt cancellation counts.
     fixture
         .expect_event()
+        .timeout(std::time::Duration::from_secs(2))
         .label("PayloadBuildingJobCancelled after disabling sequencing")
         .where_event(|e| matches!(e, ChainOrchestratorEvent::PayloadBuildingJobCancelled))
         .await?;
@@ -1094,8 +1096,10 @@ async fn test_revert_to_l1_block_cancels_inflight_payload_job() -> eyre::Result<
     fixture.sequencer().rollup_manager_handle.build_block();
     fixture.sequencer().rollup_manager_handle.revert_to_l1_block(0).await?;
 
+    // Bounded like the sibling tests: only a prompt cancellation counts.
     fixture
         .expect_event()
+        .timeout(std::time::Duration::from_secs(2))
         .label("PayloadBuildingJobCancelled after administrative L1 unwind")
         .where_event(|e| matches!(e, ChainOrchestratorEvent::PayloadBuildingJobCancelled))
         .await?;
@@ -1120,16 +1124,32 @@ async fn test_block_building_skipped_carries_head_number() -> eyre::Result<()> {
 
     fixture.l1().sync().await?;
 
-    // No transactions and no L1 messages: the payload is empty and the build
-    // is skipped at head 0.
+    // Give block 1 real content (an L1 message) so it is BUILT even with
+    // empty blocks disallowed: asserting the skip identity at head 0 could
+    // not distinguish a carried head from u64::default().
+    fixture
+        .l1()
+        .add_message()
+        .queue_index(0)
+        .sender(Address::random())
+        .value(1)
+        .at_block(1)
+        .send()
+        .await?;
+    fixture.expect_event().l1_message_committed().await?;
+    fixture.l1().new_block(1).await?;
+    fixture.expect_event().new_l1_block().await?;
+    fixture.build_block().expect_block_number(1).build_and_await_block().await?;
+
+    // No new messages: the next build is empty and skipped at head 1.
     fixture.sequencer().rollup_manager_handle.build_block();
     fixture
         .expect_event()
-        .label("BlockBuildingSkipped at head 0")
+        .label("BlockBuildingSkipped at head 1")
         .where_event(|e| {
             matches!(
                 e,
-                ChainOrchestratorEvent::BlockBuildingSkipped { head_block_number } if *head_block_number == 0
+                ChainOrchestratorEvent::BlockBuildingSkipped { head_block_number } if *head_block_number == 1
             )
         })
         .await?;

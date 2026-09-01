@@ -12,6 +12,7 @@ use reth_network_api::{FullNetwork, PeerId};
 use reth_provider::BlockReader;
 use reth_tokio_util::EventStream;
 use rollup_node_chain_orchestrator::{ChainOrchestratorEvent, ChainOrchestratorHandle};
+use rollup_node_primitives::BlockInfo;
 use scroll_network::{DogeosNetworkPrimitives, NewBlockWithPeer};
 use tokio::time::{interval, Duration};
 
@@ -41,8 +42,9 @@ where
     /// (issue #38): a connection error at startup used to abort the whole node.
     /// Also reset to `None` whenever it can no longer be trusted (settlement's
     /// `Superseded`/`Resync`/`Abandon` outcomes, an import the engine did not
-    /// apply, and repeated import rejections), forcing a fresh
-    /// common-ancestor walk on the next tick.
+    /// apply, repeated import rejections, the pre-issue head re-check, and
+    /// the follow-loop's local-head guard), forcing a fresh common-ancestor
+    /// walk on the next tick.
     last_imported_block: Option<u64>,
     /// Whether `init_last_imported_block` has ever succeeded. Terminal
     /// (node-killing) escalation of the walk's divergence verdicts is
@@ -315,7 +317,7 @@ where
     /// Called every poll tick until it succeeds — this call *is* the first
     /// contact with the remote; a failure (e.g. the remote is not up yet) is
     /// retried on the next tick.
-    async fn init_last_imported_block(&self) -> eyre::Result<u64> {
+    async fn init_last_imported_block(&self) -> eyre::Result<(u64, alloy_primitives::B256, u64)> {
         let local_head = self
             .orchestrator_handle
             .status()
@@ -330,6 +332,7 @@ where
         let start = local_head.min(remote_head);
         let floor = start.saturating_sub(MAX_ANCESTOR_LOOKBACK);
         let last_imported_block;
+        let resume_hash;
         let mut search = start;
         loop {
             if search == 0 {
@@ -342,7 +345,9 @@ where
                 let local_genesis = self.provider.block_hash(0)?;
                 let remote_genesis = self.remote.get_block_by_number(0u64.into()).await?;
                 match (local_genesis, remote_genesis) {
-                    (Some(lh), Some(rb)) if lh == rb.header.hash => {}
+                    (Some(lh), Some(rb)) if lh == rb.header.hash => {
+                        resume_hash = lh;
+                    }
                     (Some(lh), Some(rb)) => {
                         tracing::error!(
                             target: "scroll::remote_source",
@@ -395,6 +400,7 @@ where
             match (local_hash, remote_block) {
                 (Some(lh), Some(rb)) if lh == rb.header.hash => {
                     last_imported_block = search;
+                    resume_hash = lh;
                     break;
                 }
                 (Some(_), Some(_)) => {
@@ -429,7 +435,7 @@ where
             remote_head,
             "Determined highest common block with remote"
         );
-        Ok(last_imported_block)
+        Ok((last_imported_block, resume_hash, local_head))
     }
 
     /// Runs the remote block source until shutdown.
@@ -574,7 +580,7 @@ where
             Duration::from_millis(self.payload_building_duration_ms.saturating_mul(5))
                 .clamp(Duration::from_secs(5), Duration::from_secs(60));
         let events = &mut self.events;
-        tokio::time::timeout(wait_budget, async {
+        let result = tokio::time::timeout(wait_budget, async {
             loop {
                 match events.next().await {
                     Some(ChainOrchestratorEvent::BlockSequenced(block))
@@ -623,13 +629,23 @@ where
                 }
             }
         })
-        .await
-        .map_err(|_| {
-            eyre::eyre!(
-                "Timed out after {wait_budget:?} waiting for the build outcome of block \
-                 {expected_number}"
-            )
-        })?
+        .await;
+        match result {
+            Ok(outcome) => outcome,
+            Err(_) => {
+                // The broadcast stream swallows Lagged with an upstream warn
+                // and drops events, so the awaited outcome may already be
+                // gone. Re-subscribe so the NEXT wait starts on a fresh,
+                // unlagged stream before surfacing the timeout.
+                if let Ok(fresh) = self.orchestrator_handle.get_event_listener().await {
+                    self.events = fresh;
+                }
+                Err(eyre::eyre!(
+                    "Timed out after {wait_budget:?} waiting for the build outcome of block \
+                     {expected_number}"
+                ))
+            }
+        }
     }
 
     /// Requests block building and waits (bounded) for the outcome. The
@@ -639,8 +655,10 @@ where
     ///
     /// Stale outcomes queued by earlier, given-up requests are drained first
     /// so they cannot be attributed to this request. `pending_build` stays set
-    /// on failure so the build is settled on the next poll tick instead of
-    /// being lost.
+    /// on cancellation and timeout failures so the build is settled on the
+    /// next poll tick instead of being lost; supersession and the pre-issue
+    /// head mismatch clear it (with the resume pointer) instead — the debt is
+    /// moot once the head moved past it.
     async fn trigger_build_and_await(&mut self, expected_number: u64) -> eyre::Result<()> {
         // Drop build outcomes left over from earlier requests (e.g. a build
         // that completed after its settlement was given up). Stale outcomes
@@ -671,6 +689,13 @@ where
             .fcs
             .head_block_info()
             .number;
+        if head == expected_number {
+            // The build landed between the settlement snapshot and here (the
+            // drain above consumed its event). Same classification the
+            // settlement table gives this pair: Landed.
+            self.clear_pending_build();
+            return Ok(());
+        }
         if head.saturating_add(1) != expected_number {
             self.clear_pending_build();
             self.last_imported_block = None;
@@ -729,7 +754,10 @@ where
     /// build is abandoned and imports resume — rather than risk building the
     /// same height twice.
     async fn settle_owed_build(&mut self) -> eyre::Result<()> {
-        let last_imported = self.last_imported_block.expect("initialized above");
+        // Never unwrap: a None pointer just means "re-derive next tick".
+        let Some(last_imported) = self.last_imported_block else {
+            return Ok(());
+        };
         let head = self
             .orchestrator_handle
             .status()
@@ -768,10 +796,15 @@ where
                 // Importing `last_imported + 1` against an advanced head
                 // would rewind the engine (ImportBlock bypasses the gossip
                 // path's parent-linkage and safe-head guards) — re-derive
-                // the common ancestor instead.
+                // the common ancestor instead. Err for the same reason as
+                // Resync/Abandon below: Ok would reset consecutive_failures
+                // and could log a spurious recovery.
                 self.last_imported_block = None;
                 self.consecutive_import_rejections = 0;
-                Ok(())
+                Err(eyre::eyre!(
+                    "owed build superseded by an unrelated head advance (head {head}, expected \
+                     {expected}); re-deriving the resume point"
+                ))
             }
             SettleAction::Resync => {
                 tracing::warn!(
@@ -854,7 +887,30 @@ where
     async fn follow_and_build(&mut self) -> eyre::Result<()> {
         // First successful contact with the remote determines the resume point.
         if self.last_imported_block.is_none() {
-            let resume = self.init_last_imported_block().await?;
+            let (resume, resume_hash, local_head) = self.init_last_imported_block().await?;
+            if local_head > resume.saturating_add(1) {
+                // The local chain extends past the freshly derived common
+                // ancestor by more than our own single build: it sits on a
+                // fork the remote no longer serves (remote reorg), or the
+                // remote lags far behind. Refusing forever would wedge the
+                // follower (the next walk returns the same ancestor), and
+                // importing over it would silently reorg blocks out — so
+                // rewind through the administrative path, which collects
+                // reverted transactions, uses a checked FCU, and cancels any
+                // in-flight job. The remote is authoritative in this
+                // deployment shape; rewound derivation blocks are re-imported
+                // as the remote serves them.
+                tracing::warn!(
+                    target: "scroll::remote_source",
+                    local_head,
+                    resume,
+                    "Local head extends past the common ancestor; rewinding to follow the remote"
+                );
+                self.orchestrator_handle
+                    .update_fcs_head(BlockInfo { number: resume, hash: resume_hash })
+                    .await
+                    .map_err(|e| self.classify_recv_error(e))?;
+            }
             self.last_imported_block = Some(resume);
             self.initialized_once = true;
         }
@@ -956,7 +1012,6 @@ where
                     if self.consecutive_import_rejections >= MAX_IMPORT_REJECTIONS {
                         self.consecutive_import_rejections = 0;
                         self.last_imported_block = None;
-                        self.consecutive_import_rejections = 0;
                         return Err(eyre::eyre!(
                             "import rejected {MAX_IMPORT_REJECTIONS} times in a row (last: \
                              {e}); re-deriving the resume point"

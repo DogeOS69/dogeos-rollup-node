@@ -365,12 +365,13 @@ from every pass is either fixed in the PR or recorded here.
     but touches the fail-stop routing that just settled.
   - Suggested Linear title: "chain-orchestrator: order fatal-divergence vs held-batch accounting in the run loop"
 
-- **Docker lane can hang to the 90-minute SIGKILL with no nextest summary**
+- **Docker lane hangs die without a nextest summary (per-test bound missing)**
   (`.github/workflows/test.yaml`, integration-docker-compose)
   - Impact/evidence: Claude pass flag — no `.config/nextest.toml`, so no
-    slow-timeout/terminate-after; with `--no-fail-fast` and
-    `--test-threads=1`, a hanging docker test burns the full job cap and dies
-    without a summary.
+    slow-timeout/terminate-after. The lane now has a 75-minute STEP timeout
+    (added in this PR), so a hang no longer rides to the job-level SIGKILL —
+    but a single hanging docker test still eats the whole step budget and
+    the run ends without a per-test summary.
   - First/most-recent pass: Claude (Opus, high thinking), 2026-08-31T20:58Z.
   - Why unaddressed: needs a decision between a CLI `--slow-timeout` (version
     -sensitive syntax) and introducing `.config/nextest.toml` (affects local

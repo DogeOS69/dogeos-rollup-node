@@ -417,6 +417,18 @@ impl<
         match event {
             SignerEvent::SignedBlock { block, signature } => {
                 let hash = block.hash_slow();
+                // A stale signer result — the block was imported over or
+                // reorged out while signing ran — must be dropped entirely:
+                // persisting it would rewind the restart anchor, and
+                // announcing it would gossip a non-canonical block.
+                if self.engine.fcs().head_block_info().hash != hash {
+                    tracing::warn!(
+                        target: "scroll::chain_orchestrator",
+                        block_number = block.header.number,
+                        "Dropping a stale signer result (no longer the engine head)"
+                    );
+                    return Ok(None);
+                }
                 if let Err(err) = self
                     .database
                     .tx_mut(move |tx| async move {
@@ -425,25 +437,11 @@ impl<
                     })
                     .await
                 {
-                    // Fatal only while this block is still the engine head: a
-                    // stale signer result (the block was imported over or
-                    // reorged out while signing ran) failing to persist is
-                    // not a divergence of current state.
-                    if self.engine.fcs().head_block_info().hash != hash {
-                        tracing::warn!(
-                            target: "scroll::chain_orchestrator",
-                            block_number = block.header.number,
-                            %err,
-                            "Failed to persist a stale signed block (no longer the engine \
-                             head); ignoring"
-                        );
-                        return Ok(None);
-                    }
                     // The signed block sits at the engine head but its head
                     // number and signature could not be persisted — a restart
                     // would rewind past it and peers would never see it
-                    // (announce below never runs). Same condition
-                    // UpdateFcsHead treats as fatal.
+                    // (announce below never runs). Unlike UpdateFcsHead there is
+                    // no compensation available here, so it is fatal directly.
                     tracing::error!(
                         target: "scroll::chain_orchestrator",
                         block_number = block.header.number,
@@ -551,8 +549,8 @@ impl<
                         // are not marked: they would be re-selected for the
                         // next block (selection filters on a null L2 block
                         // number) — duplicate L1 messages across consecutive
-                        // blocks. Same condition UpdateFcsHead treats as
-                        // fatal.
+                        // blocks. Unlike UpdateFcsHead there is no
+                        // compensation available here, so it is fatal directly.
                         tracing::error!(
                             target: "scroll::chain_orchestrator",
                             block_number = block_info.block_info.number,
@@ -804,7 +802,9 @@ impl<
                 // at the end can reopen the gate), so a bad RPC argument —
                 // or a transient DB read error — must be refused here, where
                 // nothing has mutated, with a `false` reply instead of a
-                // node-killing panic.
+                // node-killing panic. (The bound is the latest RECORDED L1
+                // block — get_latest_l1_block_number — not derivation's
+                // processed marker.)
                 let latest_l1 = match self
                     .database
                     .tx(|tx| async move { tx.get_latest_l1_block_number().await })
@@ -847,6 +847,44 @@ impl<
                 self.derivation_driver.cancel_attempt();
                 let (unwind_result, held_outcome) =
                     self.unwind_and_revalidate_held_batch(block_number).await?;
+
+                // The unwind rewound the persisted L2 head; move the engine
+                // head with it, or the re-scan re-inserts the deleted L1
+                // messages while the sequencer re-selects them on the
+                // un-rewound head — duplicate L1 messages in consecutive
+                // blocks. Any error here fail-stops via the admin-unwind
+                // policy.
+                if let Some(head_number) = unwind_result.l2_head_block_number {
+                    let head_hash = self
+                        .l2_client
+                        .get_block_by_number(head_number.into())
+                        .full()
+                        .await?
+                        .ok_or(ChainOrchestratorError::L2BlockNotFoundInL2Client(head_number))?
+                        .header
+                        .hash_slow();
+                    let reverted_transactions = self
+                        .collect_reverted_txs_in_range(
+                            head_number.saturating_add(1),
+                            self.engine.fcs().head_block_info().number,
+                        )
+                        .await?;
+                    let result = self
+                        .engine
+                        .update_fcs_checked(
+                            Some(BlockInfo { number: head_number, hash: head_hash }),
+                            None,
+                            None,
+                        )
+                        .await?;
+                    if !result.is_valid() {
+                        return Err(ChainOrchestratorError::FcuRejected(
+                            "administrative unwind head update was not applied by the \
+                             engine (INVALID or SYNCING)",
+                        ));
+                    }
+                    self.reinsert_txs_into_pool(reverted_transactions).await;
+                }
 
                 // Check if the unwind impacts the fcs safe head.
                 if let Some(block_info) = unwind_result.l2_safe_block_info {
@@ -1105,23 +1143,51 @@ impl<
 
         let (l2_head_block_info, reverted_transactions) =
             if let Some(block_number) = l2_head_block_number {
-                // Fetch the block hash of the new L2 head block.
-                let block_hash = self
-                    .l2_client
-                    .get_block_by_number(block_number.into())
-                    .full()
-                    .await?
-                    .ok_or(ChainOrchestratorError::L2BlockNotFoundInL2Client(block_number))?
-                    .header
-                    .hash_slow();
+                // The unwind above is already committed (persisted head
+                // rewound, mappings purged). A failure between here and the
+                // FCU would leave the engine on the old chain with the
+                // notification consumed and never retried — strictly worse
+                // than a rejected FCU, so both reads share its fatal policy.
+                let block_hash =
+                    match self.l2_client.get_block_by_number(block_number.into()).full().await {
+                        Ok(Some(block)) => block.header.hash_slow(),
+                        outcome => {
+                            tracing::error!(
+                                target: "scroll::chain_orchestrator",
+                                block_number,
+                                ?outcome,
+                                "Post-unwind L2 head lookup failed; engine and database now diverge"
+                            );
+                            return Err(ChainOrchestratorError::FatalStateDivergence(
+                                "post-unwind L2 head lookup failed before the reorg FCU; \
+                             restart re-converges from the persisted state",
+                            ));
+                        }
+                    };
 
                 // Collect transactions of reverted blocks from l2 client.
-                let reverted_transactions = self
+                let reverted_transactions = match self
                     .collect_reverted_txs_in_range(
                         block_number.saturating_add(1),
                         self.engine.fcs().head_block_info().number,
                     )
-                    .await?;
+                    .await
+                {
+                    Ok(txs) => txs,
+                    Err(err) => {
+                        tracing::error!(
+                            target: "scroll::chain_orchestrator",
+                            block_number,
+                            %err,
+                            "Post-unwind reverted-transaction collection failed; engine and \
+                             database now diverge"
+                        );
+                        return Err(ChainOrchestratorError::FatalStateDivergence(
+                            "post-unwind reverted-transaction collection failed before the \
+                             reorg FCU; restart re-converges from the persisted state",
+                        ));
+                    }
+                };
 
                 (Some(BlockInfo { number: block_number, hash: block_hash }), reverted_transactions)
             } else {
@@ -1148,20 +1214,20 @@ impl<
             // does not apply leaves the engine on the reorged-out chain, no
             // L1Reorg event emitted, reverted transactions not reinserted.
             match self.engine.update_fcs(l2_head_block_info, l2_safe_block_info, None).await {
-                Ok(result) if !result.is_invalid() => {}
+                Ok(result) if result.is_valid() => {}
                 Ok(_) => {
                     tracing::error!(
                         target: "scroll::chain_orchestrator",
                         ?l2_head_block_info,
                         ?l2_safe_block_info,
-                        "L1-reorg FCU rejected as INVALID AFTER the L1 database unwind; \
-                         engine and database now diverge"
+                        "L1-reorg FCU not applied (INVALID or SYNCING) AFTER the L1 \
+                         database unwind; engine and database now diverge"
                     );
                     // No in-process compensation exists here; a restart
                     // re-derives from the (unwound) database and converges.
                     return Err(ChainOrchestratorError::FatalStateDivergence(
-                        "post-unwind L1-reorg forkchoice update rejected as INVALID; \
-                         restart re-converges from the persisted state",
+                        "post-unwind L1-reorg forkchoice update was not applied; restart \
+                         re-converges from the persisted state",
                     ));
                 }
                 Err(err) => {

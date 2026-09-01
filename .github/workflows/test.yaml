@@ -48,8 +48,18 @@ jobs:
       - uses: taiki-e/install-action@nextest
       - name: Install pinned Anvil
         run: |
+          set -euo pipefail
           ANVIL_BIN="$(.github/assets/install_anvil.sh "$RUNNER_TEMP/anvil" | tail -n1)"
+          [ -x "$ANVIL_BIN" ] || { echo "::error::Anvil install produced no executable at '$ANVIL_BIN'"; exit 1; }
           echo "ANVIL_BIN=$ANVIL_BIN" >> "$GITHUB_ENV"
+      - name: Build test binaries
+        # Separate step so the run cap below bounds TESTS, not a cold
+        # compile (25-40 min), and a hung build fails here with its own
+        # output preserved.
+        timeout-minutes: 45
+        run: |
+          cargo nextest run --all-features --workspace --locked --no-run \
+            -E 'kind(test) and not test(docker)'
       - name: Run integration tests
         # Step-level: with --no-fail-fast a broadly-broken build burns the
         # full budget, and only a step timeout preserves the step's output
@@ -88,6 +98,12 @@ jobs:
             echo "Docker Compose tests require at least 32 GiB free; available_kib=$available_kib" >&2
             exit 1
           fi
+      - name: Build test binaries
+        # Separate step: see the integration lane's rationale.
+        timeout-minutes: 45
+        run: |
+          cargo nextest run --all-features --workspace --locked --no-run \
+            -E 'test(docker)'
       - name: Run Docker Compose integration tests
         # Step-level: see the integration lane's rationale.
         timeout-minutes: 75

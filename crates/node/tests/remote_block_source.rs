@@ -155,9 +155,11 @@ async fn test_remote_block_source_resumes_from_correct_head() -> eyre::Result<()
     fixture.start_node(1).await?;
 
     // Synchronise L1 state on the restarted remote source node — and WAIT
-    // for it: sync() only sends the notification, and an import tick that
-    // races it takes the not-synced branch, permanently skipping that
-    // height's build (the waits below would then burn their full budgets).
+    // for it: sync() only sends the notification. NOTE: this narrows the
+    // race window but does not fully order against the add-on's first
+    // import tick (the not-synced branch advances the pointer before the
+    // gate is re-checked); the durable fix is owed-build bookkeeping for
+    // not-synced imports, tracked in the follow-ups ledger.
     fixture.l1().for_node(1).sync().await?;
     fixture.expect_event_on(1).l1_synced().await?;
 

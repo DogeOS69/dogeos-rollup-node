@@ -593,10 +593,12 @@ where
     /// landed (head advanced past the imported block), completed as a skipped
     /// empty build (head unchanged — only re-observing the event settles
     /// this case), was cancelled, or is still in flight. Only an *observed*
-    /// `PayloadBuildingJobCancelled` — either carried over from an earlier
-    /// tick in `pending_build_cancelled`, or consumed inline by the wait
-    /// below — proves no outcome will ever arrive; re-issuing is limited to
-    /// that case, which (with a single build requester) is race-free. On a plain
+    /// `PayloadBuildingJobCancelled` proves no outcome will ever arrive — but
+    /// only the flag carried over from an earlier tick in
+    /// `pending_build_cancelled` licenses a re-issue here, against a head
+    /// snapshot taken this tick. A cancellation consumed inline by the wait
+    /// below is recorded and its re-issue deferred to the next tick's fresh
+    /// head check (with a single build requester either path is race-free). On a plain
     /// timeout the job may still be running, so we keep waiting on later
     /// ticks — bounded by [`MAX_PENDING_BUILD_RETRIES`], after which the
     /// build is abandoned and imports resume — rather than risk building the
@@ -705,10 +707,22 @@ where
         // the requested block would be lost.
         if self.pending_build {
             self.settle_owed_build().await?;
+            // Resync/Abandon clear the resume pointer to force a fresh
+            // common-ancestor walk; hand control back so the next tick's
+            // lazy-init guard performs it before any import.
+            if self.last_imported_block.is_none() {
+                return Ok(());
+            }
         }
 
         loop {
-            let last_imported = self.last_imported_block.expect("initialized above");
+            // Never unwrap here: the pointer is cleared by settlement above
+            // and by unapplied imports below (which error out). A None means
+            // "re-derive on the next tick", not an invariant violation worth
+            // killing the node over.
+            let Some(last_imported) = self.last_imported_block else {
+                return Ok(());
+            };
 
             // Get remote head
             let remote_block = self

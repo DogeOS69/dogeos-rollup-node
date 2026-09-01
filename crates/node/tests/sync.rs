@@ -629,6 +629,7 @@ async fn test_chain_orchestrator_l1_reorg() -> eyre::Result<()> {
         sequencer_l1_watcher_tx.notification_tx.send(l1_message.clone()).await.unwrap();
         sequencer_l1_watcher_tx.notification_tx.send(new_block.clone()).await.unwrap();
         wait_n_events(
+            "sequencer NewL1Block",
             &mut sequencer_events,
             |e| matches!(e, ChainOrchestratorEvent::NewL1Block(_)),
             1,
@@ -637,6 +638,7 @@ async fn test_chain_orchestrator_l1_reorg() -> eyre::Result<()> {
         follower_l1_watcher_tx.notification_tx.send(l1_message).await.unwrap();
         follower_l1_watcher_tx.notification_tx.send(new_block).await.unwrap();
         wait_n_events(
+            "follower NewL1Block",
             &mut follower_events,
             |e| matches!(e, ChainOrchestratorEvent::NewL1Block(_)),
             1,
@@ -645,12 +647,14 @@ async fn test_chain_orchestrator_l1_reorg() -> eyre::Result<()> {
 
         sequencer_handle.build_block();
         wait_n_events(
+            "sequencer BlockSequenced",
             &mut sequencer_events,
             |e| matches!(e, ChainOrchestratorEvent::BlockSequenced(_)),
             1,
         )
         .await;
         wait_n_events(
+            "follower ChainExtended (gossiped block)",
             &mut follower_events,
             |e| matches!(e, ChainOrchestratorEvent::ChainExtended(_)),
             1,
@@ -665,6 +669,7 @@ async fn test_chain_orchestrator_l1_reorg() -> eyre::Result<()> {
         .await
         .unwrap();
     wait_n_events(
+        "sequencer L1Reorg(50)",
         &mut sequencer_events,
         |e| {
             matches!(
@@ -704,6 +709,7 @@ async fn test_chain_orchestrator_l1_reorg() -> eyre::Result<()> {
         sequencer_l1_watcher_tx.notification_tx.send(l1_message.clone()).await.unwrap();
         sequencer_l1_watcher_tx.notification_tx.send(new_block.clone()).await.unwrap();
         wait_n_events(
+            "sequencer NewL1Block",
             &mut sequencer_events,
             |e| matches!(e, ChainOrchestratorEvent::NewL1Block(_)),
             1,
@@ -712,6 +718,7 @@ async fn test_chain_orchestrator_l1_reorg() -> eyre::Result<()> {
 
         sequencer_handle.build_block();
         wait_n_events(
+            "sequencer BlockSequenced",
             &mut sequencer_events,
             |e| matches!(e, ChainOrchestratorEvent::BlockSequenced(_)),
             1,
@@ -728,6 +735,7 @@ async fn test_chain_orchestrator_l1_reorg() -> eyre::Result<()> {
 
     // The follower node should reject the new block as it has a different view of L1 data.
     wait_n_events(
+        "follower L1MessageMismatch",
         &mut follower_events,
         |e| matches!(e, ChainOrchestratorEvent::L1MessageMismatch { .. }),
         1,
@@ -739,14 +747,20 @@ async fn test_chain_orchestrator_l1_reorg() -> eyre::Result<()> {
     for notification in l1_notifications {
         follower_l1_watcher_tx.notification_tx.send(notification).await.unwrap();
     }
-    wait_n_events(&mut follower_events, |e| matches!(e, ChainOrchestratorEvent::NewL1Block(_)), 20)
-        .await;
+    wait_n_events(
+        "follower NewL1Block x20 (post-reorg L1 update)",
+        &mut follower_events,
+        |e| matches!(e, ChainOrchestratorEvent::NewL1Block(_)),
+        20,
+    )
+    .await;
 
     // Now build a new block on the sequencer to trigger the reorg on the follower
     sequencer_handle.build_block();
 
     // Wait for the follower node to accept the new chain
     wait_n_events(
+        "follower ChainExtended (post-reorg)",
         &mut follower_events,
         |e| matches!(e, ChainOrchestratorEvent::ChainExtended(_)),
         1,
@@ -792,8 +806,10 @@ async fn test_manual_build_block_coalesces_with_inflight_job() -> eyre::Result<(
     // Exactly one block results: number 1.
     fixture.expect_event().block_sequenced(1).await?;
 
-    // A follow-up build produces number 2 — numbering is contiguous, so the
-    // coalesced command did not spawn a phantom second job.
+    // A follow-up build produces number 2. (`BuildBlockCoalesced` above is
+    // what distinguishes coalescing from the old replace-semantics; a phantom
+    // second job would also sequence 1 then 2, so contiguous numbering alone
+    // proves nothing.)
     fixture.build_block().expect_block_number(2).build_and_await_block().await?;
 
     Ok(())
@@ -818,12 +834,16 @@ async fn test_manual_build_block_coalesces_with_timer_job() -> eyre::Result<()> 
         .await?;
 
     fixture.l1().sync().await?;
+    // Observable precondition, not a guess: the sequencer arm's slot gate
+    // opens only once the Synced notification is processed, while a manual
+    // BuildBlock is ungated — sleeping blind here would race gate-open
+    // latency and let the manual command start the job itself.
+    fixture.expect_event().l1_synced().await?;
 
-    // The timer's first slot fires once L1 sync lands and its job runs for
-    // 3s (comfortably inside the engine's ~12s payload-job deadline); with a
-    // 100ms slot interval a job is in flight essentially continuously, so a
-    // manual request at t=500ms lands mid-job with seconds of margin on both
-    // sides.
+    // From gate-open, slots fire every 100ms and each job runs 3s
+    // (comfortably inside the engine's ~12s payload-job deadline), so a job
+    // is in flight essentially continuously and a manual request at t=500ms
+    // lands mid-job with seconds of margin on both sides.
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
     fixture.sequencer().rollup_manager_handle.build_block();
 
@@ -1064,6 +1084,7 @@ async fn test_block_building_skipped_carries_head_number() -> eyre::Result<()> {
 /// binary forever (a hung test is indistinguishable from a slow one in CI and
 /// burns the whole job's timeout — issue #38).
 async fn wait_n_events(
+    label: &str,
     events: &mut EventStream<ChainOrchestratorEvent>,
     mut matches: impl FnMut(ChainOrchestratorEvent) -> bool,
     mut n: u64,
@@ -1082,9 +1103,9 @@ async fn wait_n_events(
     })
     .await
     .unwrap_or_else(|_| {
-        panic!("Timeout (60s) waiting for {total} matching events ({n} still missing)")
+        panic!("[{label}] Timeout (60s) waiting for {total} matching events ({n} still missing)")
     });
     // The stream ending early falls out of the while-let without the timeout
     // firing; that must not pass silently either.
-    assert_eq!(n, 0, "event stream ended with {n}/{total} matching events still missing");
+    assert_eq!(n, 0, "[{label}] event stream ended with {n}/{total} matching events still missing");
 }

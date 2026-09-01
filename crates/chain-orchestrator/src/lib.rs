@@ -719,8 +719,8 @@ impl<
     /// latency and must not pollute the duration histograms), counts the
     /// cancellation, and notifies waiters so they can fail fast instead of
     /// burning their full wait timeout. Call wherever the job's inputs are
-    /// invalidated — a head move, an L1 unwind past its origin, or sequencing
-    /// being disabled.
+    /// invalidated — a head move, an L1 unwind while the job carries any L1
+    /// messages, or sequencing being disabled.
     fn cancel_payload_building_job(&mut self, reason: &'static str) {
         let Some(sequencer) = self.sequencer.as_mut() else { return };
         let Some(job) = sequencer.payload_building_job() else { return };

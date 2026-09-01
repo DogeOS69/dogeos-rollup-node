@@ -2,8 +2,10 @@ name: nightly-soak
 
 # Recurrence guard for the CI races fixed in issue #38. Soaks the previously
 # flaky spots off the merge path (same tier idea as dogeos-core's tiered CI):
-#   - test_should_consolidate_after_optimistic_sync, plain and under deliberate
-#     CPU contention (the original race only fired on contended runners), and
+#   - the in-process timing-sensitive suite — the optimistic-sync
+#     consolidation test, both build-coalescing tests, and the four payload-job
+#     cancellation tests — plain and under deliberate CPU contention (the
+#     original race only fired on contended runners), and
 #   - the docker remote-source startup pair, repeated serially.
 # Any failure here is a regression of a fixed race — treat it as a bug, not as
 # noise to re-run. (A job hitting its own timeout is a capacity problem, not a
@@ -54,7 +56,7 @@ jobs:
         run: |
           cargo nextest run --all-features --workspace --locked --no-run \
             -E 'test(test_should_consolidate_after_optimistic_sync) or test(coalesces_with) or test(cancels_inflight_payload_job)'
-      - name: Soak optimistic-sync consolidation test (idle)
+      - name: Soak timing-sensitive integration tests (idle)
         id: soak
         env:
           # Passed through env, never interpolated into the script body: a
@@ -101,7 +103,7 @@ jobs:
         run: |
           cargo nextest run --all-features --workspace --locked --no-run \
             -E 'test(test_should_consolidate_after_optimistic_sync) or test(coalesces_with) or test(cancels_inflight_payload_job)'
-      - name: Soak optimistic-sync consolidation test (under CPU contention)
+      - name: Soak timing-sensitive integration tests (under CPU contention)
         id: soak
         env:
           ITERATIONS: ${{ inputs.iterations || '12' }}
@@ -121,7 +123,7 @@ jobs:
           for i in $(seq "$ITERATIONS"); do
             echo "::group::loaded iteration $i/$ITERATIONS"
             # Also soak the wall-clock-sensitive tests this fix introduced:
-            # the coalescing tests and both cancellation tests.
+            # the two coalescing tests and the four cancellation tests.
             cargo nextest run --all-features --workspace --locked --test-threads=1 \
               -E 'test(test_should_consolidate_after_optimistic_sync) or test(coalesces_with) or test(cancels_inflight_payload_job)'
             echo "::endgroup::"

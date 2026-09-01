@@ -268,12 +268,15 @@ impl<'a> EventWaiter<'a> {
             .await;
 
             match result {
-                Ok(_) => matched_events = node_matched_events,
+                Ok(Ok(_)) => matched_events = node_matched_events,
+                // The stream ending before `count` matches must not pass as
+                // success with a partial (or empty) result.
+                Ok(Err(e)) => return Err(e),
                 Err(_) => {
                     return Err(eyre::eyre!(
                         "Timeout waiting for {} events (matched {} so far)",
                         count,
-                        matched_events.len()
+                        node_matched_events.len()
                     ))
                 }
             }

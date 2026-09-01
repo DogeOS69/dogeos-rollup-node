@@ -41,8 +41,8 @@ from every pass is either fixed in the PR or recorded here.
     source is mid-wait* needs L1-reorg injection into the remote-source
     fixture node at a precise moment — new fixture plumbing, and a real risk
     of adding a new flaky test to a stabilization PR. Indirect coverage now
-    exists for the pieces: both cancellation-event tests, the coalescing
-    tests, and the validate() rules.
+    exists for the pieces: the four cancellation-event tests, the two
+    coalescing tests, and the validate() rules.
   - Suggested Linear title: "rollup-node: end-to-end test for the remote source's owed-build retry path"
 
 - **Unit coverage for the handle's closed-channel surface**
@@ -98,21 +98,27 @@ from every pass is either fixed in the PR or recorded here.
     explicit error log is the in-scope mitigation.
   - Suggested Linear title: "chain-orchestrator: propagate head-persistence failures to UpdateFcsHead/RevertToL1Block callers"
 
-- **Integration test for the batch-reconciliation cancellation site**
-  (`crates/chain-orchestrator/src/lib.rs` batch-reconciliation arm,
-  `crates/node/tests/sync.rs`)
-  - Impact/evidence: Claude pass 13 g2 — of the cancellation sites only the
-    batch-reconciliation one sits on the routine derivation path, and it is
-    the only head-moving site without a dedicated test; a false positive
-    there would silently degrade block production on every batch.
-  - First/most-recent pass: Claude pass 13 (2026-09-01T04:00Z).
-  - Why unaddressed: deterministically holding a payload job open across a
-    batch commit needs L1 derivation traffic plus an in-flight build in one
-    fixture; none of the existing tests drive both, and building that
-    scaffolding is beyond the review loop. The site shares
-    `cancel_payload_building_job` with the six tested sites, and the head
-    snapshot logic it wraps is exercised by the settlement table test.
-  - Suggested Linear title: "rollup-node: integration test for payload-job cancellation during batch reconciliation"
+- **Integration tests for the consensus-path cancellation sites**
+  (`crates/chain-orchestrator/src/lib.rs` — batch reconciliation, L1 reorg
+  head move, optimistic sync; `crates/node/tests/sync.rs`)
+  - Impact/evidence: Claude pass 13 g2 + pass 15 item 6 — of the eight
+    `cancel_payload_building_job` call sites, four have dedicated tests
+    (chain import, UpdateFcsHead, disable sequencing, RevertToL1Block) and
+    they are the administrative ones. Untested: batch reconciliation (the
+    routine derivation path — a false positive silently degrades block
+    production on every batch), the L1-reorg head move, and optimistic sync
+    including the pass-14 `!result.is_invalid()` guard, which nothing would
+    catch if inverted or dropped. These are the branches where a stale job
+    finalizing reorgs a derived/synced chain back out.
+  - First/most-recent pass: Claude pass 13 (2026-09-01T04:00Z); Claude
+    pass 15 (2026-09-01T07:30Z).
+  - Why unaddressed: each needs a deterministic in-flight build held across
+    an event none of the existing fixtures drive concurrently (a batch
+    commit, an L1 reorg rewinding the L2 head, a peer block beyond the
+    optimistic-sync threshold); building that scaffolding risks adding new
+    flaky tests to a stabilization PR. The sites share
+    `cancel_payload_building_job` with the four tested ones.
+  - Suggested Linear title: "rollup-node: integration tests for payload-job cancellation on the consensus paths (batch reconciliation, L1 reorg, optimistic sync)"
 
 - **Ancestor-walk DB reads block the poll tick**
   (`crates/node/src/add_ons/remote_block_source.rs`, `init_last_imported_block`)
@@ -126,6 +132,37 @@ from every pass is either fixed in the PR or recorded here.
     `spawn_blocking` touches the provider's Send/lifetime bounds for a rare
     path. Low severity per the review.
   - Suggested Linear title: "rollup-node: move the remote source's ancestor walk off the async poll tick"
+
+- **Purely numeric catch-up check cannot see a frozen or equal-height-reorged remote**
+  (`crates/node/src/add_ons/remote_block_source.rs`, `follow_and_build` head comparison)
+  - Impact/evidence: Claude pass 15 (pre-existing flag) — the per-tick check
+    is `remote_head <= last_imported` with hashes compared only during
+    resume-point derivation. A frozen remote RPC or a remote reorg to the
+    same height leaves the node importing nothing, logging at trace, and
+    resetting `consecutive_failures = 0` every tick — indistinguishable from
+    healthy. Same shape on `main`; the metrics/status follow-up above is the
+    natural place for the reachable/last-imported gauges that would expose it.
+  - First/most-recent pass: Claude pass 15 (2026-09-01T07:30Z).
+  - Why unaddressed: pre-existing behavior outside this PR's diff; a per-tick
+    hash comparison changes steady-state RPC traffic and belongs with the
+    metrics/status design decision (see the remote-source metrics entry
+    above).
+  - Suggested Linear title: "rollup-node: detect a frozen or equal-height-reorged remote in the block source's catch-up check"
+
+- **Blind sleeps in the optimistic-sync consolidation test run under the soak lane**
+  (`crates/node/tests/sync.rs` `test_should_consolidate_after_optimistic_sync`, ~:282 and ~:308)
+  - Impact/evidence: Claude pass 15 (pre-existing flag) — two 1-second
+    sleeps ("let the unsynced node process the optimistic sync" / "…the L1
+    messages", the latter after 200 L1 messages) are capacity assumptions,
+    and the nightly soak lane now runs this test under four CPU spinners and
+    auto-comments on issue #38 — a capacity failure would be reported as a
+    race regression.
+  - First/most-recent pass: Claude pass 15 (2026-09-01T07:30Z).
+  - Why unaddressed: pre-existing test structure outside the PR's own edits;
+    replacing the sleeps needs an observable "L1 messages drained" signal the
+    fixture does not currently expose, and this test was already soaked
+    60/60 as-is.
+  - Suggested Linear title: "rollup-node: replace blind sleeps in the optimistic-sync consolidation test with observable preconditions"
 
 - **Docker lane can hang to the 90-minute SIGKILL with no nextest summary**
   (`.github/workflows/test.yaml`, integration-docker-compose)

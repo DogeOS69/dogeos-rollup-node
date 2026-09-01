@@ -1218,14 +1218,21 @@ impl<
                 number: received_block_number,
                 hash: block_with_peer.block.header.hash_slow(),
             };
-            // Cancel any in-flight payload building job: the head is about to
-            // jump far ahead. (A parked job could not complete anyway —
-            // set_syncing() closes the sequencer arm's gate, and the path back
-            // to synced cancels first — but leaving it in the slot would make
-            // every BuildBlock during the sync window coalesce into a job that
-            // can never emit an outcome.)
-            self.cancel_payload_building_job("optimistic sync moved the head");
-            self.engine.optimistic_sync(block_info).await?;
+            let result = self.engine.optimistic_sync(block_info).await?;
+            // Cancel any in-flight payload building job now that the head
+            // jumped far ahead — after the FCU, and only when the engine
+            // accepted it, so a transient engine error or an INVALID result
+            // (head unchanged in both cases) does not destroy a valid job.
+            // Mirrors the ordering at the other head-moving sites; the
+            // single-task run loop means the job cannot complete in between.
+            // Cancelling matters even though a parked job could not complete
+            // anyway — set_syncing() closes the sequencer arm's gate, and the
+            // path back to synced cancels first — because leaving it in the
+            // slot would make every BuildBlock during the sync window
+            // coalesce into a job that can never emit an outcome.
+            if !result.is_invalid() {
+                self.cancel_payload_building_job("optimistic sync moved the head");
+            }
             self.sync_state.l2_mut().set_syncing();
 
             // Purge all L1 message to L2 block mappings as they may be invalid after an

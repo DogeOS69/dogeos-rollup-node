@@ -91,20 +91,28 @@ pub enum ChainOrchestratorEvent {
     /// A new block has been sequenced by the sequencer.
     BlockSequenced(DogeosBlock),
     /// Block building was skipped because the built payload was empty and empty blocks are
-    /// disabled.
-    BlockBuildingSkipped,
+    /// disabled. Carries the head the skipped build sat on, so waiters can attribute the
+    /// skip to a specific request (a skip for a request expecting block N has
+    /// `head_block_number == N - 1`).
+    BlockBuildingSkipped {
+        /// The FCS head block number at the time the build was skipped.
+        head_block_number: u64,
+    },
     /// A manual `BuildBlock` command arrived while a payload building job was already in
     /// flight and was coalesced with it instead of replacing it.
     BuildBlockCoalesced,
-    /// The in-flight payload building job was cancelled, failed, or could not be created —
-    /// in every case no `BlockSequenced`/`BlockBuildingSkipped` will follow, and waiters on
-    /// a build outcome should treat it as their request failing. Emission sites: the head
-    /// moved under the job (chain import, batch consolidation, administrative FCS head
-    /// update, optimistic sync, or an L1 reorg that rewound the L2 head); an L1 unwind
-    /// (reorg or administrative revert) before the job's L1-message origin invalidated its
-    /// inputs; automatic sequencing was disabled; a `BuildBlock` command failed to start a
-    /// job (including when no sequencer is configured — a permanent misconfiguration, not a
-    /// transient cancellation); or payload finalization failed after the job completed.
+    /// The in-flight payload building job was cancelled, failed, or could not be created;
+    /// no `BlockSequenced`/`BlockBuildingSkipped` will follow for it. Emission sites: the
+    /// head moved under the job (chain import, batch reconciliation, administrative FCS
+    /// head update, optimistic sync, or an L1 reorg that rewound the L2 head); an L1
+    /// unwind (reorg or administrative revert); automatic sequencing was disabled; a
+    /// `BuildBlock` command failed to start a job (including when no sequencer is
+    /// configured — a permanent misconfiguration, not a transient cancellation); payload
+    /// finalization failed; or post-finalization persistence/signing failed. CAUTION for
+    /// consumers: on the two post-finalization sites the block WAS built and the FCS head
+    /// has already advanced — re-check the head before re-issuing a build, or a duplicate
+    /// block one height up may be produced (the remote block source's settlement does its
+    /// head check first for exactly this reason).
     PayloadBuildingJobCancelled,
     /// A new block has been signed by the signer.
     SignedBlock {

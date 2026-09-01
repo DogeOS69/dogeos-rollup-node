@@ -66,15 +66,13 @@ where
     /// [`MAX_PENDING_BUILD_RETRIES`] settlement attempts, kept for the error
     /// logs (this add-on currently exports no metrics).
     builds_abandoned: u64,
-    /// Set when a build is abandoned while its job may still be in flight:
-    /// the next wait ignores one numberless outcome (skip/cancel) so a late
-    /// event from the abandoned job is not attributed to a new request.
-    /// Number-carrying outcomes are already excluded by the `>=` gate.
-    ignore_stale_skip: bool,
     /// When the last "Sync error" line was logged and what it said, used to
-    /// rate-limit repeated identical errors by elapsed time while always
-    /// logging a *changed* error immediately.
+    /// rate-limit repeated errors by elapsed time (changed messages log
+    /// promptly but with a floor).
     last_error_log: Option<(std::time::Instant, String)>,
+    /// Errors suppressed by the rate limiter since the last emitted line,
+    /// reported on the next emitted line so no fault leaves zero trace.
+    suppressed_errors: u64,
 }
 
 /// After this many consecutive failed settlement attempts for an owed build,
@@ -100,6 +98,53 @@ enum BuildOutcome {
     Landed,
     /// The payload building job was cancelled; no outcome will arrive.
     Cancelled,
+}
+
+/// The action `settle_owed_build` takes for an owed build, decided purely
+/// from `(head, expected, cancellation_observed, retries)` so the state
+/// machine is table-testable without fixtures or timing.
+#[derive(Debug, PartialEq, Eq)]
+enum SettleAction {
+    /// The build landed at the expected height; clear the debt.
+    Landed,
+    /// The head moved past the expected height for another reason; the owed
+    /// build is moot.
+    Superseded,
+    /// The settlement budget is exhausted; abandon the build and resume
+    /// imports.
+    Abandon,
+    /// An observed cancellation proves the job is gone; a re-issue is
+    /// race-free.
+    Reissue,
+    /// The job may still be in flight; keep waiting for its outcome.
+    Wait,
+}
+
+/// Decides how to settle an owed build. Ordering is load-bearing:
+/// - the head checks come first (an outcome that already materialized must never be re-issued — see
+///   the `PayloadBuildingJobCancelled` contract note about the post-finalization emission sites),
+///   and
+/// - the budget check precedes the re-issue so repeated cancellations (e.g. payload creation
+///   failing every time) cannot re-issue forever.
+const fn settlement_decision(
+    head: u64,
+    expected: u64,
+    cancellation_observed: bool,
+    retries: u8,
+) -> SettleAction {
+    if head == expected {
+        return SettleAction::Landed;
+    }
+    if head > expected {
+        return SettleAction::Superseded;
+    }
+    if retries >= MAX_PENDING_BUILD_RETRIES {
+        return SettleAction::Abandon;
+    }
+    if cancellation_observed {
+        return SettleAction::Reissue;
+    }
+    SettleAction::Wait
 }
 
 /// Marker for genuine unrecoverable remote-source faults (e.g. a remote on a
@@ -189,8 +234,8 @@ where
             pending_build_cancelled: false,
             pending_build_retries: 0,
             builds_abandoned: 0,
-            ignore_stale_skip: false,
             last_error_log: None,
+            suppressed_errors: 0,
         })
     }
 
@@ -244,22 +289,38 @@ where
                 // Verify the chains actually share a genesis before declaring
                 // it common: a remote on a different chain would otherwise
                 // loop forever re-importing a block that can never connect.
+                // Absence of either block is a transient condition (pruning,
+                // lagging backend) — only two PRESENT but different hashes
+                // prove divergence.
                 let local_genesis = self.provider.block_hash(0)?;
                 let remote_genesis = self.remote.get_block_by_number(0u64.into()).await?;
                 match (local_genesis, remote_genesis) {
                     (Some(lh), Some(rb)) if lh == rb.header.hash => {}
-                    _ => {
+                    (Some(lh), Some(rb)) => {
+                        tracing::error!(
+                            target: "scroll::remote_source",
+                            local = ?lh,
+                            remote = ?rb.header.hash,
+                            "Remote genesis hash does not match the local chain"
+                        );
                         return Err(terminal_error(
                             "remote genesis hash does not match the local chain; wrong \
                              --remote-source.url?",
-                        ))
+                        ));
+                    }
+                    _ => {
+                        return Err(eyre::eyre!(
+                            "genesis block unavailable locally or remotely; retrying"
+                        ));
                     }
                 }
                 last_imported_block = 0;
                 break;
             }
             if search < floor {
-                // The block at `floor` itself has been checked by now.
+                // The block at `floor` itself has been checked by now. This
+                // walk only steps past PRESENT-but-different blocks, so
+                // exhausting the window proves divergence, not availability.
                 return Err(terminal_error(
                     "no common ancestor with the remote within the lookback window",
                 ));
@@ -271,7 +332,9 @@ where
                     last_imported_block = search;
                     break;
                 }
-                _ => {
+                (Some(_), Some(_)) => {
+                    // Both present, hashes differ: genuinely divergent at this
+                    // height — walk down.
                     if search.is_multiple_of(256) {
                         tracing::info!(
                             target: "scroll::remote_source",
@@ -281,6 +344,16 @@ where
                         );
                     }
                     search = search.saturating_sub(1);
+                }
+                _ => {
+                    // One side lacks the block (pruned, lagging, or a fresh
+                    // load-balancer backend): transient — retry the whole walk
+                    // on the next tick rather than misreading absence as
+                    // divergence.
+                    return Err(eyre::eyre!(
+                        "block {search} unavailable locally or remotely during the common-ancestor \
+                         walk; retrying"
+                    ));
                 }
             }
         }
@@ -299,7 +372,9 @@ where
         mut self,
         mut shutdown: impl std::future::Future<Output = ()> + Unpin,
     ) -> eyre::Result<()> {
-        let mut poll_interval = interval(Duration::from_millis(self.config.poll_interval_ms));
+        // interval() panics on a zero period; clamp a misconfigured value.
+        let mut poll_interval =
+            interval(Duration::from_millis(self.config.poll_interval_ms.max(1)));
         // A tick can legitimately take far longer than the interval (bounded
         // build-outcome waits, deep catch-up); Burst would then fire every
         // missed tick back-to-back, hammering an already-slow remote.
@@ -365,11 +440,15 @@ where
                                     ?e,
                                     consecutive_failures = self.consecutive_failures,
                                     builds_abandoned = self.builds_abandoned,
+                                    suppressed_errors = self.suppressed_errors,
                                     initialized = self.last_imported_block.is_some(),
                                     url = ?self.config.url,
                                     "Sync error"
                                 );
                                 self.last_error_log = Some((now, msg));
+                                self.suppressed_errors = 0;
+                            } else {
+                                self.suppressed_errors += 1;
                             }
                         }
                     }
@@ -386,15 +465,14 @@ where
     /// A `BlockSequenced` is only accepted at or above `expected_number`
     /// (stale outcomes are strictly lower-numbered), so an outcome from a
     /// previous build cannot be attributed to this request.
-    /// `BlockBuildingSkipped` carries no number and is accepted as landed —
-    /// except immediately after an abandoned build, whose still-in-flight job
-    /// may emit a late numberless outcome (`ignore_stale_skip`). What makes
-    /// attribution sound otherwise is the single-build-requester assumption
-    /// *plus* `import_chain` cancelling any in-flight job as part of every
-    /// successful import (after its validity checks): by the time a build is
-    /// requested here, the job slot is empty. Config-level violations of the
-    /// assumption are rejected by `validate()` (no `sequencer.auto-start`
-    /// with `remote-source.build`), but the
+    /// `BlockBuildingSkipped` carries the head it sat on and is accepted only
+    /// when that head is the expected parent (or beyond), so stale outcomes
+    /// from abandoned builds are excluded by identity, like `BlockSequenced`.
+    /// `import_chain` additionally cancels any in-flight job as part of every
+    /// successful import (after its validity checks), so by the time a build
+    /// is requested here the job slot is empty. Config-level violations of
+    /// the single-requester assumption are rejected by `validate()` (no
+    /// `sequencer.auto-start` with `remote-source.build`), but the
     /// `rollupNodeAdmin_enableAutomaticSequencing` RPC can still start the
     /// timer at runtime and break it — do not enable it on a remote-source
     /// node.
@@ -409,7 +487,6 @@ where
             Duration::from_millis(self.payload_building_duration_ms.saturating_mul(5))
                 .clamp(Duration::from_secs(5), Duration::from_secs(60));
         let events = &mut self.events;
-        let ignore_stale_skip = &mut self.ignore_stale_skip;
         tokio::time::timeout(wait_budget, async {
             loop {
                 match events.next().await {
@@ -422,22 +499,13 @@ where
                             "Block built successfully, proceeding to next");
                         break Ok(BuildOutcome::Landed);
                     }
-                    Some(ChainOrchestratorEvent::BlockBuildingSkipped) => {
-                        if *ignore_stale_skip {
-                            // A build abandoned while its job was still in
-                            // flight may emit a late numberless outcome;
-                            // attribute at most one such event to it.
-                            *ignore_stale_skip = false;
-                            continue;
-                        }
-                        tracing::debug!(target: "scroll::remote_source", "Block building skipped (empty block)");
+                    Some(ChainOrchestratorEvent::BlockBuildingSkipped { head_block_number })
+                        if head_block_number.saturating_add(1) >= expected_number =>
+                    {
+                        tracing::debug!(target: "scroll::remote_source", head_block_number, "Block building skipped (empty block)");
                         break Ok(BuildOutcome::Landed);
                     }
                     Some(ChainOrchestratorEvent::PayloadBuildingJobCancelled) => {
-                        if *ignore_stale_skip {
-                            *ignore_stale_skip = false;
-                            continue;
-                        }
                         break Ok(BuildOutcome::Cancelled);
                     }
                     Some(ChainOrchestratorEvent::Shutdown) => {
@@ -464,7 +532,7 @@ where
     /// Requests block building and waits (bounded) for the outcome. The
     /// command may coalesce with an already in-flight job; for the remote
     /// source that job is never stale, because `import_chain` cancels the job
-    /// slot before every import.
+    /// slot as part of every successful import (after its validity checks).
     ///
     /// Stale outcomes queued by earlier, given-up requests are drained first
     /// so they cannot be attributed to this request. `pending_build` stays set
@@ -472,20 +540,14 @@ where
     /// being lost.
     async fn trigger_build_and_await(&mut self, expected_number: u64) -> eyre::Result<()> {
         // Drop build outcomes left over from earlier requests (e.g. a build
-        // that completed after its settlement was given up). A drained
-        // numberless outcome accounts for an abandoned job, so the stale-skip
-        // guard must be cleared here — otherwise it would swallow the NEW
-        // request's genuine outcome.
+        // that completed after its settlement was given up). Stale outcomes
+        // are also excluded by identity: BlockSequenced and
+        // BlockBuildingSkipped both carry heights and are gated against the
+        // expected height in await_build_outcome.
         while let Some(event) = self.events.next().now_or_never() {
             match event {
                 Some(ChainOrchestratorEvent::Shutdown) => {
                     return Err(orchestrator_gone("Chain orchestrator is shutting down"));
-                }
-                Some(
-                    ChainOrchestratorEvent::BlockBuildingSkipped |
-                    ChainOrchestratorEvent::PayloadBuildingJobCancelled,
-                ) => {
-                    self.ignore_stale_skip = false;
                 }
                 Some(_) => {}
                 None => return Err(orchestrator_gone("Event stream ended unexpectedly")),
@@ -540,58 +602,59 @@ where
             .head_block_info()
             .number;
         let expected = last_imported + 1;
-        if head == expected {
-            // The build landed after its wait timed out.
-            self.clear_pending_build();
-            return Ok(());
-        }
-        if head > expected {
-            // The head moved past the owed height for another reason (e.g.
-            // derivation or a gossip import advanced it); the owed build is
-            // moot — its parent has been superseded.
-            tracing::info!(
-                target: "scroll::remote_source",
-                head,
-                expected,
-                "Owed build superseded by an unrelated head advance; dropping it"
-            );
-            self.clear_pending_build();
-            return Ok(());
-        }
 
-        // Every settlement attempt — a plain wait OR a cancellation-driven
-        // re-issue — consumes the same bounded budget: repeated cancellations
-        // (e.g. payload creation failing every time) must not re-issue
-        // forever and stall imports.
-        if self.pending_build_retries >= MAX_PENDING_BUILD_RETRIES {
-            self.builds_abandoned += 1;
-            self.ignore_stale_skip = true;
-            tracing::error!(
-                target: "scroll::remote_source",
-                retries = self.pending_build_retries,
-                builds_abandoned = self.builds_abandoned,
-                last_imported,
-                head,
-                "Giving up on settling an owed build; resuming imports"
-            );
-            self.clear_pending_build();
-            return Ok(());
-        }
-        self.pending_build_retries += 1;
-
-        // The cancellation was already observed (by the wait that set
-        // pending_build_cancelled): the job is provably gone, so re-issuing
-        // now cannot double-build.
-        if std::mem::take(&mut self.pending_build_cancelled) {
-            return self.trigger_build_and_await(expected).await;
-        }
-
-        match self.await_build_outcome(expected).await? {
-            BuildOutcome::Landed => {
+        match settlement_decision(
+            head,
+            expected,
+            self.pending_build_cancelled,
+            self.pending_build_retries,
+        ) {
+            SettleAction::Landed => {
+                // The build landed after its wait timed out.
                 self.clear_pending_build();
                 Ok(())
             }
-            BuildOutcome::Cancelled => self.trigger_build_and_await(expected).await,
+            SettleAction::Superseded => {
+                // The head moved past the owed height for another reason
+                // (e.g. derivation or a gossip import advanced it); the owed
+                // build is moot — its parent has been superseded.
+                tracing::info!(
+                    target: "scroll::remote_source",
+                    head,
+                    expected,
+                    "Owed build superseded by an unrelated head advance; dropping it"
+                );
+                self.clear_pending_build();
+                Ok(())
+            }
+            SettleAction::Abandon => {
+                self.builds_abandoned += 1;
+                tracing::error!(
+                    target: "scroll::remote_source",
+                    retries = self.pending_build_retries,
+                    builds_abandoned = self.builds_abandoned,
+                    last_imported,
+                    head,
+                    "Giving up on settling an owed build; resuming imports"
+                );
+                self.clear_pending_build();
+                Ok(())
+            }
+            SettleAction::Reissue => {
+                self.pending_build_retries += 1;
+                self.pending_build_cancelled = false;
+                self.trigger_build_and_await(expected).await
+            }
+            SettleAction::Wait => {
+                self.pending_build_retries += 1;
+                match self.await_build_outcome(expected).await? {
+                    BuildOutcome::Landed => {
+                        self.clear_pending_build();
+                        Ok(())
+                    }
+                    BuildOutcome::Cancelled => self.trigger_build_and_await(expected).await,
+                }
+            }
         }
     }
 
@@ -701,6 +764,45 @@ where
             self.trigger_build_and_await(next_block_num + 1).await?;
 
             // Loop continues to process next block
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn settlement_decision_table() {
+        // (head, expected, cancellation_observed, retries) -> action
+        let cases: &[(u64, u64, bool, u8, SettleAction)] = &[
+            // The build landed at exactly the expected height, regardless of
+            // other state.
+            (6, 6, false, 0, SettleAction::Landed),
+            (6, 6, true, MAX_PENDING_BUILD_RETRIES, SettleAction::Landed),
+            // The head moved past the expected height: superseded, even with
+            // budget exhausted or a cancellation observed.
+            (7, 6, false, 0, SettleAction::Superseded),
+            (9, 6, true, MAX_PENDING_BUILD_RETRIES, SettleAction::Superseded),
+            // Budget exhausted before anything else resolves: abandon, even
+            // when a cancellation was observed (repeated cancellations must
+            // not re-issue forever).
+            (5, 6, true, MAX_PENDING_BUILD_RETRIES, SettleAction::Abandon),
+            (5, 6, false, MAX_PENDING_BUILD_RETRIES, SettleAction::Abandon),
+            // An observed cancellation licenses exactly one race-free
+            // re-issue per settlement attempt.
+            (5, 6, true, 0, SettleAction::Reissue),
+            (5, 6, true, MAX_PENDING_BUILD_RETRIES - 1, SettleAction::Reissue),
+            // Otherwise the job may still be in flight: wait.
+            (5, 6, false, 0, SettleAction::Wait),
+            (5, 6, false, MAX_PENDING_BUILD_RETRIES - 1, SettleAction::Wait),
+        ];
+        for (head, expected, cancelled, retries, want) in cases {
+            let got = settlement_decision(*head, *expected, *cancelled, *retries);
+            assert_eq!(
+                &got, want,
+                "settlement_decision({head}, {expected}, {cancelled}, {retries})"
+            );
         }
     }
 }

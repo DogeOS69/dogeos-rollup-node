@@ -45,20 +45,6 @@ from every pass is either fixed in the PR or recorded here.
     tests, and the validate() rules.
   - Suggested Linear title: "rollup-node: end-to-end test for the remote source's owed-build retry path"
 
-- **Outcome-event identity (numbers on skip/cancel events)**
-  (`crates/chain-orchestrator/src/event.rs`, remote block source waits)
-  - Impact/evidence: Claude pass 9 S1 — `BlockBuildingSkipped` and
-    `PayloadBuildingJobCancelled` carry no height, so attribution of
-    numberless outcomes rests on the single-requester assumption plus
-    import-time cancellation. The PR ships a cheap mitigation (one stale
-    numberless outcome is ignored after an abandonment); giving the events an
-    identity (a block_number field, gated at-or-above expected like
-    `BlockSequenced`) removes the assumption entirely.
-  - First/most-recent pass: Claude pass 9 (2026-09-01T00:22Z).
-  - Why unaddressed: additive event-payload change rippling through every
-    match on the enum; the mitigation covers the realistic window.
-  - Suggested Linear title: "chain-orchestrator: carry the target height on skip/cancel build outcome events"
-
 - **Unit coverage for the handle's closed-channel surface**
   (`crates/chain-orchestrator/src/handle/mod.rs`, `classify_recv_error`)
   - Impact/evidence: Claude pass 9 S5 — `is_closed`/`try_build_block` and the
@@ -69,6 +55,35 @@ from every pass is either fixed in the PR or recorded here.
     constructing a concrete network type in a unit test needs test plumbing
     that does not exist in the handle crate today.
   - Suggested Linear title: "chain-orchestrator: unit-test the handle's closed-channel classification surface"
+
+- **Runtime enforcement of the single-build-requester assumption**
+  (`crates/node/src/add_ons/rpc.rs`, `crates/chain-orchestrator/src/lib.rs` enable arm)
+  - Impact/evidence: Claude pass 11 M3 — `rollupNodeAdmin_enableAutomaticSequencing`
+    can start the build timer on a remote-source node at runtime, breaking the
+    attribution assumption validate() enforces at config time. The shipped
+    docker launch script legitimately enables the admin RPC, so rejecting the
+    flag combination in validate() would break it; the correct fix is for the
+    enable command to be refused when the remote block source owns building,
+    which needs that bit plumbed into the orchestrator.
+  - First/most-recent pass: Claude pass 5 (doc caveat added), pass 11 M3
+    (2026-09-01T01:40Z).
+  - Why unaddressed: requires threading remote-source ownership into
+    ChainOrchestrator construction; the mitigation is the documented caveat
+    plus config validation, and skip attribution is now identity-gated so a
+    runtime violation degrades to reorged-out side blocks rather than silent
+    misattribution.
+  - Suggested Linear title: "chain-orchestrator: refuse enableAutomaticSequencing while the remote block source owns building"
+
+- **Unit tests for the ancestor walk's terminal paths**
+  (`crates/node/src/add_ons/remote_block_source.rs`, `init_last_imported_block`)
+  - Impact/evidence: Claude pass 11 — the genesis-mismatch and
+    lookback-exhausted paths fail-stop the node and have no direct tests
+    (absence-vs-divergence classification landed in the same pass).
+  - First/most-recent pass: Claude pass 11 (2026-09-01T01:40Z).
+  - Why unaddressed: needs a mocked BlockReader + remote RPC pair; no such
+    harness exists in the add-on today. The settlement decision logic, by
+    contrast, was extracted into a pure function and table-tested in-PR.
+  - Suggested Linear title: "rollup-node: unit-test the remote source's common-ancestor terminal paths"
 
 - **Docker lane can hang to the 90-minute SIGKILL with no nextest summary**
   (`.github/workflows/test.yaml`, integration-docker-compose)

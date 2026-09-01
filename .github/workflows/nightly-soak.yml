@@ -53,8 +53,9 @@ jobs:
       - name: Build test binaries
         run: |
           cargo nextest run --all-features --workspace --locked --no-run \
-            -E 'test(test_should_consolidate_after_optimistic_sync)'
+            -E 'test(test_should_consolidate_after_optimistic_sync) or test(coalesces_with) or test(cancels_inflight_payload_job)'
       - name: Soak optimistic-sync consolidation test (idle)
+        id: soak
         env:
           # Passed through env, never interpolated into the script body: a
           # workflow_dispatch input is attacker-influencable text.
@@ -65,13 +66,16 @@ jobs:
           for i in $(seq "$ITERATIONS"); do
             echo "::group::idle iteration $i/$ITERATIONS"
             # Same filter as the loaded job so a loaded-only failure is
-            # distinguishable from a plain regression.
-            cargo nextest run --all-features --workspace --locked \
+            # distinguishable from a plain regression. Single-threaded so the
+            # tests' internal timing budgets are not compounded by peer load.
+            cargo nextest run --all-features --workspace --locked --test-threads=1 \
               -E 'test(test_should_consolidate_after_optimistic_sync) or test(coalesces_with) or test(cancels_inflight_payload_job)'
             echo "::endgroup::"
           done
       - name: Report failure on the tracking issue
-        if: failure()
+        # Only a soak failure is a race regression; setup/toolchain failures
+        # must not be reported as one.
+        if: failure() && steps.soak.outcome == 'failure'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -96,27 +100,32 @@ jobs:
       - name: Build test binaries
         run: |
           cargo nextest run --all-features --workspace --locked --no-run \
-            -E 'test(test_should_consolidate_after_optimistic_sync)'
+            -E 'test(test_should_consolidate_after_optimistic_sync) or test(coalesces_with) or test(cancels_inflight_payload_job)'
       - name: Soak optimistic-sync consolidation test (under CPU contention)
+        id: soak
         env:
           ITERATIONS: ${{ inputs.iterations || '25' }}
         run: |
           set -euo pipefail
           [[ "$ITERATIONS" =~ ^[1-9][0-9]*$ ]] || { echo "::error::iterations must be a positive integer"; exit 1; }
-          # Saturate most cores to mimic a contended runner — the condition
-          # under which the original race fired.
-          for c in $(seq 6); do yes > /dev/null & done
-          trap 'jobs -p | xargs -r kill 2>/dev/null || true' EXIT
+          # Add real contention — the condition under which the original race
+          # fired — but leave headroom: the tests run single-threaded below,
+          # and full saturation would blow their internal budgets and
+          # manufacture the false signal this lane exists to prevent.
+          trap 'jobs -p | xargs -r kill 2>/dev/null || true' EXIT INT TERM
+          for c in $(seq 4); do yes > /dev/null & done
           for i in $(seq "$ITERATIONS"); do
             echo "::group::loaded iteration $i/$ITERATIONS"
             # Also soak the wall-clock-sensitive tests this fix introduced:
             # the coalescing tests and both cancellation tests.
-            cargo nextest run --all-features --workspace --locked \
+            cargo nextest run --all-features --workspace --locked --test-threads=1 \
               -E 'test(test_should_consolidate_after_optimistic_sync) or test(coalesces_with) or test(cancels_inflight_payload_job)'
             echo "::endgroup::"
           done
       - name: Report failure on the tracking issue
-        if: failure()
+        # Only a soak failure is a race regression; setup/toolchain failures
+        # must not be reported as one.
+        if: failure() && steps.soak.outcome == 'failure'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -149,6 +158,7 @@ jobs:
             exit 1
           fi
       - name: Soak docker remote-source tests
+        id: soak
         run: |
           set -euo pipefail
           # Deliberately NO --no-tests=pass: if a rename ever empties the
@@ -161,7 +171,9 @@ jobs:
             echo "::endgroup::"
           done
       - name: Report failure on the tracking issue
-        if: failure()
+        # Only a soak failure is a race regression; setup/toolchain failures
+        # must not be reported as one.
+        if: failure() && steps.soak.outcome == 'failure'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

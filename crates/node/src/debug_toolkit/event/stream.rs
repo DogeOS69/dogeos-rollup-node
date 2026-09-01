@@ -173,7 +173,7 @@ pub fn event_type_name(event: &ChainOrchestratorEvent) -> String {
         ChainOrchestratorEvent::L2FinalizedBlockReceived(_, _) => {
             "L2FinalizedBlockReceived".to_string()
         }
-        ChainOrchestratorEvent::BlockBuildingSkipped => "BlockBuildingSkipped".to_string(),
+        ChainOrchestratorEvent::BlockBuildingSkipped { .. } => "BlockBuildingSkipped".to_string(),
         ChainOrchestratorEvent::BuildBlockCoalesced => "BuildBlockCoalesced".to_string(),
         ChainOrchestratorEvent::PayloadBuildingJobCancelled => {
             "PayloadBuildingJobCancelled".to_string()
@@ -307,7 +307,7 @@ pub fn format_event_short(event: &ChainOrchestratorEvent) -> String {
             format!("{:?}", hash),
             format!("{:?}", peer)
         ),
-        ChainOrchestratorEvent::BlockBuildingSkipped => "BlockBuildingSkipped".to_string(),
+        ChainOrchestratorEvent::BlockBuildingSkipped { .. } => "BlockBuildingSkipped".to_string(),
         ChainOrchestratorEvent::BuildBlockCoalesced => "BuildBlockCoalesced".to_string(),
         ChainOrchestratorEvent::PayloadBuildingJobCancelled => {
             "PayloadBuildingJobCancelled".to_string()

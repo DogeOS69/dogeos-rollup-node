@@ -926,7 +926,12 @@ async fn test_update_fcs_head_cancels_inflight_payload_job() -> eyre::Result<()>
     let genesis = fixture.get_block(0).await?;
     let genesis_info = BlockInfo { number: genesis.header.number, hash: genesis.header.hash };
 
-    // Start a long build, then move the head administratively while it is in
+    // Advance the head to block 1 so the administrative update below
+    // genuinely MOVES the head (updating a genesis head to genesis would
+    // exercise nothing).
+    fixture.build_block().expect_block_number(1).build_and_await_block().await?;
+
+    // Start a long build, then move the head back to genesis while it is in
     // flight. No sleep is needed: the command channel is FIFO, so the head
     // update is processed after the build command.
     fixture.sequencer().rollup_manager_handle.build_block();

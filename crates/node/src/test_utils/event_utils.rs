@@ -42,7 +42,8 @@ impl<'a> EventWaiter<'a> {
             .wait_for_event_on_all(|e| {
                 if let ChainOrchestratorEvent::BlockSequenced(block) = e {
                     if block.header.number > target {
-                        overshoot.store(block.header.number, std::sync::atomic::Ordering::Relaxed);
+                        overshoot
+                            .fetch_max(block.header.number, std::sync::atomic::Ordering::Relaxed);
                     }
                     (block.header.number == target).then(|| block.clone())
                 } else {
@@ -59,8 +60,8 @@ impl<'a> EventWaiter<'a> {
             if seen > target {
                 e.wrap_err(format!(
                     "while waiting for BlockSequenced({target}), BlockSequenced({seen}) was \
-                     observed on one of the waited nodes; numbers are monotone per node, so if \
-                     that node is the incomplete one the target can no longer arrive"
+                     observed on one of the waited nodes; absent a reorg, numbers only grow, so \
+                     if that node is the incomplete one the target likely can no longer arrive"
                 ))
             } else {
                 e

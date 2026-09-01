@@ -469,7 +469,9 @@ impl<
                     }
                     return Ok(Some(ChainOrchestratorEvent::BlockSequenced(block)));
                 }
-                return Ok(Some(ChainOrchestratorEvent::BlockBuildingSkipped));
+                return Ok(Some(ChainOrchestratorEvent::BlockBuildingSkipped {
+                    head_block_number: self.engine.fcs().head_block_info().number,
+                }));
             }
         }
 
@@ -488,12 +490,15 @@ impl<
                 // (unsynced, or pending derivation work) is parked until the
                 // gate reopens — deliberately NOT rejected. Gates reopen (sync
                 // completes, derivation drains), after which the job is polled
-                // normally, and every long-lived gate-closing transition
-                // (optimistic sync, L1 reorg/unwind, sequencing disabled,
-                // chain import, batch reconciliation head moves) cancels the
-                // job observably. Rejecting here instead was tried and races
-                // startup: a build command can legitimately arrive before the
-                // L1-synced notification is processed.
+                // normally, and the gate-closing transitions that invalidate
+                // a job (optimistic sync, L1 reorg/unwind, sequencing
+                // disabled, chain import, batch reconciliation head moves)
+                // cancel it observably. A held derivation attempt keeps the
+                // gate closed without cancelling; the parked job then simply
+                // resumes when the hold resolves (its head snapshot check
+                // cancels it if the head moved). Rejecting here instead was
+                // tried and races startup: a build command can legitimately
+                // arrive before the L1-synced notification is processed.
                 if let Some(sequencer) = self.sequencer.as_mut() {
                     // Coalesce with an in-flight job instead of silently
                     // replacing it: a replaced job discards engine work and
@@ -880,9 +885,6 @@ impl<
                     .header
                     .hash_slow();
 
-                // Cancel the inflight payload building job if the head has changed.
-                self.cancel_payload_building_job("L1 reorg moved the L2 head");
-
                 // Collect transactions of reverted blocks from l2 client.
                 let reverted_transactions = self
                     .collect_reverted_txs_in_range(
@@ -909,6 +911,15 @@ impl<
         // TODO: Add retry logic
         if l2_head_block_info.is_some() || l2_safe_block_info.is_some() {
             self.engine.update_fcs(l2_head_block_info, l2_safe_block_info, None).await?;
+        }
+
+        // Cancel the inflight payload building job if the head has changed —
+        // after the FCU so a failed update does not destroy a valid job (a
+        // job with L1 messages above the unwind point was already cancelled
+        // above). The single-task run loop means the job cannot complete in
+        // between.
+        if l2_head_block_info.is_some() {
+            self.cancel_payload_building_job("L1 reorg moved the L2 head");
         }
 
         // Add all reverted transactions to the transaction pool.

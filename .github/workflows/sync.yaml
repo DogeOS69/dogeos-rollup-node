@@ -36,6 +36,7 @@ jobs:
             exit 1
           fi
           echo "Required configuration present."
+          echo "::warning::Even with the secret provisioned this workflow cannot pass until issue #43 lands (DOGEOS_CHIKYU genesis lacks startL1Block; the test's L1 endpoints are Scroll-heritage). See the trigger comment."
 
   sync:
     needs: preflight

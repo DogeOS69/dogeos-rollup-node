@@ -1022,6 +1022,20 @@ where
                      {last_imported}; re-deriving the common ancestor"
                 ));
             }
+            if local_head < last_imported {
+                // The local head was rewound below the pointer (L1 reorg or
+                // administrative unwind) with no build owed — the settlement
+                // Resync arm only covers the owed-build case. Continuing
+                // would either report "already synced" forever (remote still
+                // at the pointer) or skip the rewound range and its purged
+                // L1-message mappings.
+                self.last_imported_block = None;
+                self.consecutive_import_rejections = 0;
+                return Err(eyre::eyre!(
+                    "local head {local_head} rewound below the resume pointer \
+                     {last_imported}; re-deriving the common ancestor"
+                ));
+            }
 
             // Get remote head (number only — fetching the full latest
             // block here pulled one unused body per catch-up iteration).

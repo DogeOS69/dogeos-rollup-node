@@ -427,11 +427,26 @@ impl<
                 let canonical = if hash == head.hash {
                     true
                 } else if block.header.number < head.number {
-                    matches!(
-                        self.l2_client.get_block_by_number(block.header.number.into()).full().await,
-                        Ok(Some(canonical_block)) if canonical_block.header.hash_slow() == hash
-                    )
+                    match self
+                        .l2_client
+                        .get_block_by_number(block.header.number.into())
+                        .full()
+                        .await
+                    {
+                        // Only a returned block with a DIFFERENT hash proves
+                        // the signed block was reorged out.
+                        Ok(Some(canonical_block)) => canonical_block.header.hash_slow() == hash,
+                        // Unknown (transient RPC error or a gap): the signer
+                        // result is one-shot, so demoting it here would lose
+                        // a possibly-canonical block's anchor and
+                        // announcement on a blip. Proceed on the full path —
+                        // an anchor write stays monotone and a stale
+                        // announcement is harmless gossip.
+                        _ => true,
+                    }
                 } else {
+                    // A number above the current head cannot be canonical:
+                    // the head was rewound below the signed block.
                     false
                 };
                 if !canonical {

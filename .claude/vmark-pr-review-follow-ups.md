@@ -45,6 +45,31 @@ from every pass is either fixed in the PR or recorded here.
     tests, and the validate() rules.
   - Suggested Linear title: "rollup-node: end-to-end test for the remote source's owed-build retry path"
 
+- **Outcome-event identity (numbers on skip/cancel events)**
+  (`crates/chain-orchestrator/src/event.rs`, remote block source waits)
+  - Impact/evidence: Claude pass 9 S1 — `BlockBuildingSkipped` and
+    `PayloadBuildingJobCancelled` carry no height, so attribution of
+    numberless outcomes rests on the single-requester assumption plus
+    import-time cancellation. The PR ships a cheap mitigation (one stale
+    numberless outcome is ignored after an abandonment); giving the events an
+    identity (a block_number field, gated at-or-above expected like
+    `BlockSequenced`) removes the assumption entirely.
+  - First/most-recent pass: Claude pass 9 (2026-09-01T00:22Z).
+  - Why unaddressed: additive event-payload change rippling through every
+    match on the enum; the mitigation covers the realistic window.
+  - Suggested Linear title: "chain-orchestrator: carry the target height on skip/cancel build outcome events"
+
+- **Unit coverage for the handle's closed-channel surface**
+  (`crates/chain-orchestrator/src/handle/mod.rs`, `classify_recv_error`)
+  - Impact/evidence: Claude pass 9 S5 — `is_closed`/`try_build_block` and the
+    gone-vs-transient classification have no direct unit tests, and a
+    misclassification changes node-lifecycle behavior.
+  - First/most-recent pass: Claude pass 9 (2026-09-01T00:22Z).
+  - Why unaddressed: `ChainOrchestratorHandle` is generic over `FullNetwork`;
+    constructing a concrete network type in a unit test needs test plumbing
+    that does not exist in the handle crate today.
+  - Suggested Linear title: "chain-orchestrator: unit-test the handle's closed-channel classification surface"
+
 - **Docker lane can hang to the 90-minute SIGKILL with no nextest summary**
   (`.github/workflows/test.yaml`, integration-docker-compose)
   - Impact/evidence: Claude pass flag — no `.config/nextest.toml`, so no

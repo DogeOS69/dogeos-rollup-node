@@ -811,8 +811,8 @@ async fn test_manual_build_block_coalesces_with_timer_job() -> eyre::Result<()> 
         .sequencer()
         .with_memory_db()
         .auto_start(true)
-        .block_time(500)
-        .payload_building_duration(2000)
+        .block_time(100)
+        .payload_building_duration(8000)
         .allow_empty_blocks(true)
         .build()
         .await?;
@@ -820,9 +820,10 @@ async fn test_manual_build_block_coalesces_with_timer_job() -> eyre::Result<()> 
     fixture.l1().sync().await?;
 
     // The timer's first slot fires once L1 sync lands and its job runs for
-    // 2s; with a 500ms slot interval a job is in flight essentially
-    // continuously, so a manual request at t=1s lands mid-job.
-    tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+    // 8s; with a 100ms slot interval a job is in flight essentially
+    // continuously, so a manual request at t=2s lands mid-job with wide
+    // margin even on a heavily loaded runner.
+    tokio::time::sleep(tokio::time::Duration::from_millis(2000)).await;
     fixture.sequencer().rollup_manager_handle.build_block();
 
     // The manual request coalesced with the timer's in-flight job.
@@ -944,6 +945,73 @@ async fn test_update_fcs_head_cancels_inflight_payload_job() -> eyre::Result<()>
 
     // A follow-up build proceeds cleanly from the updated head.
     fixture.build_block().expect_block_number(1).build_and_await_block().await?;
+
+    Ok(())
+}
+
+/// Disabling automatic sequencing must cancel an in-flight payload building
+/// job through the observable path (`PayloadBuildingJobCancelled`), not clear
+/// it silently (issue #38 review).
+#[allow(clippy::large_stack_frames)]
+#[tokio::test]
+async fn test_disable_sequencing_cancels_inflight_payload_job() -> eyre::Result<()> {
+    reth_tracing::init_test_tracing();
+
+    let mut fixture = TestFixture::builder()
+        .sequencer()
+        .with_memory_db()
+        .payload_building_duration(8000)
+        .allow_empty_blocks(true)
+        .build()
+        .await?;
+
+    fixture.l1().sync().await?;
+
+    // Start a long build, then disable sequencing while it is in flight (the
+    // command channel is FIFO, so the disable is processed after the build
+    // command).
+    fixture.sequencer().rollup_manager_handle.build_block();
+    eyre::ensure!(
+        fixture.sequencer().rollup_manager_handle.disable_automatic_sequencing().await?,
+        "disable_automatic_sequencing should report success"
+    );
+
+    fixture
+        .expect_event()
+        .where_event(|e| matches!(e, ChainOrchestratorEvent::PayloadBuildingJobCancelled))
+        .await?;
+
+    Ok(())
+}
+
+/// An administrative L1 unwind closes the sequencer gate for the whole
+/// re-scan, so it must cancel an in-flight payload building job observably
+/// (issue #38 review).
+#[allow(clippy::large_stack_frames)]
+#[tokio::test]
+async fn test_revert_to_l1_block_cancels_inflight_payload_job() -> eyre::Result<()> {
+    reth_tracing::init_test_tracing();
+
+    let mut fixture = TestFixture::builder()
+        .sequencer()
+        .with_memory_db()
+        .payload_building_duration(8000)
+        .allow_empty_blocks(true)
+        .build()
+        .await?;
+
+    fixture.l1().sync().await?;
+
+    // Start a long build, then revert the L1 view while it is in flight. The
+    // cancellation happens before any fallible unwind work, so the event is
+    // asserted regardless of the revert's own outcome.
+    fixture.sequencer().rollup_manager_handle.build_block();
+    let _ = fixture.sequencer().rollup_manager_handle.revert_to_l1_block(0).await;
+
+    fixture
+        .expect_event()
+        .where_event(|e| matches!(e, ChainOrchestratorEvent::PayloadBuildingJobCancelled))
+        .await?;
 
     Ok(())
 }

@@ -22,7 +22,9 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Queue rather than cancel: a cancelled soak does not satisfy if: failure(),
+  # so its result would vanish without any signal.
+  cancel-in-progress: false
 
 # The failure-report steps comment on an issue; everything else is read-only.
 permissions:

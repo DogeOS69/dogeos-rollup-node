@@ -212,6 +212,7 @@ impl<
                         .expect("metric exists")
                         .clone();
                     let started = Instant::now();
+                    let head_before_attempt = *self.engine.fcs().head_block_info();
                     let step = {
                         let mut attempt = Box::pin(self.derivation_driver.run_attempt(
                             &*self.l2_client,
@@ -231,18 +232,20 @@ impl<
                         return Ok(())
                     };
 
+                    // Any attempt variant may have moved the L2 head before
+                    // stopping — a held attempt commits every FCU it applied
+                    // before the hold. An in-flight payload building job
+                    // (parked while the sequencer arm is gated on derivation
+                    // work) would finalize against the pre-attempt head and
+                    // reorg the derived chain back out, so key the
+                    // cancellation off the observed head, not a per-variant
+                    // flag.
+                    if *self.engine.fcs().head_block_info() != head_before_attempt {
+                        self.cancel_payload_building_job("batch reconciliation moved the L2 head");
+                    }
+
                     match step {
                         AttemptStep::Completed(consolidated) => {
-                            // Consolidation may have moved the L2 head; an
-                            // in-flight payload building job (parked while the
-                            // sequencer arm was gated on derivation work)
-                            // would finalize against the pre-consolidation
-                            // head and reorg the derived chain back out.
-                            if consolidated.batch_outcome.l2_head_updated {
-                                self.cancel_payload_building_job(
-                                    "batch consolidation moved the L2 head",
-                                );
-                            }
                             for outcome in consolidated.block_outcomes {
                                 self.notify(ChainOrchestratorEvent::BlockConsolidated(outcome));
                             }
@@ -444,13 +447,26 @@ impl<
 
                 if let Some(block) = block {
                     let block_info: L2BlockInfoWithL1Messages = (&block).into();
-                    self.database
+                    // The block is built and head-committed by this point; a
+                    // failure below must still emit a terminal outcome event
+                    // or waiters would burn their full budget in silence.
+                    if let Err(err) = self
+                        .database
                         .update_l1_messages_from_l2_blocks(vec![block_info.clone()])
-                        .await?;
-                    self.signer
+                        .await
+                    {
+                        self.notify(ChainOrchestratorEvent::PayloadBuildingJobCancelled);
+                        return Err(err.into());
+                    }
+                    if let Err(err) = self
+                        .signer
                         .as_mut()
                         .expect("signer must be present")
-                        .sign_block(block.clone())?;
+                        .sign_block(block.clone())
+                    {
+                        self.notify(ChainOrchestratorEvent::PayloadBuildingJobCancelled);
+                        return Err(err.into());
+                    }
                     return Ok(Some(ChainOrchestratorEvent::BlockSequenced(block)));
                 }
                 return Ok(Some(ChainOrchestratorEvent::BlockBuildingSkipped));
@@ -468,6 +484,16 @@ impl<
         tracing::debug!(target: "scroll::chain_orchestrator", ?command, "Handling command");
         match command {
             ChainOrchestratorCommand::BuildBlock => {
+                // Note: a job started while the sequencer select arm is gated
+                // (unsynced, or pending derivation work) is parked until the
+                // gate reopens — deliberately NOT rejected. Gates reopen (sync
+                // completes, derivation drains), after which the job is polled
+                // normally, and every long-lived gate-closing transition
+                // (optimistic sync, L1 reorg/unwind, sequencing disabled,
+                // chain import, batch reconciliation head moves) cancels the
+                // job observably. Rejecting here instead was tried and races
+                // startup: a build command can legitimately arrive before the
+                // L1-synced notification is processed.
                 if let Some(sequencer) = self.sequencer.as_mut() {
                     // Coalesce with an in-flight job instead of silently
                     // replacing it: a replaced job discards engine work and
@@ -588,24 +614,16 @@ impl<
             },
             ChainOrchestratorCommand::RevertToL1Block((block_number, tx)) => {
                 self.sync_state.l1_mut().set_syncing();
+                // The gate is now closed for the whole administrative re-scan:
+                // a parked job could not be polled to completion, later
+                // BuildBlocks would coalesce into it with no outcome ever
+                // arriving, and (for a job with an L1 origin above the unwind
+                // point) the unwind deletes L1 messages it depends on. Cancel
+                // unconditionally before any fallible work.
+                self.cancel_payload_building_job("administrative L1 unwind");
                 self.derivation_driver.cancel_attempt();
                 let (unwind_result, held_outcome) =
                     self.unwind_and_revalidate_held_batch(block_number).await?;
-
-                // The unwind deletes L1 messages above the ancestor; a parked
-                // payload building job whose L1 origin lies above the unwind
-                // point would finalize with messages that no longer exist
-                // (mirrors handle_l1_reorg's guard).
-                if Some(block_number) <
-                    self.sequencer
-                        .as_ref()
-                        .and_then(|s| s.payload_building_job().map(|p| p.l1_origin()))
-                        .flatten()
-                {
-                    self.cancel_payload_building_job(
-                        "administrative L1 unwind before the job's L1 origin",
-                    );
-                }
 
                 // Check if the unwind impacts the fcs safe head.
                 if let Some(block_info) = unwind_result.l2_safe_block_info {

@@ -28,8 +28,9 @@ impl MetricsHandler {
     }
 
     /// Discards the current block building recording without recording a
-    /// duration sample (the job was cancelled, so its elapsed time is not a
-    /// build latency), and counts the cancellation.
+    /// duration sample — the attempt did not produce a valid build latency
+    /// (the job was cancelled in flight, or payload start/finalization
+    /// failed) — and counts it in `payload_building_jobs_cancelled`.
     pub(crate) fn discard_block_building_recording(&mut self) {
         self.block_building_meter.block_building_start = None;
         self.block_building_meter.metric.payload_building_jobs_cancelled.increment(1);
@@ -155,6 +156,7 @@ pub(crate) struct BlockBuildingMetric {
     all_block_building_duration: Histogram,
     /// The duration of the block interval include empty block
     consecutive_block_interval: Histogram,
-    /// The number of payload building jobs cancelled before completion
+    /// The number of payload building attempts abandoned without a duration sample:
+    /// cancelled in flight, or failed at payload start or finalization
     payload_building_jobs_cancelled: Counter,
 }

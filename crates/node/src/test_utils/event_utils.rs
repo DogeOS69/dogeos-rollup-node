@@ -325,9 +325,10 @@ impl<'a> EventWaiter<'a> {
                     let events = &mut node_handle.chain_orchestrator_rx;
 
                     // Drain every event that is already available on this node.
-                    // Consuming only one event per sleep cycle (~100 events/s)
-                    // let the lossy broadcast event channel back up and drop
-                    // events under load (issue #38).
+                    // The old one-event-per-10ms drain cost latency (a ~100
+                    // events/s ceiling, hundreds of mandatory sleeps per
+                    // test), not event loss — the broadcast channel holds
+                    // 5000 events (issue #38).
                     while let Some(event) = events.next().now_or_never() {
                         drained_any = true;
                         match event {

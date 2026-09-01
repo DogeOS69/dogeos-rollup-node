@@ -2110,14 +2110,27 @@ async fn wait_n_events(
     mut n: u64,
 ) {
     // TODO: refactor using `wait_for_event_predicate`
-    while let Some(event) = events.next().await {
-        if matches(event) {
-            n -= 1;
+    //
+    // Bounded like the sync.rs copy: an unmet expectation must fail with a
+    // diagnosis instead of hanging the binary for the whole job timeout, and
+    // an early stream end must not pass silently (issue #38).
+    assert!(n > 0, "wait_n_events requires n > 0");
+    let total = n;
+    tokio::time::timeout(tokio::time::Duration::from_secs(60), async {
+        while let Some(event) = events.next().await {
+            if matches(event) {
+                n -= 1;
+            }
+            if n == 0 {
+                break
+            }
         }
-        if n == 0 {
-            break
-        }
-    }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!("Timeout (60s) waiting for {total} matching events ({n} still missing)")
+    });
+    assert_eq!(n, 0, "event stream ended with {n}/{total} matching events still missing");
 }
 
 /// Helper function to wait until a predicate is true or a timeout occurs.

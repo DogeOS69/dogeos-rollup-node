@@ -181,7 +181,8 @@ impl ScrollRollupNodeConfig {
             // the settlement budget is exhausted and the build abandoned.
             return Err(
                 "remote-source.build requires sequencer.enabled: building on top of imported \
-                 blocks needs a configured sequencer"
+                 blocks needs a configured sequencer (note sequencer.enabled itself requires a \
+                 signer key source unless consensus is noop)"
                     .to_string(),
             );
         }

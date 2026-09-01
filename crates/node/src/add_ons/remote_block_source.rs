@@ -66,6 +66,11 @@ where
     /// [`MAX_PENDING_BUILD_RETRIES`] settlement attempts, kept for the error
     /// logs (this add-on currently exports no metrics).
     builds_abandoned: u64,
+    /// Set when a build is abandoned while its job may still be in flight:
+    /// the next wait ignores one numberless outcome (skip/cancel) so a late
+    /// event from the abandoned job is not attributed to a new request.
+    /// Number-carrying outcomes are already excluded by the `>=` gate.
+    ignore_stale_skip: bool,
     /// When the last "Sync error" line was logged and what it said, used to
     /// rate-limit repeated identical errors by elapsed time while always
     /// logging a *changed* error immediately.
@@ -80,6 +85,14 @@ const MAX_PENDING_BUILD_RETRIES: u8 = 5;
 /// Minimum interval between repeated identical "Sync error" log lines.
 const ERROR_LOG_INTERVAL: Duration = Duration::from_secs(10);
 
+/// Floor for logging a *changed* error message ahead of the full interval.
+const ERROR_LOG_MIN_INTERVAL: Duration = Duration::from_secs(1);
+
+/// How far below `min(local_head, remote_head)` the common-ancestor walk may
+/// search before giving up: an unbounded walk against a wrong or flaky remote
+/// never finishes and restarts from the top on every failure.
+const MAX_ANCESTOR_LOOKBACK: u64 = 8192;
+
 /// The outcome of waiting for a requested build.
 enum BuildOutcome {
     /// The build completed (a block at or above the expected height was
@@ -89,9 +102,9 @@ enum BuildOutcome {
     Cancelled,
 }
 
-/// Marker for errors that cannot resolve on their own: retrying the poll loop
-/// after one of these is pointless (the orchestrator is gone or shutting
-/// down), so `run_until_shutdown` surfaces them instead of spinning.
+/// Marker for genuine unrecoverable remote-source faults (e.g. a remote on a
+/// different chain): retrying is pointless and the node should fail-stop so
+/// the fault is visible.
 #[derive(Debug)]
 struct TerminalSyncError;
 
@@ -103,9 +116,30 @@ impl std::fmt::Display for TerminalSyncError {
 
 impl std::error::Error for TerminalSyncError {}
 
-/// Returns an error that `run_until_shutdown` treats as fatal.
+/// Returns an error that `run_until_shutdown` surfaces as fatal (the spawn
+/// wrapper panics, fail-stopping the node).
 fn terminal_error(msg: &'static str) -> eyre::Report {
     eyre::Report::new(TerminalSyncError).wrap_err(msg)
+}
+
+/// Marker for the orchestrator being gone or shutting down. This is never a
+/// remote-source fault — the orchestrator fail-stops on its own errors and
+/// returns cleanly on shutdown — so the run loop stops *gracefully* instead of
+/// panicking a node that is already going down.
+#[derive(Debug)]
+struct OrchestratorGoneError;
+
+impl std::fmt::Display for OrchestratorGoneError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "chain orchestrator is gone or shutting down")
+    }
+}
+
+impl std::error::Error for OrchestratorGoneError {}
+
+/// Returns an error that `run_until_shutdown` treats as a graceful stop.
+fn orchestrator_gone(msg: &'static str) -> eyre::Report {
+    eyre::Report::new(OrchestratorGoneError).wrap_err(msg)
 }
 
 impl<N, P> RemoteBlockSourceAddOn<N, P>
@@ -155,6 +189,7 @@ where
             pending_build_cancelled: false,
             pending_build_retries: 0,
             builds_abandoned: 0,
+            ignore_stale_skip: false,
             last_error_log: None,
         })
     }
@@ -168,14 +203,14 @@ where
     }
 
     /// Classifies a `RecvError` on a command reply. The error is ambiguous: it
-    /// can mean the orchestrator is gone (channel closed — terminal) or that
-    /// the command's handler failed and dropped its response sender (e.g. a
-    /// transient database error — retryable). A genuine closure that races
-    /// this check is classified as transient once and terminal on the next
-    /// tick.
+    /// can mean the orchestrator is gone (channel closed — the node is going
+    /// down, stop gracefully) or that the command's handler failed and dropped
+    /// its response sender (e.g. a transient database error — retryable). A
+    /// genuine closure that races this check is classified as transient once
+    /// and as gone on the next tick.
     fn classify_recv_error(&self, e: tokio::sync::oneshot::error::RecvError) -> eyre::Report {
         if self.orchestrator_handle.is_closed() {
-            eyre::Report::new(TerminalSyncError)
+            eyre::Report::new(OrchestratorGoneError)
                 .wrap_err(format!("chain orchestrator command channel closed: {e}"))
         } else {
             eyre::eyre!("chain orchestrator dropped the command response (transient failure): {e}")
@@ -200,13 +235,33 @@ where
             .number;
         let remote_head = self.remote.get_block_number().await?;
 
+        let start = local_head.min(remote_head);
+        let floor = start.saturating_sub(MAX_ANCESTOR_LOOKBACK);
         let last_imported_block;
-        let mut search = local_head.min(remote_head);
+        let mut search = start;
         loop {
             if search == 0 {
-                // Genesis is always a common block (same chain spec assumed).
+                // Verify the chains actually share a genesis before declaring
+                // it common: a remote on a different chain would otherwise
+                // loop forever re-importing a block that can never connect.
+                let local_genesis = self.provider.block_hash(0)?;
+                let remote_genesis = self.remote.get_block_by_number(0u64.into()).await?;
+                match (local_genesis, remote_genesis) {
+                    (Some(lh), Some(rb)) if lh == rb.header.hash => {}
+                    _ => {
+                        return Err(terminal_error(
+                            "remote genesis hash does not match the local chain; wrong \
+                             --remote-source.url?",
+                        ))
+                    }
+                }
                 last_imported_block = 0;
                 break;
+            }
+            if search <= floor && floor > 0 {
+                return Err(terminal_error(
+                    "no common ancestor with the remote within the lookback window",
+                ));
             }
             let local_hash = self.provider.block_hash(search)?;
             let remote_block = self.remote.get_block_by_number(search.into()).await?;
@@ -216,6 +271,14 @@ where
                     break;
                 }
                 _ => {
+                    if search.is_multiple_of(256) {
+                        tracing::info!(
+                            target: "scroll::remote_source",
+                            search,
+                            start,
+                            "Searching for the highest common block with the remote"
+                        );
+                    }
                     search = search.saturating_sub(1);
                 }
             }
@@ -236,21 +299,41 @@ where
         mut shutdown: impl std::future::Future<Output = ()> + Unpin,
     ) -> eyre::Result<()> {
         let mut poll_interval = interval(Duration::from_millis(self.config.poll_interval_ms));
+        // A tick can legitimately take far longer than the interval (bounded
+        // build-outcome waits, deep catch-up); Burst would then fire every
+        // missed tick back-to-back, hammering an already-slow remote.
+        poll_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
             tokio::select! {
                 biased;
                 _guard = &mut shutdown => break,
                 _ = poll_interval.tick() => {
-                    match self.follow_and_build().await {
+                    // Let shutdown preempt an in-flight tick: follow_and_build
+                    // can block on multi-second waits.
+                    let result = tokio::select! {
+                        biased;
+                        _guard = &mut shutdown => break,
+                        r = self.follow_and_build() => r,
+                    };
+                    match result {
                         Ok(()) => {
+                            // Keep last_error_log: clearing it on success
+                            // would let an alternating success/failure pattern
+                            // log at full poll cadence.
                             self.consecutive_failures = 0;
-                            self.last_error_log = None;
                         }
                         Err(e) => {
-                            // Errors that cannot resolve on their own (the
-                            // orchestrator is gone or shutting down) must not
-                            // be retried at poll cadence forever.
+                            // The orchestrator being gone or shutting down is
+                            // not a remote-source fault: stop gracefully — the
+                            // node is already going down.
+                            if e.chain().any(|c| c.downcast_ref::<OrchestratorGoneError>().is_some()) {
+                                tracing::info!(target: "scroll::remote_source", %e, "Chain orchestrator is gone; stopping remote block source");
+                                break;
+                            }
+                            // Genuine unrecoverable faults must not be retried
+                            // at poll cadence forever; surface them so the
+                            // node fail-stops visibly.
                             if e.chain().any(|c| c.downcast_ref::<TerminalSyncError>().is_some()) {
                                 tracing::error!(target: "scroll::remote_source", ?e, "Terminal sync error; stopping remote block source");
                                 return Err(e);
@@ -265,8 +348,13 @@ where
                             let now = std::time::Instant::now();
                             let should_log = match &self.last_error_log {
                                 Some((at, prev)) => {
-                                    *prev != msg ||
-                                        now.duration_since(*at) >= ERROR_LOG_INTERVAL
+                                    // A changed message logs promptly but not
+                                    // unboundedly: dynamic messages (block
+                                    // numbers, budgets) would otherwise defeat
+                                    // the limiter entirely.
+                                    let elapsed = now.duration_since(*at);
+                                    elapsed >= ERROR_LOG_INTERVAL ||
+                                        (*prev != msg && elapsed >= ERROR_LOG_MIN_INTERVAL)
                                 }
                                 None => true,
                             };
@@ -297,12 +385,15 @@ where
     /// A `BlockSequenced` is only accepted at or above `expected_number`
     /// (stale outcomes are strictly lower-numbered), so an outcome from a
     /// previous build cannot be attributed to this request.
-    /// `BlockBuildingSkipped` carries no number and is accepted as landed.
-    /// What makes attribution sound is the single-build-requester assumption
-    /// *plus* `import_chain` cancelling any in-flight job before each import:
-    /// together they mean any outcome observed here belongs to this request.
-    /// Config-level violations of the assumption are rejected by `validate()`
-    /// (no `sequencer.auto-start` with `remote-source.build`), but the
+    /// `BlockBuildingSkipped` carries no number and is accepted as landed —
+    /// except immediately after an abandoned build, whose still-in-flight job
+    /// may emit a late numberless outcome (`ignore_stale_skip`). What makes
+    /// attribution sound otherwise is the single-build-requester assumption
+    /// *plus* `import_chain` cancelling any in-flight job as part of every
+    /// successful import (after its validity checks): by the time a build is
+    /// requested here, the job slot is empty. Config-level violations of the
+    /// assumption are rejected by `validate()` (no `sequencer.auto-start`
+    /// with `remote-source.build`), but the
     /// `rollupNodeAdmin_enableAutomaticSequencing` RPC can still start the
     /// timer at runtime and break it — do not enable it on a remote-source
     /// node.
@@ -317,6 +408,7 @@ where
             Duration::from_millis(self.payload_building_duration_ms.saturating_mul(5))
                 .clamp(Duration::from_secs(5), Duration::from_secs(60));
         let events = &mut self.events;
+        let ignore_stale_skip = &mut self.ignore_stale_skip;
         tokio::time::timeout(wait_budget, async {
             loop {
                 match events.next().await {
@@ -330,20 +422,31 @@ where
                         break Ok(BuildOutcome::Landed);
                     }
                     Some(ChainOrchestratorEvent::BlockBuildingSkipped) => {
+                        if *ignore_stale_skip {
+                            // A build abandoned while its job was still in
+                            // flight may emit a late numberless outcome;
+                            // attribute at most one such event to it.
+                            *ignore_stale_skip = false;
+                            continue;
+                        }
                         tracing::debug!(target: "scroll::remote_source", "Block building skipped (empty block)");
                         break Ok(BuildOutcome::Landed);
                     }
                     Some(ChainOrchestratorEvent::PayloadBuildingJobCancelled) => {
+                        if *ignore_stale_skip {
+                            *ignore_stale_skip = false;
+                            continue;
+                        }
                         break Ok(BuildOutcome::Cancelled);
                     }
                     Some(ChainOrchestratorEvent::Shutdown) => {
-                        break Err(terminal_error("Chain orchestrator is shutting down"));
+                        break Err(orchestrator_gone("Chain orchestrator is shutting down"));
                     }
                     Some(_) => {
                         // Ignore other events, keep waiting
                     }
                     None => {
-                        break Err(terminal_error("Event stream ended unexpectedly"));
+                        break Err(orchestrator_gone("Event stream ended unexpectedly"));
                     }
                 }
             }
@@ -372,7 +475,7 @@ where
         while let Some(event) = self.events.next().now_or_never() {
             match event {
                 Some(ChainOrchestratorEvent::Shutdown) => {
-                    return Err(terminal_error("Chain orchestrator is shutting down"));
+                    return Err(orchestrator_gone("Chain orchestrator is shutting down"));
                 }
                 Some(_) => {}
                 None => return Err(terminal_error("Event stream ended unexpectedly")),
@@ -382,7 +485,8 @@ where
         self.pending_build = true;
         self.pending_build_cancelled = false;
         self.orchestrator_handle.try_build_block().map_err(|e| {
-            eyre::Report::new(TerminalSyncError).wrap_err(format!("failed to send BuildBlock: {e}"))
+            eyre::Report::new(OrchestratorGoneError)
+                .wrap_err(format!("failed to send BuildBlock: {e}"))
         })?;
 
         match self.await_build_outcome(expected_number).await? {
@@ -406,9 +510,10 @@ where
     /// landed (head advanced past the imported block), completed as a skipped
     /// empty build (head unchanged — only re-observing the event settles
     /// this case), was cancelled, or is still in flight. Only an *observed*
-    /// `PayloadBuildingJobCancelled` (recorded in `pending_build_cancelled` by whichever wait
-    /// consumed it) proves no outcome will ever arrive — re-issuing is limited to that
-    /// case, which (with a single build requester) is race-free. On a plain
+    /// `PayloadBuildingJobCancelled` — either carried over from an earlier
+    /// tick in `pending_build_cancelled`, or consumed inline by the wait
+    /// below — proves no outcome will ever arrive; re-issuing is limited to
+    /// that case, which (with a single build requester) is race-free. On a plain
     /// timeout the job may still be running, so we keep waiting on later
     /// ticks — bounded by [`MAX_PENDING_BUILD_RETRIES`], after which the
     /// build is abandoned and imports resume — rather than risk building the
@@ -424,8 +529,22 @@ where
             .fcs
             .head_block_info()
             .number;
-        if head > last_imported {
+        let expected = last_imported + 1;
+        if head == expected {
             // The build landed after its wait timed out.
+            self.clear_pending_build();
+            return Ok(());
+        }
+        if head > expected {
+            // The head moved past the owed height for another reason (e.g.
+            // derivation or a gossip import advanced it); the owed build is
+            // moot — its parent has been superseded.
+            tracing::info!(
+                target: "scroll::remote_source",
+                head,
+                expected,
+                "Owed build superseded by an unrelated head advance; dropping it"
+            );
             self.clear_pending_build();
             return Ok(());
         }
@@ -436,6 +555,7 @@ where
         // forever and stall imports.
         if self.pending_build_retries >= MAX_PENDING_BUILD_RETRIES {
             self.builds_abandoned += 1;
+            self.ignore_stale_skip = true;
             tracing::error!(
                 target: "scroll::remote_source",
                 retries = self.pending_build_retries,
@@ -448,8 +568,6 @@ where
             return Ok(());
         }
         self.pending_build_retries += 1;
-
-        let expected = last_imported + 1;
 
         // The cancellation was already observed (by the wait that set
         // pending_build_cancelled): the job is provably gone, so re-issuing

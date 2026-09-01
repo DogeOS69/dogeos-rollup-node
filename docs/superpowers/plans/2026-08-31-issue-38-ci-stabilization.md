@@ -109,9 +109,11 @@ Expected: a nonzero count — the 20 ms timer is live and colliding with manual 
 > follower's optimistic sync right after `connect()`, and landing the
 > consolidation-triggering block while the follower's sync pipeline is busy.
 > With the timer gone those became single-shot and the test timed out on a
-> unit-typed wait. A2 as implemented therefore pairs the timer removal with
-> bounded build-and-check retry loops at both one-shot points (30 × 2 s;
-> assertions unchanged — `chain_extended` already uses >=). Additionally,
+> unit-typed wait. A2 as finally shipped therefore *defers* the timer instead
+> of removing it: the exact-numbered loop runs with automatic sequencing
+> disabled, and `enable_automatic_sequencing()` turns the timer back on for
+> the sync/consolidation phase (an intermediate retry-loop design was tried
+> and replaced — no such loops exist in the tree). Additionally,
 > `wait_n_events` (used by the chain-orchestrator tests in the same file) got a
 > 60 s timeout so an unmet expectation fails with a diagnosis instead of
 > hanging the binary; `test_chain_orchestrator_l1_reorg` was observed hanging
@@ -127,9 +129,15 @@ Expected: a nonzero count — the 20 ms timer is live and colliding with manual 
 - Consumes: `TestFixture::builder()` API as-is.
 - Produces: nothing new; test behavior only.
 
-- [ ] **Step 1: Edit the fixture: drop `auto_start(true)` and `block_time(20)`**
+- [ ] **Step 1: Edit the fixture: drop `auto_start(true)` (KEEP `block_time(20)`)**
 
-Every block this test asserts on is triggered manually via `build_block()`; the automatic timer only injects nondeterminism. Replace the builder chain:
+> **Superseded detail:** the shipped test keeps `.block_time(20)` and re-enables
+> the timer after the loop via `enable_automatic_sequencing()` — the
+> sync/consolidation phase depends on its continuous block stream. Only
+> `.auto_start(true)` is dropped. Following the original instruction below
+> literally re-breaks the test.
+
+Every block the exact-number loop asserts on is triggered manually via `build_block()`; during that loop the automatic timer only injects nondeterminism. Replace the builder chain:
 
 ```rust
 let mut sequencer = TestFixture::builder()
@@ -143,7 +151,7 @@ let mut sequencer = TestFixture::builder()
     .await?;
 ```
 
-(`.auto_start(true)` and `.block_time(20)` deleted; everything else unchanged. The `sequencer()` preset already sets `auto_start = false`.)
+(`.auto_start(true)` deleted — the `sequencer()` preset already sets `auto_start = false`; as shipped, `.block_time(20)` stays and the timer is re-enabled after the loop.)
 
 Do NOT touch the assertions: 200 exact-numbered blocks, `optimistic_sync`, `chain_extended(202)`, `L1MessageNotFoundInDatabase` all stay. Coverage is unchanged — the follower still optimistically syncs (201 blocks ahead > the 100-block trigger) and still consolidates.
 

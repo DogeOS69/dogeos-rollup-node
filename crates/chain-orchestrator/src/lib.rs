@@ -797,45 +797,14 @@ impl<
                 }
             },
             ChainOrchestratorCommand::RevertToL1Block((block_number, tx)) => {
-                // Validate BEFORE latching the sync gate: everything after
-                // set_syncing() fail-stops on error (only the watcher reset
-                // at the end can reopen the gate), so a bad RPC argument —
-                // or a transient DB read error — must be refused here, where
-                // nothing has mutated, with a `false` reply instead of a
-                // node-killing panic. (The bound is the latest RECORDED L1
-                // block — get_latest_l1_block_number — not derivation's
-                // processed marker.)
-                let latest_l1 = match self
-                    .database
-                    .tx(|tx| async move { tx.get_latest_l1_block_number().await })
-                    .await
-                {
-                    Ok(latest) => latest,
-                    Err(err) => {
-                        tracing::warn!(
-                            target: "scroll::chain_orchestrator",
-                            block_number,
-                            %err,
-                            "Refusing administrative L1 unwind: could not read the latest \
-                             L1 block"
-                        );
-                        let _ = tx.send(false);
-                        return Ok(());
-                    }
-                };
-                // Refuse only a target ABOVE what exists (a fresh database
-                // reports 0 and makes any unwind a trivial no-op).
-                if block_number > latest_l1 {
-                    tracing::warn!(
-                        target: "scroll::chain_orchestrator",
-                        block_number,
-                        ?latest_l1,
-                        "Refusing administrative L1 unwind to a block above the latest \
-                         processed L1 block"
-                    );
-                    let _ = tx.send(false);
-                    return Ok(());
-                }
+                // No numeric pre-validation: a target above everything known
+                // is a harmless no-op unwind (and the latest-L1 marker is
+                // only advanced by NewBlock notifications, so comparing
+                // against it refuses legitimate reverts between known batch
+                // blocks — e2e can_revert_to_l1_block). Errors after the
+                // latch below deliberately fail-stop: the L1 index may be
+                // half-unwound and the sync gate can only be reopened by the
+                // watcher reset at the end.
                 self.sync_state.l1_mut().set_syncing();
                 // The gate is now closed for the whole administrative re-scan:
                 // a parked job could not be polled to completion, later
@@ -848,13 +817,16 @@ impl<
                 let (unwind_result, held_outcome) =
                     self.unwind_and_revalidate_held_batch(block_number).await?;
 
-                // The unwind rewound the persisted L2 head; move the engine
-                // head with it, or the re-scan re-inserts the deleted L1
-                // messages while the sequencer re-selects them on the
-                // un-rewound head — duplicate L1 messages in consecutive
-                // blocks. Any error here fail-stops via the admin-unwind
-                // policy.
-                if let Some(head_number) = unwind_result.l2_head_block_number {
+                // The unwind may rewind the persisted L2 head and/or the safe
+                // head. Issue ONE combined FCU preserving head >= safe >=
+                // finalized: a head-only update can trip HeadBelowSafe when
+                // the unwind also removed the batch that made the current
+                // safe head safe — and the database unwind is already
+                // committed, so an avoidable FCS-order error here would
+                // fail-stop the node for nothing. Any genuine error still
+                // fail-stops via the admin-unwind policy.
+                let finalized = *self.engine.fcs().finalized_block_info();
+                let new_head = if let Some(head_number) = unwind_result.l2_head_block_number {
                     let head_hash = self
                         .l2_client
                         .get_block_by_number(head_number.into())
@@ -863,52 +835,45 @@ impl<
                         .ok_or(ChainOrchestratorError::L2BlockNotFoundInL2Client(head_number))?
                         .header
                         .hash_slow();
-                    let reverted_transactions = self
-                        .collect_reverted_txs_in_range(
-                            head_number.saturating_add(1),
+                    Some(BlockInfo { number: head_number, hash: head_hash })
+                } else {
+                    None
+                };
+                // New safe target: the unwind's value floored at finalized.
+                let mut new_safe = unwind_result.l2_safe_block_info.map(|block_info| {
+                    if block_info.number >= finalized.number {
+                        block_info
+                    } else {
+                        finalized
+                    }
+                });
+                // Preserve head >= safe: a head rewound below the (current or
+                // new) safe head must drag the safe head down with it.
+                if let Some(head) = new_head {
+                    let effective_safe =
+                        new_safe.unwrap_or_else(|| *self.engine.fcs().safe_block_info());
+                    if effective_safe.number > head.number {
+                        new_safe = Some(head);
+                    }
+                }
+                if new_head.is_some() || new_safe.is_some() {
+                    let reverted_transactions = if let Some(head) = new_head {
+                        self.collect_reverted_txs_in_range(
+                            head.number.saturating_add(1),
                             self.engine.fcs().head_block_info().number,
                         )
-                        .await?;
-                    let result = self
-                        .engine
-                        .update_fcs_checked(
-                            Some(BlockInfo { number: head_number, hash: head_hash }),
-                            None,
-                            None,
-                        )
-                        .await?;
+                        .await?
+                    } else {
+                        Vec::new()
+                    };
+                    let result = self.engine.update_fcs_checked(new_head, new_safe, None).await?;
                     if !result.is_valid() {
                         return Err(ChainOrchestratorError::FcuRejected(
-                            "administrative unwind head update was not applied by the \
-                             engine (INVALID or SYNCING)",
+                            "administrative unwind forkchoice update was not applied by \
+                             the engine (INVALID or SYNCING)",
                         ));
                     }
                     self.reinsert_txs_into_pool(reverted_transactions).await;
-                }
-
-                // Check if the unwind impacts the fcs safe head.
-                if let Some(block_info) = unwind_result.l2_safe_block_info {
-                    // If the new safe head is above the current finalized head, update the fcs safe
-                    // head to the new safe head; otherwise move it to the finalized head.
-                    let target =
-                        if block_info.number >= self.engine.fcs().finalized_block_info().number {
-                            block_info
-                        } else {
-                            *self.engine.fcs().finalized_block_info()
-                        };
-                    let result = self.engine.update_fcs(None, Some(target), None).await?;
-                    if result.is_invalid() {
-                        // Replying success while the engine refused the safe
-                        // head would misreport the unwind; the run loop
-                        // fail-stops on any error from this command. Only
-                        // INVALID is refused — a SYNCING safe head is
-                        // acceptable mid-sync (unlike the head updates above,
-                        // nothing downstream persists state keyed to it).
-                        return Err(ChainOrchestratorError::FcuRejected(
-                            "administrative unwind safe-head update rejected as INVALID by \
-                             the engine",
-                        ));
-                    }
                 }
 
                 // Revert the L1 watcher to the specified block.
@@ -2390,11 +2355,6 @@ mod run_loop_policy_tests {
             })
             .await
             .unwrap();
-        // The revert target below must pass the handler's pre-latch
-        // validation (target <= latest processed L1 block), which reads this
-        // watcher-maintained marker.
-        database.set_latest_l1_block_number(10).await.unwrap();
-
         let engine_client = Arc::new(ScriptedEngineClient::new());
         engine_client
             .push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Syncing, None)));

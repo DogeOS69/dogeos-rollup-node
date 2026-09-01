@@ -317,16 +317,13 @@ where
     /// Called every poll tick until it succeeds — this call *is* the first
     /// contact with the remote; a failure (e.g. the remote is not up yet) is
     /// retried on the next tick.
-    async fn init_last_imported_block(&self) -> eyre::Result<(u64, alloy_primitives::B256, u64)> {
-        let local_head = self
-            .orchestrator_handle
-            .status()
-            .await
-            .map_err(|e| self.classify_recv_error(e))?
-            .l2
-            .fcs
-            .head_block_info()
-            .number;
+    async fn init_last_imported_block(
+        &self,
+    ) -> eyre::Result<(u64, alloy_primitives::B256, u64, u64)> {
+        let status =
+            self.orchestrator_handle.status().await.map_err(|e| self.classify_recv_error(e))?;
+        let local_head = status.l2.fcs.head_block_info().number;
+        let local_safe = status.l2.fcs.safe_block_info().number;
         let remote_head = self.remote.get_block_number().await?;
 
         let start = local_head.min(remote_head);
@@ -435,7 +432,7 @@ where
             remote_head,
             "Determined highest common block with remote"
         );
-        Ok((last_imported_block, resume_hash, local_head))
+        Ok((last_imported_block, resume_hash, local_head, local_safe))
     }
 
     /// Runs the remote block source until shutdown.
@@ -887,8 +884,22 @@ where
     async fn follow_and_build(&mut self) -> eyre::Result<()> {
         // First successful contact with the remote determines the resume point.
         if self.last_imported_block.is_none() {
-            let (resume, resume_hash, local_head) = self.init_last_imported_block().await?;
+            let (resume, resume_hash, local_head, local_safe) =
+                self.init_last_imported_block().await?;
             if local_head > resume.saturating_add(1) {
+                if resume < local_safe {
+                    // A common ancestor below the local SAFE head means the
+                    // remote lags behind derivation-finalized state (e.g. a
+                    // backend a few blocks behind while safe == head).
+                    // Rewinding would trip HeadBelowSafe and livelock the
+                    // follower on refusals — wait for the remote to catch up
+                    // instead (it must eventually serve >= safe).
+                    return Err(eyre::eyre!(
+                        "common ancestor {resume} is below the local safe head {local_safe}; \
+                         waiting for the remote to catch up instead of rewinding past safe \
+                         state"
+                    ));
+                }
                 // The local chain extends past the freshly derived common
                 // ancestor by more than our own single build: it sits on a
                 // fork the remote no longer serves (remote reorg), or the

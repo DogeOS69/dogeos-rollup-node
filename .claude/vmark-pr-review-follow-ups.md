@@ -102,6 +102,11 @@ from every pass is either fixed in the PR or recorded here.
   - Why unaddressed: changing the reply types is an API change across the
     command enum, handle, and admin RPC — beyond a review-loop fix. The
     explicit error log is the in-scope mitigation.
+  - Note: a pre-latch numeric validation for RevertToL1Block (pass 25 M3)
+    was tried and REMOVED in pass 28 — an above-range target is a harmless
+    no-op unwind, and the latest-L1 marker is not advanced by batch commits,
+    so the check refused legitimate reverts (broke e2e
+    can_revert_to_l1_block). The remaining M3 surface is the reply type.
   - Suggested Linear title: "chain-orchestrator: propagate head-persistence failures to UpdateFcsHead/RevertToL1Block callers"
 
 - **Integration tests for the consensus-path cancellation sites**

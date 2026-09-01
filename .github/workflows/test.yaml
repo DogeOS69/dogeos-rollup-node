@@ -33,7 +33,10 @@ jobs:
 
   integration:
     runs-on: blacksmith-8vcpu-ubuntu-2404
-    timeout-minutes: 60
+    # Above the sum of the step budgets (45-minute build + 50-minute run)
+    # plus setup, or the job-level cap cancels the active step and discards
+    # the output the step caps exist to preserve.
+    timeout-minutes: 110
     env:
       RUST_BACKTRACE: 1
     steps:
@@ -75,7 +78,9 @@ jobs:
 
   integration-docker-compose:
     runs-on: blacksmith-8vcpu-ubuntu-2404
-    timeout-minutes: 90
+    # Above the sum of the step budgets (45-minute build + 75-minute run)
+    # plus setup: see the integration job.
+    timeout-minutes: 135
     env:
       RUST_BACKTRACE: 1
     steps:

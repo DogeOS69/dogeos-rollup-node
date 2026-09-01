@@ -975,8 +975,11 @@ async fn test_update_fcs_head_cancels_inflight_payload_job() -> eyre::Result<()>
         .expect("update_fcs_head should succeed");
 
     // The head update must have cancelled the in-flight job.
+    // Bounded like the chain-import test: a post-finalization emission from
+    // the 3s job must not be able to satisfy this wait.
     fixture
         .expect_event()
+        .timeout(std::time::Duration::from_secs(2))
         .label("PayloadBuildingJobCancelled after UpdateFcsHead")
         .where_event(|e| matches!(e, ChainOrchestratorEvent::PayloadBuildingJobCancelled))
         .await?;

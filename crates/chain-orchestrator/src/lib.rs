@@ -308,7 +308,7 @@ impl<
                     }
                 }, if self.signer.is_some() => {
                     let res = self.handle_signer_event(event).await;
-                    self.handle_outcome(res);
+                    self.handle_outcome(res)?;
                 }
                 Some(event) = async {
                     if let Some(seq) = self.sequencer.as_mut() {
@@ -318,14 +318,14 @@ impl<
                     }
                 }, if self.sequencer.is_some() && self.sync_state.is_synced() && !self.has_pending_derivation_work() => {
                     let res = self.handle_sequencer_event(event).await;
-                    self.handle_outcome(res);
+                    self.handle_outcome(res)?;
                 }
                 Some(batch) = self.derivation_pipeline.next(), if self.derivation_driver.can_accept_batch() => {
                     self.derivation_driver.hold_batch(batch);
                 }
                 Some(event) = self.network.events().next() => {
                     let res = self.handle_network_event(event).await;
-                    self.handle_outcome(res);
+                    self.handle_outcome(res)?;
                 }
                 Some(notification) = self.l1_watcher.l1_notification_receiver().recv(), if l1_notification_receiver_may_poll(
                     self.sync_state.l2().is_synced(),
@@ -333,7 +333,7 @@ impl<
                     self.derivation_driver.can_accept_batch(),
                 ) => {
                     let result = self.handle_l1_notification(notification).await;
-                    self.handle_outcome(result);
+                    self.handle_outcome(result)?;
                 }
 
             }
@@ -383,18 +383,29 @@ impl<
     }
 
     /// Handles the outcome of an operation, logging errors and notifying event listeners as
-    /// appropriate.
+    /// appropriate. Only [`ChainOrchestratorError::FatalStateDivergence`] is propagated —
+    /// every select arm must `?` this so a fatal divergence raised from any handler
+    /// (not just the command arm) actually stops the run loop.
+    // The enum's size is pre-existing (the async handlers returning it are
+    // exempt from the lint); boxing it for this one sync pass-through would
+    // change every construction site for no runtime benefit.
+    #[allow(clippy::result_large_err)]
     fn handle_outcome(
         &self,
         outcome: Result<Option<ChainOrchestratorEvent>, ChainOrchestratorError>,
-    ) {
+    ) -> Result<(), ChainOrchestratorError> {
         match outcome {
             Ok(Some(event)) => self.notify(event),
             Err(err) => {
+                if matches!(err, ChainOrchestratorError::FatalStateDivergence(_)) {
+                    tracing::error!(target: "scroll::chain_orchestrator", ?err, "Fatal state divergence; shutting down so restart re-converges");
+                    return Err(err);
+                }
                 tracing::error!(target: "scroll::chain_orchestrator", ?err, "Encountered error in the chain orchestrator");
             }
             Ok(None) => {}
         }
+        Ok(())
     }
 
     /// Handles an event from the signer.
@@ -599,7 +610,16 @@ impl<
                     )
                     .await?;
                 let previous_head = *self.engine.fcs().head_block_info();
-                self.engine.update_fcs(Some(head), None, None).await?;
+                let forward = self.engine.update_fcs(Some(head), None, None).await?;
+                if forward.is_invalid() {
+                    // The engine rejected the head and update_fcs did not
+                    // commit its mirror — nothing has been mutated, so refuse
+                    // the command before purging mappings, persisting the
+                    // unapplied head, or cancelling a valid job.
+                    return Err(ChainOrchestratorError::FcuRejected(
+                        "administrative FCS head update rejected as INVALID by the engine",
+                    ));
+                }
 
                 // The head was moved administratively: an in-flight payload
                 // building job still targets the previous head and finalizing
@@ -627,13 +647,15 @@ impl<
                         "UpdateFcsHead persistence failed after the engine head moved; \
                          rolling the engine head back to keep state convergent"
                     );
-                    // The rollback commits only on Ok with a non-INVALID
-                    // status: update_fcs returns Ok carrying INVALID when the
-                    // engine rejects the forkchoice, leaving the head where
-                    // it was.
+                    // The rollback counts as committed only on VALID:
+                    // update_fcs_checked commits its mirror only then, and a
+                    // SYNCING response means the EL has not applied the
+                    // forkchoice either — treating it as success would skip
+                    // the fail-stop while state stays diverged.
                     let rollback_committed =
-                        match self.engine.update_fcs(Some(previous_head), None, None).await {
-                            Ok(result) if !result.is_invalid() => true,
+                        match self.engine.update_fcs_checked(Some(previous_head), None, None).await
+                        {
+                            Ok(result) if result.is_valid() => true,
                             rollback_outcome => {
                                 tracing::error!(
                                     target: "scroll::chain_orchestrator",
@@ -993,23 +1015,37 @@ impl<
 
         // TODO: Add retry logic
         if l2_head_block_info.is_some() || l2_safe_block_info.is_some() {
-            if let Err(err) =
-                self.engine.update_fcs(l2_head_block_info, l2_safe_block_info, None).await
-            {
-                // The L1 database is already unwound; the engine still points
-                // at the reorged-out chain, no L1Reorg event will be emitted,
-                // and the reverted transactions below are not reinserted.
-                // Name the divergence explicitly — the generic outcome log
-                // would hide it.
-                tracing::error!(
-                    target: "scroll::chain_orchestrator",
-                    ?l2_head_block_info,
-                    ?l2_safe_block_info,
-                    %err,
-                    "L1-reorg FCU failed AFTER the L1 database unwind; engine and database \
-                     now diverge"
-                );
-                return Err(err.into());
+            // The L1 database is already unwound by this point: an FCU that
+            // does not apply leaves the engine on the reorged-out chain, no
+            // L1Reorg event emitted, reverted transactions not reinserted.
+            match self.engine.update_fcs(l2_head_block_info, l2_safe_block_info, None).await {
+                Ok(result) if !result.is_invalid() => {}
+                Ok(_) => {
+                    tracing::error!(
+                        target: "scroll::chain_orchestrator",
+                        ?l2_head_block_info,
+                        ?l2_safe_block_info,
+                        "L1-reorg FCU rejected as INVALID AFTER the L1 database unwind; \
+                         engine and database now diverge"
+                    );
+                    // No in-process compensation exists here; a restart
+                    // re-derives from the (unwound) database and converges.
+                    return Err(ChainOrchestratorError::FatalStateDivergence(
+                        "post-unwind L1-reorg forkchoice update rejected as INVALID; \
+                         restart re-converges from the persisted state",
+                    ));
+                }
+                Err(err) => {
+                    tracing::error!(
+                        target: "scroll::chain_orchestrator",
+                        ?l2_head_block_info,
+                        ?l2_safe_block_info,
+                        %err,
+                        "L1-reorg FCU failed AFTER the L1 database unwind; engine and \
+                         database now diverge"
+                    );
+                    return Err(err.into());
+                }
             }
         }
 

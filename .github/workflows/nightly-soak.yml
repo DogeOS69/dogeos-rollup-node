@@ -3,9 +3,15 @@ name: nightly-soak
 # Recurrence guard for the CI races fixed in issue #38. Soaks the previously
 # flaky spots off the merge path (same tier idea as dogeos-core's tiered CI):
 #   - the in-process timing-sensitive suite — the optimistic-sync
-#     consolidation test, both build-coalescing tests, and the four payload-job
-#     cancellation tests — plain and under deliberate CPU contention (the
-#     original race only fired on contended runners), and
+#     consolidation test, the four payload-job cancellation tests, the
+#     remote-source launch test, and the skip-identity test — (the resume
+#     test is deliberately NOT soaked: its shutdown/restart fixture has a
+#     known teardown race — a blind 1s cleanup sleep vs the rocksdb lock —
+#     that would file false regression reports; see the follow-ups ledger) —
+#     plain and under deliberate CPU contention (the original race only fired
+#     on contended runners); the two build-coalescing tests soak in the idle
+#     lane only (contention can legitimately defeat their in-flight-job
+#     precondition), and
 #   - the docker remote-source startup pair, repeated serially.
 # Any failure here is a regression of a fixed race — treat it as a bug, not as
 # noise to re-run. (A job hitting its own timeout is a capacity problem, not a
@@ -40,7 +46,11 @@ env:
 jobs:
   soak-integration-idle:
     runs-on: blacksmith-8vcpu-ubuntu-2404
-    timeout-minutes: 90
+    # Must exceed the soak step's 80-minute step-level timeout by enough to
+    # cover setup and a cold --all-features workspace test build (25-40 min),
+    # or the job-level cap fires first, cancels the job, and skips the
+    # reporter the step-level timeout exists to protect.
+    timeout-minutes: 130
     env:
       RUST_BACKTRACE: 1
     steps:
@@ -56,7 +66,7 @@ jobs:
       - name: Build test binaries
         run: |
           cargo nextest run --all-features --workspace --locked --no-run \
-            -E 'test(test_should_consolidate_after_optimistic_sync) or test(coalesces_with) or test(cancels_inflight_payload_job) or test(remote_source_node_launches_when_remote_unreachable) or test(block_building_skipped_carries_head_number) or test(test_remote_block_source_resumes_from_correct_head)'
+            -E 'test(test_should_consolidate_after_optimistic_sync) or test(coalesces_with) or test(cancels_inflight_payload_job) or test(remote_source_node_launches_when_remote_unreachable) or test(block_building_skipped_carries_head_number)'
       - name: Soak timing-sensitive integration tests (idle)
         id: soak
         # Step-level timeout, below the job's 90: a JOB-level timeout cancels
@@ -79,7 +89,7 @@ jobs:
             # distinguishable from a plain regression. Single-threaded so the
             # tests' internal timing budgets are not compounded by peer load.
             cargo nextest run --all-features --workspace --locked --test-threads=1 \
-              --no-tests=fail -E 'test(test_should_consolidate_after_optimistic_sync) or test(coalesces_with) or test(cancels_inflight_payload_job) or test(remote_source_node_launches_when_remote_unreachable) or test(block_building_skipped_carries_head_number) or test(test_remote_block_source_resumes_from_correct_head)'
+              --no-tests=fail -E 'test(test_should_consolidate_after_optimistic_sync) or test(coalesces_with) or test(cancels_inflight_payload_job) or test(remote_source_node_launches_when_remote_unreachable) or test(block_building_skipped_carries_head_number)'
             echo "::endgroup::"
           done
       - name: Report failure on the tracking issue
@@ -95,6 +105,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # PR #45 closes issue 38; a comment on a closed issue notifies
+          # nobody, so reopen it first (best-effort — already-open is fine).
+          gh issue reopen 38 --repo "$GITHUB_REPOSITORY" 2>/dev/null || true
           if [ "${{ steps.soak.outcome }}" = "cancelled" ]; then
             body="nightly-soak job **${{ github.job }}** soak step was cancelled mid-soak (step timeout — possible hang/livelock regression or capacity problem — or a manual cancellation): ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           else
@@ -104,7 +117,11 @@ jobs:
 
   soak-integration-loaded:
     runs-on: blacksmith-8vcpu-ubuntu-2404
-    timeout-minutes: 90
+    # Must exceed the soak step's 80-minute step-level timeout by enough to
+    # cover setup and a cold --all-features workspace test build (25-40 min),
+    # or the job-level cap fires first, cancels the job, and skips the
+    # reporter the step-level timeout exists to protect.
+    timeout-minutes: 130
     env:
       RUST_BACKTRACE: 1
     steps:
@@ -120,7 +137,7 @@ jobs:
       - name: Build test binaries
         run: |
           cargo nextest run --all-features --workspace --locked --no-run \
-            -E 'test(test_should_consolidate_after_optimistic_sync) or test(coalesces_with) or test(cancels_inflight_payload_job) or test(remote_source_node_launches_when_remote_unreachable) or test(block_building_skipped_carries_head_number) or test(test_remote_block_source_resumes_from_correct_head)'
+            -E 'test(test_should_consolidate_after_optimistic_sync) or test(coalesces_with) or test(cancels_inflight_payload_job) or test(remote_source_node_launches_when_remote_unreachable) or test(block_building_skipped_carries_head_number)'
       - name: Soak timing-sensitive integration tests (under CPU contention)
         id: soak
         # Step-level timeout: see the idle job's soak step.
@@ -148,7 +165,7 @@ jobs:
             # spinners can legitimately defeat, and a false failure here would
             # be auto-reported as a race regression. The idle job soaks them.
             cargo nextest run --all-features --workspace --locked --test-threads=1 \
-              --no-tests=fail -E 'test(test_should_consolidate_after_optimistic_sync) or test(cancels_inflight_payload_job) or test(remote_source_node_launches_when_remote_unreachable) or test(block_building_skipped_carries_head_number) or test(test_remote_block_source_resumes_from_correct_head)'
+              --no-tests=fail -E 'test(test_should_consolidate_after_optimistic_sync) or test(cancels_inflight_payload_job) or test(remote_source_node_launches_when_remote_unreachable) or test(block_building_skipped_carries_head_number)'
             echo "::endgroup::"
           done
       - name: Report failure on the tracking issue
@@ -164,6 +181,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # PR #45 closes issue 38; a comment on a closed issue notifies
+          # nobody, so reopen it first (best-effort — already-open is fine).
+          gh issue reopen 38 --repo "$GITHUB_REPOSITORY" 2>/dev/null || true
           if [ "${{ steps.soak.outcome }}" = "cancelled" ]; then
             body="nightly-soak job **${{ github.job }}** soak step was cancelled mid-soak (step timeout — possible hang/livelock regression or capacity problem — or a manual cancellation): ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           else
@@ -173,7 +193,11 @@ jobs:
 
   soak-docker-remote-source:
     runs-on: blacksmith-8vcpu-ubuntu-2404
-    timeout-minutes: 90
+    # Must exceed the soak step's 80-minute step-level timeout by enough to
+    # cover setup and a cold --all-features workspace test build (25-40 min),
+    # or the job-level cap fires first, cancels the job, and skips the
+    # reporter the step-level timeout exists to protect.
+    timeout-minutes: 130
     env:
       RUST_BACKTRACE: 1
     steps:
@@ -225,6 +249,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # PR #45 closes issue 38; a comment on a closed issue notifies
+          # nobody, so reopen it first (best-effort — already-open is fine).
+          gh issue reopen 38 --repo "$GITHUB_REPOSITORY" 2>/dev/null || true
           if [ "${{ steps.soak.outcome }}" = "cancelled" ]; then
             body="nightly-soak job **${{ github.job }}** soak step was cancelled mid-soak (step timeout — possible hang/livelock regression or capacity problem — or a manual cancellation): ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           else

@@ -22,6 +22,10 @@ pub enum ChainOrchestratorError {
     /// on would keep serving from divergent state.
     #[error("fatal state divergence: {0}")]
     FatalStateDivergence(&'static str),
+    /// The engine rejected a forkchoice update as INVALID before any state
+    /// was mutated; the command is refused cleanly.
+    #[error("forkchoice update rejected by the engine: {0}")]
+    FcuRejected(&'static str),
     /// An error occurred while trying to fetch the L2 block from the database.
     #[error("L2 block not found - block number: {0}")]
     L2BlockNotFoundInDatabase(u64),

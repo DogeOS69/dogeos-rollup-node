@@ -191,8 +191,11 @@ from every pass is either fixed in the PR or recorded here.
     L1 database unwind fails, the engine still points at the reorged-out chain
     while the database is unwound; no L1Reorg event is emitted and the
     reverted transactions are not reinserted. The PR now logs an explicit
-    divergence error at the site; the run loop's outcome handler still only
-    logs and continues (the `// TODO: Add retry logic` predates this PR).
+    divergence error at the site, and an FCU the engine rejects as INVALID
+    fail-stops via FatalStateDivergence (propagated through handle_outcome
+    from every select arm). What remains open is the transport-Err path:
+    it propagates and is logged, but the retry-vs-fail-stop policy (the
+    `// TODO: Add retry logic` predates this PR) is undecided.
   - First/most-recent pass: Claude pass 19 (2026-09-01T10:30Z).
   - Why unaddressed: choosing fail-stop vs bounded retry on an event-driven
     reorg path is a node-lifecycle policy decision (an L1 reorg can arrive at
@@ -229,6 +232,41 @@ from every pass is either fixed in the PR or recorded here.
     cycle; every downstream match arm and the settlement's event handling
     would need auditing in the same change.
   - Suggested Linear title: "chain-orchestrator: carry the cancellation reason on PayloadBuildingJobCancelled"
+
+- **Table-test the head-update fatal paths as a pure function**
+  (`crates/chain-orchestrator/src/lib.rs` UpdateFcsHead arm and rollback)
+  - Impact/evidence: Claude pass 21 coverage note — FatalStateDivergence has
+    only definition/raise sites in the tree: the forward-INVALID refusal, the
+    rollback three-way outcome (VALID commits / SYNCING and INVALID do not /
+    transport error), and the post-unwind reorg-FCU INVALID case have no
+    tests. The PR's own settlement_decision pattern applies directly:
+    extract the outcome classification into a pure function and table-test
+    it.
+  - First/most-recent pass: Claude pass 21 (2026-09-01T11:50Z).
+  - Why unaddressed: the refactor touches the command handler late in the
+    review cycle; the logic just landed across passes 19-21 and the shape
+    should settle before extraction.
+  - Suggested Linear title: "chain-orchestrator: extract and table-test the head-update/rollback outcome classification"
+
+- **Harden the reboot fixture's teardown before soaking the resume test**
+  (`crates/node/src/test_utils/reboot.rs`, `shutdown_node`/`start_node`;
+  `.github/workflows/nightly-soak.yml`)
+  - Impact/evidence: observed during the pass-21 verification battery — the
+    restarted node failed with "failed to open the database: IO error: lock
+    hold by current process ... rocksdb/LOCK" plus a reth persistence-service
+    error, under suite contention. `shutdown_node` ends in a blind 1-second
+    cleanup sleep (the exact anti-pattern issue #38 removes elsewhere), so
+    DB-handle release can lose the race with `start_node`. The resume test
+    was therefore deliberately left OUT of the nightly soak filters: a
+    teardown flake there would auto-file false race-regression reports on
+    the tracking issue.
+  - First/most-recent pass: orchestrator observation during Claude pass 21
+    fixes (2026-09-01T12:20Z).
+  - Why unaddressed: the fix is fixture-level (replace the sleep with an
+    observable release — poll the rocksdb lock's acquirability or await the
+    persistence task handle) and risks touching every reboot-based test in a
+    stabilization PR.
+  - Suggested Linear title: "rollup-node: make the reboot fixture's shutdown observable, then soak the resume test"
 
 - **Docker lane can hang to the 90-minute SIGKILL with no nextest summary**
   (`.github/workflows/test.yaml`, integration-docker-compose)

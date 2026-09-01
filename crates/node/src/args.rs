@@ -186,6 +186,26 @@ impl ScrollRollupNodeConfig {
             );
         }
 
+        if !self.remote_block_source_args.enabled &&
+            (self.remote_block_source_args.build || self.remote_block_source_args.url.is_some())
+        {
+            return Err("remote-source.build/remote-source.url have no effect without \
+                 remote-source.enabled"
+                .to_string());
+        }
+
+        if self.remote_block_source_args.enabled &&
+            self.remote_block_source_args.build &&
+            self.sequencer_args.payload_building_duration >= 12_000
+        {
+            // The engine drops payload jobs at its ~12s deadline, and the
+            // remote source's build wait is clamped to 60s — every build
+            // would either lose its payload or expire into the retry path.
+            return Err("remote-source.build requires sequencer.payload-building-duration below \
+                 12000ms (the engine's payload-job deadline)"
+                .to_string());
+        }
+
         if self.remote_block_source_args.enabled &&
             self.remote_block_source_args.poll_interval_ms == 0
         {

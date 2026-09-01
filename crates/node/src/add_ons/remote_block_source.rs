@@ -680,9 +680,16 @@ where
                     target: "scroll::remote_source",
                     head,
                     expected,
-                    "Owed build superseded by an unrelated head advance; dropping it"
+                    "Owed build superseded by an unrelated head advance; dropping it and \
+                     re-deriving the resume point"
                 );
                 self.clear_pending_build();
+                // The head moved without us, so the pointer now trails it.
+                // Importing `last_imported + 1` against an advanced head
+                // would rewind the engine (ImportBlock bypasses the gossip
+                // path's parent-linkage and safe-head guards) — re-derive
+                // the common ancestor instead.
+                self.last_imported_block = None;
                 Ok(())
             }
             SettleAction::Resync => {
@@ -694,7 +701,13 @@ where
                 );
                 self.clear_pending_build();
                 self.last_imported_block = None;
-                Ok(())
+                // Err for the same reason as Abandon below: Ok would reset
+                // consecutive_failures (and could log a spurious recovery) on
+                // a tick that only detected a rewound head.
+                Err(eyre::eyre!(
+                    "local head rewound below the owed build's parent (head {head}, expected \
+                     {expected}); re-deriving the resume point"
+                ))
             }
             SettleAction::Abandon => {
                 self.builds_abandoned += 1;

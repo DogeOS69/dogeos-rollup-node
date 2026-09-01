@@ -14,6 +14,10 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Read-only workflow; do not inherit broader default token scopes.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 

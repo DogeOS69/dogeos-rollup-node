@@ -1355,15 +1355,19 @@ impl<
 
         if finalized_block_info.is_some() {
             tracing::info!(target: "scroll::chain_orchestrator", ?finalized_block_info, "Updating FCS with new finalized block info from L1 finalization");
-            let result = self.engine.update_fcs_checked(None, None, finalized_block_info).await?;
-            if !result.is_valid() {
-                // Mirror left unchanged (checked commits only on VALID);
-                // self-heals on the next full FCU — but status must not
-                // advertise a finalized head the EL never adopted.
+            // Deliberately UNCHECKED: SYNCING is routine while the EL catches
+            // up, and refusing to commit the mirror would leave the finalized
+            // marker stale with NO retry path — the batch is already
+            // finalized in the database above and the notification is
+            // consumed. The mirror-committed value rides every later FCU
+            // until the EL adopts it. Only INVALID (never committed) is
+            // surfaced.
+            let result = self.engine.update_fcs(None, None, finalized_block_info).await?;
+            if result.is_invalid() {
                 tracing::warn!(
                     target: "scroll::chain_orchestrator",
                     ?finalized_block_info,
-                    "Finalized-head FCU was not applied by the engine"
+                    "Finalized-head FCU rejected as INVALID by the engine"
                 );
             }
         }
@@ -1480,14 +1484,17 @@ impl<
         // Update the forkchoice state to the new safe block.
         if self.sync_state.is_synced() {
             tracing::info!(target: "scroll::chain_orchestrator", ?safe_block_info, "Updating safe head to block after batch revert");
-            let result = self.engine.update_fcs_checked(None, Some(safe_block_info), None).await?;
-            if !result.is_valid() {
-                // See the finalized-head FCU above: honest mirror over an
-                // optimistic one.
+            // Deliberately UNCHECKED (see the finalized-head FCU in the L1
+            // finalization handler): the batch-revert database mutation is
+            // already committed, so a checked refusal on SYNCING would leave
+            // the old safe head standing with no retry while imports that
+            // must reorg below it get refused indefinitely.
+            let result = self.engine.update_fcs(None, Some(safe_block_info), None).await?;
+            if result.is_invalid() {
                 tracing::warn!(
                     target: "scroll::chain_orchestrator",
                     ?safe_block_info,
-                    "Post-batch-revert safe-head FCU was not applied by the engine"
+                    "Post-batch-revert safe-head FCU rejected as INVALID by the engine"
                 );
             }
         }

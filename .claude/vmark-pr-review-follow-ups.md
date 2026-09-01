@@ -406,25 +406,6 @@ from every pass is either fixed in the PR or recorded here.
     the table-test entry.
   - Suggested Linear title: "rollup-node: behavioural tests for the finalized-floor refusal and owed-build re-issue"
 
-- **Consolidation is never re-run when L1 syncs after L2 (and the flagship test cannot assert it)**
-  (`crates/chain-orchestrator/src/lib.rs` consolidate_chain call sites,
-  `crates/node/tests/sync.rs` test_should_consolidate_after_optimistic_sync)
-  - Impact/evidence: Claude pass 31 T4 asked the flagship test to assert a
-    ChainConsolidated event; implementing that timed out deterministically
-    and revealed why: consolidate_chain runs only at the L2 syncing->synced
-    transition AND only when L1 is already synced — in this test (and any
-    node whose L2 catches up before L1) the transition happens L1-unsynced,
-    and no later path re-runs consolidation when L1 completes. The test's
-    extension wait is therefore its only signal, and production nodes in
-    that ordering may skip consolidation entirely.
-  - First/most-recent pass: orchestrator observation implementing Claude
-    pass 31 T4 (2026-09-01T17:30Z).
-  - Why unaddressed: confirming and fixing the ordering gap is a
-    consensus-path behavior change (add a consolidation trigger on the
-    L1-synced transition) well beyond the review loop; the test assertion
-    only becomes possible after it.
-  - Suggested Linear title: "chain-orchestrator: run consolidation when L1 syncs after L2, and assert it in the optimistic-sync test"
-
 - **Docker lane hangs die without a nextest summary (per-test bound missing)**
   (`.github/workflows/test.yaml`, integration-docker-compose)
   - Impact/evidence: Claude pass flag — no `.config/nextest.toml`, so no

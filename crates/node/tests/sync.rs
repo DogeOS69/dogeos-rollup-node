@@ -310,6 +310,17 @@ async fn test_should_consolidate_after_optimistic_sync() -> eyre::Result<()> {
     // Send a notification to the unsynced node that the L1 watcher is synced.
     follower.l1().sync().await?;
 
+    // The Synced notification triggers consolidation (L2 is already
+    // synced) and ChainConsolidated is emitted BEFORE L1Synced — capture it
+    // first, or the l1_synced waiter drains and discards it. This is the
+    // assertion the test is named for: the consolidated range must cover
+    // the optimistically-synced blocks.
+    let consolidations = follower.expect_event().chain_consolidated().await?;
+    eyre::ensure!(
+        consolidations.iter().any(|(_, to)| *to >= L1_MESSAGES_COUNT as u64),
+        "consolidation did not cover the optimistic range: {consolidations:?}"
+    );
+
     // Wait for the unsynced node to sync to the L1 watcher.
     follower.expect_event().l1_synced().await?;
 
@@ -318,13 +329,6 @@ async fn test_should_consolidate_after_optimistic_sync() -> eyre::Result<()> {
 
     // build a new block on the sequencer node to trigger consolidation on the unsynced node.
     sequencer.build_block().build_and_await_block().await?;
-
-    // NOTE: no ChainConsolidated event is asserted here because none is
-    // emitted in this flow — the L2 syncing->synced transition happens while
-    // L1 is still unsynced (consolidate_chain is gated on both), and nothing
-    // re-runs consolidation when L1 syncs afterwards. Whether that is a
-    // production gap is tracked in the follow-ups ledger; the extension wait
-    // below is the test's effective signal.
 
     // Assert that the unsynced node consolidates the chain.
     follower.expect_event().chain_extended((L1_MESSAGES_COUNT + 2) as u64).await?;

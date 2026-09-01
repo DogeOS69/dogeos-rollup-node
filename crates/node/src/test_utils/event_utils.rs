@@ -350,13 +350,21 @@ impl<'a> EventWaiter<'a> {
                     })?;
                     let events = &mut node_handle.chain_orchestrator_rx;
 
-                    // Drain every event that is already available on this node.
-                    // The old one-event-per-10ms drain cost latency (a ~100
-                    // events/s ceiling, hundreds of mandatory sleeps per
-                    // test), not event loss — the broadcast channel holds
-                    // 5000 events (issue #38).
+                    // Drain the events already available on this node, in
+                    // BOUNDED batches: under sustained traffic (automatic
+                    // sequencing) an always-ready stream would otherwise
+                    // never reach the yield below, starving the other nodes
+                    // and the enclosing timeout. The old one-event-per-10ms
+                    // drain cost latency (a ~100 events/s ceiling), not event
+                    // loss — the broadcast channel holds 5000 events
+                    // (issue #38).
+                    let mut batch = 0usize;
                     while let Some(event) = events.next().now_or_never() {
                         drained_any = true;
+                        batch += 1;
+                        if batch > 256 {
+                            break;
+                        }
                         match event {
                             Some(event) => {
                                 if let Some(value) = extractor(&event) {

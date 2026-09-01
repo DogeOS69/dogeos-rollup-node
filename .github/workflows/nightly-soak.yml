@@ -69,7 +69,7 @@ jobs:
             -E 'test(test_should_consolidate_after_optimistic_sync) or test(coalesces_with) or test(cancels_inflight_payload_job) or test(remote_source_node_launches_when_remote_unreachable) or test(block_building_skipped_carries_head_number)'
       - name: Soak timing-sensitive integration tests (idle)
         id: soak
-        # Step-level timeout, below the job's 90: a JOB-level timeout cancels
+        # Step-level timeout, below the job's 130: a JOB-level timeout cancels
         # the whole job and no later step (even with always()) runs, so a
         # hang would post nothing. A step-level timeout terminates only this
         # step and the reporter below still fires.
@@ -97,7 +97,7 @@ jobs:
         # step-level timeout (the likeliest shape of a reintroduced
         # hang/livelock — reported as 'failure' or 'cancelled' depending on
         # runner version) must also leave a signal. always() is required
-        # because the job is failing at this point. The job-level 90-minute
+        # because the job is failing at this point. The job-level 130-minute
         # backstop is NOT reportable from inside the job (it cancels every
         # remaining step); it only exists for a hang in a non-soak step.
         # Setup/toolchain failures still must not be reported as regressions.
@@ -173,7 +173,7 @@ jobs:
         # step-level timeout (the likeliest shape of a reintroduced
         # hang/livelock — reported as 'failure' or 'cancelled' depending on
         # runner version) must also leave a signal. always() is required
-        # because the job is failing at this point. The job-level 90-minute
+        # because the job is failing at this point. The job-level 130-minute
         # backstop is NOT reportable from inside the job (it cancels every
         # remaining step); it only exists for a hang in a non-soak step.
         # Setup/toolchain failures still must not be reported as regressions.
@@ -241,7 +241,7 @@ jobs:
         # step-level timeout (the likeliest shape of a reintroduced
         # hang/livelock — reported as 'failure' or 'cancelled' depending on
         # runner version) must also leave a signal. always() is required
-        # because the job is failing at this point. The job-level 90-minute
+        # because the job is failing at this point. The job-level 130-minute
         # backstop is NOT reportable from inside the job (it cancels every
         # remaining step); it only exists for a hang in a non-soak step.
         # Setup/toolchain failures still must not be reported as regressions.

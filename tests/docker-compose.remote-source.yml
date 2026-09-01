@@ -34,6 +34,11 @@ services:
     depends_on:
       l1-node:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "--header", "Content-Type: application/json", "--data", '{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1}', "http://localhost:8545"]
+      interval: 1s
+      timeout: 2s
+      retries: 60
 
   rollup-node-remote-source:
     build:
@@ -53,6 +58,8 @@ services:
       - l2reth-remote-source:/l2reth
     depends_on:
       l1-node:
+        condition: service_healthy
+      rollup-node-sequencer:
         condition: service_healthy
 
   l2geth-skipsignercheck:

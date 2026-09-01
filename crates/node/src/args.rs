@@ -187,18 +187,17 @@ impl ScrollRollupNodeConfig {
             );
         }
 
-        if !self.remote_block_source_args.enabled && self.remote_block_source_args.build {
-            return Err(
-                "remote-source.build has no effect without remote-source.enabled".to_string()
-            );
-        }
-        if !self.remote_block_source_args.enabled && self.remote_block_source_args.url.is_some() {
-            // A URL templated into every node role with only `enabled`
-            // toggled per role is a common, harmless deployment shape —
-            // warn, never break the launch.
+        if !self.remote_block_source_args.enabled &&
+            (self.remote_block_source_args.build || self.remote_block_source_args.url.is_some())
+        {
+            // Remote-source flags templated into every node role with only
+            // `enabled` toggled per role are a common, harmless deployment
+            // shape — warn, never break the launch.
             tracing::warn!(
                 target: "scroll::node::args",
-                "remote-source.url is set but remote-source.enabled is off; the URL is ignored"
+                build = self.remote_block_source_args.build,
+                url = ?self.remote_block_source_args.url,
+                "remote-source flags are set but remote-source.enabled is off; they are ignored"
             );
         }
 
@@ -206,12 +205,18 @@ impl ScrollRollupNodeConfig {
             self.remote_block_source_args.build &&
             self.sequencer_args.payload_building_duration >= 12_000
         {
-            // The engine drops payload jobs at its ~12s deadline, and the
-            // remote source's build wait is clamped to 60s — every build
-            // would either lose its payload or expire into the retry path.
-            return Err("remote-source.build requires sequencer.payload-building-duration below \
-                 12000ms (the engine's payload-job deadline)"
-                .to_string());
+            // 12s is reth's DEFAULT --builder.deadline, which is
+            // runtime-configurable — this config cannot see the actual
+            // value, so a hard error here would reject valid deployments
+            // that raised the deadline (and could not catch ones that
+            // lowered it). Warn about the likely misconfiguration instead.
+            tracing::warn!(
+                target: "scroll::node::args",
+                payload_building_duration = self.sequencer_args.payload_building_duration,
+                "sequencer.payload-building-duration is at or above reth's default 12s \
+                 builder deadline; unless --builder.deadline was raised to match, every \
+                 remote-source build will lose its payload and expire into the retry path"
+            );
         }
 
         if self.remote_block_source_args.enabled &&

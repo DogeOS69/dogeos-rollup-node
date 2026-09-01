@@ -55,9 +55,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
+      - uses: taiki-e/install-action@nextest
       - name: Run consolidation test
         env:
           ALCHEMY_KEY: ${{ secrets.ALCHEMY_KEY }}
           RUST_LOG: "sqlx=off,info,scroll::engine=debug"
         run: |
-          cargo test --release -p rollup-node test_should_consolidate_to_block_15k
+          # nextest with --no-tests=fail: bare `cargo test <filter>` exits 0
+          # when the filter matches nothing, and issue #43 (which re-enables
+          # this workflow) is precisely a rename-the-test change.
+          cargo nextest run --release --locked -p rollup-node --no-tests=fail \
+            -E 'test(test_should_consolidate_to_block_15k)'

@@ -19,7 +19,7 @@ use rollup_node_primitives::{
     L2BlockInfoWithL1Messages,
 };
 use rollup_node_providers::L1MessageProvider;
-use rollup_node_sequencer::{Sequencer, SequencerEvent};
+use rollup_node_sequencer::{Sequencer, SequencerError, SequencerEvent};
 use rollup_node_signer::{SignatureAsBytes, SignerEvent, SignerHandle};
 use rollup_node_watcher::{L1Notification, L1WatcherHandle};
 use scroll_db::{
@@ -472,8 +472,10 @@ impl<
                         // Close the recording so the failed attempt does not
                         // pollute the next slot's duration sample, and notify
                         // like the BuildBlock path — the identity gates make a
-                        // spurious cancellation event harmless, and symmetry
-                        // keeps the metric and the event stream 1:1.
+                        // spurious cancellation event harmless. (Metric and
+                        // event stream are NOT 1:1 overall: the
+                        // no-sequencer BuildBlock arm emits without a
+                        // recording ever starting — see metrics.rs.)
                         self.metric_handler.discard_block_building_recording();
                         self.notify(ChainOrchestratorEvent::PayloadBuildingJobCancelled);
                         return Err(err.into());
@@ -497,6 +499,23 @@ impl<
                     Err(err) => {
                         self.metric_handler.discard_block_building_recording();
                         self.notify(ChainOrchestratorEvent::PayloadBuildingJobCancelled);
+                        // Pre-commit failures (get_payload, FcuNotValid) are
+                        // recoverable — the head never moved. The dedicated
+                        // post-commit variant is not: the head already
+                        // advanced to a block that will never be signed or
+                        // persisted, the exact divergence the fatal sites
+                        // below name.
+                        if matches!(err, SequencerError::PayloadCommittedButUnusable) {
+                            tracing::error!(
+                                target: "scroll::chain_orchestrator",
+                                %err,
+                                "Payload finalization failed AFTER the engine head moved"
+                            );
+                            return Err(ChainOrchestratorError::FatalStateDivergence(
+                                "built payload committed as the engine head but is unusable; \
+                                 restart re-converges from the persisted state",
+                            ));
+                        }
                         return Err(err.into());
                     }
                 };
@@ -577,12 +596,11 @@ impl<
                 // (unsynced, or pending derivation work) is parked until the
                 // gate reopens — deliberately NOT rejected. Gates reopen (sync
                 // completes, derivation drains), after which the job is polled
-                // normally, and the job-invalidating transitions
-                // (optimistic sync, L1 reorg/unwind, sequencing disabled,
-                // chain import, batch reconciliation head moves) cancel it
-                // observably. A held derivation attempt keeps the
-                // gate closed without cancelling; the parked job then simply
-                // resumes when the hold resolves (its head snapshot check
+                // normally, and every job-invalidating transition cancels it
+                // observably (the complete emission-site list lives on
+                // `ChainOrchestratorEvent::PayloadBuildingJobCancelled`). A held derivation attempt
+                // keeps the gate closed without cancelling; the parked job then
+                // simply resumes when the hold resolves (its head snapshot check
                 // cancels it if the head moved). Rejecting here instead was
                 // tried and races startup: a build command can legitimately
                 // arrive before the L1-synced notification is processed.
@@ -592,10 +610,9 @@ impl<
                     // makes block numbering timing-dependent when the build
                     // timer and manual triggers race (issue #38). The
                     // in-flight job normally emits BlockSequenced or
-                    // BlockBuildingSkipped; if it is cancelled instead (L1
-                    // reorg, chain import, administrative FCS head update, or
-                    // sequencing disabled), PayloadBuildingJobCancelled is
-                    // emitted so waiters can fail fast — they should still
+                    // BlockBuildingSkipped; if it is cancelled instead,
+                    // PayloadBuildingJobCancelled is emitted (complete site
+                    // list on that event's doc) so waiters can fail fast — they should still
                     // bound their wait (the remote block source does).
                     if sequencer.payload_building_job().is_some() {
                         tracing::debug!(
@@ -768,6 +785,43 @@ impl<
                 }
             },
             ChainOrchestratorCommand::RevertToL1Block((block_number, tx)) => {
+                // Validate BEFORE latching the sync gate: everything after
+                // set_syncing() fail-stops on error (only the watcher reset
+                // at the end can reopen the gate), so a bad RPC argument —
+                // or a transient DB read error — must be refused here, where
+                // nothing has mutated, with a `false` reply instead of a
+                // node-killing panic.
+                let latest_l1 = match self
+                    .database
+                    .tx(|tx| async move { tx.get_latest_l1_block_number().await })
+                    .await
+                {
+                    Ok(latest) => latest,
+                    Err(err) => {
+                        tracing::warn!(
+                            target: "scroll::chain_orchestrator",
+                            block_number,
+                            %err,
+                            "Refusing administrative L1 unwind: could not read the latest \
+                             L1 block"
+                        );
+                        let _ = tx.send(false);
+                        return Ok(());
+                    }
+                };
+                // Refuse only a target ABOVE what exists (a fresh database
+                // reports 0 and makes any unwind a trivial no-op).
+                if block_number > latest_l1 {
+                    tracing::warn!(
+                        target: "scroll::chain_orchestrator",
+                        block_number,
+                        ?latest_l1,
+                        "Refusing administrative L1 unwind to a block above the latest \
+                         processed L1 block"
+                    );
+                    let _ = tx.send(false);
+                    return Ok(());
+                }
                 self.sync_state.l1_mut().set_syncing();
                 // The gate is now closed for the whole administrative re-scan:
                 // a parked job could not be polled to completion, later
@@ -794,7 +848,10 @@ impl<
                     if result.is_invalid() {
                         // Replying success while the engine refused the safe
                         // head would misreport the unwind; the run loop
-                        // fail-stops on any error from this command.
+                        // fail-stops on any error from this command. Only
+                        // INVALID is refused — a SYNCING safe head is
+                        // acceptable mid-sync (unlike the head updates above,
+                        // nothing downstream persists state keyed to it).
                         return Err(ChainOrchestratorError::FcuRejected(
                             "administrative unwind safe-head update rejected as INVALID by \
                              the engine",
@@ -1397,20 +1454,31 @@ impl<
                 hash: block_with_peer.block.header.hash_slow(),
             };
             let result = self.engine.optimistic_sync(block_info).await?;
-            // Cancel any in-flight payload building job now that the head
-            // jumped far ahead — after the FCU, and only when the engine
-            // accepted it, so a transient engine error or an INVALID result
-            // (head unchanged in both cases) does not destroy a valid job.
-            // Mirrors the ordering at the other head-moving sites; the
-            // single-task run loop means the job cannot complete in between.
-            // Cancelling matters even though a parked job could not complete
-            // anyway — set_syncing() closes the sequencer arm's gate, and the
-            // path back to synced cancels first — because leaving it in the
-            // slot would make every BuildBlock during the sync window
-            // coalesce into a job that can never emit an outcome.
-            if !result.is_invalid() {
-                self.cancel_payload_building_job("optimistic sync moved the head");
+            if result.is_invalid() {
+                // The engine rejected the target and kept the old head: a
+                // rejection must be a TRUE no-op. Closing the gate or purging
+                // mappings here would strand a surviving job behind a gate
+                // that never reopens (every later BuildBlock coalescing into
+                // it with only non-terminal events) while nothing was synced.
+                tracing::warn!(
+                    target: "scroll::chain_orchestrator",
+                    ?block_info,
+                    "Optimistic sync target rejected as INVALID by the engine; ignoring \
+                     the peer block"
+                );
+                return Ok(None);
             }
+            // Cancel any in-flight payload building job now that the head
+            // jumped far ahead — after the FCU so a transient engine error
+            // (head unchanged) does not destroy a valid job. Mirrors the
+            // ordering at the other head-moving sites; the single-task run
+            // loop means the job cannot complete in between. Cancelling
+            // matters even though a parked job could not complete anyway —
+            // set_syncing() closes the sequencer arm's gate, and the path
+            // back to synced cancels first — because leaving it in the slot
+            // would make every BuildBlock during the sync window coalesce
+            // into a job that can never emit an outcome.
+            self.cancel_payload_building_job("optimistic sync moved the head");
             self.sync_state.l2_mut().set_syncing();
 
             // Purge all L1 message to L2 block mappings as they may be invalid after an
@@ -2242,6 +2310,10 @@ mod run_loop_policy_tests {
             })
             .await
             .unwrap();
+        // The revert target below must pass the handler's pre-latch
+        // validation (target <= latest processed L1 block), which reads this
+        // watcher-maintained marker.
+        database.set_latest_l1_block_number(10).await.unwrap();
 
         let engine_client = Arc::new(ScriptedEngineClient::new());
         engine_client

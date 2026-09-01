@@ -16,14 +16,19 @@ pub enum ChainOrchestratorError {
     /// An error occurred in the engine.
     #[error("engine error occurred: {0}")]
     EngineError(#[from] EngineError),
-    /// Engine and persisted state diverged and the in-process compensation
-    /// did not commit. The run loop treats this as fatal: a restart
+    /// Engine and persisted state diverged with no in-process recovery left
+    /// (most sites have no compensation; the one that does — the
+    /// `UpdateFcsHead` rollback — raises this only when the compensation
+    /// itself did not commit). The run loop treats this as fatal: a restart
     /// re-derives its state from the database and converges, while running
     /// on would keep serving from divergent state.
     #[error("fatal state divergence: {0}")]
     FatalStateDivergence(&'static str),
-    /// The engine rejected a forkchoice update as INVALID before any state
-    /// was mutated; the command is refused cleanly.
+    /// The engine did not apply a forkchoice update (INVALID, or — for the
+    /// head updates that require VALID — SYNCING) and the command was
+    /// refused. At the `UpdateFcsHead` site nothing has been mutated; at the
+    /// `RevertToL1Block` safe-head site the unwind has already run and the
+    /// run loop escalates this to a fail-stop.
     #[error("forkchoice update rejected by the engine: {0}")]
     FcuRejected(&'static str),
     /// An error occurred while trying to fetch the L2 block from the database.

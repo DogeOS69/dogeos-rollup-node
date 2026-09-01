@@ -154,8 +154,12 @@ async fn test_remote_block_source_resumes_from_correct_head() -> eyre::Result<()
     // The add-on should therefore import blocks 4, 5, 6 and build 5, 6, 7 on top.
     fixture.start_node(1).await?;
 
-    // Synchronise L1 state on the restarted remote source node.
+    // Synchronise L1 state on the restarted remote source node — and WAIT
+    // for it: sync() only sends the notification, and an import tick that
+    // races it takes the not-synced branch, permanently skipping that
+    // height's build (the waits below would then burn their full budgets).
     fixture.l1().for_node(1).sync().await?;
+    fixture.expect_event_on(1).l1_synced().await?;
 
     // Verify the remote source catches up with the 3 missed sequencer
     // blocks, pinning the FIRST post-restart build (see the doc above —

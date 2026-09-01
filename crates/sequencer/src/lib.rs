@@ -207,12 +207,17 @@ where
             let expected_hash = payload.block_hash;
             let ExecutionData { payload, sidecar } =
                 ExecutionData { payload: payload.into(), sidecar: Default::default() };
+            // POST-COMMIT failures from here down: the head already moved,
+            // so these must carry the dedicated variant the orchestrator
+            // escalates to a fatal divergence (a plain PayloadError reads as
+            // recoverable and would leave the node building on an unsigned,
+            // unpersisted head).
             let mut block: DogeosBlock = payload
                 .try_into_block_with_sidecar::<ScrollTransactionSigned>(&sidecar)
-                .map_err(|_| SequencerError::PayloadError)?;
+                .map_err(|_| SequencerError::PayloadCommittedButUnusable)?;
             block.header.difficulty = U256::ONE;
             if block.hash_slow() != expected_hash {
-                return Err(SequencerError::PayloadError)
+                return Err(SequencerError::PayloadCommittedButUnusable)
             }
             Ok(Some(block))
         }

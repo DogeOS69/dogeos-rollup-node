@@ -99,13 +99,13 @@ where
     suppressed_errors: u64,
 }
 
-/// After this many consecutive failed settlement attempts for an owed build,
-/// give it up and resume importing: a build outcome that never arrives must
-/// not stall the import loop indefinitely.
 /// Consecutive import rejections tolerated before the resume pointer is
 /// re-derived (see `consecutive_import_rejections`).
 const MAX_IMPORT_REJECTIONS: u32 = 3;
 
+/// After this many consecutive failed settlement attempts for an owed build,
+/// give it up and resume importing: a build outcome that never arrives must
+/// not stall the import loop indefinitely.
 const MAX_PENDING_BUILD_RETRIES: u8 = 5;
 
 /// Minimum interval between repeated identical "Sync error" log lines.
@@ -126,6 +126,9 @@ enum BuildOutcome {
     Landed,
     /// The payload building job was cancelled; no outcome will arrive.
     Cancelled,
+    /// An outcome for a strictly higher height arrived: the head advanced
+    /// through another path and the owed build is moot.
+    Superseded,
 }
 
 /// The action `settle_owed_build` takes for an owed build, decided purely
@@ -564,7 +567,7 @@ where
             loop {
                 match events.next().await {
                     Some(ChainOrchestratorEvent::BlockSequenced(block))
-                        if block.header.number >= expected_number =>
+                        if block.header.number == expected_number =>
                     {
                         tracing::info!(target: "scroll::remote_source",
                             block_number = block.header.number,
@@ -572,11 +575,27 @@ where
                             "Block built successfully, proceeding to next");
                         break Ok(BuildOutcome::Landed);
                     }
+                    Some(ChainOrchestratorEvent::BlockSequenced(block))
+                        if block.header.number > expected_number =>
+                    {
+                        // A strictly-higher build is NOT this request's
+                        // outcome: the head advanced through another path and
+                        // a build issued against the stale parent would sit
+                        // one height above it. Treat as superseded, never as
+                        // landed.
+                        break Ok(BuildOutcome::Superseded);
+                    }
                     Some(ChainOrchestratorEvent::BlockBuildingSkipped { head_block_number })
-                        if head_block_number.saturating_add(1) >= expected_number =>
+                        if head_block_number.saturating_add(1) == expected_number =>
                     {
                         tracing::debug!(target: "scroll::remote_source", head_block_number, "Block building skipped (empty block)");
                         break Ok(BuildOutcome::Landed);
+                    }
+                    Some(ChainOrchestratorEvent::BlockBuildingSkipped { head_block_number })
+                        if head_block_number.saturating_add(1) > expected_number =>
+                    {
+                        // Skip at a higher head: same supersession logic.
+                        break Ok(BuildOutcome::Superseded);
                     }
                     Some(ChainOrchestratorEvent::PayloadBuildingJobCancelled) => {
                         break Ok(BuildOutcome::Cancelled);
@@ -627,6 +646,30 @@ where
             }
         }
 
+        // Fresh head check after the drain: a gossip or derivation import can
+        // land between the settlement's snapshot and here (the drain above
+        // consumes its events), and issuing then would build one height above
+        // the imported block, only for it to be reorged out. Bail to a
+        // re-derive instead.
+        let head = self
+            .orchestrator_handle
+            .status()
+            .await
+            .map_err(|e| self.classify_recv_error(e))?
+            .l2
+            .fcs
+            .head_block_info()
+            .number;
+        if head.saturating_add(1) != expected_number {
+            self.clear_pending_build();
+            self.last_imported_block = None;
+            self.consecutive_import_rejections = 0;
+            return Err(eyre::eyre!(
+                "head moved to {head} before the build for {expected_number} was issued; \
+                 re-deriving the resume point"
+            ));
+        }
+
         self.pending_build = true;
         self.pending_build_cancelled = false;
         self.orchestrator_handle.try_build_block().map_err(|e| {
@@ -644,6 +687,15 @@ where
                 // settlement to re-issue this build race-free.
                 self.pending_build_cancelled = true;
                 Err(eyre::eyre!("The payload building job was cancelled before completing"))
+            }
+            BuildOutcome::Superseded => {
+                self.clear_pending_build();
+                self.last_imported_block = None;
+                self.consecutive_import_rejections = 0;
+                Err(eyre::eyre!(
+                    "build outcome superseded by an unrelated head advance; re-deriving \
+                     the resume point"
+                ))
             }
         }
     }
@@ -707,6 +759,7 @@ where
                 // path's parent-linkage and safe-head guards) — re-derive
                 // the common ancestor instead.
                 self.last_imported_block = None;
+                self.consecutive_import_rejections = 0;
                 Ok(())
             }
             SettleAction::Resync => {
@@ -718,6 +771,7 @@ where
                 );
                 self.clear_pending_build();
                 self.last_imported_block = None;
+                self.consecutive_import_rejections = 0;
                 // Err for the same reason as Abandon below: Ok would reset
                 // consecutive_failures (and could log a spurious recovery) on
                 // a tick that only detected a rewound head.
@@ -739,6 +793,7 @@ where
                 );
                 self.clear_pending_build();
                 self.last_imported_block = None;
+                self.consecutive_import_rejections = 0;
                 // Err (not Ok) so the run loop's failure accounting sees the
                 // abandon: an Ok here would reset consecutive_failures on the
                 // very tick that gave up, understating a permanent
@@ -769,6 +824,15 @@ where
                         // of double-building.
                         self.pending_build_cancelled = true;
                         Err(eyre::eyre!("The payload building job was cancelled before completing"))
+                    }
+                    BuildOutcome::Superseded => {
+                        self.clear_pending_build();
+                        self.last_imported_block = None;
+                        self.consecutive_import_rejections = 0;
+                        Err(eyre::eyre!(
+                            "owed build superseded by an unrelated head advance; \
+                             re-deriving the resume point"
+                        ))
                     }
                 }
             }
@@ -808,6 +872,31 @@ where
             let Some(last_imported) = self.last_imported_block else {
                 return Ok(());
             };
+
+            // Guard against importing behind an advanced local head: gossip
+            // or derivation may have moved it past the pointer while the
+            // remote lagged, and ImportBlock bypasses the gossip path's
+            // parent-linkage and safe-head guards — importing
+            // last_imported+1 would silently reorg the local chain out. (The
+            // settlement's Superseded arm covers this only while a build is
+            // owed; this covers the steady state.)
+            let local_head = self
+                .orchestrator_handle
+                .status()
+                .await
+                .map_err(|e| self.classify_recv_error(e))?
+                .l2
+                .fcs
+                .head_block_info()
+                .number;
+            if local_head > last_imported.saturating_add(1) {
+                self.last_imported_block = None;
+                self.consecutive_import_rejections = 0;
+                return Err(eyre::eyre!(
+                    "local head {local_head} advanced past the resume pointer \
+                     {last_imported}; re-deriving the common ancestor"
+                ));
+            }
 
             // Get remote head (number only — fetching the full latest
             // block here pulled one unused body per catch-up iteration).
@@ -856,6 +945,7 @@ where
                     if self.consecutive_import_rejections >= MAX_IMPORT_REJECTIONS {
                         self.consecutive_import_rejections = 0;
                         self.last_imported_block = None;
+                        self.consecutive_import_rejections = 0;
                         return Err(eyre::eyre!(
                             "import rejected {MAX_IMPORT_REJECTIONS} times in a row (last: \
                              {e}); re-deriving the resume point"
@@ -880,6 +970,7 @@ where
                     next_block_num,
                     "Imported block was not applied by forkchoice; re-deriving the resume point");
                 self.last_imported_block = None;
+                self.consecutive_import_rejections = 0;
                 return Err(eyre::eyre!(
                     "block {next_block_num} was not applied by forkchoice; re-deriving the \
                      common ancestor"

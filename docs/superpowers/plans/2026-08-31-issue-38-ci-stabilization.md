@@ -24,7 +24,7 @@
 > disagree, the code and the PR #45 description are authoritative. Checkboxes
 > were deliberately left unticked; execution was tracked in the PR itself.
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** (historical boilerplate — this plan is superseded and must NOT be executed; see the banner above.) Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Fix the three CI defects from https://github.com/DogeOS69/dogeos-rollup-node/issues/38 at their root causes: the flaky `test_should_consolidate_after_optimistic_sync`, the remote-source/sequencer startup race in the Docker tests, and the sync workflow's missing-configuration preflight.
 

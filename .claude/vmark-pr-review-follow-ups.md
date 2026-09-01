@@ -113,8 +113,8 @@ from every pass is either fixed in the PR or recorded here.
     they are the administrative ones. Untested: batch reconciliation (the
     routine derivation path — a false positive silently degrades block
     production on every batch), the L1-reorg head move, the L1-reorg
-    carries-L1-messages guard, and optimistic sync including the pass-14
-    `!result.is_invalid()` guard, which nothing would catch if inverted or
+    carries-L1-messages guard, and optimistic sync including the pass-25
+    INVALID-is-a-no-op guard, which nothing would catch if inverted or
     dropped. These are the branches where a stale job
     finalizing reorgs a derived/synced chain back out.
   - First/most-recent pass: Claude pass 13 (2026-09-01T04:00Z); Claude
@@ -195,8 +195,9 @@ from every pass is either fixed in the PR or recorded here.
 
 - **Non-panicking config validation at launch**
   (`crates/node/src/node.rs` `ScrollRollupNode::new`, `crates/node/src/args.rs`)
-  - Impact/evidence: Claude pass 19 M4 — the five new validate() rules are a
-    breaking config change (a sixth check warns without erroring), and `.expect("Configuration validation failed")`
+  - Impact/evidence: Claude pass 19 M4 — the three new hard validate() rules
+    are a breaking config change (two further checks warn without erroring
+    after pass 25 downgraded them), and `.expect("Configuration validation failed")`
     turns a stale deployment manifest into a launch panic/crash-loop under a
     supervisor. The rules themselves are correct and the PR description now
     calls out the breaking change; the panic-vs-clean-exit shape predates
@@ -210,8 +211,8 @@ from every pass is either fixed in the PR or recorded here.
 - **`reason` discriminant on `PayloadBuildingJobCancelled`**
   (`crates/chain-orchestrator/src/event.rs`, `cancel_payload_building_job`)
   - Impact/evidence: Claude pass 19 L2 + coverage-gap note — the event is a
-    unit variant emitted from 13 documented logical paths (6 direct notify
-    sites plus the shared cancel helper's callers), so tests can only assert "some
+    unit variant emitted from 14 documented logical paths (6 direct notify
+    sites plus the shared cancel helper's 8 callers), so tests can only assert "some
     cancellation happened" (the chain-import test is now time-bounded as a
     partial mitigation), and consumers cannot tell a head-move cancel from a
     start failure. `cancel_payload_building_job` already carries a
@@ -263,6 +264,104 @@ from every pass is either fixed in the PR or recorded here.
     persistence task handle) and risks touching every reboot-based test in a
     stabilization PR.
   - Suggested Linear title: "rollup-node: make the reboot fixture's shutdown observable, then soak the resume test"
+
+- **Remote-source liveness set: typed import errors, walk resumption, settlement budget, event-lag recovery, sync-aware walk messages**
+  (`crates/node/src/add_ons/remote_block_source.rs`,
+  `crates/chain-orchestrator/src/lib.rs` ImportBlock arm)
+  - Impact/evidence: Claude pass 25 M6/M7/M8/M12 — four related liveness and
+    observability gaps the reviewer scoped as follow-ups: (M6) `ImportBlock`
+    stringifies every orchestrator error, so repeated `InvalidBlock` for the
+    same height cannot be distinguished from transient faults and escalated
+    (the pass-25 rejection bound re-derives but cannot terminate a truly
+    divergent remote, and any FatalStateDivergence under import_chain is
+    downgraded to a String); the ancestor walk restarts from the top on every
+    tick, making terminal escalation effectively unreachable on a mature
+    chain (~8193 iterations); (M7) the settlement budget can head-of-line
+    block imports up to 5x the 60s wait cap when a build parks behind the
+    derivation gate — a Wait should not consume a retry when status() reports
+    not-synced; (M8) broadcast lag (5000-event channel) can silently drop the
+    outcome events the settlement waits on — a monotonic build-generation
+    counter in status() would make a lost `BlockBuildingSkipped` settleable;
+    (M12) during pipeline sync the walk misattributes "block unavailable" to
+    the remote — clamp the walk start with the provider's best block and say
+    "still syncing". Also: deep divergence is terminal above the lookback
+    window but resumes from genesis below it (two outcomes for one fault
+    class), and "ticks since last import" would expose an alternating Ok/Err
+    livelock that `consecutive_failures` hides.
+  - First/most-recent pass: Claude pass 25 (2026-09-01T13:40Z).
+  - Why unaddressed: all need either a typed error channel through
+    `import_block`, new status surface, or walk-state persistence — design
+    changes the reviewer explicitly recommended scoping as follow-ups rather
+    than landing late in a stabilization PR. The in-PR mitigations (bounded
+    rejection re-derive, local-head loop guard, strict outcome identity)
+    close the consensus-facing rewind/livelock holes.
+  - Suggested Linear title: "rollup-node: remote block source liveness — typed import errors, resumable walk, sync-aware settlement"
+
+- **Not-synced import tick advances the resume pointer and drops that height's build**
+  (`crates/node/src/add_ons/remote_block_source.rs`, follow loop not-synced branch)
+  - Impact/evidence: Claude pass 25 (production observation attached to M11)
+    — when a tick imports a block while the node is not L1-synced, the
+    branch `continue`s after the pointer already advanced, so that height's
+    build is skipped permanently with no owed-build bookkeeping — the one
+    spot in the rewritten loop outside the settlement machinery. Not a
+    consensus fault (the block itself was imported).
+  - First/most-recent pass: Claude pass 25 (2026-09-01T13:40Z).
+  - Why unaddressed: folding the branch into the owed-build machinery needs
+    a decision on whether a not-synced tick should defer the build (set
+    pending) or skip it; the observable-precondition fix in the resume test
+    removes the flake this caused in CI.
+  - Suggested Linear title: "rollup-node: owed-build bookkeeping for imports that land while L1-unsynced"
+
+- **Test-fixture ergonomics follow-ups**
+  (`crates/node/src/test_utils/{event_utils,fixture}.rs`, `reboot.rs`)
+  - Impact/evidence: Claude pass 25 minors — `EventWaiter::label` is
+    `&'static str`, so `block_sequenced(target)` cannot carry the target
+    number into its timeout message (Cow would fix it); the
+    `remote_source_url` builder override is not carried onto the fixture, so
+    `start_node()` silently reconnects a restarted node to the real
+    sequencer (a future restart-under-gated-remote test would pass for the
+    wrong reason); `where_n_events` applies its timeout per node (documented
+    in-PR, not unified); the drain loop needs a live clock (comment added
+    in-PR for future `start_paused` tests).
+  - First/most-recent pass: Claude pass 25 (2026-09-01T13:40Z).
+  - Why unaddressed: pure test-infrastructure ergonomics with no current
+    false-pass; each touches shared fixture surface used by every suite.
+  - Suggested Linear title: "rollup-node: test-fixture ergonomics — Cow labels, restart URL carry-over, unified waiter budgets"
+
+- **FcuRejected refusal is a bare RecvError to the admin caller**
+  (`crates/chain-orchestrator/src/lib.rs` UpdateFcsHead arm, `handle/mod.rs`)
+  - Impact/evidence: Claude pass 25 minor — the new refusal drops the reply
+    sender, so "engine refused the head" and "orchestrator is gone" are the
+    same RecvError to the caller — the ambiguity `is_closed()` was added to
+    resolve for BuildBlock. Same reply-widening as the persistence entry
+    above; the two should land together.
+  - First/most-recent pass: Claude pass 25 (2026-09-01T13:40Z).
+  - Why unaddressed: covered by the existing reply-widening entry; recorded
+    here so the refusal path is not forgotten when that lands.
+  - Suggested Linear title: "chain-orchestrator: reply Result to UpdateFcsHead so refusals are distinguishable"
+
+- **Metric skew: parked BuildBlock jobs count park time as build latency**
+  (`crates/chain-orchestrator/src/lib.rs` BuildBlock arm, metrics)
+  - Impact/evidence: Claude pass 25 minor — `start_block_building_recording`
+    runs when the command is handled, but a job started under a closed gate
+    parks until the gate reopens, so park time lands in the build-duration
+    histograms that alarm on build latency (the timer path could never
+    park). Carrying the start Instant on PayloadBuildingJob fixes it.
+  - First/most-recent pass: Claude pass 25 (2026-09-01T13:40Z).
+  - Why unaddressed: touches the metric recording lifecycle; low urgency
+    while the histograms are used qualitatively.
+  - Suggested Linear title: "chain-orchestrator: measure build duration from job start, not command receipt"
+
+- **FatalStateDivergence early return pre-empts held-batch fatal accounting**
+  (`crates/chain-orchestrator/src/lib.rs` run loop command arm)
+  - Impact/evidence: Claude pass 25 minor — the fatal-divergence check runs
+    before the `held_unwind_context` branch, so a future fatal variant
+    raised from the RevertToL1Block arm would skip
+    `log_fatal_held_operation`/`record_fatal()`. Unreachable today.
+  - First/most-recent pass: Claude pass 25 (2026-09-01T13:40Z).
+  - Why unaddressed: dead path today; reordering the two checks is trivial
+    but touches the fail-stop routing that just settled.
+  - Suggested Linear title: "chain-orchestrator: order fatal-divergence vs held-batch accounting in the run loop"
 
 - **Docker lane can hang to the 90-minute SIGKILL with no nextest summary**
   (`.github/workflows/test.yaml`, integration-docker-compose)

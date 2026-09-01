@@ -16,6 +16,12 @@ pub enum ChainOrchestratorError {
     /// An error occurred in the engine.
     #[error("engine error occurred: {0}")]
     EngineError(#[from] EngineError),
+    /// Engine and persisted state diverged and the in-process compensation
+    /// did not commit. The run loop treats this as fatal: a restart
+    /// re-derives its state from the database and converges, while running
+    /// on would keep serving from divergent state.
+    #[error("fatal state divergence: {0}")]
+    FatalStateDivergence(&'static str),
     /// An error occurred while trying to fetch the L2 block from the database.
     #[error("L2 block not found - block number: {0}")]
     L2BlockNotFoundInDatabase(u64),

@@ -91,10 +91,12 @@ from every pass is either fixed in the PR or recorded here.
     after a successful engine-head move fails, the admin caller sees only an
     opaque dropped-channel error. The PR now compensates in-process: the
     engine head is rolled back to the pre-command value on a persistence
-    failure (with a loud error if the rollback itself fails), so divergence
-    across restarts occurs only when BOTH writes fail. What remains is the
-    reply type: the caller still cannot distinguish "reverted cleanly
-    refused" from any internal failure.
+    failure, and a rollback that does not commit (transport error or an
+    INVALID forkchoice status) fail-stops the orchestrator so a restart
+    re-converges on the persisted head — divergence can no longer persist
+    in-process or across restarts. What remains is the reply type: the
+    caller still cannot distinguish "rolled back, retryable" from
+    "fail-stopped" (both surface as a dropped reply channel).
   - First/most-recent pass: Claude pass 13 (2026-09-01T04:00Z); Codex pass 18
     staleness note (2026-09-01T09:30Z).
   - Why unaddressed: changing the reply types is an API change across the

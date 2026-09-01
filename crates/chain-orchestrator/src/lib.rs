@@ -269,6 +269,14 @@ impl<
                         .then(|| self.derivation_driver.fatal_context())
                         .flatten();
                     if let Err(err) = self.handle_command(command).await {
+                        if matches!(err, ChainOrchestratorError::FatalStateDivergence(_)) {
+                            tracing::error!(
+                                target: "scroll::chain_orchestrator",
+                                ?err,
+                                "Fatal state divergence; shutting down so restart re-converges"
+                            );
+                            return Err(err)
+                        }
                         if let Some(context) = held_unwind_context {
                             self.log_fatal_held_operation(context, "administrative L1 unwind", &err);
                             return Err(err)
@@ -619,17 +627,33 @@ impl<
                         "UpdateFcsHead persistence failed after the engine head moved; \
                          rolling the engine head back to keep state convergent"
                     );
-                    if let Err(rollback_err) =
-                        self.engine.update_fcs(Some(previous_head), None, None).await
-                    {
-                        tracing::error!(
-                            target: "scroll::chain_orchestrator",
-                            ?previous_head,
-                            %rollback_err,
-                            "rolling the engine head back after the persistence failure \
-                             also failed; engine and persisted state remain diverged \
-                             until restart"
-                        );
+                    // The rollback commits only on Ok with a non-INVALID
+                    // status: update_fcs returns Ok carrying INVALID when the
+                    // engine rejects the forkchoice, leaving the head where
+                    // it was.
+                    let rollback_committed =
+                        match self.engine.update_fcs(Some(previous_head), None, None).await {
+                            Ok(result) if !result.is_invalid() => true,
+                            rollback_outcome => {
+                                tracing::error!(
+                                    target: "scroll::chain_orchestrator",
+                                    ?previous_head,
+                                    ?rollback_outcome,
+                                    "engine-head rollback after the persistence failure did \
+                                     not commit"
+                                );
+                                false
+                            }
+                        };
+                    if !rollback_committed {
+                        // Engine on the new head, database on the old one, and
+                        // the compensation failed: running on serves divergent
+                        // state, while a restart re-derives the head from the
+                        // persisted number and converges. Fail-stop.
+                        return Err(ChainOrchestratorError::FatalStateDivergence(
+                            "UpdateFcsHead persistence failed and the engine-head rollback \
+                             did not commit; restart re-converges on the persisted head",
+                        ));
                     }
                     return Err(err.into());
                 }

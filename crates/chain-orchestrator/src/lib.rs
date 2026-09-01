@@ -261,15 +261,32 @@ impl<
                     }
                 }
                 Some(command) = self.handle_rx.recv() => {
-                    let held_unwind_context = matches!(
+                    let is_admin_unwind = matches!(
                         &command,
                         ChainOrchestratorCommand::RevertToL1Block(_)
-                    )
-                    .then(|| self.derivation_driver.fatal_context())
-                    .flatten();
+                    );
+                    let held_unwind_context = is_admin_unwind
+                        .then(|| self.derivation_driver.fatal_context())
+                        .flatten();
                     if let Err(err) = self.handle_command(command).await {
                         if let Some(context) = held_unwind_context {
                             self.log_fatal_held_operation(context, "administrative L1 unwind", &err);
+                            return Err(err)
+                        }
+                        if is_admin_unwind {
+                            // A failed administrative unwind leaves the L1
+                            // index indeterminate (possibly half-unwound) AND
+                            // the sync gate latched closed: set_syncing() ran,
+                            // and only the watcher reset the failure skipped
+                            // can re-emit Synced. Logging and running on would
+                            // look healthy while never sequencing again —
+                            // fail-stop instead.
+                            tracing::error!(
+                                target: "scroll::chain_orchestrator",
+                                ?err,
+                                "Administrative L1 unwind failed; shutting down rather than \
+                                 running on with a latched-closed sync gate"
+                            );
                             return Err(err)
                         }
                         tracing::error!(target: "scroll::chain_orchestrator", ?err, "Error handling command");
@@ -737,8 +754,9 @@ impl<
     /// latency and must not pollute the duration histograms), counts the
     /// cancellation, and notifies waiters so they can fail fast instead of
     /// burning their full wait timeout. Call wherever the job's inputs are
-    /// invalidated — a head move, an L1 unwind while the job carries any L1
-    /// messages, or sequencing being disabled.
+    /// invalidated — a head move; an L1 unwind (unconditionally for an
+    /// administrative revert, and on an L1 reorg when the job carries L1
+    /// messages or the head moved); or sequencing being disabled.
     fn cancel_payload_building_job(&mut self, reason: &'static str) {
         let Some(sequencer) = self.sequencer.as_mut() else { return };
         let Some(job) = sequencer.payload_building_job() else { return };
@@ -951,7 +969,24 @@ impl<
 
         // TODO: Add retry logic
         if l2_head_block_info.is_some() || l2_safe_block_info.is_some() {
-            self.engine.update_fcs(l2_head_block_info, l2_safe_block_info, None).await?;
+            if let Err(err) =
+                self.engine.update_fcs(l2_head_block_info, l2_safe_block_info, None).await
+            {
+                // The L1 database is already unwound; the engine still points
+                // at the reorged-out chain, no L1Reorg event will be emitted,
+                // and the reverted transactions below are not reinserted.
+                // Name the divergence explicitly — the generic outcome log
+                // would hide it.
+                tracing::error!(
+                    target: "scroll::chain_orchestrator",
+                    ?l2_head_block_info,
+                    ?l2_safe_block_info,
+                    %err,
+                    "L1-reorg FCU failed AFTER the L1 database unwind; engine and database \
+                     now diverge"
+                );
+                return Err(err.into());
+            }
         }
 
         // Cancel the inflight payload building job if the head has changed —

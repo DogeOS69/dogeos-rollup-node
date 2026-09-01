@@ -800,6 +800,7 @@ async fn test_manual_build_block_coalesces_with_inflight_job() -> eyre::Result<(
     // BlockSequenced below and the waiter cannot discard that one.
     fixture
         .expect_event()
+        .label("BuildBlockCoalesced with the in-flight manual job")
         .where_event(|e| matches!(e, ChainOrchestratorEvent::BuildBlockCoalesced))
         .await?;
 
@@ -850,6 +851,7 @@ async fn test_manual_build_block_coalesces_with_timer_job() -> eyre::Result<()> 
     // The manual request coalesced with the timer's in-flight job.
     fixture
         .expect_event()
+        .label("BuildBlockCoalesced with the in-flight timer job")
         .where_event(|e| matches!(e, ChainOrchestratorEvent::BuildBlockCoalesced))
         .await?;
 
@@ -911,8 +913,14 @@ async fn test_chain_import_cancels_inflight_payload_job() -> eyre::Result<()> {
         .map_err(|e| eyre::eyre!("import failed: {e}"))?;
 
     // The import moved the head and must have cancelled the in-flight job.
+    // Tightly bounded: this test cannot pre-build a block (node_a must stay
+    // at genesis for the import to be a clean extension), so a loose wait
+    // could be satisfied by a finalization-time emission from the 3s job
+    // instead of the import's prompt cancellation.
     node_a
         .expect_event()
+        .timeout(std::time::Duration::from_secs(2))
+        .label("PayloadBuildingJobCancelled promptly after chain import")
         .where_event(|e| matches!(e, ChainOrchestratorEvent::PayloadBuildingJobCancelled))
         .await?;
 
@@ -969,6 +977,7 @@ async fn test_update_fcs_head_cancels_inflight_payload_job() -> eyre::Result<()>
     // The head update must have cancelled the in-flight job.
     fixture
         .expect_event()
+        .label("PayloadBuildingJobCancelled after UpdateFcsHead")
         .where_event(|e| matches!(e, ChainOrchestratorEvent::PayloadBuildingJobCancelled))
         .await?;
 
@@ -1012,6 +1021,7 @@ async fn test_disable_sequencing_cancels_inflight_payload_job() -> eyre::Result<
 
     fixture
         .expect_event()
+        .label("PayloadBuildingJobCancelled after disabling sequencing")
         .where_event(|e| matches!(e, ChainOrchestratorEvent::PayloadBuildingJobCancelled))
         .await?;
 
@@ -1052,6 +1062,7 @@ async fn test_revert_to_l1_block_cancels_inflight_payload_job() -> eyre::Result<
 
     fixture
         .expect_event()
+        .label("PayloadBuildingJobCancelled after administrative L1 unwind")
         .where_event(|e| matches!(e, ChainOrchestratorEvent::PayloadBuildingJobCancelled))
         .await?;
 
@@ -1080,6 +1091,7 @@ async fn test_block_building_skipped_carries_head_number() -> eyre::Result<()> {
     fixture.sequencer().rollup_manager_handle.build_block();
     fixture
         .expect_event()
+        .label("BlockBuildingSkipped at head 0")
         .where_event(|e| {
             matches!(
                 e,

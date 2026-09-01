@@ -56,7 +56,7 @@ jobs:
       - name: Build test binaries
         run: |
           cargo nextest run --all-features --workspace --locked --no-run \
-            -E 'test(test_should_consolidate_after_optimistic_sync) or test(coalesces_with) or test(cancels_inflight_payload_job) or test(remote_source_node_launches_when_remote_unreachable) or test(block_building_skipped_carries_head_number)'
+            -E 'test(test_should_consolidate_after_optimistic_sync) or test(coalesces_with) or test(cancels_inflight_payload_job) or test(remote_source_node_launches_when_remote_unreachable) or test(block_building_skipped_carries_head_number) or test(test_remote_block_source_resumes_from_correct_head)'
       - name: Soak timing-sensitive integration tests (idle)
         id: soak
         # Step-level timeout, below the job's 90: a JOB-level timeout cancels
@@ -79,7 +79,7 @@ jobs:
             # distinguishable from a plain regression. Single-threaded so the
             # tests' internal timing budgets are not compounded by peer load.
             cargo nextest run --all-features --workspace --locked --test-threads=1 \
-              --no-tests=fail -E 'test(test_should_consolidate_after_optimistic_sync) or test(coalesces_with) or test(cancels_inflight_payload_job) or test(remote_source_node_launches_when_remote_unreachable) or test(block_building_skipped_carries_head_number)'
+              --no-tests=fail -E 'test(test_should_consolidate_after_optimistic_sync) or test(coalesces_with) or test(cancels_inflight_payload_job) or test(remote_source_node_launches_when_remote_unreachable) or test(block_building_skipped_carries_head_number) or test(test_remote_block_source_resumes_from_correct_head)'
             echo "::endgroup::"
           done
       - name: Report failure on the tracking issue
@@ -120,7 +120,7 @@ jobs:
       - name: Build test binaries
         run: |
           cargo nextest run --all-features --workspace --locked --no-run \
-            -E 'test(test_should_consolidate_after_optimistic_sync) or test(coalesces_with) or test(cancels_inflight_payload_job) or test(remote_source_node_launches_when_remote_unreachable) or test(block_building_skipped_carries_head_number)'
+            -E 'test(test_should_consolidate_after_optimistic_sync) or test(coalesces_with) or test(cancels_inflight_payload_job) or test(remote_source_node_launches_when_remote_unreachable) or test(block_building_skipped_carries_head_number) or test(test_remote_block_source_resumes_from_correct_head)'
       - name: Soak timing-sensitive integration tests (under CPU contention)
         id: soak
         # Step-level timeout: see the idle job's soak step.
@@ -148,7 +148,7 @@ jobs:
             # spinners can legitimately defeat, and a false failure here would
             # be auto-reported as a race regression. The idle job soaks them.
             cargo nextest run --all-features --workspace --locked --test-threads=1 \
-              --no-tests=fail -E 'test(test_should_consolidate_after_optimistic_sync) or test(cancels_inflight_payload_job) or test(remote_source_node_launches_when_remote_unreachable) or test(block_building_skipped_carries_head_number)'
+              --no-tests=fail -E 'test(test_should_consolidate_after_optimistic_sync) or test(cancels_inflight_payload_job) or test(remote_source_node_launches_when_remote_unreachable) or test(block_building_skipped_carries_head_number) or test(test_remote_block_source_resumes_from_correct_head)'
             echo "::endgroup::"
           done
       - name: Report failure on the tracking issue

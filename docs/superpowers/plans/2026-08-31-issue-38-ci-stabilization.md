@@ -1,5 +1,11 @@
 # Issue #38 CI Stabilization Implementation Plan
 
+> **Checkbox note (2026-09-01):** the `- [ ]` boxes below reflect plan-authoring
+> time and were deliberately left unticked — execution is tracked by PR #45's
+> commits, not this file. Workstream B3 (compose ordering) was skipped: it was
+> optional and became unnecessary once B2 landed.
+
+
 > **Historical plan-of-record — superseded by the shipped code.** This document
 > guided the initial implementation; the shipped design then evolved through a
 > multi-pass adversarial review cycle on PR #45 (commits `31f2742`, `bd7f303`,

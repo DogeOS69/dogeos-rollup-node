@@ -183,6 +183,51 @@ from every pass is either fixed in the PR or recorded here.
     the false-report path.
   - Suggested Linear title: "chain-orchestrator: emit PayloadBuildingJobStarted so coalescing tests can await an in-flight job"
 
+- **Fail-stop or bounded retry for a post-unwind FCU failure in `handle_l1_reorg`**
+  (`crates/chain-orchestrator/src/lib.rs`, L1-reorg handler)
+  - Impact/evidence: Claude pass 19 M2 (pre-existing) — when the FCU after the
+    L1 database unwind fails, the engine still points at the reorged-out chain
+    while the database is unwound; no L1Reorg event is emitted and the
+    reverted transactions are not reinserted. The PR now logs an explicit
+    divergence error at the site; the run loop's outcome handler still only
+    logs and continues (the `// TODO: Add retry logic` predates this PR).
+  - First/most-recent pass: Claude pass 19 (2026-09-01T10:30Z).
+  - Why unaddressed: choosing fail-stop vs bounded retry on an event-driven
+    reorg path is a node-lifecycle policy decision (an L1 reorg can arrive at
+    any time, unlike the administrative unwind this PR now fail-stops).
+  - Suggested Linear title: "chain-orchestrator: fail-stop or retry when the post-unwind L1-reorg FCU fails"
+
+- **Non-panicking config validation at launch**
+  (`crates/node/src/node.rs` `ScrollRollupNode::new`, `crates/node/src/args.rs`)
+  - Impact/evidence: Claude pass 19 M4 — the three new validate() rules are a
+    breaking config change, and `.expect("Configuration validation failed")`
+    turns a stale deployment manifest into a launch panic/crash-loop under a
+    supervisor. The rules themselves are correct and the PR description now
+    calls out the breaking change; the panic-vs-clean-exit shape predates
+    this PR.
+  - First/most-recent pass: Claude pass 19 (2026-09-01T10:30Z).
+  - Why unaddressed: returning `eyre::Result` from `ScrollRollupNode::new`
+    changes the constructor's public signature and its callers — beyond a
+    review-loop fix.
+  - Suggested Linear title: "rollup-node: exit cleanly (not panic) on config validation failure"
+
+- **`reason` discriminant on `PayloadBuildingJobCancelled`**
+  (`crates/chain-orchestrator/src/event.rs`, `cancel_payload_building_job`)
+  - Impact/evidence: Claude pass 19 L2 + coverage-gap note — the event is a
+    unit variant with eight emission sites, so tests can only assert "some
+    cancellation happened" (the chain-import test is now time-bounded as a
+    partial mitigation), and consumers cannot tell a head-move cancel from a
+    start failure. `cancel_payload_building_job` already carries a
+    `&'static str` reason; lifting it into the event
+    (`PayloadBuildingJobCancelled { reason }`) would make every cancellation
+    site assertable from existing fixtures and close most of the
+    orchestrator-side coverage gaps.
+  - First/most-recent pass: Claude pass 19 (2026-09-01T10:30Z).
+  - Why unaddressed: changes the public event enum shape late in the review
+    cycle; every downstream match arm and the settlement's event handling
+    would need auditing in the same change.
+  - Suggested Linear title: "chain-orchestrator: carry the cancellation reason on PayloadBuildingJobCancelled"
+
 - **Docker lane can hang to the 90-minute SIGKILL with no nextest summary**
   (`.github/workflows/test.yaml`, integration-docker-compose)
   - Impact/evidence: Claude pass flag — no `.config/nextest.toml`, so no

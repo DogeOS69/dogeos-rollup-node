@@ -5,6 +5,7 @@
 //! - Build new blocks on top of each imported block
 
 use rollup_node::test_utils::{EventAssertions, TestFixture};
+use rollup_node_chain_orchestrator::ChainOrchestratorEvent;
 
 #[allow(clippy::large_stack_frames)]
 #[tokio::test]
@@ -117,9 +118,11 @@ async fn test_remote_source_node_launches_when_remote_unreachable() -> eyre::Res
 /// from sequencer's block 4) and import only blocks 4-6.
 ///
 /// If the detection were broken (e.g. always returning 0), the remote source would try
-/// to re-import blocks 1-6, producing 6 `BlockSequenced` events before reaching blocks
-/// 5, 6, 7. This test asserts exactly three events in the correct order, confirming
-/// the resume point is block 3.
+/// to re-import blocks 1-6, sequencing 2, 3, 4 before reaching 5, 6, 7 — and the
+/// `block_sequenced` waiter DRAINS non-matching events, so waiting for 5 directly
+/// would still pass. The load-bearing assertion is therefore on the FIRST
+/// post-restart `BlockSequenced` number, which is what encodes the resume point
+/// (issue #38 review).
 #[allow(clippy::large_stack_frames)]
 #[tokio::test]
 async fn test_remote_block_source_resumes_from_correct_head() -> eyre::Result<()> {
@@ -154,8 +157,22 @@ async fn test_remote_block_source_resumes_from_correct_head() -> eyre::Result<()
     // Synchronise L1 state on the restarted remote source node.
     fixture.l1().for_node(1).sync().await?;
 
-    // Verify the remote source catches up with the 3 missed sequencer blocks.
-    fixture.expect_event_on(1).block_sequenced(5).await?;
+    // Verify the remote source catches up with the 3 missed sequencer
+    // blocks, pinning the FIRST post-restart build (see the doc above —
+    // waiting for 5 directly cannot fail when the resume walk is broken).
+    let first = fixture
+        .expect_event_on(1)
+        .label("first post-restart BlockSequenced")
+        .extract(|e| match e {
+            ChainOrchestratorEvent::BlockSequenced(b) => Some(b.header.number),
+            _ => None,
+        })
+        .await?;
+    eyre::ensure!(
+        first.first() == Some(&5),
+        "remote source resumed from the wrong point: first built block {:?}, expected 5",
+        first.first()
+    );
     fixture.expect_event_on(1).block_sequenced(6).await?;
     fixture.expect_event_on(1).block_sequenced(7).await?;
 

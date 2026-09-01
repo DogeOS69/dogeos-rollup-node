@@ -43,6 +43,14 @@ where
     /// `Resync`/`Abandon` outcomes, and an import the engine did not apply),
     /// forcing a fresh common-ancestor walk on the next tick.
     last_imported_block: Option<u64>,
+    /// Whether `init_last_imported_block` has ever succeeded. Terminal
+    /// (node-killing) escalation of the walk's divergence verdicts is
+    /// reserved for the FIRST initialization: after one success, a genesis
+    /// mismatch or exhausted lookback is far more likely a misrouted or
+    /// lagging remote backend than a wrong `--remote-source.url`, and the
+    /// re-walk (the pointer resets at runtime now) retries at poll cadence
+    /// instead of fail-stopping a healthy node.
+    initialized_once: bool,
     /// The sequencer's payload building duration (milliseconds), used to size
     /// the build-outcome wait budget.
     payload_building_duration_ms: u64,
@@ -247,6 +255,7 @@ where
             provider,
             payload_building_duration_ms,
             last_imported_block: None,
+            initialized_once: false,
             consecutive_failures: 0,
             pending_build: false,
             pending_build_cancelled: false,
@@ -321,6 +330,15 @@ where
                             remote = ?rb.header.hash,
                             "Remote genesis hash does not match the local chain"
                         );
+                        if self.initialized_once {
+                            // A remote that served our genesis before cannot
+                            // have changed chains; treat as a transient
+                            // backend fault and retry at poll cadence.
+                            return Err(eyre::eyre!(
+                                "remote genesis hash mismatch after a previously successful \
+                                 initialization; retrying"
+                            ));
+                        }
                         return Err(terminal_error(
                             "remote genesis hash does not match the local chain; wrong \
                              --remote-source.url?",
@@ -339,6 +357,15 @@ where
                 // The block at `floor` itself has been checked by now. This
                 // walk only steps past PRESENT-but-different blocks, so
                 // exhausting the window proves divergence, not availability.
+                if self.initialized_once {
+                    // See the genesis-mismatch arm: after one successful
+                    // initialization this reads as a remote-side fault, not
+                    // an operator error worth killing the node over.
+                    return Err(eyre::eyre!(
+                        "no common ancestor within the lookback window after a previously \
+                         successful initialization; retrying"
+                    ));
+                }
                 return Err(terminal_error(
                     "no common ancestor with the remote within the lookback window",
                 ));
@@ -724,6 +751,7 @@ where
         if self.last_imported_block.is_none() {
             let resume = self.init_last_imported_block().await?;
             self.last_imported_block = Some(resume);
+            self.initialized_once = true;
         }
 
         // A build owed from a previous tick is settled before importing
@@ -749,15 +777,9 @@ where
                 return Ok(());
             };
 
-            // Get remote head
-            let remote_block = self
-                .remote
-                .get_block_by_number(alloy_eips::BlockNumberOrTag::Latest)
-                .full()
-                .await?
-                .ok_or_else(|| eyre::eyre!("Remote block not found"))?;
-
-            let remote_head = remote_block.header.number;
+            // Get remote head (number only — fetching the full latest
+            // block here pulled one unused body per catch-up iteration).
+            let remote_head = self.remote.get_block_number().await?;
 
             // Compare against last imported block
             if remote_head <= last_imported {

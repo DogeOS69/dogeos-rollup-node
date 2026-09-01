@@ -18,17 +18,25 @@ pub struct EventWaiter<'a> {
     fixture: &'a mut TestFixture,
     node_indices: Vec<usize>,
     timeout_duration: Duration,
+    label: Option<&'static str>,
 }
 
 impl<'a> EventWaiter<'a> {
     /// Create a new multi-node event waiter.
     pub const fn new(fixture: &'a mut TestFixture, node_indices: Vec<usize>) -> Self {
-        Self { fixture, node_indices, timeout_duration: Duration::from_secs(30) }
+        Self { fixture, node_indices, timeout_duration: Duration::from_secs(30), label: None }
     }
 
     /// Set a custom timeout for waiting.
     pub const fn timeout(mut self, duration: Duration) -> Self {
         self.timeout_duration = duration;
+        self
+    }
+
+    /// Name what is being waited for, so a timeout says more than the event
+    /// enum's type name (predicate-based waits are otherwise anonymous).
+    pub const fn label(mut self, label: &'static str) -> Self {
+        self.label = Some(label);
         self
     }
 
@@ -249,7 +257,9 @@ impl<'a> EventWaiter<'a> {
         let mut matched_events = Vec::new();
         for node in self.node_indices {
             let Some(node_handle) = &mut self.fixture.nodes[node] else {
-                continue; // Skip shutdown nodes
+                // Match wait_for_event_on_all: silently skipping a shut-down
+                // node could return success with zero matches.
+                return Err(eyre::eyre!("Node at index {node} has been shutdown"));
             };
             let events = &mut node_handle.chain_orchestrator_rx;
             let mut node_matched_events = Vec::new();
@@ -271,7 +281,9 @@ impl<'a> EventWaiter<'a> {
             .await;
 
             match result {
-                Ok(Ok(_)) => matched_events = node_matched_events,
+                // Extend, not overwrite: a multi-node call must return every
+                // node's matches, not just the final node's.
+                Ok(Ok(())) => matched_events.extend(node_matched_events),
                 // The stream ending before `count` matches must not pass as
                 // success with a partial (or empty) result.
                 Ok(Err(e)) => return Err(e),
@@ -308,6 +320,7 @@ impl<'a> EventWaiter<'a> {
         T: Send + Clone + 'static,
     {
         let timeout_duration = self.timeout_duration;
+        let waited_for = self.label.unwrap_or_else(|| std::any::type_name::<T>());
         let node_indices = self.node_indices;
         let node_count = node_indices.len();
 
@@ -381,7 +394,7 @@ impl<'a> EventWaiter<'a> {
             Err(eyre::eyre!(
                 "Timeout ({:.1}s) waiting for event '{}' on {} nodes (completed {}/{})",
                 timeout_duration.as_secs_f64(),
-                std::any::type_name::<T>(),
+                waited_for,
                 node_count,
                 completed,
                 node_count

@@ -1319,6 +1319,25 @@ impl<
         // startup-time reorg below the persisted finalized marker — that
         // fcs.update() refuses LOCALLY after the unwind is already durable.
         let finalized = *self.engine.fcs().finalized_block_info();
+        // The head first: FINALIZED L2 state is irreversible by definition,
+        // so an unwind result claiming a head below it is reconciled at the
+        // finalized floor — otherwise the safe-floor + head-drag below would
+        // reconstruct safe < finalized and refuse locally AFTER the unwind
+        // committed.
+        let l2_head_block_info = l2_head_block_info.map(|head| {
+            if head.number >= finalized.number {
+                head
+            } else {
+                tracing::warn!(
+                    target: "scroll::chain_orchestrator",
+                    ?head,
+                    ?finalized,
+                    "L1 reorg computed an L2 head below the finalized block; reconciling \
+                     at the finalized floor"
+                );
+                finalized
+            }
+        });
         let l2_safe_block_info =
             l2_safe_block_info
                 .map(|safe| if safe.number >= finalized.number { safe } else { finalized });

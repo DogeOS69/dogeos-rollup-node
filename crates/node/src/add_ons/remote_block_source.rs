@@ -88,6 +88,12 @@ where
     /// sufficient: the settlement's head checks and retry budget still gate
     /// the actual re-issue.
     pending_build_cancelled: bool,
+    /// Whether the owed build's `BuildBlock` command was actually SENT.
+    /// The debt itself is recorded at import time (before any await), so an
+    /// aborted tick cannot lose a build in the gap between the pointer
+    /// advancing and the request going out; an unissued debt is simply
+    /// issued by the next settlement, consuming no retry budget.
+    pending_build_issued: bool,
     /// Consecutive settlement attempts for the owed build. Bounded so an
     /// outcome that never arrives does not head-of-line-block imports
     /// forever.
@@ -305,6 +311,7 @@ where
             consecutive_failures: 0,
             pending_build: false,
             pending_build_cancelled: false,
+            pending_build_issued: false,
             pending_build_retries: 0,
             builds_abandoned: 0,
             last_error_log: None,
@@ -317,6 +324,7 @@ where
     const fn clear_pending_build(&mut self) {
         self.pending_build = false;
         self.pending_build_cancelled = false;
+        self.pending_build_issued = false;
         self.pending_build_retries = 0;
     }
 
@@ -768,6 +776,7 @@ where
 
         self.pending_build = true;
         self.pending_build_cancelled = false;
+        self.pending_build_issued = true;
         self.orchestrator_handle.try_build_block().map_err(|e| {
             eyre::Report::new(OrchestratorGoneError)
                 .wrap_err(format!("failed to send BuildBlock: {e}"))
@@ -829,6 +838,20 @@ where
             .number;
         let expected = last_imported + 1;
 
+        if !self.pending_build_issued && head.saturating_add(1) == expected {
+            // The debt was recorded at import time but the request was never
+            // sent (the tick was aborted in between): issue it now —
+            // race-free by construction, no retry budget consumed. A moved
+            // head falls through to the normal decision (Landed/Superseded/
+            // Resync all handle an unissued debt correctly: nothing was ever
+            // in flight).
+            tracing::debug!(
+                target: "scroll::remote_source",
+                expected,
+                "Issuing an owed build that was recorded but never sent"
+            );
+            return self.trigger_build_and_await(expected).await;
+        }
         match settlement_decision(
             head,
             expected,
@@ -1154,6 +1177,15 @@ where
             }
             self.last_imported_block = Some(next_block_num);
             self.consecutive_import_rejections = 0;
+            if self.config.build {
+                // Record the build debt BEFORE any await: if the tick is
+                // aborted (stall budget) between here and the request going
+                // out, the next tick's settlement finds an unissued debt and
+                // issues it — the build cannot be silently lost.
+                self.pending_build = true;
+                self.pending_build_cancelled = false;
+                self.pending_build_issued = false;
+            }
 
             if !self.config.build {
                 tracing::debug!(target: "scroll::remote_source", "Imported block is valid, but build is disabled, skipping build");
@@ -1180,6 +1212,10 @@ where
                 } else {
                     tracing::debug!(target: "scroll::remote_source", "Imported block is valid, but orchestrator is not synced, skipping build");
                 }
+                // The skip is deliberate: release the debt recorded at the
+                // import above (the not-synced skip semantics are tracked in
+                // the follow-ups ledger).
+                self.clear_pending_build();
                 continue;
             }
 

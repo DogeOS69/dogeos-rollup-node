@@ -309,9 +309,13 @@ async fn test_should_consolidate_after_optimistic_sync() -> eyre::Result<()> {
     // Send a notification to the unsynced node that the L1 watcher is synced.
     follower.l1().sync().await?;
 
-    // The Synced notification triggers consolidation (L2 is already
-    // synced) and ChainConsolidated is emitted BEFORE L1Synced — capture it
-    // first, or the l1_synced waiter drains and discards it. This is the
+    // Consolidation is triggered by whichever completes last: the Synced
+    // notification (ChainConsolidated then L1Synced) or the L2 sync
+    // transition on a later import (L1Synced then ChainConsolidated). This
+    // waiter is safe under BOTH orderings — and deliberately NOT followed by
+    // an l1_synced() wait, which the drain here could strand:
+    // ChainConsolidated is only emitted when sync_state.is_synced(), which
+    // already proves the Synced notification was processed. This is the
     // assertion the test is named for: the consolidated range must cover
     // the optimistically-synced blocks.
     let consolidations = follower.expect_event().chain_consolidated().await?;
@@ -324,9 +328,6 @@ async fn test_should_consolidate_after_optimistic_sync() -> eyre::Result<()> {
         from == 0 && to >= L1_MESSAGES_COUNT as u64,
         "consolidation did not cover the optimistic range: from={from} to={to}"
     );
-
-    // Wait for the unsynced node to sync to the L1 watcher.
-    follower.expect_event().l1_synced().await?;
 
     // Let the unsynced node process the L1 messages.
     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;

@@ -105,17 +105,17 @@ where
     suppressed_errors: u64,
 }
 
-/// Consecutive import rejections tolerated before the resume pointer is
-/// re-derived (see `consecutive_import_rejections`).
-/// Upper bound on one poll tick. The remote HTTP client has no request
-/// timeout, so a black-holed connection (NAT/LB idle drop) would otherwise
-/// hang `follow_and_build` forever with ZERO log output — the run loop would
-/// reach neither arm and the poll timer (Delay behavior) would never fire
-/// again. Aborting a tick is safe: the state machine is tick-resumable by
-/// design (imports advance the pointer one by one; an owed build settles on
-/// the next tick).
+/// Upper bound on one poll tick — the outer backstop behind the client's
+/// 30s per-request timeout: a long catch-up or settlement chain can outlast
+/// the poll interval, and the poll timer (Delay behavior) cannot fire while
+/// a tick is in flight. Aborting a tick is safe: the state machine is
+/// tick-resumable by design (imports advance the pointer one by one; an
+/// owed build settles on the next tick), and the run loop treats an aborted
+/// tick that ADVANCED the pointer as catch-up progress, not a stall.
 const TICK_STALL_BUDGET: Duration = Duration::from_secs(600);
 
+/// Consecutive import rejections tolerated before the resume pointer is
+/// re-derived (see `consecutive_import_rejections`).
 const MAX_IMPORT_REJECTIONS: u32 = 3;
 
 /// After this many consecutive failed settlement attempts for an owed build,
@@ -136,9 +136,9 @@ const MAX_ANCESTOR_LOOKBACK: u64 = 8192;
 
 /// The outcome of waiting for a requested build.
 enum BuildOutcome {
-    /// The build landed at EXACTLY the expected height (anything higher is
-    /// `Superseded`, never a success for this request).
-    /// sequenced, or building was skipped for an empty payload).
+    /// The build landed at EXACTLY the expected height — the block was
+    /// sequenced, or building was skipped for an empty payload. (Anything
+    /// higher is `Superseded`, never a success for this request.)
     Landed,
     /// The payload building job was cancelled; no outcome will arrive.
     Cancelled,
@@ -484,16 +484,34 @@ where
                 _ = poll_interval.tick() => {
                     // Let shutdown preempt an in-flight tick: follow_and_build
                     // can block on multi-second waits.
+                    let pointer_before = self.last_imported_block;
                     let result = tokio::select! {
                         biased;
                         _guard = &mut shutdown => break,
                         r = tokio::time::timeout(TICK_STALL_BUDGET, self.follow_and_build()) => {
-                            r.unwrap_or_else(|_| {
-                                Err(eyre::eyre!(
-                                    "poll tick stalled for {TICK_STALL_BUDGET:?} (remote \
-                                     connection black-holed?); retrying"
-                                ))
-                            })
+                            match r {
+                                Ok(r) => r,
+                                Err(_) if self.last_imported_block > pointer_before => {
+                                    // The budget elapsed while IMPORTING — a
+                                    // deep catch-up, not a stall. Treat as a
+                                    // healthy tick so consecutive_failures
+                                    // does not climb through the add-on's
+                                    // most common operational scenario.
+                                    tracing::info!(
+                                        target: "scroll::remote_source",
+                                        last_imported = ?self.last_imported_block,
+                                        budget = ?TICK_STALL_BUDGET,
+                                        "Deep catch-up tick exceeded the stall budget; continuing"
+                                    );
+                                    Ok(())
+                                }
+                                Err(_) => Err(eyre::eyre!(
+                                    "poll tick stalled for {TICK_STALL_BUDGET:?} with no import \
+                                     progress (last_imported {:?}; deep settlement chain, or the \
+                                     remote connection is black-holed); retrying",
+                                    self.last_imported_block
+                                )),
+                            }
                         }
                     };
                     match result {
@@ -931,6 +949,14 @@ where
         if self.last_imported_block.is_none() {
             let (resume, resume_hash, local_head, local_safe, diverged) =
                 self.init_last_imported_block().await?;
+            // The walk SUCCEEDING is what proves the remote serves our chain
+            // (it returned a matching hash) — set the flag here, before the
+            // guards below: a benign lagging-remote/below-safe tick must not
+            // keep the node in first-init mode where a later misrouted
+            // backend's genesis mismatch would fail-stop it. A wrong URL can
+            // never produce a matching hash, so first-init protection is
+            // not weakened.
+            self.initialized_once = true;
             // Checked UNCONDITIONALLY (not only when the head is 2+ past the
             // ancestor): with head == safe == S and the remote forking at S,
             // resume is S-1 and the head is exactly resume+1 — importing over
@@ -982,7 +1008,6 @@ where
                     })?;
             }
             self.last_imported_block = Some(resume);
-            self.initialized_once = true;
         }
 
         // A build owed from a previous tick is settled before importing

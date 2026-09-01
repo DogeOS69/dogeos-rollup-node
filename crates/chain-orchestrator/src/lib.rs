@@ -716,12 +716,27 @@ impl<
             }
             ChainOrchestratorCommand::UpdateFcsHead((head, sender)) => {
                 // Collect transactions of reverted blocks from l2 client.
-                let reverted_transactions = self
+                // Best-effort: a failure must neither abort the update nor
+                // drop the responder without a reply.
+                let reverted_transactions = match self
                     .collect_reverted_txs_in_range(
                         head.number.saturating_add(1),
                         self.engine.fcs().head_block_info().number,
                     )
-                    .await?;
+                    .await
+                {
+                    Ok(txs) => txs,
+                    Err(err) => {
+                        tracing::warn!(
+                            target: "scroll::chain_orchestrator",
+                            ?head,
+                            %err,
+                            "Failed to collect reverted transactions for the pool refill; \
+                             continuing the head update without them"
+                        );
+                        Vec::new()
+                    }
+                };
                 let previous_head = *self.engine.fcs().head_block_info();
                 let forward = match self.engine.update_fcs_checked(Some(head), None, None).await {
                     Ok(forward) => forward,
@@ -943,12 +958,28 @@ impl<
                     }
                 }
                 if new_head.is_some() || new_safe.is_some() {
+                    // Best-effort (see handle_l1_reorg): a collection failure
+                    // must not abort the unwind — and on this admin path it
+                    // would even fail-stop the node.
                     let reverted_transactions = if let Some(head) = new_head {
-                        self.collect_reverted_txs_in_range(
-                            head.number.saturating_add(1),
-                            self.engine.fcs().head_block_info().number,
-                        )
-                        .await?
+                        match self
+                            .collect_reverted_txs_in_range(
+                                head.number.saturating_add(1),
+                                self.engine.fcs().head_block_info().number,
+                            )
+                            .await
+                        {
+                            Ok(txs) => txs,
+                            Err(err) => {
+                                tracing::warn!(
+                                    target: "scroll::chain_orchestrator",
+                                    %err,
+                                    "Failed to collect reverted transactions for the pool \
+                                     refill; continuing the unwind without them"
+                                );
+                                Vec::new()
+                            }
+                        }
                     } else {
                         Vec::new()
                     };
@@ -1237,6 +1268,11 @@ impl<
                     };
 
                 // Collect transactions of reverted blocks from l2 client.
+                // BEST-EFFORT: the only consumer is the pool refill, which
+                // already tolerates per-tx failure with a warn. One transport
+                // blip on one of N per-block round-trips must not abort the
+                // unwind (let alone fail-stop) — the FCU below is what
+                // converges state, and it must still run.
                 let reverted_transactions = match self
                     .collect_reverted_txs_in_range(
                         block_number.saturating_add(1),
@@ -1246,17 +1282,14 @@ impl<
                 {
                     Ok(txs) => txs,
                     Err(err) => {
-                        tracing::error!(
+                        tracing::warn!(
                             target: "scroll::chain_orchestrator",
                             block_number,
                             %err,
-                            "Post-unwind reverted-transaction collection failed; engine and \
-                             database now diverge"
+                            "Failed to collect reverted transactions for the pool refill; \
+                             continuing the unwind without them"
                         );
-                        return Err(ChainOrchestratorError::FatalStateDivergence(
-                            "post-unwind reverted-transaction collection failed before the \
-                             reorg FCU; restart re-converges from the persisted state",
-                        ));
+                        Vec::new()
                     }
                 };
 
@@ -1279,6 +1312,27 @@ impl<
         {
             self.cancel_payload_building_job("L1 reorg while the job may carry L1 messages");
         }
+
+        // Preserve head >= safe >= finalized before issuing the FCU (mirrors
+        // the administrative unwind's clamping): the automatic reorg path
+        // could otherwise construct an order-violating triple — e.g. a
+        // startup-time reorg below the persisted finalized marker — that
+        // fcs.update() refuses LOCALLY after the unwind is already durable.
+        let finalized = *self.engine.fcs().finalized_block_info();
+        let l2_safe_block_info =
+            l2_safe_block_info
+                .map(|safe| if safe.number >= finalized.number { safe } else { finalized });
+        let l2_safe_block_info = if let Some(head) = l2_head_block_info {
+            let effective_safe =
+                l2_safe_block_info.unwrap_or_else(|| *self.engine.fcs().safe_block_info());
+            if effective_safe.number > head.number {
+                Some(head)
+            } else {
+                l2_safe_block_info
+            }
+        } else {
+            l2_safe_block_info
+        };
 
         if l2_head_block_info.is_some() || l2_safe_block_info.is_some() {
             // The L1 database is already unwound by this point: an FCU that
@@ -1316,20 +1370,24 @@ impl<
                     ));
                 }
                 Err(EngineError::FcsError(err)) => {
-                    // Pre-flight LOCAL validation: fcs.update() failed before
-                    // anything was sent to the engine, so there is no
-                    // divergence to converge — surface a plain error instead
-                    // of killing the node (reachable e.g. via a startup-time
-                    // L1 reorg below the persisted finalized block).
+                    // Local pre-flight refusal — but the DB unwind is already
+                    // durable, so engine and database HAVE diverged (nothing
+                    // was sent to the engine, yet nothing will re-send it:
+                    // the notification is consumed). The clamping above makes
+                    // every benign refusal unconstructible, so reaching this
+                    // arm means genuinely inconsistent durable state.
                     tracing::error!(
                         target: "scroll::chain_orchestrator",
                         ?l2_head_block_info,
                         ?l2_safe_block_info,
                         %err,
-                        "Post-unwind L1-reorg FCU refused by local forkchoice validation; \
-                         nothing was sent to the engine"
+                        "Post-unwind L1-reorg FCU refused by local forkchoice validation \
+                         with the unwind already committed"
                     );
-                    return Err(EngineError::FcsError(err).into());
+                    return Err(ChainOrchestratorError::FatalStateDivergence(
+                        "post-unwind L1-reorg forkchoice targets failed local validation; \
+                         restart re-converges from the persisted state",
+                    ));
                 }
                 Err(err) => {
                     // Transport error with the unwind already committed and
@@ -1922,6 +1980,12 @@ impl<
                 ?head,
                 "EL has not adopted the imported head; re-entering L2 sync"
             );
+            // Cancel any in-flight job before closing the gate: a parked
+            // job could never be polled again and every later BuildBlock
+            // would coalesce into it with no terminal event (mirrors the
+            // optimistic-sync site). The mirror is untouched, so the job is
+            // not stale — this is about not stranding waiters.
+            self.cancel_payload_building_job("EL has not adopted the imported head");
             self.sync_state.l2_mut().set_syncing();
             return Err(ChainOrchestratorError::FcuRejected(
                 "peer chain import forkchoice update was not applied by the engine",

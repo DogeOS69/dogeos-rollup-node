@@ -6,10 +6,11 @@ name: nightly-soak
 #     consolidation test, both build-coalescing tests, the four payload-job
 #     cancellation tests, the remote-source launch test, and the
 #     skip-identity test — plain and under deliberate CPU contention (the
-#     original race only fired on contended runners). The resume test soaks
-#     in the IDLE lane only (it is skipped in the merge lane and its
-#     shutdown/restart fixture retains a known teardown race — single-
-#     threaded idle is the lowest-risk home; see the follow-ups ledger). And
+#     original race only fired on contended runners). The resume test runs
+#     in NO lane: it is skipped in the merge lane and excluded here because
+#     its own comment documents an unfixed first-tick race and its restart
+#     fixture retains a teardown race — a flake would be auto-filed as a
+#     regression of a fixed race (see the follow-ups ledger). And
 #   - the docker remote-source pair (follow/import parity, and recovery
 #     across a sequencer restart), repeated serially.
 # Any failure here is a regression of a fixed race — treat it as a bug, not as
@@ -93,7 +94,7 @@ jobs:
         timeout-minutes: 45
         run: |
           cargo nextest run --all-features --workspace --locked --no-run \
-            -E 'test(test_should_consolidate_after_optimistic_sync) or test(coalesces_with) or test(cancels_inflight_payload_job) or test(remote_source_node_launches_when_remote_unreachable) or test(block_building_skipped_carries_head_number) or test(test_remote_block_source_resumes_from_correct_head)'
+            -E 'test(test_should_consolidate_after_optimistic_sync) or test(coalesces_with) or test(cancels_inflight_payload_job) or test(remote_source_node_launches_when_remote_unreachable) or test(block_building_skipped_carries_head_number)'
       - name: Soak timing-sensitive integration tests (idle)
         id: soak
         # Step-level timeout, below the job's 150: a JOB-level timeout cancels
@@ -114,7 +115,7 @@ jobs:
             # distinguishable from a plain regression. Single-threaded so the
             # tests' internal timing budgets are not compounded by peer load.
             cargo nextest run --all-features --workspace --locked --test-threads=1 \
-              --no-tests=fail -E 'test(test_should_consolidate_after_optimistic_sync) or test(coalesces_with) or test(cancels_inflight_payload_job) or test(remote_source_node_launches_when_remote_unreachable) or test(block_building_skipped_carries_head_number) or test(test_remote_block_source_resumes_from_correct_head)'
+              --no-tests=fail -E 'test(test_should_consolidate_after_optimistic_sync) or test(coalesces_with) or test(cancels_inflight_payload_job) or test(remote_source_node_launches_when_remote_unreachable) or test(block_building_skipped_carries_head_number)'
             echo "::endgroup::"
           done
 
@@ -171,8 +172,9 @@ jobs:
         id: soak
         # Step-level timeout: see the idle job's soak step. Larger than the
         # idle lane's 80 because four of eight vCPUs are pinned by the
-        # spinners — this is the lane most likely to time out, and a timeout
-        # posts a hang report.
+        # spinners — this is the lane most likely to hit its cap (reported
+        # by the reporter job's widened failure message; a step timeout
+        # surfaces as outcome 'failure').
         timeout-minutes: 100
         env:
           ITERATIONS: ${{ inputs.iterations || '12' }}
@@ -300,7 +302,9 @@ jobs:
             local job="$1" outcome="$2" result="$3" body=""
             case "$outcome" in
               failure)
-                body="nightly-soak job **$job** failed: $RUN_URL — a failure here is a regression of a race fixed in #45."
+                # A soak step that exceeds its step-level timeout is ALSO
+                # recorded as 'failure', so this body must name both readings.
+                body="nightly-soak job **$job** failed or hit its soak-step timeout: $RUN_URL — either a regression of a race fixed in #45, or a hang/capacity problem."
                 ;;
               cancelled)
                 body="nightly-soak job **$job** soak step was cancelled mid-soak (step timeout — possible hang/livelock regression or capacity problem — or a manual cancellation): $RUN_URL"

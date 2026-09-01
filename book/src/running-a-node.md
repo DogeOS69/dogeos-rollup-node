@@ -360,3 +360,32 @@ Look for log entries indicating successful block processing and chain advancemen
 
 For additional support and detailed implementation information, refer to the project's CLAUDE.md and source code
 documentation.
+
+## Remote Block Source
+
+A node can follow another node's chain over RPC instead of (or in addition
+to) P2P gossip, optionally building its own block on top of every import.
+This is the mode the docker test topology uses.
+
+| Flag | Meaning |
+|---|---|
+| `--remote-source.enabled` | Enable the remote block source add-on. |
+| `--remote-source.url <URL>` | The remote node's RPC endpoint. Must be `http` or `https`. |
+| `--remote-source.poll-interval-ms <MS>` | Poll cadence (must be > 0). |
+| `--remote-source.build` | Build a local block on top of every imported block (requires a configured sequencer). |
+
+Configuration is validated at launch and the node refuses to start (with a
+clear message) when:
+
+- `--remote-source.build` is set without `--sequencer.enabled` — no job
+  could ever start, so every build request would fail.
+- `--remote-source.build` is combined with `--sequencer.auto-start` — the
+  remote source must be the only build requester, or build outcomes cannot
+  be attributed to their requests.
+- `--remote-source.poll-interval-ms` is `0`.
+- `--remote-source.url` uses a scheme other than `http`/`https`.
+
+Two further shapes only warn: remote-source flags set while
+`--remote-source.enabled` is off (they are ignored — a templated fleet
+layout stays valid), and `--sequencer.payload-building-duration` at or above
+reth's default 12s `--builder.deadline`.

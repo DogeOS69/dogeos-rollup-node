@@ -105,7 +105,8 @@ pub enum ChainOrchestratorEvent {
     /// no `BlockSequenced`/`BlockBuildingSkipped` will follow for it. Emission sites: the
     /// head moved under the job (chain import, batch reconciliation, administrative FCS
     /// head update, optimistic sync, or an L1 reorg that rewound the L2 head); an L1
-    /// unwind (reorg or administrative revert); automatic sequencing was disabled; a
+    /// unwind (reorg or administrative revert); the EL declining to adopt an imported
+    /// head (the import re-enters L2 sync); automatic sequencing was disabled; a
     /// `BuildBlock` command or a timer slot failed to start a job (including when no
     /// sequencer is configured — a permanent misconfiguration, not a transient
     /// cancellation); payload

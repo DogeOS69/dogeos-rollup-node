@@ -10,6 +10,7 @@ use crate::ChainOrchestratorError;
 use alloy_provider::Provider;
 use alloy_rpc_types_engine::PayloadStatusEnum;
 use dogeos_rpc_types::Scroll;
+use rollup_node_primitives::BlockInfo;
 use scroll_db::{
     Database, DatabaseReadOperations, DatabaseWriteOperations, FrontierTransitionKind,
     PendingFrontierTransition, StoredForkchoiceState,
@@ -50,6 +51,32 @@ fn conflict(
         transition.target,
         observed,
     )
+}
+
+/// Selects the head for a startup repair without turning a safe-only rewind into a head unwind.
+///
+/// Node startup has already selected the persisted database head when that block is still present
+/// in the execution node. Preserve it only when the provider's canonical block at the durable safe
+/// height proves that the selected head extends the database-backed safe chain. Otherwise, fall
+/// back to the safe block and let the Engine reorg onto the authoritative database frontier.
+async fn startup_repair_head<P: Provider<Scroll>>(
+    provider: &P,
+    database: &Database,
+    database_safe: BlockInfo,
+    selected_head: BlockInfo,
+) -> Result<BlockInfo, ChainOrchestratorError> {
+    let persisted_head_number = database.get_l2_head_block_number().await?;
+    if selected_head.number <= database_safe.number || selected_head.number != persisted_head_number
+    {
+        return Ok(database_safe)
+    }
+
+    let canonical_safe = provider
+        .get_block(database_safe.number.into())
+        .await?
+        .map(|block| BlockInfo::from(&block.header));
+
+    Ok(if canonical_safe == Some(database_safe) { selected_head } else { database_safe })
 }
 
 /// Applies the durable frontier transition, resolving ambiguous Engine errors by observing the
@@ -197,6 +224,7 @@ where
         "Database and cached Engine safe frontiers differ"
     );
 
+    let selected_head = *engine.fcs().head_block_info();
     let observed_fcs = observe_forkchoice_for_recovery(provider).await?;
     let observed = stored_forkchoice(&observed_fcs);
     engine.replace_fcs_from_provider(observed_fcs);
@@ -221,14 +249,15 @@ where
         })
     }
 
+    let target_head = startup_repair_head(provider, database, database_safe, selected_head).await?;
     let target = StoredForkchoiceState {
-        head: database_safe,
+        head: target_head,
         safe: database_safe,
         finalized: observed.finalized,
     };
     database
         .tx_mut(move |tx| async move {
-            tx.set_l2_head_block_number(database_safe.number).await?;
+            tx.set_l2_head_block_number(target_head.number).await?;
             tx.set_pending_frontier_transition(PendingFrontierTransition {
                 kind: FrontierTransitionKind::StartupRepair,
                 expected: observed,
@@ -316,6 +345,40 @@ mod tests {
         assert_eq!(inputs.len(), 1);
         assert!(!inputs[0].1);
         assert_eq!(inputs[0].0.head_block_hash, database_safe.hash);
+        assert_eq!(inputs[0].0.safe_block_hash, database_safe.hash);
+    }
+
+    #[tokio::test]
+    async fn startup_repair_preserves_persisted_head_for_safe_only_rewind() {
+        let database = setup_test_db().await;
+        let (finalized_block, finalized) = rpc_block(0, B256::ZERO, 0xf0);
+        let (old_safe_block, old_safe) = rpc_block(99, finalized.hash, 0xb1);
+        let (database_safe_block, database_safe) = rpc_block(100, old_safe.hash, 0xa1);
+        let (database_head_block, database_head) = rpc_block(101, database_safe.hash, 0xc1);
+        database.insert_blocks(vec![database_safe], BatchInfo::new(0, B256::ZERO)).await.unwrap();
+        database.set_l2_head_block_number(database_head.number).await.unwrap();
+
+        let asserter = Asserter::new();
+        asserter.push_success(&Some(database_head_block));
+        asserter.push_success(&Some(old_safe_block));
+        asserter.push_success(&Some(finalized_block));
+        asserter.push_success(&Some(database_safe_block));
+        let provider = ProviderBuilder::<_, _, Scroll>::default().connect_mocked_client(asserter);
+
+        let client = Arc::new(ScriptedEngineClient::new());
+        client.push_fork_choice_updated(ScriptedResponse::Ok(valid_fcu()));
+        let mut engine =
+            Engine::new(client.clone(), ForkchoiceState::new(database_head, old_safe, finalized));
+
+        ensure_database_frontier(&provider, &mut engine, &database).await.unwrap();
+
+        assert_eq!(*engine.fcs().head_block_info(), database_head);
+        assert_eq!(*engine.fcs().safe_block_info(), database_safe);
+        assert_eq!(database.get_l2_head_block_number().await.unwrap(), database_head.number);
+        assert_eq!(database.get_pending_frontier_transition().await.unwrap(), None);
+        let inputs = client.fork_choice_inputs();
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].0.head_block_hash, database_head.hash);
         assert_eq!(inputs[0].0.safe_block_hash, database_safe.hash);
     }
 

@@ -34,10 +34,12 @@ concurrency:
   # that superseded it.
   cancel-in-progress: false
 
-# The failure-report steps comment on an issue; everything else is read-only.
 permissions:
+  # Read-only for the soak jobs: a write-capable token must not be exposed
+  # to the third-party setup actions (mutable tags) they run. Reporting is
+  # isolated in its own needs-gated job below, which alone carries
+  # issues: write.
   contents: read
-  issues: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -47,6 +49,8 @@ jobs:
     # Forks must not run these jobs at all (a dispatched fork run would
     # still burn a long job and comment on the fork's own issue #38).
     if: ${{ github.repository == 'DogeOS69/dogeos-rollup-node' }}
+    outputs:
+      soak_outcome: ${{ steps.soak.outcome }}
     runs-on: blacksmith-8vcpu-ubuntu-2404
     # Must exceed the SUM of the step budgets (45-minute build + 80-minute
     # soak) plus checkout/toolchain/cache/Anvil setup, or the job-level cap
@@ -95,7 +99,7 @@ jobs:
         # Step-level timeout, below the job's 150: a JOB-level timeout cancels
         # the whole job and no later step (even with always()) runs, so a
         # hang would post nothing. A step-level timeout terminates only this
-        # step and the reporter below still fires.
+        # step and the reporter job still fires.
         timeout-minutes: 80
         env:
           # Passed through env, never interpolated into the script body: a
@@ -113,36 +117,13 @@ jobs:
               --no-tests=fail -E 'test(test_should_consolidate_after_optimistic_sync) or test(coalesces_with) or test(cancels_inflight_payload_job) or test(remote_source_node_launches_when_remote_unreachable) or test(block_building_skipped_carries_head_number) or test(test_remote_block_source_resumes_from_correct_head)'
             echo "::endgroup::"
           done
-      - name: Report failure on the tracking issue
-        # A soak failure is a race regression; a soak step killed by its
-        # step-level timeout (the likeliest shape of a reintroduced
-        # hang/livelock — reported as 'failure' or 'cancelled' depending on
-        # runner version) must also leave a signal. !cancelled() (rather than
-        # always()) keeps a manual RUN cancellation from posting a bogus
-        # hang report: it is false only when the job itself is cancelled,
-        # while a step-level timeout leaves the job running this reporter.
-        # The job-level 150-minute backstop is NOT reportable from inside
-        # the job (it cancels every remaining step); it only exists for a
-        # hang in a non-soak step. Setup/toolchain failures still must not
-        # be reported as regressions.
-        if: ${{ !cancelled() && (steps.soak.outcome == 'failure' || steps.soak.outcome == 'cancelled') }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          # PR #45 closes issue 38; a comment on a closed issue notifies
-          # nobody, so reopen it first (best-effort — already-open is fine).
-          gh issue reopen 38 --repo "$GITHUB_REPOSITORY" 2>/dev/null || true
-          if [ "${{ steps.soak.outcome }}" = "cancelled" ]; then
-            body="nightly-soak job **${{ github.job }}** soak step was cancelled mid-soak (step timeout — possible hang/livelock regression or capacity problem — or a manual cancellation): ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          else
-            body="nightly-soak job **${{ github.job }}** failed: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} — a failure here is a regression of a race fixed in #45."
-          fi
-          gh issue comment 38 --repo "$GITHUB_REPOSITORY" --body "$body"
 
   soak-integration-loaded:
     # Forks must not run these jobs at all (a dispatched fork run would
     # still burn a long job and comment on the fork's own issue #38).
     if: ${{ github.repository == 'DogeOS69/dogeos-rollup-node' }}
+    outputs:
+      soak_outcome: ${{ steps.soak.outcome }}
     runs-on: blacksmith-8vcpu-ubuntu-2404
     # Must exceed the SUM of the step budgets (45-minute build + 100-minute
     # soak) plus checkout/toolchain/cache/Anvil setup, or the job-level cap
@@ -221,36 +202,13 @@ jobs:
               --no-tests=fail -E 'test(test_should_consolidate_after_optimistic_sync) or test(coalesces_with) or test(cancels_inflight_payload_job) or test(remote_source_node_launches_when_remote_unreachable) or test(block_building_skipped_carries_head_number)'
             echo "::endgroup::"
           done
-      - name: Report failure on the tracking issue
-        # A soak failure is a race regression; a soak step killed by its
-        # step-level timeout (the likeliest shape of a reintroduced
-        # hang/livelock — reported as 'failure' or 'cancelled' depending on
-        # runner version) must also leave a signal. !cancelled() (rather than
-        # always()) keeps a manual RUN cancellation from posting a bogus
-        # hang report: it is false only when the job itself is cancelled,
-        # while a step-level timeout leaves the job running this reporter.
-        # The job-level 170-minute backstop is NOT reportable from inside
-        # the job (it cancels every remaining step); it only exists for a
-        # hang in a non-soak step. Setup/toolchain failures still must not
-        # be reported as regressions.
-        if: ${{ !cancelled() && (steps.soak.outcome == 'failure' || steps.soak.outcome == 'cancelled') }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          # PR #45 closes issue 38; a comment on a closed issue notifies
-          # nobody, so reopen it first (best-effort — already-open is fine).
-          gh issue reopen 38 --repo "$GITHUB_REPOSITORY" 2>/dev/null || true
-          if [ "${{ steps.soak.outcome }}" = "cancelled" ]; then
-            body="nightly-soak job **${{ github.job }}** soak step was cancelled mid-soak (step timeout — possible hang/livelock regression or capacity problem — or a manual cancellation): ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          else
-            body="nightly-soak job **${{ github.job }}** failed: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} — a failure here is a regression of a race fixed in #45."
-          fi
-          gh issue comment 38 --repo "$GITHUB_REPOSITORY" --body "$body"
 
   soak-docker-remote-source:
     # Forks must not run these jobs at all (a dispatched fork run would
     # still burn a long job and comment on the fork's own issue #38).
     if: ${{ github.repository == 'DogeOS69/dogeos-rollup-node' }}
+    outputs:
+      soak_outcome: ${{ steps.soak.outcome }}
     runs-on: blacksmith-8vcpu-ubuntu-2404
     # Must exceed the SUM of the step budgets (45-minute build + 80-minute
     # soak) plus checkout/toolchain/cache/Anvil setup, or the job-level cap
@@ -313,28 +271,57 @@ jobs:
               --test-threads=1 --failure-output immediate --success-output never
             echo "::endgroup::"
           done
-      - name: Report failure on the tracking issue
-        # A soak failure is a race regression; a soak step killed by its
-        # step-level timeout (the likeliest shape of a reintroduced
-        # hang/livelock — reported as 'failure' or 'cancelled' depending on
-        # runner version) must also leave a signal. !cancelled() (rather than
-        # always()) keeps a manual RUN cancellation from posting a bogus
-        # hang report: it is false only when the job itself is cancelled,
-        # while a step-level timeout leaves the job running this reporter.
-        # The job-level 150-minute backstop is NOT reportable from inside
-        # the job (it cancels every remaining step); it only exists for a
-        # hang in a non-soak step. Setup/toolchain failures still must not
-        # be reported as regressions.
-        if: ${{ !cancelled() && (steps.soak.outcome == 'failure' || steps.soak.outcome == 'cancelled') }}
-        env:
-          GH_TOKEN: ${{ github.token }}
+
+  report-soak-failures:
+    # Sole carrier of issues:write — the soak jobs stay read-only so a
+    # compromised third-party setup action cannot touch repository issues.
+    # !cancelled() (not the implicit success()) lets this run when a needed
+    # soak job failed; a manual run cancellation still skips it.
+    needs: [soak-integration-idle, soak-integration-loaded, soak-docker-remote-source]
+    if: ${{ !cancelled() && github.repository == 'DogeOS69/dogeos-rollup-node' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      IDLE_OUTCOME: ${{ needs.soak-integration-idle.outputs.soak_outcome }}
+      IDLE_RESULT: ${{ needs.soak-integration-idle.result }}
+      LOADED_OUTCOME: ${{ needs.soak-integration-loaded.outputs.soak_outcome }}
+      LOADED_RESULT: ${{ needs.soak-integration-loaded.result }}
+      DOCKER_OUTCOME: ${{ needs.soak-docker-remote-source.outputs.soak_outcome }}
+      DOCKER_RESULT: ${{ needs.soak-docker-remote-source.result }}
+    steps:
+      - name: Report failures on the tracking issue
         run: |
-          # PR #45 closes issue 38; a comment on a closed issue notifies
-          # nobody, so reopen it first (best-effort — already-open is fine).
-          gh issue reopen 38 --repo "$GITHUB_REPOSITORY" 2>/dev/null || true
-          if [ "${{ steps.soak.outcome }}" = "cancelled" ]; then
-            body="nightly-soak job **${{ github.job }}** soak step was cancelled mid-soak (step timeout — possible hang/livelock regression or capacity problem — or a manual cancellation): ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          else
-            body="nightly-soak job **${{ github.job }}** failed: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} — a failure here is a regression of a race fixed in #45."
-          fi
-          gh issue comment 38 --repo "$GITHUB_REPOSITORY" --body "$body"
+          set -euo pipefail
+          report() {
+            local job="$1" outcome="$2" result="$3" body=""
+            case "$outcome" in
+              failure)
+                body="nightly-soak job **$job** failed: $RUN_URL — a failure here is a regression of a race fixed in #45."
+                ;;
+              cancelled)
+                body="nightly-soak job **$job** soak step was cancelled mid-soak (step timeout — possible hang/livelock regression or capacity problem — or a manual cancellation): $RUN_URL"
+                ;;
+              *)
+                # The soak step never reported an outcome (a setup step
+                # failed, or the JOB-level cap cancelled everything). Only a
+                # cancelled job — the shape a hang in a non-soak step takes —
+                # is worth a signal; setup failures are not race regressions.
+                if [ "$result" = "cancelled" ]; then
+                  body="nightly-soak job **$job** was cancelled before its soak step finished (job-level timeout — possible hang outside the soak step): $RUN_URL"
+                fi
+                ;;
+            esac
+            if [ -n "$body" ]; then
+              # PR #45 closes issue 38; a comment on a closed issue notifies
+              # nobody, so reopen it first (best-effort).
+              gh issue reopen 38 --repo "$GITHUB_REPOSITORY" 2>/dev/null || true
+              gh issue comment 38 --repo "$GITHUB_REPOSITORY" --body "$body"
+            fi
+          }
+          report soak-integration-idle "${IDLE_OUTCOME:-}" "${IDLE_RESULT:-}"
+          report soak-integration-loaded "${LOADED_OUTCOME:-}" "${LOADED_RESULT:-}"
+          report soak-docker-remote-source "${DOCKER_OUTCOME:-}" "${DOCKER_RESULT:-}"

@@ -59,6 +59,11 @@ jobs:
             -E 'test(test_should_consolidate_after_optimistic_sync) or test(coalesces_with) or test(cancels_inflight_payload_job) or test(remote_source_node_launches_when_remote_unreachable) or test(block_building_skipped_carries_head_number)'
       - name: Soak timing-sensitive integration tests (idle)
         id: soak
+        # Step-level timeout, below the job's 90: a JOB-level timeout cancels
+        # the whole job and no later step (even with always()) runs, so a
+        # hang would post nothing. A step-level timeout terminates only this
+        # step and the reporter below still fires.
+        timeout-minutes: 80
         env:
           # Passed through env, never interpolated into the script body: a
           # workflow_dispatch input is attacker-influencable text.
@@ -78,17 +83,20 @@ jobs:
             echo "::endgroup::"
           done
       - name: Report failure on the tracking issue
-        # A soak failure is a race regression; a cancelled soak step (the
-        # job's 90-minute timeout — the likeliest shape of a reintroduced
-        # hang/livelock — or a manual cancellation) must also leave a signal,
-        # and failure() alone misses it because a timeout cancels the job.
+        # A soak failure is a race regression; a soak step killed by its
+        # step-level timeout (the likeliest shape of a reintroduced
+        # hang/livelock — reported as 'failure' or 'cancelled' depending on
+        # runner version) must also leave a signal. always() is required
+        # because the job is failing at this point. The job-level 90-minute
+        # backstop is NOT reportable from inside the job (it cancels every
+        # remaining step); it only exists for a hang in a non-soak step.
         # Setup/toolchain failures still must not be reported as regressions.
         if: always() && (steps.soak.outcome == 'failure' || steps.soak.outcome == 'cancelled')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           if [ "${{ steps.soak.outcome }}" = "cancelled" ]; then
-            body="nightly-soak job **${{ github.job }}** was cancelled mid-soak (job timeout — possible hang/livelock regression or capacity problem — or a manual cancellation): ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            body="nightly-soak job **${{ github.job }}** soak step was cancelled mid-soak (step timeout — possible hang/livelock regression or capacity problem — or a manual cancellation): ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           else
             body="nightly-soak job **${{ github.job }}** failed: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} — a failure here is a regression of a race fixed in #45."
           fi
@@ -115,6 +123,8 @@ jobs:
             -E 'test(test_should_consolidate_after_optimistic_sync) or test(coalesces_with) or test(cancels_inflight_payload_job) or test(remote_source_node_launches_when_remote_unreachable) or test(block_building_skipped_carries_head_number)'
       - name: Soak timing-sensitive integration tests (under CPU contention)
         id: soak
+        # Step-level timeout: see the idle job's soak step.
+        timeout-minutes: 80
         env:
           ITERATIONS: ${{ inputs.iterations || '12' }}
         run: |
@@ -142,17 +152,20 @@ jobs:
             echo "::endgroup::"
           done
       - name: Report failure on the tracking issue
-        # A soak failure is a race regression; a cancelled soak step (the
-        # job's 90-minute timeout — the likeliest shape of a reintroduced
-        # hang/livelock — or a manual cancellation) must also leave a signal,
-        # and failure() alone misses it because a timeout cancels the job.
+        # A soak failure is a race regression; a soak step killed by its
+        # step-level timeout (the likeliest shape of a reintroduced
+        # hang/livelock — reported as 'failure' or 'cancelled' depending on
+        # runner version) must also leave a signal. always() is required
+        # because the job is failing at this point. The job-level 90-minute
+        # backstop is NOT reportable from inside the job (it cancels every
+        # remaining step); it only exists for a hang in a non-soak step.
         # Setup/toolchain failures still must not be reported as regressions.
         if: always() && (steps.soak.outcome == 'failure' || steps.soak.outcome == 'cancelled')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           if [ "${{ steps.soak.outcome }}" = "cancelled" ]; then
-            body="nightly-soak job **${{ github.job }}** was cancelled mid-soak (job timeout — possible hang/livelock regression or capacity problem — or a manual cancellation): ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            body="nightly-soak job **${{ github.job }}** soak step was cancelled mid-soak (step timeout — possible hang/livelock regression or capacity problem — or a manual cancellation): ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           else
             body="nightly-soak job **${{ github.job }}** failed: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} — a failure here is a regression of a race fixed in #45."
           fi
@@ -185,6 +198,8 @@ jobs:
           fi
       - name: Soak docker remote-source tests
         id: soak
+        # Step-level timeout: see the idle job's soak step.
+        timeout-minutes: 80
         run: |
           set -euo pipefail
           # --no-tests=fail (nextest's default, pinned explicitly since the
@@ -198,17 +213,20 @@ jobs:
             echo "::endgroup::"
           done
       - name: Report failure on the tracking issue
-        # A soak failure is a race regression; a cancelled soak step (the
-        # job's 90-minute timeout — the likeliest shape of a reintroduced
-        # hang/livelock — or a manual cancellation) must also leave a signal,
-        # and failure() alone misses it because a timeout cancels the job.
+        # A soak failure is a race regression; a soak step killed by its
+        # step-level timeout (the likeliest shape of a reintroduced
+        # hang/livelock — reported as 'failure' or 'cancelled' depending on
+        # runner version) must also leave a signal. always() is required
+        # because the job is failing at this point. The job-level 90-minute
+        # backstop is NOT reportable from inside the job (it cancels every
+        # remaining step); it only exists for a hang in a non-soak step.
         # Setup/toolchain failures still must not be reported as regressions.
         if: always() && (steps.soak.outcome == 'failure' || steps.soak.outcome == 'cancelled')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           if [ "${{ steps.soak.outcome }}" = "cancelled" ]; then
-            body="nightly-soak job **${{ github.job }}** was cancelled mid-soak (job timeout — possible hang/livelock regression or capacity problem — or a manual cancellation): ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            body="nightly-soak job **${{ github.job }}** soak step was cancelled mid-soak (step timeout — possible hang/livelock regression or capacity problem — or a manual cancellation): ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           else
             body="nightly-soak job **${{ github.job }}** failed: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} — a failure here is a regression of a race fixed in #45."
           fi

@@ -87,12 +87,16 @@ from every pass is either fixed in the PR or recorded here.
 
 - **Widen `UpdateFcsHead`/`RevertToL1Block` replies to carry persistence failures**
   (`crates/chain-orchestrator/src/lib.rs`, command enum + admin RPC)
-  - Impact/evidence: Claude pass 13 M3 — when the DB write after a successful
-    engine-head move fails, persisted state diverges from the engine across
-    restarts and the admin caller sees only an opaque dropped-channel error.
-    The PR now logs an explicit divergence error at the failure site; the
-    reply channels still cannot carry the failure to the caller.
-  - First/most-recent pass: Claude pass 13 (2026-09-01T04:00Z).
+  - Impact/evidence: Claude pass 13 M3, pass 17 item 1 — when the DB write
+    after a successful engine-head move fails, the admin caller sees only an
+    opaque dropped-channel error. The PR now compensates in-process: the
+    engine head is rolled back to the pre-command value on a persistence
+    failure (with a loud error if the rollback itself fails), so divergence
+    across restarts occurs only when BOTH writes fail. What remains is the
+    reply type: the caller still cannot distinguish "reverted cleanly
+    refused" from any internal failure.
+  - First/most-recent pass: Claude pass 13 (2026-09-01T04:00Z); Codex pass 18
+    staleness note (2026-09-01T09:30Z).
   - Why unaddressed: changing the reply types is an API change across the
     command enum, handle, and admin RPC — beyond a review-loop fix. The
     explicit error log is the in-scope mitigation.

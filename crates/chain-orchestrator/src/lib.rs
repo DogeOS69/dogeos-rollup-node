@@ -385,7 +385,9 @@ impl<
     /// Handles the outcome of an operation, logging errors and notifying event listeners as
     /// appropriate. Only [`ChainOrchestratorError::FatalStateDivergence`] is propagated —
     /// every select arm must `?` this so a fatal divergence raised from any handler
-    /// (not just the command arm) actually stops the run loop.
+    /// (not just the command arm) actually stops the run loop. (The `ImportBlock`
+    /// command arm, which stringifies its reply, extracts the fatal variant before
+    /// stringifying for the same reason.)
     // The enum's size is pre-existing (the async handlers returning it are
     // exempt from the lint); boxing it for this one sync pass-through would
     // change every construction site for no runtime benefit.
@@ -440,13 +442,15 @@ impl<
                         // result is one-shot, so demoting it here would lose
                         // a possibly-canonical block's anchor and
                         // announcement on a blip. Proceed on the full path —
-                        // an anchor write stays monotone and a stale
-                        // announcement is harmless gossip.
+                        // the anchor write below is made monotone explicitly,
+                        // and a stale announcement is harmless gossip.
                         _ => true,
                     }
                 } else {
-                    // A number above the current head cannot be canonical:
-                    // the head was rewound below the signed block.
+                    // number >= head.number with a differing hash: either the
+                    // head was rewound below the signed block, or this is a
+                    // same-height sibling the chain moved past. Not canonical
+                    // either way.
                     false
                 };
                 if !canonical {
@@ -469,7 +473,16 @@ impl<
                 if let Err(err) = self
                     .database
                     .tx_mut(move |tx| async move {
-                        tx.set_l2_head_block_number(block.header.number).await?;
+                        // Monotone: a late-but-canonical signer result must
+                        // not move the anchor BACKWARDS below a head a
+                        // concurrent import already persisted — that value
+                        // is restart authority, and a lower write would
+                        // un-mark messages consumed by blocks peers already
+                        // have.
+                        let current = tx.get_l2_head_block_number().await?;
+                        if block.header.number > current {
+                            tx.set_l2_head_block_number(block.header.number).await?;
+                        }
                         tx.insert_signature(hash, signature).await
                     })
                     .await
@@ -942,11 +955,20 @@ impl<
                 let _ = tx.send(true);
             }
             ChainOrchestratorCommand::ImportBlock { block_with_peer, response } => {
-                let result = self
-                    .import_chain(vec![block_with_peer.block.clone()], block_with_peer)
-                    .await
-                    .map_err(|e| e.to_string());
-                let _ = response.send(result);
+                let result =
+                    self.import_chain(vec![block_with_peer.block.clone()], block_with_peer).await;
+                match result {
+                    // A fatal divergence must reach the run loop: stringifying
+                    // it into the reply would downgrade head-committed-but-
+                    // unpersisted state to a mere import rejection.
+                    Err(ChainOrchestratorError::FatalStateDivergence(msg)) => {
+                        let _ = response.send(Err(format!("fatal state divergence: {msg}")));
+                        return Err(ChainOrchestratorError::FatalStateDivergence(msg));
+                    }
+                    other => {
+                        let _ = response.send(other.map_err(|e| e.to_string()));
+                    }
+                }
             }
             #[cfg(feature = "test-utils")]
             ChainOrchestratorCommand::SetGossip((enabled, tx)) => {
@@ -1156,8 +1178,19 @@ impl<
         block_number: u64,
     ) -> Result<Option<ChainOrchestratorEvent>, ChainOrchestratorError> {
         self.derivation_driver.cancel_attempt();
+        // On failure the unwind transaction rolled back (state untouched),
+        // but cancel_attempt() above cleared the attempt timer while KEEPING
+        // the held batch — without rescheduling, reconciliation, L1
+        // ingestion, and sequencing would all gate closed forever behind a
+        // healthy-looking process. Reschedule and surface the error.
         let (unwind_result, held_outcome) =
-            self.unwind_and_revalidate_held_batch(block_number).await?;
+            match self.unwind_and_revalidate_held_batch(block_number).await {
+                Ok(result) => result,
+                Err(err) => {
+                    self.derivation_driver.schedule_fresh_reconciliation();
+                    return Err(err);
+                }
+            };
         let UnwindResult { l1_block_number, queue_index, l2_head_block_number, l2_safe_block_info } =
             unwind_result;
 
@@ -1229,7 +1262,6 @@ impl<
             self.cancel_payload_building_job("L1 reorg while the job may carry L1 messages");
         }
 
-        // TODO: Add retry logic
         if l2_head_block_info.is_some() || l2_safe_block_info.is_some() {
             // The L1 database is already unwound by this point: an FCU that
             // does not apply leaves the engine on the reorged-out chain, no
@@ -1793,10 +1825,16 @@ impl<
 
         // Update the FCS to the new head.
         let head = BlockInfo { number: chain_head_number, hash: chain_head_hash };
-        let result = if self.sync_state.l2().is_syncing() {
+        let was_syncing = self.sync_state.l2().is_syncing();
+        let result = if was_syncing {
             self.engine.optimistic_sync(head).await?
         } else {
-            self.engine.update_fcs(Some(head), None, None).await?
+            // Checked: on a synced node the mirror must not advance to a head
+            // the EL has not adopted — plain update_fcs commits on SYNCING
+            // too, which would freeze the persisted anchor while the mirror
+            // climbs and stall a sequencer at MissingPayloadId behind a
+            // healthy-looking status.
+            self.engine.update_fcs_checked(Some(head), None, None).await?
         };
 
         // If the FCS update resulted in an invalid state, we return an error.
@@ -1804,9 +1842,24 @@ impl<
             tracing::warn!(target: "scroll::chain_orchestrator", ?chain_head_hash, ?chain_head_number, ?result, "Failed to update FCS after importing new chain from peer");
             return Err(ChainOrchestratorError::InvalidBlock);
         }
+        if !was_syncing && !result.is_valid() {
+            // SYNCING from a synced node's own EL: it lost recent ancestors
+            // (e.g. an EL restart dropping unpersisted blocks). The checked
+            // FCU left the mirror untouched; re-enter the L2 sync path that
+            // exists for exactly this instead of pretending the head moved.
+            tracing::warn!(
+                target: "scroll::chain_orchestrator",
+                ?head,
+                "EL has not adopted the imported head; re-entering L2 sync"
+            );
+            self.sync_state.l2_mut().set_syncing();
+            return Err(ChainOrchestratorError::FcuRejected(
+                "peer chain import forkchoice update was not applied by the engine",
+            ));
+        }
 
-        // The head may have moved (and on a SYNCING result the engine's view
-        // is unknown): cancel any in-flight payload building job
+        // The head moved (on the optimistic branch a SYNCING result still
+        // commits the mirror): cancel any in-flight payload building job
         // unconditionally once the import was not rejected. Its attributes
         // were fixed against the pre-import head, and finalizing it now could
         // reorg the imported chain back out via a stale side chain (mirrors
@@ -1835,7 +1888,8 @@ impl<
         // result is valid.
         if self.sync_state.is_synced() && result.is_valid() {
             let blocks = chain.iter().map(|block| block.into()).collect::<Vec<_>>();
-            self.database
+            if let Err(err) = self
+                .database
                 .tx_mut(move |tx| {
                     let blocks = blocks.clone();
                     async move {
@@ -1843,7 +1897,23 @@ impl<
                         tx.set_l2_head_block_number(block_with_peer.block.header.number).await
                     }
                 })
-                .await?;
+                .await
+            {
+                // The FCU above already committed the head: unmarked L1
+                // messages get re-selected for the next block and a frozen
+                // anchor rewinds a restart past adopted blocks — the same
+                // divergence the sequencing path treats as fatal.
+                tracing::error!(
+                    target: "scroll::chain_orchestrator",
+                    block_number = block_with_peer.block.header.number,
+                    %err,
+                    "Post-import persistence failed after the engine head moved"
+                );
+                return Err(ChainOrchestratorError::FatalStateDivergence(
+                    "imported chain committed to the engine but could not be persisted; \
+                     restart re-converges from the persisted state",
+                ));
+            }
 
             self.network.handle().block_import_outcome(BlockImportOutcome::valid_block(
                 block_with_peer.peer_id,

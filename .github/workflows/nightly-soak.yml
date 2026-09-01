@@ -57,6 +57,11 @@ jobs:
       RUST_BACKTRACE: 1
     steps:
       - uses: actions/checkout@v6
+        with:
+          # Only the reporter needs a token (and takes it explicitly); the
+          # build/soak steps run third-party build scripts for hours and
+          # must not find one in .git/config.
+          persist-credentials: false
       - uses: rui314/setup-mold@v1
       - uses: dtolnay/rust-toolchain@nightly
         with:
@@ -64,6 +69,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
+          # One shared entry for both in-process soak jobs: three extra
+          # nightly writers against the repo's 10 GB cache LRU would evict
+          # the PR lanes' entries.
+          shared-key: soak-integration
       - uses: taiki-e/install-action@nextest
       - name: Install pinned Anvil
         # None of the currently-soaked tests use the Anvil fixture, but the
@@ -144,6 +153,11 @@ jobs:
       RUST_BACKTRACE: 1
     steps:
       - uses: actions/checkout@v6
+        with:
+          # Only the reporter needs a token (and takes it explicitly); the
+          # build/soak steps run third-party build scripts for hours and
+          # must not find one in .git/config.
+          persist-credentials: false
       - uses: rui314/setup-mold@v1
       - uses: dtolnay/rust-toolchain@nightly
         with:
@@ -151,6 +165,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
+          # One shared entry for both in-process soak jobs: three extra
+          # nightly writers against the repo's 10 GB cache LRU would evict
+          # the PR lanes' entries.
+          shared-key: soak-integration
       - uses: taiki-e/install-action@nextest
       - name: Install pinned Anvil
         # None of the currently-soaked tests use the Anvil fixture, but the
@@ -243,6 +261,11 @@ jobs:
       RUST_BACKTRACE: 1
     steps:
       - uses: actions/checkout@v6
+        with:
+          # Only the reporter needs a token (and takes it explicitly); the
+          # build/soak steps run third-party build scripts for hours and
+          # must not find one in .git/config.
+          persist-credentials: false
       - uses: rui314/setup-mold@v1
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2

@@ -341,7 +341,7 @@ loop {
 - [ ] **Step 2: Run the full non-docker integration suite as the regression net**
 
 ```bash
-cargo nextest run --all-features --locked --no-tests=pass <!-- superseded: shipped as --no-tests=fail --> -E 'kind(test) and not test(docker)' -- --skip test_should_consolidate_to_block_15k
+cargo nextest run --all-features --locked --no-tests=pass # superseded: shipped as --no-tests=fail -E 'kind(test) and not test(docker)' -- --skip test_should_consolidate_to_block_15k
 ```
 
 Expected: same set of passes as before the change (61 tests in the CI lane).
@@ -670,7 +670,7 @@ logged and retried at poll cadence."
 - [ ] **Step 2: Run both docker tests locally; commit**
 
 ```bash
-cargo nextest run --all-features --locked --no-tests=pass <!-- superseded: shipped as --no-tests=fail --> -E 'test(docker_test_remote_block_source)' --test-threads=1
+cargo nextest run --all-features --locked --no-tests=pass # superseded: shipped as --no-tests=fail -E 'test(docker_test_remote_block_source)' --test-threads=1
 git add tests/docker-compose.remote-source.yml
 git commit -m "test(docker): gate remote-source container on sequencer RPC readiness"
 ```
@@ -752,7 +752,7 @@ git commit -m "ci(sync): fail on missing/empty ALCHEMY_KEY before the release bu
 - [ ] **Step 2: Verify both paths compile and skip**
 
 ```bash
-ALCHEMY_KEY= cargo nextest run --all-features --locked -E 'test(test_should_consolidate_to_block_15k)' --no-tests=pass <!-- superseded: shipped as --no-tests=fail -->
+ALCHEMY_KEY= cargo nextest run --all-features --locked -E 'test(test_should_consolidate_to_block_15k)' --no-tests=pass # superseded: shipped as --no-tests=fail
 ```
 
 Expected: test runs and returns Ok (skip message on stderr), no failure.

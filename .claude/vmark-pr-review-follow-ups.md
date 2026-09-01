@@ -374,6 +374,57 @@ from every pass is either fixed in the PR or recorded here.
     but touches the fail-stop routing that just settled.
   - Suggested Linear title: "chain-orchestrator: order fatal-divergence vs held-batch accounting in the run loop"
 
+- **Asynchronous signing failure must emit a SignerEvent, not just a log line**
+  (`crates/signer/src/lib.rs` signer task, `crates/chain-orchestrator/src/lib.rs` signer arm)
+  - Impact/evidence: Claude pass 31 M1 — the orchestrator's fatal contract
+    covers only the ENQUEUE of a signing request (which essentially never
+    fails); the actual signing failure (remote KMS) is handled in the signer
+    task as a bare error log with no event. By then the head is committed and
+    the L1 messages are marked consumed, so the node keeps sequencing on an
+    unsigned, never-announced block — exactly the outcome the enqueue path
+    declares fatal, reached by the likelier route.
+  - First/most-recent pass: Claude pass 31 (2026-09-01T17:00Z).
+  - Why unaddressed: needs a failure variant on SignerEvent and handling in
+    the orchestrator — an API change in the signer crate, beyond the review
+    loop's local-fix bar per the reviewer's own recommendation.
+  - Suggested Linear title: "signer: surface signing failures as SignerEvents so the orchestrator can apply its fatal contract"
+
+- **Behavioural tests for the finalized-floor refusal and the Reissue arm**
+  (`crates/chain-orchestrator/src/lib.rs`, `crates/node/src/add_ons/remote_block_source.rs`)
+  - Impact/evidence: Claude pass 31 T5 — the two cheapest untested fail-stop
+    behaviors: the RevertToL1Block finalized-floor refusal (seed a finalized
+    L1 block, assert the reply is false and no UnwoundToL1Block event), and
+    settle_owed_build's Reissue arm ("exactly one BuildBlock per observed
+    cancellation" — the property whose violation double-builds a height).
+    Folded into the existing fail-stop/table-test entries above; recorded
+    separately because the reviewer called these two out as cheap enough to
+    land with existing fixtures.
+  - First/most-recent pass: Claude pass 31 (2026-09-01T17:00Z).
+  - Why unaddressed: the finalized-floor test needs a fixture path that
+    seeds L1 finalization metadata (none of the sync.rs fixtures do); the
+    Reissue test needs the extracted-head-fetch refactor already recorded in
+    the table-test entry.
+  - Suggested Linear title: "rollup-node: behavioural tests for the finalized-floor refusal and owed-build re-issue"
+
+- **Consolidation is never re-run when L1 syncs after L2 (and the flagship test cannot assert it)**
+  (`crates/chain-orchestrator/src/lib.rs` consolidate_chain call sites,
+  `crates/node/tests/sync.rs` test_should_consolidate_after_optimistic_sync)
+  - Impact/evidence: Claude pass 31 T4 asked the flagship test to assert a
+    ChainConsolidated event; implementing that timed out deterministically
+    and revealed why: consolidate_chain runs only at the L2 syncing->synced
+    transition AND only when L1 is already synced — in this test (and any
+    node whose L2 catches up before L1) the transition happens L1-unsynced,
+    and no later path re-runs consolidation when L1 completes. The test's
+    extension wait is therefore its only signal, and production nodes in
+    that ordering may skip consolidation entirely.
+  - First/most-recent pass: orchestrator observation implementing Claude
+    pass 31 T4 (2026-09-01T17:30Z).
+  - Why unaddressed: confirming and fixing the ordering gap is a
+    consensus-path behavior change (add a consolidation trigger on the
+    L1-synced transition) well beyond the review loop; the test assertion
+    only becomes possible after it.
+  - Suggested Linear title: "chain-orchestrator: run consolidation when L1 syncs after L2, and assert it in the optimistic-sync test"
+
 - **Docker lane hangs die without a nextest summary (per-test bound missing)**
   (`.github/workflows/test.yaml`, integration-docker-compose)
   - Impact/evidence: Claude pass flag — no `.config/nextest.toml`, so no

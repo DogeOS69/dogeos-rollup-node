@@ -1176,7 +1176,10 @@ async fn can_revert_to_l1_block() -> eyre::Result<()> {
     assert_eq!(status.l2.fcs.safe_block_info().number, 57);
 
     // Now send a revert to L1 block 18318210
-    fixture.follower(0).rollup_manager_handle.revert_to_l1_block(18318210).await?;
+    eyre::ensure!(
+        fixture.follower(0).rollup_manager_handle.revert_to_l1_block(18318210).await?,
+        "administrative unwind was refused"
+    );
 
     // Wait for the chain to be unwound
     fixture.expect_event().revert_to_l1_block().await?;

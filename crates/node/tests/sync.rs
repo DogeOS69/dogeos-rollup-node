@@ -189,6 +189,12 @@ async fn test_should_trigger_pipeline_sync_for_execution_node() -> eyre::Result<
         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
         retries += 1;
     }
+    // Exhausting the retries must FAIL, not fall through into the >=-matched
+    // extension wait below with num still at 0.
+    eyre::ensure!(
+        num > OPTIMISTIC_SYNC_TRIGGER,
+        "EN did not pipeline-sync past the optimistic-sync trigger: follower head {num}"
+    );
 
     // Assert that the unsynced node triggers a chain extension on the optimistic chain.
     follower.expect_event().chain_extended(num).await?;
@@ -312,6 +318,13 @@ async fn test_should_consolidate_after_optimistic_sync() -> eyre::Result<()> {
 
     // build a new block on the sequencer node to trigger consolidation on the unsynced node.
     sequencer.build_block().build_and_await_block().await?;
+
+    // NOTE: no ChainConsolidated event is asserted here because none is
+    // emitted in this flow — the L2 syncing->synced transition happens while
+    // L1 is still unsynced (consolidate_chain is gated on both), and nothing
+    // re-runs consolidation when L1 syncs afterwards. Whether that is a
+    // production gap is tracked in the follow-ups ledger; the extension wait
+    // below is the test's effective signal.
 
     // Assert that the unsynced node consolidates the chain.
     follower.expect_event().chain_extended((L1_MESSAGES_COUNT + 2) as u64).await?;
@@ -937,6 +950,17 @@ async fn test_chain_import_cancels_inflight_payload_job() -> eyre::Result<()> {
     // is processed after the build command.
     node_a.sequencer().rollup_manager_handle.build_block();
 
+    // Prove the job slot is actually occupied — and drain any buffered
+    // start-failure event — before importing: a second request must
+    // coalesce with the in-flight job.
+    node_a.sequencer().rollup_manager_handle.build_block();
+    node_a
+        .expect_event()
+        .timeout(std::time::Duration::from_secs(2))
+        .label("BuildBlockCoalesced before the import")
+        .where_event(|e| matches!(e, ChainOrchestratorEvent::BuildBlockCoalesced))
+        .await?;
+
     let block = node_b.build_block().expect_block_number(1).build_and_await_block().await?;
     node_a
         .sequencer()
@@ -961,13 +985,12 @@ async fn test_chain_import_cancels_inflight_payload_job() -> eyre::Result<()> {
         .where_event(|e| matches!(e, ChainOrchestratorEvent::PayloadBuildingJobCancelled))
         .await?;
 
-    // Vacuous-pass guard (this test cannot pre-build — node_a must stay at
-    // genesis for the import to be a clean extension): if the build never
-    // started, the start-failure emission satisfies the wait above, so also
-    // require that the cancelled job sequences NOTHING.
+    // Vacuous-pass guard: the window must OUTLAST the remaining payload
+    // duration (an uncancelled 3s job sequences at ~t+3.0s; a 2s window
+    // would close before it and could never fail).
     let phantom = node_a
         .expect_event()
-        .timeout(std::time::Duration::from_secs(2))
+        .timeout(std::time::Duration::from_secs(5))
         .label("no BlockSequenced after the import-cancelled job")
         .where_event(|e| matches!(e, ChainOrchestratorEvent::BlockSequenced(_)))
         .await;
@@ -1115,7 +1138,10 @@ async fn test_revert_to_l1_block_cancels_inflight_payload_job() -> eyre::Result<
     // cancellation itself happens before any fallible unwind work, so the
     // event does not depend on the unwind's outcome.
     fixture.sequencer().rollup_manager_handle.build_block();
-    fixture.sequencer().rollup_manager_handle.revert_to_l1_block(0).await?;
+    eyre::ensure!(
+        fixture.sequencer().rollup_manager_handle.revert_to_l1_block(0).await?,
+        "administrative unwind was refused"
+    );
 
     // Bounded like the sibling tests: only a prompt cancellation counts.
     fixture

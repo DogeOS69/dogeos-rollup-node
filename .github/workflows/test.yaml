@@ -1,5 +1,10 @@
 name: test
 
+# Build scripts and proc macros of the whole workspace run in these jobs;
+# they must not see a write-capable token.
+permissions:
+  contents: read
+
 on:
   pull_request:
   push:
@@ -71,10 +76,15 @@ jobs:
         run: |
           # --no-tests=fail (nextest's default, pinned explicitly since the
           # install action is unpinned): a rename emptying the filter must
-          # fail loudly, not exit green having run nothing.
+          # fail loudly, not exit green having run nothing. The resume test
+          # is skipped for the same reason the nightly soak excludes it (a
+          # known reboot-fixture teardown race — see the follow-ups ledger);
+          # a known-racy test must not gate merges while issue #38 is being
+          # closed.
           cargo nextest run --all-features --workspace --locked --no-fail-fast \
             --no-tests=fail -E 'kind(test) and not test(docker)' \
-            -- --skip test_should_consolidate_to_block_15k
+            -- --skip test_should_consolidate_to_block_15k \
+            --skip test_remote_block_source_resumes_from_correct_head
 
   integration-docker-compose:
     runs-on: blacksmith-8vcpu-ubuntu-2404

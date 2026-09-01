@@ -136,7 +136,8 @@ const MAX_ANCESTOR_LOOKBACK: u64 = 8192;
 
 /// The outcome of waiting for a requested build.
 enum BuildOutcome {
-    /// The build completed (a block at or above the expected height was
+    /// The build landed at EXACTLY the expected height (anything higher is
+    /// `Superseded`, never a success for this request).
     /// sequenced, or building was skipped for an empty payload).
     Landed,
     /// The payload building job was cancelled; no outcome will arrive.
@@ -578,9 +579,10 @@ where
     /// Waits (bounded) for the outcome of a requested build, without issuing
     /// any command.
     ///
-    /// A `BlockSequenced` is only accepted at or above `expected_number`
-    /// (stale outcomes are strictly lower-numbered), so an outcome from a
-    /// previous build cannot be attributed to this request.
+    /// A `BlockSequenced` is accepted as landed only at EXACTLY
+    /// `expected_number` (stale outcomes are strictly lower-numbered and
+    /// ignored; strictly higher ones settle as `Superseded`), so an outcome
+    /// from another build cannot be attributed to this request.
     /// `BlockBuildingSkipped` carries the head it sat on and is accepted only
     /// when that head is the expected parent (or beyond), so stale outcomes
     /// from abandoned builds are excluded by identity, like `BlockSequenced`.

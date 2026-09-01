@@ -101,8 +101,13 @@ impl TestFixture {
                 .rpc_url()
                 .port()
                 .expect("sequencer RPC port must be set");
-            let sequencer_url: reqwest::Url =
-                format!("http://localhost:{}", sequencer_port).parse()?;
+            // Prefer the builder's override: a restart-based test on the
+            // gated-proxy fixture must NOT silently reconnect to the live
+            // sequencer (the gate would stop gating).
+            let sequencer_url: reqwest::Url = match self.remote_source_url_override.clone() {
+                Some(url) => url,
+                None => format!("http://localhost:{}", sequencer_port).parse()?,
+            };
 
             let mut remote_config = self.config.clone();
             remote_config.sequencer_args.sequencer_enabled = true;

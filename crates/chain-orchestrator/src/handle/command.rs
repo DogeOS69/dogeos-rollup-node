@@ -19,7 +19,7 @@ pub enum ChainOrchestratorCommand<N: FullNetwork<Primitives = DogeosNetworkPrimi
     /// Returns the network handle.
     NetworkHandle(oneshot::Sender<ScrollNetworkHandle<N>>),
     /// Update the head of the fcs in the engine driver.
-    UpdateFcsHead((BlockInfo, oneshot::Sender<()>)),
+    UpdateFcsHead((BlockInfo, oneshot::Sender<Result<(), String>>)),
     /// Enable automatic sequencing.
     EnableAutomaticSequencing(oneshot::Sender<bool>),
     /// Disable automatic sequencing.

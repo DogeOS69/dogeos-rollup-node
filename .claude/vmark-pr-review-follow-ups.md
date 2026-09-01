@@ -46,7 +46,7 @@ from every pass is either fixed in the PR or recorded here.
   - Suggested Linear title: "rollup-node: end-to-end test for the remote source's owed-build retry path"
 
 - **Unit coverage for the handle's closed-channel surface**
-  (`crates/chain-orchestrator/src/handle/mod.rs`, `classify_recv_error`)
+  (`crates/chain-orchestrator/src/handle/mod.rs` `is_closed`/`try_build_block`; `classify_recv_error` lives in `crates/node/src/add_ons/remote_block_source.rs`)
   - Impact/evidence: Claude pass 9 S5 — `is_closed`/`try_build_block` and the
     gone-vs-transient classification have no direct unit tests, and a
     misclassification changes node-lifecycle behavior.

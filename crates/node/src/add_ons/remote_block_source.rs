@@ -57,7 +57,7 @@ where
     /// The sequencer's payload building duration (milliseconds), used to size
     /// the build-outcome wait budget.
     payload_building_duration_ms: u64,
-    /// Consecutive rejected imports of the same next block. Bounded by
+    /// Consecutive rejected imports. Bounded by
     /// [`MAX_IMPORT_REJECTIONS`]: repeated rejections mean the resume pointer
     /// no longer matches the canonical chain (the remote reorged below it, or
     /// the derived block does not connect), and re-requesting the identical
@@ -270,7 +270,16 @@ where
             return Err(eyre::eyre!("URL required when remote-source is enabled"));
         };
         let retry_layer = RetryBackoffLayer::new(10, 100, 330);
-        let client = RpcClient::builder().layer(retry_layer).http(url);
+        let http_client = reqwest_13::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .map_err(|e| eyre::eyre!("failed to build the remote HTTP client: {e}"))?;
+        // A per-request timeout: RetryBackoffLayer only retries ERRORS, so a
+        // black-holed connection (NAT/LB idle drop) would otherwise hang a
+        // request forever, with TICK_STALL_BUDGET (10 min) as the only
+        // backstop and zero log output in between.
+        let transport = alloy_transport_http::Http::with_client(http_client, url.clone());
+        let client = RpcClient::builder().layer(retry_layer).transport(transport, false);
         let remote = ProviderBuilder::<_, _, Scroll>::default().connect_client(client);
 
         // Get event listener for waiting on block completion
@@ -922,6 +931,18 @@ where
         if self.last_imported_block.is_none() {
             let (resume, resume_hash, local_head, local_safe, diverged) =
                 self.init_last_imported_block().await?;
+            // Checked UNCONDITIONALLY (not only when the head is 2+ past the
+            // ancestor): with head == safe == S and the remote forking at S,
+            // resume is S-1 and the head is exactly resume+1 — importing over
+            // it would send an FCU whose safe hash is no ancestor of the
+            // head, which the EL refuses forever (a permanent import wedge).
+            if resume < local_safe {
+                return Err(eyre::eyre!(
+                    "common ancestor {resume} is below the local safe head {local_safe}; \
+                     waiting for the remote to catch up instead of importing over safe \
+                     state"
+                ));
+            }
             if local_head > resume.saturating_add(1) {
                 if !diverged {
                     // No present-but-different hash pair was observed: the
@@ -933,19 +954,6 @@ where
                         "remote head trails the local chain (common ancestor {resume}, local \
                          head {local_head}) with no divergence observed; waiting for the \
                          remote to catch up"
-                    ));
-                }
-                if resume < local_safe {
-                    // A common ancestor below the local SAFE head means the
-                    // remote lags behind derivation-finalized state (e.g. a
-                    // backend a few blocks behind while safe == head).
-                    // Rewinding would trip HeadBelowSafe and livelock the
-                    // follower on refusals — wait for the remote to catch up
-                    // instead (it must eventually serve >= safe).
-                    return Err(eyre::eyre!(
-                        "common ancestor {resume} is below the local safe head {local_safe}; \
-                         waiting for the remote to catch up instead of rewinding past safe \
-                         state"
                     ));
                 }
                 // The local chain extends past the freshly derived common
@@ -968,7 +976,10 @@ where
                 self.orchestrator_handle
                     .update_fcs_head(BlockInfo { number: resume, hash: resume_hash })
                     .await
-                    .map_err(|e| self.classify_recv_error(e))?;
+                    .map_err(|e| self.classify_recv_error(e))?
+                    .map_err(|refusal| {
+                        eyre::eyre!("rewind to the common ancestor was refused: {refusal}")
+                    })?;
             }
             self.last_imported_block = Some(resume);
             self.initialized_once = true;

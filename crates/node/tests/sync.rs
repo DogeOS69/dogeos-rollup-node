@@ -179,18 +179,17 @@ async fn test_should_trigger_pipeline_sync_for_execution_node() -> eyre::Result<
 
     // Verify the unsynced node syncs.
     let mut num = follower.get_block(0).await?.header.number;
-    let mut retries = 0;
 
-    loop {
-        if retries > 10 || num > OPTIMISTIC_SYNC_TRIGGER {
-            break
-        }
-        num = follower.get_block(0).await?.header.number;
+    // Wall-clock deadline consistent with the other waiters: a ~2s retry
+    // budget for a 101-block pipeline sync would flake on contended runners,
+    // and this assertion gates merges.
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(30);
+    while num <= OPTIMISTIC_SYNC_TRIGGER && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-        retries += 1;
+        num = follower.get_block(0).await?.header.number;
     }
-    // Exhausting the retries must FAIL, not fall through into the >=-matched
-    // extension wait below with num still at 0.
+    // Exhausting the deadline must FAIL, not fall through into the
+    // >=-matched extension wait below with num still at 0.
     eyre::ensure!(
         num > OPTIMISTIC_SYNC_TRIGGER,
         "EN did not pipeline-sync past the optimistic-sync trigger: follower head {num}"
@@ -316,9 +315,14 @@ async fn test_should_consolidate_after_optimistic_sync() -> eyre::Result<()> {
     // assertion the test is named for: the consolidated range must cover
     // the optimistically-synced blocks.
     let consolidations = follower.expect_event().chain_consolidated().await?;
+    // Assert the RANGE: `to` alone merely restates the head the earlier
+    // optimistic_sync wait guaranteed (ChainConsolidated is emitted even on
+    // the head == safe early-out); from == 0 proves validation actually
+    // covered the optimistically-synced blocks.
+    let (from, to) = *consolidations.first().expect("one consolidation per waited node");
     eyre::ensure!(
-        consolidations.iter().any(|(_, to)| *to >= L1_MESSAGES_COUNT as u64),
-        "consolidation did not cover the optimistic range: {consolidations:?}"
+        from == 0 && to >= L1_MESSAGES_COUNT as u64,
+        "consolidation did not cover the optimistic range: from={from} to={to}"
     );
 
     // Wait for the unsynced node to sync to the L1 watcher.
@@ -535,7 +539,10 @@ async fn test_chain_orchestrator_fork_choice(
     let sequencer_handle = &sequencer.sequencer().rollup_manager_handle;
     sequencer_handle.set_gossip(false).await?;
     if let Some(block_info) = reorg_block_info {
-        sequencer_handle.update_fcs_head(block_info).await?;
+        sequencer_handle
+            .update_fcs_head(block_info)
+            .await?
+            .map_err(|refusal| eyre::eyre!("head update refused: {refusal}"))?;
     }
 
     // wait two seconds to ensure the timestamp of the new blocks is greater than the old ones
@@ -1046,12 +1053,24 @@ async fn test_update_fcs_head_cancels_inflight_payload_job() -> eyre::Result<()>
     // flight. No sleep is needed: the command channel is FIFO, so the head
     // update is processed after the build command.
     fixture.sequencer().rollup_manager_handle.build_block();
+
+    // Prove the job slot is actually occupied — and drain any buffered
+    // start-failure emission — before the operation under test: a second
+    // request must coalesce with the in-flight job.
+    fixture.sequencer().rollup_manager_handle.build_block();
+    fixture
+        .expect_event()
+        .timeout(std::time::Duration::from_secs(2))
+        .label("BuildBlockCoalesced occupancy probe")
+        .where_event(|e| matches!(e, ChainOrchestratorEvent::BuildBlockCoalesced))
+        .await?;
     fixture
         .sequencer()
         .rollup_manager_handle
         .update_fcs_head(genesis_info)
         .await
-        .expect("update_fcs_head should succeed");
+        .expect("update_fcs_head reply channel dropped")
+        .map_err(|refusal| eyre::eyre!("head update refused: {refusal}"))?;
 
     // The head update must have cancelled the in-flight job.
     // Bounded like the chain-import test: a post-finalization emission from
@@ -1096,6 +1115,17 @@ async fn test_disable_sequencing_cancels_inflight_payload_job() -> eyre::Result<
     // command channel is FIFO, so the disable is processed after the build
     // command).
     fixture.sequencer().rollup_manager_handle.build_block();
+
+    // Prove the job slot is actually occupied — and drain any buffered
+    // start-failure emission — before the operation under test: a second
+    // request must coalesce with the in-flight job.
+    fixture.sequencer().rollup_manager_handle.build_block();
+    fixture
+        .expect_event()
+        .timeout(std::time::Duration::from_secs(2))
+        .label("BuildBlockCoalesced occupancy probe")
+        .where_event(|e| matches!(e, ChainOrchestratorEvent::BuildBlockCoalesced))
+        .await?;
     eyre::ensure!(
         fixture.sequencer().rollup_manager_handle.disable_automatic_sequencing().await?,
         "disable_automatic_sequencing should report success"
@@ -1142,6 +1172,17 @@ async fn test_revert_to_l1_block_cancels_inflight_payload_job() -> eyre::Result<
     // cancellation itself happens before any fallible unwind work, so the
     // event does not depend on the unwind's outcome.
     fixture.sequencer().rollup_manager_handle.build_block();
+
+    // Prove the job slot is actually occupied — and drain any buffered
+    // start-failure emission — before the operation under test: a second
+    // request must coalesce with the in-flight job.
+    fixture.sequencer().rollup_manager_handle.build_block();
+    fixture
+        .expect_event()
+        .timeout(std::time::Duration::from_secs(2))
+        .label("BuildBlockCoalesced occupancy probe")
+        .where_event(|e| matches!(e, ChainOrchestratorEvent::BuildBlockCoalesced))
+        .await?;
     eyre::ensure!(
         fixture.sequencer().rollup_manager_handle.revert_to_l1_block(0).await?,
         "administrative unwind was refused"

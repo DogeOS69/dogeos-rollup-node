@@ -220,6 +220,23 @@ impl ScrollRollupNodeConfig {
             );
         }
 
+        if let Some(url) = self
+            .remote_block_source_args
+            .enabled
+            .then_some(())
+            .and(self.remote_block_source_args.url.as_ref())
+        {
+            // reqwest::Url happily parses ws:// or file://; the HTTP
+            // transport would then fail every poll forever behind a
+            // healthy-looking launch.
+            if url.scheme() != "http" && url.scheme() != "https" {
+                return Err(format!(
+                    "remote-source.url must use http or https (got '{}')",
+                    url.scheme()
+                ));
+            }
+        }
+
         if self.remote_block_source_args.enabled &&
             self.remote_block_source_args.poll_interval_ms == 0
         {

@@ -65,6 +65,10 @@ pub struct TestFixture {
     pub chain_spec: Arc<<ScrollRollupNode as NodeTypes>::ChainSpec>,
     /// L1 provider for making L1 RPC calls (if connected to real L1).
     pub l1_provider: Option<L1Provider>,
+    /// The builder's remote-source URL override, carried so restarts keep
+    /// pointing at the overridden endpoint instead of silently reconnecting
+    /// to the live sequencer.
+    pub remote_source_url_override: Option<reqwest::Url>,
     /// Optional Anvil instance for L1 simulation.
     ///
     /// Owns the external `anvil` child process; dropping the fixture terminates it.
@@ -829,6 +833,7 @@ impl TestFixtureBuilder {
             wallet: Arc::new(Mutex::new(wallet)),
             chain_spec,
             l1_provider: self.l1_provider,
+            remote_source_url_override: self.remote_source_url_override,
             anvil,
             config: self.config,
             has_remote_source_node: self.has_remote_source_node,

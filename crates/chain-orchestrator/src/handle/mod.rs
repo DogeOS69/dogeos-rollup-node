@@ -115,7 +115,10 @@ impl<N: FullNetwork<Primitives = DogeosNetworkPrimitives>> ChainOrchestratorHand
     }
 
     /// Sends a command to the rollup manager to update the head of the FCS in the engine driver.
-    pub async fn update_fcs_head(&self, head: BlockInfo) -> Result<(), oneshot::error::RecvError> {
+    pub async fn update_fcs_head(
+        &self,
+        head: BlockInfo,
+    ) -> Result<Result<(), String>, oneshot::error::RecvError> {
         let (tx, rx) = oneshot::channel();
         self.send_command(ChainOrchestratorCommand::UpdateFcsHead((head, tx)));
         rx.await

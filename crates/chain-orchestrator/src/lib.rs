@@ -27,7 +27,7 @@ use scroll_db::{
     UnwindResult,
 };
 use scroll_derivation_pipeline::DerivationPipeline;
-use scroll_engine::{Engine, ScrollEngineApi};
+use scroll_engine::{Engine, EngineError, ScrollEngineApi};
 use scroll_network::{
     BlockImportOutcome, DogeosNetworkPrimitives, NewBlockWithPeer, ScrollNetwork,
     ScrollNetworkManagerEvent,
@@ -723,7 +723,13 @@ impl<
                     )
                     .await?;
                 let previous_head = *self.engine.fcs().head_block_info();
-                let forward = self.engine.update_fcs_checked(Some(head), None, None).await?;
+                let forward = match self.engine.update_fcs_checked(Some(head), None, None).await {
+                    Ok(forward) => forward,
+                    Err(err) => {
+                        let _ = sender.send(Err(format!("forkchoice update failed: {err}")));
+                        return Err(err.into());
+                    }
+                };
                 if !forward.is_valid() {
                     // update_fcs_checked commits its mirror only on VALID, so
                     // nothing has been mutated — refuse before purging
@@ -731,6 +737,17 @@ impl<
                     // a valid job. SYNCING (the EL has not adopted the head)
                     // must not proceed either: the rollback below refuses it
                     // for the same reason.
+                    // M11: keep the engine's own verdict diagnosable.
+                    tracing::error!(
+                        target: "scroll::chain_orchestrator",
+                        ?head,
+                        ?forward,
+                        "Administrative FCS head update was not applied by the engine"
+                    );
+                    let _ = sender.send(Err(format!(
+                        "administrative FCS head update was not applied by the engine: {:?}",
+                        forward.payload_status.status
+                    )));
                     return Err(ChainOrchestratorError::FcuRejected(
                         "administrative FCS head update was not applied by the engine \
                          (INVALID or SYNCING)",
@@ -793,6 +810,7 @@ impl<
                              did not commit; restart re-converges on the persisted head",
                         ));
                     }
+                    let _ = sender.send(Err(format!("head persistence failed: {err}")));
                     return Err(err.into());
                 }
 
@@ -802,7 +820,7 @@ impl<
                 // and their transactions must not re-enter the pool.
                 self.reinsert_txs_into_pool(reverted_transactions).await;
                 self.notify(ChainOrchestratorEvent::FcsHeadUpdated(head));
-                let _ = sender.send(());
+                let _ = sender.send(Ok(()));
             }
             ChainOrchestratorCommand::EnableAutomaticSequencing(tx) => {
                 if let Some(sequencer) = self.sequencer.as_mut() {
@@ -1267,27 +1285,55 @@ impl<
             // does not apply leaves the engine on the reorged-out chain, no
             // L1Reorg event emitted, reverted transactions not reinserted.
             match self.engine.update_fcs(l2_head_block_info, l2_safe_block_info, None).await {
-                Ok(result) if result.is_valid() => {}
-                Ok(_) => {
+                // This is the UNCHECKED call: its mirror commits on any
+                // non-INVALID result, so on SYNCING the engine mirror and the
+                // database AGREE (the EL converges as it catches up) — that
+                // must not fail-stop.
+                Ok(result) if !result.is_invalid() => {
+                    if !result.is_valid() {
+                        tracing::warn!(
+                            target: "scroll::chain_orchestrator",
+                            ?l2_head_block_info,
+                            ?l2_safe_block_info,
+                            "L1-reorg FCU SYNCING; mirror committed, EL will converge"
+                        );
+                    }
+                }
+                Ok(result) => {
+                    // INVALID: the one response that does NOT commit the
+                    // mirror while the unwind is already durable.
                     tracing::error!(
                         target: "scroll::chain_orchestrator",
                         ?l2_head_block_info,
                         ?l2_safe_block_info,
-                        "L1-reorg FCU not applied (INVALID or SYNCING) AFTER the L1 \
-                         database unwind; engine and database now diverge"
+                        ?result,
+                        "L1-reorg FCU rejected as INVALID AFTER the L1 database unwind; \
+                         engine and database now diverge"
                     );
-                    // No in-process compensation exists here; a restart
-                    // re-derives from the (unwound) database and converges.
                     return Err(ChainOrchestratorError::FatalStateDivergence(
-                        "post-unwind L1-reorg forkchoice update was not applied; restart \
-                         re-converges from the persisted state",
+                        "post-unwind L1-reorg forkchoice update rejected as INVALID; \
+                         restart re-converges from the persisted state",
                     ));
                 }
+                Err(EngineError::FcsError(err)) => {
+                    // Pre-flight LOCAL validation: fcs.update() failed before
+                    // anything was sent to the engine, so there is no
+                    // divergence to converge — surface a plain error instead
+                    // of killing the node (reachable e.g. via a startup-time
+                    // L1 reorg below the persisted finalized block).
+                    tracing::error!(
+                        target: "scroll::chain_orchestrator",
+                        ?l2_head_block_info,
+                        ?l2_safe_block_info,
+                        %err,
+                        "Post-unwind L1-reorg FCU refused by local forkchoice validation; \
+                         nothing was sent to the engine"
+                    );
+                    return Err(EngineError::FcsError(err).into());
+                }
                 Err(err) => {
-                    // Same divergence as the INVALID arm above — the L1 unwind
-                    // is already committed — and a transport error (engine
-                    // restart, socket reset) is the more common shape in
-                    // production. One policy for both.
+                    // Transport error with the unwind already committed and
+                    // no FCU applied: genuine divergence.
                     tracing::error!(
                         target: "scroll::chain_orchestrator",
                         ?l2_head_block_info,
@@ -1305,9 +1351,9 @@ impl<
         }
 
         // Cancel the inflight payload building job if the head has changed —
-        // after the FCU so a failed update does not destroy a valid job (a
-        // job carrying L1 messages was already cancelled above). The
-        // single-task run loop means the job cannot complete in between.
+        // after the FCU (a job that may carry L1 messages was already
+        // cancelled above), so the cancel and the head move stay adjacent;
+        // the single-task run loop means the job cannot complete in between.
         if l2_head_block_info.is_some() {
             self.cancel_payload_building_job("L1 reorg moved the L2 head");
         }
@@ -1364,11 +1410,20 @@ impl<
             // surfaced.
             let result = self.engine.update_fcs(None, None, finalized_block_info).await?;
             if result.is_invalid() {
-                tracing::warn!(
+                // INVALID does not commit the mirror while the batch is
+                // already finalized in the database and the notification is
+                // consumed — no retry path exists, so this is the same
+                // divergence class the head updates treat as fatal.
+                tracing::error!(
                     target: "scroll::chain_orchestrator",
                     ?finalized_block_info,
+                    ?result,
                     "Finalized-head FCU rejected as INVALID by the engine"
                 );
+                return Err(ChainOrchestratorError::FatalStateDivergence(
+                    "finalized-head forkchoice update rejected as INVALID after the \
+                     batch was finalized; restart re-converges from the persisted state",
+                ));
             }
         }
 
@@ -1491,11 +1546,19 @@ impl<
             // must reorg below it get refused indefinitely.
             let result = self.engine.update_fcs(None, Some(safe_block_info), None).await?;
             if result.is_invalid() {
-                tracing::warn!(
+                // See the finalized-head FCU: the revert is already durable
+                // and INVALID left the mirror on the old (higher) safe head —
+                // imports that must reorg below it would be refused forever.
+                tracing::error!(
                     target: "scroll::chain_orchestrator",
                     ?safe_block_info,
+                    ?result,
                     "Post-batch-revert safe-head FCU rejected as INVALID by the engine"
                 );
+                return Err(ChainOrchestratorError::FatalStateDivergence(
+                    "post-batch-revert safe-head forkchoice update rejected as INVALID; \
+                     restart re-converges from the persisted state",
+                ));
             }
         }
 

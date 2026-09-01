@@ -359,12 +359,13 @@ impl<'a> EventWaiter<'a> {
                     // loss — the broadcast channel holds 5000 events
                     // (issue #38).
                     let mut batch = 0usize;
-                    while let Some(event) = events.next().now_or_never() {
+                    // Bound BEFORE popping: now_or_never() consumes the event,
+                    // so a post-pop bound check would silently discard the
+                    // 257th ready event of a burst.
+                    while batch < 256 {
+                        let Some(event) = events.next().now_or_never() else { break };
                         drained_any = true;
                         batch += 1;
-                        if batch > 256 {
-                            break;
-                        }
                         match event {
                             Some(event) => {
                                 if let Some(value) = extractor(&event) {
@@ -395,6 +396,8 @@ impl<'a> EventWaiter<'a> {
                 // Only sleep when nothing was immediately available; still
                 // yield after a busy pass so the enclosing timeout can fire
                 // even under a continuous event stream.
+                // NOTE: this drain requires a LIVE clock; a start_paused
+                // test would hang here rather than time out.
                 if drained_any {
                     tokio::task::yield_now().await;
                 } else {

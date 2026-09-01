@@ -1612,7 +1612,8 @@ async fn requeues_transactions_after_update_fcs_head() -> eyre::Result<()> {
         .rollup_manager_handle
         .update_fcs_head(head)
         .await
-        .expect("update_fcs_head should succeed");
+        .expect("update_fcs_head reply channel dropped")
+        .map_err(|refusal| eyre::eyre!("head update refused: {refusal}"))?;
 
     // Build the next block – the reverted transaction should have been requeued and included.
     sequencer

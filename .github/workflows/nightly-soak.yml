@@ -6,10 +6,10 @@ name: nightly-soak
 #     consolidation test, both build-coalescing tests, the four payload-job
 #     cancellation tests, the remote-source launch test, and the
 #     skip-identity test — plain and under deliberate CPU contention (the
-#     original race only fired on contended runners). The resume test is
-#     deliberately NOT soaked: its shutdown/restart fixture has a known
-#     teardown race (a blind 1s cleanup sleep vs the rocksdb lock) that
-#     would file false regression reports; see the follow-ups ledger. And
+#     original race only fired on contended runners). The resume test soaks
+#     in the IDLE lane only (it is skipped in the merge lane and its
+#     shutdown/restart fixture retains a known teardown race — single-
+#     threaded idle is the lowest-risk home; see the follow-ups ledger). And
 #   - the docker remote-source pair (follow/import parity, and recovery
 #     across a sequencer restart), repeated serially.
 # Any failure here is a regression of a fixed race — treat it as a bug, not as
@@ -89,7 +89,7 @@ jobs:
         timeout-minutes: 45
         run: |
           cargo nextest run --all-features --workspace --locked --no-run \
-            -E 'test(test_should_consolidate_after_optimistic_sync) or test(coalesces_with) or test(cancels_inflight_payload_job) or test(remote_source_node_launches_when_remote_unreachable) or test(block_building_skipped_carries_head_number)'
+            -E 'test(test_should_consolidate_after_optimistic_sync) or test(coalesces_with) or test(cancels_inflight_payload_job) or test(remote_source_node_launches_when_remote_unreachable) or test(block_building_skipped_carries_head_number) or test(test_remote_block_source_resumes_from_correct_head)'
       - name: Soak timing-sensitive integration tests (idle)
         id: soak
         # Step-level timeout, below the job's 150: a JOB-level timeout cancels
@@ -110,7 +110,7 @@ jobs:
             # distinguishable from a plain regression. Single-threaded so the
             # tests' internal timing budgets are not compounded by peer load.
             cargo nextest run --all-features --workspace --locked --test-threads=1 \
-              --no-tests=fail -E 'test(test_should_consolidate_after_optimistic_sync) or test(coalesces_with) or test(cancels_inflight_payload_job) or test(remote_source_node_launches_when_remote_unreachable) or test(block_building_skipped_carries_head_number)'
+              --no-tests=fail -E 'test(test_should_consolidate_after_optimistic_sync) or test(coalesces_with) or test(cancels_inflight_payload_job) or test(remote_source_node_launches_when_remote_unreachable) or test(block_building_skipped_carries_head_number) or test(test_remote_block_source_resumes_from_correct_head)'
             echo "::endgroup::"
           done
       - name: Report failure on the tracking issue
@@ -303,8 +303,11 @@ jobs:
           # --no-tests=fail (nextest's default, pinned explicitly since the
           # install action is unpinned): if a rename ever empties the filter,
           # this guard must fail loudly instead of soaking nothing.
-          for i in 1 2 3; do
-            echo "::group::docker iteration $i/3"
+          # Two iterations: the merge lane budgets 75 minutes for ONE pass
+          # of the docker tests, so three serial passes could hit the
+          # 80-minute cap and auto-file a false hang report.
+          for i in 1 2; do
+            echo "::group::docker iteration $i/2"
             cargo nextest run --all-features --workspace --locked --no-tests=fail \
               -E 'test(docker_test_remote_block_source)' \
               --test-threads=1 --failure-output immediate --success-output never

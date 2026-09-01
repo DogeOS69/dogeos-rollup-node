@@ -227,7 +227,8 @@ where
 
 /// A job that builds a new payload.
 pub struct PayloadBuildingJob {
-    /// The L1 origin block number of the first included L1 message, if any.
+    /// The L1 origin block number of the first CANDIDATE L1 message (recorded before the gas
+    /// filter, so it may not have been included), if any.
     l1_origin: Option<u64>,
     /// The future that resolves to the payload ID once the job is complete.
     future: PayloadBuildingJobFuture,
@@ -243,7 +244,8 @@ impl fmt::Debug for PayloadBuildingJob {
 }
 
 impl PayloadBuildingJob {
-    /// Returns the L1 origin block number of the first included L1 message, if any.
+    /// Returns the L1 origin block number of the first CANDIDATE L1 message (recorded before the
+    /// gas filter, so it may not have been included), if any.
     pub const fn l1_origin(&self) -> Option<u64> {
         self.l1_origin
     }

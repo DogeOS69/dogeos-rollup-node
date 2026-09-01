@@ -258,7 +258,8 @@ where
                 last_imported_block = 0;
                 break;
             }
-            if search <= floor && floor > 0 {
+            if search < floor {
+                // The block at `floor` itself has been checked by now.
                 return Err(terminal_error(
                     "no common ancestor with the remote within the lookback window",
                 ));
@@ -471,14 +472,23 @@ where
     /// being lost.
     async fn trigger_build_and_await(&mut self, expected_number: u64) -> eyre::Result<()> {
         // Drop build outcomes left over from earlier requests (e.g. a build
-        // that completed after its settlement was given up).
+        // that completed after its settlement was given up). A drained
+        // numberless outcome accounts for an abandoned job, so the stale-skip
+        // guard must be cleared here — otherwise it would swallow the NEW
+        // request's genuine outcome.
         while let Some(event) = self.events.next().now_or_never() {
             match event {
                 Some(ChainOrchestratorEvent::Shutdown) => {
                     return Err(orchestrator_gone("Chain orchestrator is shutting down"));
                 }
+                Some(
+                    ChainOrchestratorEvent::BlockBuildingSkipped |
+                    ChainOrchestratorEvent::PayloadBuildingJobCancelled,
+                ) => {
+                    self.ignore_stale_skip = false;
+                }
                 Some(_) => {}
-                None => return Err(terminal_error("Event stream ended unexpectedly")),
+                None => return Err(orchestrator_gone("Event stream ended unexpectedly")),
             }
         }
 

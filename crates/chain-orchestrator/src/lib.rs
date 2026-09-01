@@ -166,12 +166,11 @@ impl<
         l1_watcher: L1WatcherHandle,
         network: ScrollNetwork<N>,
         consensus: Box<dyn Consensus + 'static>,
-        mut engine: Engine<EC>,
+        engine: Engine<EC>,
         sequencer: Option<Sequencer<L1MP, ChainSpec>>,
         signer: Option<SignerHandle>,
         derivation_pipeline: DerivationPipeline,
     ) -> Result<(Self, ChainOrchestratorHandle<N>), ChainOrchestratorError> {
-        frontier::ensure_database_frontier(&l2_provider, &mut engine, &database).await?;
         let (handle_tx, handle_rx) = mpsc::unbounded_channel();
         let handle = ChainOrchestratorHandle::new(handle_tx);
         Ok((
@@ -202,6 +201,23 @@ impl<
         mut self,
         mut shutdown: impl std::future::Future<Output = ()> + Unpin,
     ) -> Result<(), ChainOrchestratorError> {
+        // The orchestrator is constructed while Reth is still launching its add-ons. Defer any
+        // startup FCU until the spawned run task gets a turn; a safe rewind can require the Engine
+        // service to process canonical-chain work that is not available from the constructor.
+        tokio::task::yield_now().await;
+        tokio::select! {
+            biased;
+            _guard = &mut shutdown => {
+                self.notify(ChainOrchestratorEvent::Shutdown);
+                return Ok(())
+            }
+            result = frontier::ensure_database_frontier(
+                &*self.l2_client,
+                &mut self.engine,
+                &self.database,
+            ) => result?,
+        }
+
         loop {
             tokio::select! {
                 biased;

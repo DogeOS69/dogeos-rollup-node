@@ -112,7 +112,11 @@ jobs:
           # fired — but leave headroom: the tests run single-threaded below,
           # and full saturation would blow their internal budgets and
           # manufacture the false signal this lane exists to prevent.
-          trap 'jobs -p | xargs -r kill 2>/dev/null || true' EXIT INT TERM
+          cleanup() { jobs -p | xargs -r kill 2>/dev/null || true; }
+          trap cleanup EXIT
+          # INT/TERM must actually stop the job (a bare cleanup trap would
+          # resume the loop after handling the signal).
+          trap 'cleanup; exit 130' INT TERM
           for c in $(seq 4); do yes > /dev/null & done
           for i in $(seq "$ITERATIONS"); do
             echo "::group::loaded iteration $i/$ITERATIONS"

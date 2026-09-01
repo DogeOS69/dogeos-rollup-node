@@ -652,7 +652,16 @@ where
                         self.clear_pending_build();
                         Ok(())
                     }
-                    BuildOutcome::Cancelled => self.trigger_build_and_await(expected).await,
+                    BuildOutcome::Cancelled => {
+                        // Preserve the observation instead of re-issuing
+                        // inline: the head snapshot above is stale by now, and
+                        // a post-finalization cancellation means the head has
+                        // ALREADY advanced — the next settlement tick redoes
+                        // the head check first and settles as Landed instead
+                        // of double-building.
+                        self.pending_build_cancelled = true;
+                        Err(eyre::eyre!("The payload building job was cancelled before completing"))
+                    }
                 }
             }
         }

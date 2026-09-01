@@ -334,7 +334,7 @@ impl ScrollRollupNodeConfig {
                 .await
                 .expect("failed to perform migration");
         } else {
-            // We can re-use the dev migration for custom chains as data source and data hash are
+            // We can reuse the dev migration for custom chains as data source and data hash are
             // None for both. The generic genesis normalization below replaces its seed.
             // This is a workaround due to the fact that sea orm migrations are static.
             // See https://github.com/scroll-tech/rollup-node/issues/297 for more details.

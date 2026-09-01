@@ -1,4 +1,4 @@
-use super::{models, DatabaseError};
+use super::{models, DatabaseError, PendingFrontierTransition};
 use crate::{ReadConnectionProvider, WriteConnectionProvider};
 
 use alloy_primitives::{Signature, B256};
@@ -18,6 +18,15 @@ use std::fmt;
 #[async_trait::async_trait]
 #[auto_impl::auto_impl(Arc)]
 pub trait DatabaseWriteOperations {
+    /// Store the single pending Engine forkchoice transition.
+    async fn set_pending_frontier_transition(
+        &self,
+        transition: PendingFrontierTransition,
+    ) -> Result<(), DatabaseError>;
+
+    /// Clear the pending Engine forkchoice transition after observing its target in the Engine.
+    async fn clear_pending_frontier_transition(&self) -> Result<(), DatabaseError>;
+
     /// Insert a [`BlockInfo`] representing an L1 block into the database.
     async fn insert_l1_block_info(&self, block_info: BlockInfo) -> Result<(), DatabaseError>;
 
@@ -151,7 +160,7 @@ pub trait DatabaseWriteOperations {
         batch_info: BatchInfo,
     ) -> Result<(), DatabaseError>;
 
-    /// Insert the genesis block into the database.
+    /// Replace the database genesis row with the canonical genesis hash.
     async fn insert_genesis_block(&self, genesis_hash: B256) -> Result<(), DatabaseError>;
 
     /// Update the executed L1 messages from the provided L2 blocks in the database.
@@ -201,6 +210,44 @@ pub trait DatabaseWriteOperations {
 
 #[async_trait::async_trait]
 impl<T: WriteConnectionProvider + ?Sized + Sync> DatabaseWriteOperations for T {
+    async fn set_pending_frontier_transition(
+        &self,
+        transition: PendingFrontierTransition,
+    ) -> Result<(), DatabaseError> {
+        use models::frontier_transition::Column;
+
+        let transition: models::frontier_transition::ActiveModel = transition.into();
+        models::frontier_transition::Entity::insert(transition)
+            .on_conflict(
+                OnConflict::column(Column::Id)
+                    .update_columns([
+                        Column::Kind,
+                        Column::ExpectedHeadNumber,
+                        Column::ExpectedHeadHash,
+                        Column::ExpectedSafeNumber,
+                        Column::ExpectedSafeHash,
+                        Column::ExpectedFinalizedNumber,
+                        Column::ExpectedFinalizedHash,
+                        Column::TargetHeadNumber,
+                        Column::TargetHeadHash,
+                        Column::TargetSafeNumber,
+                        Column::TargetSafeHash,
+                        Column::TargetFinalizedNumber,
+                        Column::TargetFinalizedHash,
+                        Column::BatchHash,
+                    ])
+                    .to_owned(),
+            )
+            .exec_without_returning(self.get_connection())
+            .await?;
+        Ok(())
+    }
+
+    async fn clear_pending_frontier_transition(&self) -> Result<(), DatabaseError> {
+        models::frontier_transition::Entity::delete_many().exec(self.get_connection()).await?;
+        Ok(())
+    }
+
     async fn insert_l1_block_info(&self, block_info: BlockInfo) -> Result<(), DatabaseError> {
         tracing::trace!(target: "scroll::db", %block_info, "Inserting L1 block info into database.");
         let finalized_l1_block_number = self.get_finalized_l1_block_number().await?;
@@ -752,6 +799,10 @@ impl<T: WriteConnectionProvider + ?Sized + Sync> DatabaseWriteOperations for T {
     }
 
     async fn insert_genesis_block(&self, genesis_hash: B256) -> Result<(), DatabaseError> {
+        models::l2_block::Entity::delete_many()
+            .filter(models::l2_block::Column::BlockNumber.eq(0))
+            .exec(self.get_connection())
+            .await?;
         let genesis_block = BlockInfo::new(0, genesis_hash);
         let genesis_batch = BatchInfo::new(0, B256::ZERO);
         self.insert_blocks(vec![genesis_block], genesis_batch).await
@@ -980,6 +1031,11 @@ impl<T: WriteConnectionProvider + ?Sized + Sync> DatabaseWriteOperations for T {
 #[async_trait::async_trait]
 #[auto_impl::auto_impl(Arc)]
 pub trait DatabaseReadOperations {
+    /// Return the pending Engine forkchoice transition, if one exists.
+    async fn get_pending_frontier_transition(
+        &self,
+    ) -> Result<Option<PendingFrontierTransition>, DatabaseError>;
+
     /// Get a [`BatchCommitData`] from the database by its batch index.
     async fn get_batch_by_index(
         &self,
@@ -1073,6 +1129,16 @@ pub trait DatabaseReadOperations {
 
 #[async_trait::async_trait]
 impl<T: ReadConnectionProvider + Sync + ?Sized> DatabaseReadOperations for T {
+    async fn get_pending_frontier_transition(
+        &self,
+    ) -> Result<Option<PendingFrontierTransition>, DatabaseError> {
+        models::frontier_transition::Entity::find_by_id(1)
+            .one(self.get_connection())
+            .await?
+            .map(TryInto::try_into)
+            .transpose()
+    }
+
     async fn get_batch_by_index(
         &self,
         batch_index: u64,
@@ -1484,7 +1550,7 @@ impl<T: ReadConnectionProvider + Sync + ?Sized> DatabaseReadOperations for T {
             .order_by_desc(models::l2_block::Column::BlockNumber)
             .one(self.get_connection())
             .await?
-            .expect("there should always be at least the genesis block in the database");
+            .ok_or(DatabaseError::MissingSafeL2Frontier)?;
 
         Ok((safe_block.block_info(), safe_block.batch_info()))
     }

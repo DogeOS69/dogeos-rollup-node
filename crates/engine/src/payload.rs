@@ -1,6 +1,8 @@
 use alloy_primitives::B64;
+use alloy_rpc_types_engine::ExecutionPayloadV1;
 use dogeos_reth_engine::ScrollPayloadAttributes;
 use reth_primitives_traits::{AlloyBlockHeader, Block, BlockBody};
+use rollup_node_primitives::BlockInfo;
 
 use tracing::debug;
 
@@ -84,6 +86,70 @@ pub fn block_matches_attributes<B: Block>(attributes: &ScrollPayloadAttributes, 
             "reorg: mismatch in nonce"
         );
         return false;
+    }
+
+    true
+}
+
+/// Returns true when an Engine-built payload is the exact child requested by derived attributes.
+/// This check runs before `engine_newPayload` so a builder operating on the wrong parent cannot
+/// silently produce a different-but-valid state transition.
+pub fn payload_matches_attributes(
+    expected_parent: BlockInfo,
+    expected_block_number: u64,
+    attributes: &ScrollPayloadAttributes,
+    payload: &ExecutionPayloadV1,
+) -> bool {
+    if payload.parent_hash != expected_parent.hash ||
+        expected_parent.number.checked_add(1) != Some(payload.block_number) ||
+        payload.block_number != expected_block_number
+    {
+        debug!(
+            target: "scroll::engine::driver",
+            ?expected_parent,
+            expected_block_number,
+            actual_parent = ?payload.parent_hash,
+            actual_block_number = payload.block_number,
+            "built payload has an unexpected parent or block number"
+        );
+        return false
+    }
+
+    if attributes.transactions.as_ref().is_none_or(|txs| txs != &payload.transactions) {
+        debug!(
+            target: "scroll::engine::driver",
+            expected = ?attributes.transactions,
+            got = ?payload.transactions,
+            "built payload has unexpected transactions"
+        );
+        return false
+    }
+
+    let expected_fee_recipient = attributes
+        .block_data_hint
+        .coinbase
+        .unwrap_or(attributes.payload_attributes.suggested_fee_recipient);
+    if payload.timestamp != attributes.payload_attributes.timestamp ||
+        payload.prev_randao != attributes.payload_attributes.prev_randao ||
+        payload.fee_recipient != expected_fee_recipient
+    {
+        debug!(
+            target: "scroll::engine::driver",
+            "built payload does not match base payload attributes"
+        );
+        return false
+    }
+
+    let hint = &attributes.block_data_hint;
+    if hint.extra_data.as_ref().is_some_and(|value| value != &payload.extra_data) ||
+        hint.state_root.is_some_and(|value| value != payload.state_root) ||
+        attributes.gas_limit.is_some_and(|value| value != payload.gas_limit)
+    {
+        debug!(
+            target: "scroll::engine::driver",
+            "built payload does not match derived block data"
+        );
+        return false
     }
 
     true

@@ -4,12 +4,69 @@ use alloy_transport::TransportErrorKind;
 use rollup_node_primitives::{BatchInfo, BlockInfo};
 use rollup_node_sequencer::SequencerError;
 use rollup_node_signer::SignerError;
-use scroll_db::{CanRetry, DatabaseError, L1MessageKey};
+use scroll_db::{
+    CanRetry, DatabaseError, FrontierTransitionKind, L1MessageKey, StoredForkchoiceState,
+};
 use scroll_engine::EngineError;
+
+/// Details for a durable frontier transition whose observed Engine state matches neither its
+/// expected nor target state.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "frontier transition {kind:?} conflicted with Engine state: expected={expected:?}, target={target:?}, observed={observed:?}"
+)]
+pub struct FrontierTransitionConflict {
+    kind: FrontierTransitionKind,
+    expected: StoredForkchoiceState,
+    target: StoredForkchoiceState,
+    observed: StoredForkchoiceState,
+}
 
 /// A type that represents an error that occurred in the chain orchestrator.
 #[derive(Debug, thiserror::Error)]
 pub enum ChainOrchestratorError {
+    /// The execution provider did not expose all latest/safe/finalized tags needed for recovery.
+    #[error("execution provider is missing latest, safe, or finalized forkchoice tags")]
+    MissingEngineForkchoiceTags,
+    /// Observing the execution provider failed while frontier recovery was required.
+    #[error("failed to observe Engine forkchoice during frontier recovery: {0}")]
+    FrontierObservation(Box<Self>),
+    /// A durable frontier transition conflicts with the Engine state observed during recovery.
+    #[error("{0}")]
+    FrontierTransitionConflict(Box<FrontierTransitionConflict>),
+    /// A frontier transition would replace or rewind an Engine-finalized block.
+    #[error("cannot move database frontier to {target} because Engine finalized is {observed}")]
+    FinalizedFrontierConflict {
+        /// The database-backed target block.
+        target: BlockInfo,
+        /// The finalized block observed from the Engine.
+        observed: BlockInfo,
+    },
+    /// An Engine request failed while a durable frontier transition remains pending.
+    #[error("Engine request failed while applying frontier transition {kind:?}: {source}")]
+    FrontierTransitionEngineRequest {
+        /// The pending transition kind.
+        kind: FrontierTransitionKind,
+        /// The Engine request error.
+        #[source]
+        source: EngineError,
+    },
+    /// Updating the unsafe Engine head after a durable L1 unwind failed. Safe/finalized are
+    /// already recoverable, but processing must stop until startup reloads the database head.
+    #[error("Engine request failed while applying the post-unwind head: {source}")]
+    PostUnwindHeadEngineRequest {
+        /// The Engine request error.
+        #[source]
+        source: EngineError,
+    },
+    /// The Engine returned a non-valid status while a durable transition remains pending.
+    #[error("Engine returned {status} while applying frontier transition {kind:?}")]
+    FrontierTransitionStatus {
+        /// The pending transition kind.
+        kind: FrontierTransitionKind,
+        /// The Engine payload status.
+        status: &'static str,
+    },
     /// An error occurred while interacting with the database.
     #[error("database error occurred: {0}")]
     DatabaseError(#[from] DatabaseError),
@@ -125,7 +182,7 @@ pub enum ChainOrchestratorError {
         /// The latest hash the Engine considers valid.
         latest_valid_hash: Option<B256>,
         /// The Engine validation detail.
-        validation_error: String,
+        validation_error: Box<str>,
     },
     /// Attempted to reorg a batch but the safe block number does not match the derived
     /// block number - 1.
@@ -138,6 +195,59 @@ pub enum ChainOrchestratorError {
         /// The derived block number.
         derived_block_number: u64,
     },
+    /// Derived attributes are not a contiguous extension of the database-backed frontier.
+    #[error(
+        "derived batch {batch_info:?} has a non-contiguous block sequence: expected block {expected_block_number}, got {actual_block_number}"
+    )]
+    InvalidDerivedBlockSequence {
+        /// The batch being reconciled.
+        batch_info: BatchInfo,
+        /// The next block number required by the verified prefix.
+        expected_block_number: u64,
+        /// The block number supplied by derivation.
+        actual_block_number: u64,
+    },
+    /// A replayed batch does not match history already covered by the authoritative safe frontier.
+    #[error(
+        "replayed batch {batch_info:?} does not match safe history at block {block_number}; database frontier is {frontier}"
+    )]
+    SafeBatchReplayMismatch {
+        /// The batch being reconciled.
+        batch_info: BatchInfo,
+        /// The replayed block that was missing or incompatible.
+        block_number: u64,
+        /// The authoritative database-backed safe frontier.
+        frontier: BlockInfo,
+    },
+    /// The Engine builder returned a payload that did not extend the exact verified parent or
+    /// match the requested derived block number.
+    #[error(
+        "Engine built an unexpected payload for batch {batch_info:?}: expected block {expected_block_number} on {expected_parent}, got block {actual_block_number} on parent {actual_parent_hash}"
+    )]
+    BuiltPayloadMismatch {
+        /// The batch being reconciled.
+        batch_info: BatchInfo,
+        /// The exact verified parent supplied to the builder.
+        expected_parent: Box<BlockInfo>,
+        /// The requested derived block number.
+        expected_block_number: u64,
+        /// The parent hash returned by the builder.
+        actual_parent_hash: B256,
+        /// The block number returned by the builder.
+        actual_block_number: u64,
+    },
+    /// A completed batch would replace the current safe/finalized hash at the same height.
+    #[error(
+        "batch {batch_info:?} produced a conflicting frontier: current={current}, candidate={candidate}"
+    )]
+    ConflictingBatchFrontier {
+        /// The batch being reconciled.
+        batch_info: BatchInfo,
+        /// The current Engine frontier.
+        current: BlockInfo,
+        /// The candidate database frontier.
+        candidate: BlockInfo,
+    },
     /// An error occurred while handling rollup node primitives.
     #[error("An error occurred while handling rollup node primitives: {0}")]
     RollupNodePrimitiveError(rollup_node_primitives::RollupNodePrimitiveError),
@@ -149,5 +259,36 @@ impl CanRetry for ChainOrchestratorError {
             Self::DatabaseError(err) => err.can_retry(),
             _ => false,
         }
+    }
+}
+
+impl ChainOrchestratorError {
+    pub(crate) fn frontier_transition_conflict(
+        kind: FrontierTransitionKind,
+        expected: StoredForkchoiceState,
+        target: StoredForkchoiceState,
+        observed: StoredForkchoiceState,
+    ) -> Self {
+        Self::FrontierTransitionConflict(Box::new(FrontierTransitionConflict {
+            kind,
+            expected,
+            target,
+            observed,
+        }))
+    }
+
+    /// Returns true when continuing the run loop could process work against an unresolved Engine
+    /// frontier.
+    pub(crate) const fn is_frontier_fatal(&self) -> bool {
+        matches!(
+            self,
+            Self::MissingEngineForkchoiceTags |
+                Self::FrontierObservation(_) |
+                Self::FrontierTransitionConflict(_) |
+                Self::FinalizedFrontierConflict { .. } |
+                Self::FrontierTransitionEngineRequest { .. } |
+                Self::PostUnwindHeadEngineRequest { .. } |
+                Self::FrontierTransitionStatus { .. }
+        )
     }
 }

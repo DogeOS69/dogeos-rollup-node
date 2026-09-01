@@ -23,7 +23,8 @@ use rollup_node_sequencer::{Sequencer, SequencerEvent};
 use rollup_node_signer::{SignatureAsBytes, SignerEvent, SignerHandle};
 use rollup_node_watcher::{L1Notification, L1WatcherHandle};
 use scroll_db::{
-    Database, DatabaseError, DatabaseReadOperations, DatabaseWriteOperations, L1MessageKey,
+    Database, DatabaseError, DatabaseReadOperations, DatabaseWriteOperations,
+    FrontierTransitionKind, L1MessageKey, PendingFrontierTransition, StoredForkchoiceState,
     UnwindResult,
 };
 use scroll_derivation_pipeline::DerivationPipeline;
@@ -51,6 +52,8 @@ pub use event::ChainOrchestratorEvent;
 
 mod error;
 pub use error::ChainOrchestratorError;
+
+mod frontier;
 
 mod handle;
 pub use handle::{ChainOrchestratorCommand, ChainOrchestratorHandle, DatabaseQuery};
@@ -163,11 +166,12 @@ impl<
         l1_watcher: L1WatcherHandle,
         network: ScrollNetwork<N>,
         consensus: Box<dyn Consensus + 'static>,
-        engine: Engine<EC>,
+        mut engine: Engine<EC>,
         sequencer: Option<Sequencer<L1MP, ChainSpec>>,
         signer: Option<SignerHandle>,
         derivation_pipeline: DerivationPipeline,
     ) -> Result<(Self, ChainOrchestratorHandle<N>), ChainOrchestratorError> {
+        frontier::ensure_database_frontier(&l2_provider, &mut engine, &database).await?;
         let (handle_tx, handle_rx) = mpsc::unbounded_channel();
         let handle = ChainOrchestratorHandle::new(handle_tx);
         Ok((
@@ -270,7 +274,7 @@ impl<
                     }
                 }, if self.signer.is_some() => {
                     let res = self.handle_signer_event(event).await;
-                    self.handle_outcome(res);
+                    self.handle_outcome(res)?;
                 }
                 Some(event) = async {
                     if let Some(seq) = self.sequencer.as_mut() {
@@ -280,14 +284,14 @@ impl<
                     }
                 }, if self.sequencer.is_some() && self.sync_state.is_synced() && !self.has_pending_derivation_work() => {
                     let res = self.handle_sequencer_event(event).await;
-                    self.handle_outcome(res);
+                    self.handle_outcome(res)?;
                 }
                 Some(batch) = self.derivation_pipeline.next(), if self.derivation_driver.can_accept_batch() => {
                     self.derivation_driver.hold_batch(batch);
                 }
                 Some(event) = self.network.events().next() => {
                     let res = self.handle_network_event(event).await;
-                    self.handle_outcome(res);
+                    self.handle_outcome(res)?;
                 }
                 Some(notification) = self.l1_watcher.l1_notification_receiver().recv(), if l1_notification_receiver_may_poll(
                     self.sync_state.l2().is_synced(),
@@ -295,7 +299,7 @@ impl<
                     self.derivation_driver.can_accept_batch(),
                 ) => {
                     let result = self.handle_l1_notification(notification).await;
-                    self.handle_outcome(result);
+                    self.handle_outcome(result)?;
                 }
 
             }
@@ -349,14 +353,16 @@ impl<
     fn handle_outcome(
         &self,
         outcome: Result<Option<ChainOrchestratorEvent>, ChainOrchestratorError>,
-    ) {
+    ) -> Result<(), ChainOrchestratorError> {
         match outcome {
             Ok(Some(event)) => self.notify(event),
+            Err(err) if err.is_frontier_fatal() => return Err(err),
             Err(err) => {
                 tracing::error!(target: "scroll::chain_orchestrator", ?err, "Encountered error in the chain orchestrator");
             }
             Ok(None) => {}
         }
+        Ok(())
     }
 
     /// Handles an event from the signer.
@@ -519,22 +525,8 @@ impl<
             ChainOrchestratorCommand::RevertToL1Block((block_number, tx)) => {
                 self.sync_state.l1_mut().set_syncing();
                 self.derivation_driver.cancel_attempt();
-                let (unwind_result, held_outcome) =
+                let (_unwind_result, held_outcome) =
                     self.unwind_and_revalidate_held_batch(block_number).await?;
-
-                // Check if the unwind impacts the fcs safe head.
-                if let Some(block_info) = unwind_result.l2_safe_block_info {
-                    // If the new safe head is above the current finalized head, update the fcs safe
-                    // head to the new safe head.
-                    if block_info.number >= self.engine.fcs().finalized_block_info().number {
-                        self.engine.update_fcs(None, Some(block_info), None).await?;
-                    } else {
-                        // Otherwise, update the fcs safe head to the finalized head.
-                        self.engine
-                            .update_fcs(None, Some(*self.engine.fcs().finalized_block_info()), None)
-                            .await?;
-                    }
-                }
 
                 // Revert the L1 watcher to the specified block.
                 self.l1_watcher.revert_to_l1_block(block_number);
@@ -593,8 +585,19 @@ impl<
         &mut self,
         ancestor: u64,
     ) -> Result<(UnwindResult, HeldReorgOutcome), ChainOrchestratorError> {
-        let (unwind_result, outcome) =
-            self.derivation_driver.unwind_and_revalidate(&self.database, ancestor).await?;
+        frontier::ensure_database_frontier(&*self.l2_client, &mut self.engine, &self.database)
+            .await?;
+        let expected = frontier::stored_forkchoice(self.engine.fcs());
+        let (unwind_result, outcome) = self
+            .derivation_driver
+            .unwind_and_revalidate(&self.database, ancestor, Some(expected))
+            .await?;
+        frontier::apply_pending_frontier_transition(
+            &*self.l2_client,
+            &mut self.engine,
+            &self.database,
+        )
+        .await?;
         match outcome {
             HeldReorgOutcome::NoHeldBatch => {}
             HeldReorgOutcome::Invalidated { batch_info, reason } => tracing::info!(
@@ -785,9 +788,13 @@ impl<
             };
         }
 
-        // TODO: Add retry logic
-        if l2_head_block_info.is_some() || l2_safe_block_info.is_some() {
-            self.engine.update_fcs(l2_head_block_info, l2_safe_block_info, None).await?;
+        // The safe transition was durably applied by `unwind_and_revalidate_held_batch`. The
+        // unsafe head remains a separate, recoverable startup concern.
+        if l2_head_block_info.is_some() {
+            self.engine
+                .update_fcs(l2_head_block_info, None, None)
+                .await
+                .map_err(|source| ChainOrchestratorError::PostUnwindHeadEngineRequest { source })?;
         }
 
         // Add all reverted transactions to the transaction pool.
@@ -813,6 +820,9 @@ impl<
         &mut self,
         block_number: u64,
     ) -> Result<Option<ChainOrchestratorEvent>, ChainOrchestratorError> {
+        frontier::ensure_database_frontier(&*self.l2_client, &mut self.engine, &self.database)
+            .await?;
+        let expected = frontier::stored_forkchoice(self.engine.fcs());
         let (finalized_block_info, triggered_batches) = self
             .database
             .tx_mut(move |tx| async move {
@@ -821,6 +831,34 @@ impl<
 
                 // Finalize consolidated batches up to the finalized L1 block number.
                 let finalized_block_info = tx.finalize_consolidated_batches(block_number).await?;
+                if let Some(finalized) = finalized_block_info {
+                    let target_finalized = match finalized.number.cmp(&expected.finalized.number) {
+                        std::cmp::Ordering::Greater => finalized,
+                        std::cmp::Ordering::Equal if finalized == expected.finalized => {
+                            expected.finalized
+                        }
+                        std::cmp::Ordering::Equal | std::cmp::Ordering::Less => {
+                            return Err(ChainOrchestratorError::FinalizedFrontierConflict {
+                                target: finalized,
+                                observed: expected.finalized,
+                            })
+                        }
+                    };
+                    let target = StoredForkchoiceState {
+                        head: expected.head,
+                        safe: expected.safe,
+                        finalized: target_finalized,
+                    };
+                    if target != expected {
+                        tx.set_pending_frontier_transition(PendingFrontierTransition {
+                            kind: FrontierTransitionKind::FinalizeBatch,
+                            expected,
+                            target,
+                            batch_hash: None,
+                        })
+                        .await?;
+                    }
+                }
 
                 // Get all unprocessed batches that have been finalized by this L1 block
                 // finalization.
@@ -832,8 +870,13 @@ impl<
             .await?;
 
         if finalized_block_info.is_some() {
-            tracing::info!(target: "scroll::chain_orchestrator", ?finalized_block_info, "Updating FCS with new finalized block info from L1 finalization");
-            self.engine.update_fcs(None, None, finalized_block_info).await?;
+            tracing::info!(target: "scroll::chain_orchestrator", ?finalized_block_info, "Applying durable finalized frontier from L1 finalization");
+            frontier::apply_pending_frontier_transition(
+                &*self.l2_client,
+                &mut self.engine,
+                &self.database,
+            )
+            .await?;
         }
 
         for batch in &triggered_batches {
@@ -929,6 +972,9 @@ impl<
         end_index: u64,
         l1_block_info: BlockInfo,
     ) -> Result<Option<ChainOrchestratorEvent>, ChainOrchestratorError> {
+        frontier::ensure_database_frontier(&*self.l2_client, &mut self.engine, &self.database)
+            .await?;
+        let expected = frontier::stored_forkchoice(self.engine.fcs());
         let (safe_block_info, batch_info) = self
             .database
             .tx_mut(move |tx| async move {
@@ -940,16 +986,48 @@ impl<
                 )
                 .await?;
 
-                // handle the case of a batch revert.
-                Ok::<_, ChainOrchestratorError>(tx.get_latest_safe_l2_info().await?)
+                // Handle the case of a batch revert and durably record the corresponding Engine
+                // transition in the same database transaction.
+                let (safe_block_info, batch_info) = tx.get_latest_safe_l2_info().await?;
+                if safe_block_info.number < expected.finalized.number {
+                    return Err(ChainOrchestratorError::FinalizedFrontierConflict {
+                        target: safe_block_info,
+                        observed: expected.finalized,
+                    })
+                }
+                let head = if expected.head.number < safe_block_info.number ||
+                    (expected.head.number == safe_block_info.number &&
+                        expected.head != safe_block_info)
+                {
+                    safe_block_info
+                } else {
+                    expected.head
+                };
+                let target = StoredForkchoiceState {
+                    head,
+                    safe: safe_block_info,
+                    finalized: expected.finalized,
+                };
+                if target != expected {
+                    tx.set_pending_frontier_transition(PendingFrontierTransition {
+                        kind: FrontierTransitionKind::RevertBatch,
+                        expected,
+                        target,
+                        batch_hash: None,
+                    })
+                    .await?;
+                }
+                Ok::<_, ChainOrchestratorError>((safe_block_info, batch_info))
             })
             .await?;
 
-        // Update the forkchoice state to the new safe block.
-        if self.sync_state.is_synced() {
-            tracing::info!(target: "scroll::chain_orchestrator", ?safe_block_info, "Updating safe head to block after batch revert");
-            self.engine.update_fcs(None, Some(safe_block_info), None).await?;
-        }
+        tracing::info!(target: "scroll::chain_orchestrator", ?safe_block_info, "Applying durable safe frontier after batch revert");
+        frontier::apply_pending_frontier_transition(
+            &*self.l2_client,
+            &mut self.engine,
+            &self.database,
+        )
+        .await?;
 
         Ok(Some(ChainOrchestratorEvent::BatchReverted { batch_info, safe_head: safe_block_info }))
     }
@@ -1540,7 +1618,7 @@ mod run_loop_policy_tests {
 
     fn payload(number: u64) -> ExecutionPayloadV1 {
         ExecutionPayloadV1 {
-            parent_hash: B256::ZERO,
+            parent_hash: info(SAFE, 0x11).hash,
             fee_recipient: Address::ZERO,
             state_root: B256::ZERO,
             receipts_root: B256::ZERO,
@@ -1570,6 +1648,7 @@ mod run_loop_policy_tests {
             latest_valid_hash: None,
         }));
         client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Valid, None)));
+        client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Valid, None)));
     }
 
     async fn test_scroll_network() -> ScrollNetwork<NoopNetwork<DogeosNetworkPrimitives>> {
@@ -1594,6 +1673,10 @@ mod run_loop_policy_tests {
         derived: BatchDerivationResult,
     ) -> (TestOrchestrator, ChainOrchestratorHandle<TestNetwork>, mpsc::Sender<Arc<L1Notification>>)
     {
+        database
+            .insert_blocks(vec![info(SAFE, 0x11)], BatchInfo::new(0, B256::ZERO))
+            .await
+            .unwrap();
         let engine = Engine::new(
             engine_client,
             ForkchoiceState::new(info(SAFE, 0x11), info(SAFE, 0x11), info(0, 0)),
@@ -1688,7 +1771,10 @@ mod run_loop_policy_tests {
             BatchDerivationResult {
                 attributes: vec![DerivedAttributes {
                     block_number: SAFE + 1,
-                    attributes: ScrollPayloadAttributes::default(),
+                    attributes: ScrollPayloadAttributes {
+                        transactions: Some(vec![]),
+                        ..Default::default()
+                    },
                 }],
                 batch_info,
                 skipped_l1_messages: vec![],
@@ -1750,7 +1836,7 @@ mod run_loop_policy_tests {
         .expect("the notification must apply once derivation is idle");
         assert_eq!(notification_tx.capacity(), TEST_L1_NOTIFICATION_CAPACITY);
         assert!(matches!(handle.status().await.unwrap().derivation, DerivationStatus::Idle));
-        assert_eq!(engine_client.fork_choice_updated_calls(), 3);
+        assert_eq!(engine_client.fork_choice_updated_calls(), 4);
 
         let _ = shutdown_tx.send(());
         assert!(run_task.await.unwrap().is_ok());
@@ -1790,7 +1876,10 @@ mod run_loop_policy_tests {
             BatchDerivationResult {
                 attributes: vec![DerivedAttributes {
                     block_number: SAFE + 1,
-                    attributes: ScrollPayloadAttributes::default(),
+                    attributes: ScrollPayloadAttributes {
+                        transactions: Some(vec![]),
+                        ..Default::default()
+                    },
                 }],
                 batch_info,
                 skipped_l1_messages: vec![],
@@ -1844,7 +1933,7 @@ mod run_loop_policy_tests {
         assert_eq!(observed, ["consolidated", "reorg"]);
         assert_eq!(database.get_latest_l1_block_number().await.unwrap(), 5);
         assert!(database.get_batch_by_index(batch_info.index).await.unwrap().is_none());
-        assert_eq!(engine_client.fork_choice_updated_calls(), 4);
+        assert_eq!(engine_client.fork_choice_updated_calls(), 5);
         assert_eq!(engine_client.get_payload_calls(), 1);
         assert_eq!(engine_client.new_payload_calls(), 1);
 
@@ -1853,7 +1942,7 @@ mod run_loop_policy_tests {
     }
 
     #[tokio::test]
-    async fn administrative_post_unwind_engine_failure_fail_stops_without_retry() {
+    async fn administrative_unwind_without_frontier_change_skips_engine_update() {
         let database = Arc::new(setup_test_db().await);
         database.insert_genesis_block(B256::ZERO).await.unwrap();
         let batch_info = BatchInfo::new(1, B256::repeat_byte(1));
@@ -1861,7 +1950,7 @@ mod run_loop_policy_tests {
             .insert_batch(BatchCommitData {
                 hash: batch_info.hash,
                 index: batch_info.index,
-                block_number: 1,
+                block_number: 10,
                 block_timestamp: 0,
                 calldata: Arc::new(Bytes::new()),
                 blob_versioned_hash: None,
@@ -1888,7 +1977,6 @@ mod run_loop_policy_tests {
         let engine_client = Arc::new(ScriptedEngineClient::new());
         engine_client
             .push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Syncing, None)));
-        engine_client.push_fork_choice_updated(ScriptedResponse::TransportFailure);
         let asserter = Asserter::new();
         asserter.push_success(&Option::<()>::None);
         let (orchestrator, handle, _notification_tx) = test_orchestrator(
@@ -1898,7 +1986,10 @@ mod run_loop_policy_tests {
             BatchDerivationResult {
                 attributes: vec![DerivedAttributes {
                     block_number: SAFE + 1,
-                    attributes: ScrollPayloadAttributes::default(),
+                    attributes: ScrollPayloadAttributes {
+                        transactions: Some(vec![]),
+                        ..Default::default()
+                    },
                 }],
                 batch_info,
                 skipped_l1_messages: vec![],
@@ -1907,7 +1998,7 @@ mod run_loop_policy_tests {
         )
         .await;
 
-        let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let run_task = tokio::spawn(orchestrator.run_until_shutdown(Box::pin(async move {
             let _ = shutdown_rx.await;
         })));
@@ -1926,19 +2017,11 @@ mod run_loop_policy_tests {
         .await
         .expect("first Engine SYNCING response must hold the batch");
 
-        let revert_task = tokio::spawn(async move { handle.revert_to_l1_block(5).await });
-        let result = time::timeout(Duration::from_secs(2), run_task)
-            .await
-            .expect("post-unwind Engine failure must terminate the run loop")
-            .unwrap();
-        assert!(revert_task.await.unwrap().is_err());
-        assert!(matches!(result, Err(ChainOrchestratorError::EngineError(_))));
-        assert_eq!(engine_client.fork_choice_updated_calls(), 2);
-        assert_eq!(
-            database.get_batch_status_by_hash(batch_info.hash).await.unwrap(),
-            Some(BatchStatus::Processing),
-            "the surviving held row must remain for restart recovery"
-        );
+        assert!(handle.revert_to_l1_block(5).await.is_ok());
+        assert_eq!(engine_client.fork_choice_updated_calls(), 1);
+        assert!(database.get_batch_by_index(batch_info.index).await.unwrap().is_none());
         assert!(database.get_batch_by_index(2).await.unwrap().is_none());
+        let _ = shutdown_tx.send(());
+        assert!(run_task.await.unwrap().is_ok());
     }
 }

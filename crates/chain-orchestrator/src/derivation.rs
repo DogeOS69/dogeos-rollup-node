@@ -2,6 +2,7 @@
 
 use crate::{
     consolidation::{reconcile_batch, BlockConsolidationAction},
+    frontier::{apply_pending_frontier_transition, ensure_database_frontier, stored_forkchoice},
     metrics::DerivedBatchMetrics,
     status::{DerivationStatus, HeldBatchStatus},
     ChainOrchestratorError,
@@ -13,9 +14,12 @@ use rollup_node_primitives::{
     BatchConsolidationOutcome, BatchInfo, BatchStatus, BlockConsolidationOutcome,
     L2BlockInfoWithL1Messages,
 };
-use scroll_db::{Database, DatabaseReadOperations, DatabaseWriteOperations, UnwindResult};
+use scroll_db::{
+    Database, DatabaseReadOperations, DatabaseWriteOperations, FrontierTransitionKind,
+    PendingFrontierTransition, StoredForkchoiceState, UnwindResult,
+};
 use scroll_derivation_pipeline::BatchDerivationResult;
-use scroll_engine::{Engine, EngineError, ScrollEngineApi};
+use scroll_engine::{payload_matches_attributes, Engine, EngineError, ScrollEngineApi};
 use std::{pin::Pin, time::Duration};
 use tokio::time::{Instant, Sleep};
 
@@ -233,11 +237,35 @@ impl DerivationDriver {
         &mut self,
         database: &Database,
         ancestor: u64,
+        transition_expected: Option<StoredForkchoiceState>,
     ) -> Result<(UnwindResult, HeldReorgOutcome), ChainOrchestratorError> {
         let held = self.held_identity();
         let (unwind_result, outcome) = database
             .tx_mut(move |tx| async move {
                 let unwind_result = tx.unwind(ancestor).await?;
+                if let (Some(expected), Some(mut safe)) =
+                    (transition_expected, unwind_result.l2_safe_block_info)
+                {
+                    // Finalized history cannot be rewound by an ordinary L1 unwind. Retaining the
+                    // finalized block as safe mirrors the previous administrative behavior while
+                    // making the intent durable in the same database transaction as the unwind.
+                    if safe.number < expected.finalized.number {
+                        safe = expected.finalized;
+                    }
+                    let head =
+                        if expected.head.number < safe.number { safe } else { expected.head };
+                    let target =
+                        StoredForkchoiceState { head, safe, finalized: expected.finalized };
+                    if target != expected {
+                        tx.set_pending_frontier_transition(PendingFrontierTransition {
+                            kind: FrontierTransitionKind::UnwindL1,
+                            expected,
+                            target,
+                            batch_hash: None,
+                        })
+                        .await?;
+                    }
+                }
                 let Some(held) = held else {
                     return Ok::<_, ChainOrchestratorError>((
                         unwind_result,
@@ -376,7 +404,17 @@ where
     EC: ScrollEngineApi + Sync + Send + 'static,
 {
     let batch_info = batch.batch_info;
-    let reconciliation = reconcile_batch(l2_client, batch, engine.fcs())
+    ensure_database_frontier(l2_client, engine, database)
+        .await
+        .map_err(|error| AttemptFailure::fatal("reconcileFrontier", "FRONTIER_ERROR", error))?;
+    let (frontier, _) = database.get_latest_safe_l2_info().await.map_err(|error| {
+        AttemptFailure::fatal(
+            "getLatestSafeL2Info",
+            "ERROR",
+            ChainOrchestratorError::DatabaseError(error),
+        )
+    })?;
+    let reconciliation = reconcile_batch(l2_client, batch, engine.fcs(), frontier)
         .await
         .map_err(|error| AttemptFailure::fatal("reconcileBatch", "ERROR", error))?;
     let target_status = reconciliation.target_status;
@@ -387,102 +425,190 @@ where
     let mut l2_head_updated = false;
 
     for action in aggregated.actions {
-        let outcome = match action {
+        match action {
             BlockConsolidationAction::Skip(_) => {
                 unreachable!("Skip actions have been filtered out in aggregation")
             }
             BlockConsolidationAction::UpdateFcs(block_info) => {
                 let target = block_info.block_info;
                 let current_head = *engine.fcs().head_block_info();
-                // A prior checked FCU may have returned SYNCING, intentionally leaving the local
-                // FCS at its last confirmed value. If fresh reconciliation now finds the target
-                // canonical, advance head with safe so the candidate remains coherent. This also
-                // avoids an equal-height, different-hash head/safe pair.
+                // Confirm only the candidate head here. The durable transition below is the sole
+                // operation allowed to promote a block to safe or finalized.
                 let head = (current_head.number <= target.number && current_head != target)
                     .then_some(target);
-                let finalized = target_status.is_finalized().then_some(target);
-                let response = engine
-                    .update_fcs_checked(head, Some(target), finalized)
-                    .await
-                    .map_err(engine_request_failure(batch_info, FCU_METHOD))?;
-                classify_checked_fcu(response, batch_info, Some(target.number))?;
+                if let Some(head) = head {
+                    let response = engine
+                        .update_fcs_checked(Some(head), None, None)
+                        .await
+                        .map_err(engine_request_failure(batch_info, FCU_METHOD))?;
+                    classify_checked_fcu(response, batch_info, Some(target.number))?;
+                }
                 l2_head_updated |= head.is_some();
-                BlockConsolidationOutcome::UpdateFcs(block_info)
+                block_outcomes.push(BlockConsolidationOutcome::UpdateFcs(block_info));
             }
-            BlockConsolidationAction::Reorg(attribute_index) => {
-                let attributes = &batch.attributes[attribute_index];
-                let safe = *engine.fcs().safe_block_info();
-                if safe.number != attributes.block_number.saturating_sub(1) {
-                    return Err(AttemptFailure::fatal(
-                        "reconcileBatch",
-                        "INVARIANT_ERROR",
-                        ChainOrchestratorError::InvalidBatchReorg {
-                            batch_info,
-                            safe_block_number: safe.number,
-                            derived_block_number: attributes.block_number,
-                        },
-                    ));
+            BlockConsolidationAction::ReorgSuffix {
+                first_attribute_index,
+                mut expected_parent,
+            } => {
+                if *engine.fcs().head_block_info() != expected_parent {
+                    let response = engine
+                        .update_fcs_checked(Some(expected_parent), None, None)
+                        .await
+                        .map_err(engine_request_failure(batch_info, FCU_METHOD))?;
+                    classify_checked_fcu(response, batch_info, Some(expected_parent.number))?;
+                    l2_head_updated = true;
                 }
 
-                let build_response = engine
-                    .build_payload(Some(safe), attributes.attributes.clone())
-                    .await
-                    .map_err(engine_request_failure(batch_info, BUILD_FCU_METHOD))?;
-                let payload_id = classify_build_fcu(build_response, batch_info)?;
+                for attributes in &batch.attributes[first_attribute_index..] {
+                    if expected_parent.number.checked_add(1) != Some(attributes.block_number) {
+                        return Err(AttemptFailure::fatal(
+                            "reconcileBatch",
+                            "INVARIANT_ERROR",
+                            ChainOrchestratorError::InvalidBatchReorg {
+                                batch_info,
+                                safe_block_number: expected_parent.number,
+                                derived_block_number: attributes.block_number,
+                            },
+                        ));
+                    }
 
-                let payload = engine
-                    .get_payload(payload_id)
-                    .await
-                    .map_err(engine_request_failure(batch_info, GET_PAYLOAD_METHOD))?;
-                let block_info: L2BlockInfoWithL1Messages =
-                    (&payload).try_into().map_err(|error| {
-                        AttemptFailure::fatal(
+                    let build_response = engine
+                        .build_payload(Some(expected_parent), attributes.attributes.clone())
+                        .await
+                        .map_err(engine_request_failure(batch_info, BUILD_FCU_METHOD))?;
+                    let payload_id = classify_build_fcu(build_response, batch_info)?;
+
+                    let payload = engine
+                        .get_payload(payload_id)
+                        .await
+                        .map_err(engine_request_failure(batch_info, GET_PAYLOAD_METHOD))?;
+                    if !payload_matches_attributes(
+                        expected_parent,
+                        attributes.block_number,
+                        &attributes.attributes,
+                        &payload,
+                    ) {
+                        return Err(AttemptFailure::fatal(
                             GET_PAYLOAD_METHOD,
-                            "CONVERSION_ERROR",
-                            ChainOrchestratorError::RollupNodePrimitiveError(error),
-                        )
-                    })?;
+                            "PAYLOAD_MISMATCH",
+                            ChainOrchestratorError::BuiltPayloadMismatch {
+                                batch_info,
+                                expected_parent: Box::new(expected_parent),
+                                expected_block_number: attributes.block_number,
+                                actual_parent_hash: payload.parent_hash,
+                                actual_block_number: payload.block_number,
+                            },
+                        ));
+                    }
+                    let block_info: L2BlockInfoWithL1Messages =
+                        (&payload).try_into().map_err(|error| {
+                            AttemptFailure::fatal(
+                                GET_PAYLOAD_METHOD,
+                                "CONVERSION_ERROR",
+                                ChainOrchestratorError::RollupNodePrimitiveError(error),
+                            )
+                        })?;
 
-                let payload_status = engine
-                    .new_payload(payload)
-                    .await
-                    .map_err(engine_request_failure(batch_info, NEW_PAYLOAD_METHOD))?;
-                classify_new_payload(payload_status, batch_info, block_info.block_info.number)?;
+                    let payload_status = engine
+                        .new_payload(payload)
+                        .await
+                        .map_err(engine_request_failure(batch_info, NEW_PAYLOAD_METHOD))?;
+                    classify_new_payload(payload_status, batch_info, block_info.block_info.number)?;
 
-                let finalized = target_status.is_finalized().then_some(block_info.block_info);
-                let final_fcu = engine
-                    .update_fcs_checked(
-                        Some(block_info.block_info),
-                        Some(block_info.block_info),
-                        finalized,
-                    )
-                    .await
-                    .map_err(engine_request_failure(batch_info, FCU_METHOD))?;
-                classify_checked_fcu(final_fcu, batch_info, Some(block_info.block_info.number))?;
-                l2_head_updated = true;
+                    let final_fcu = engine
+                        .update_fcs_checked(Some(block_info.block_info), None, None)
+                        .await
+                        .map_err(engine_request_failure(batch_info, FCU_METHOD))?;
+                    classify_checked_fcu(
+                        final_fcu,
+                        batch_info,
+                        Some(block_info.block_info.number),
+                    )?;
+                    l2_head_updated = true;
 
-                reorg_results.push(block_info.clone());
-                BlockConsolidationOutcome::Reorged(block_info)
+                    expected_parent = block_info.block_info;
+                    reorg_results.push(block_info.clone());
+                    block_outcomes.push(BlockConsolidationOutcome::Reorged(block_info));
+                }
             }
-        };
-        block_outcomes.push(outcome);
+        }
     }
 
-    let batch_outcome = reconciliation
+    let mut batch_outcome = reconciliation
         .into_batch_consolidation_outcome(reorg_results, l2_head_updated)
         .await
         .map_err(|error| AttemptFailure::fatal("consolidateBatch", "ERROR", error))?;
+    if let Some(tip) = batch_outcome.blocks.last() {
+        let database_head = database.get_l2_head_block_number().await.map_err(|error| {
+            AttemptFailure::fatal(
+                "getL2HeadBlockNumber",
+                "ERROR",
+                ChainOrchestratorError::DatabaseError(error),
+            )
+        })?;
+        batch_outcome.l2_head_updated |= tip.block_info.number > database_head;
+    }
     let mut persisted = batch_outcome.clone();
     persisted.with_skipped_l1_messages(batch.skipped_l1_messages.clone());
-    database.insert_batch_consolidation_outcome(persisted).await.map_err(|error| {
-        AttemptFailure::fatal(
-            "insertBatchConsolidationOutcome",
-            "ERROR",
-            ChainOrchestratorError::DatabaseError(error),
-        )
-    })?;
+
+    let expected = stored_forkchoice(engine.fcs());
+    let transition = if let Some(block) = persisted.blocks.last() {
+        let tip = block.block_info;
+        let safe = advance_frontier(expected.safe, tip, batch_info)?;
+        let finalized = if target_status.is_finalized() {
+            advance_frontier(expected.finalized, tip, batch_info)?
+        } else {
+            expected.finalized
+        };
+        let target = StoredForkchoiceState { head: expected.head, safe, finalized };
+        (target != expected).then_some(PendingFrontierTransition {
+            kind: FrontierTransitionKind::ConsolidateBatch,
+            expected,
+            target,
+            batch_hash: Some(batch_info.hash),
+        })
+    } else {
+        None
+    };
+
+    database
+        .tx_mut(move |tx| {
+            let persisted = persisted.clone();
+            async move {
+                tx.insert_batch_consolidation_outcome(persisted).await?;
+                if let Some(transition) = transition {
+                    tx.set_pending_frontier_transition(transition).await?;
+                }
+                Ok::<_, ChainOrchestratorError>(())
+            }
+        })
+        .await
+        .map_err(|error| AttemptFailure::fatal("commitBatchConsolidation", "ERROR", error))?;
+
+    if transition.is_some() {
+        apply_pending_frontier_transition(l2_client, engine, database).await.map_err(|error| {
+            AttemptFailure::fatal("applyFrontierTransition", "FRONTIER_ERROR", error)
+        })?;
+    }
 
     Ok(ConsolidatedBatch { batch_outcome, block_outcomes })
+}
+
+fn advance_frontier(
+    current: rollup_node_primitives::BlockInfo,
+    candidate: rollup_node_primitives::BlockInfo,
+    batch_info: BatchInfo,
+) -> Result<rollup_node_primitives::BlockInfo, AttemptFailure> {
+    match candidate.number.cmp(&current.number) {
+        std::cmp::Ordering::Less => Ok(current),
+        std::cmp::Ordering::Equal if candidate == current => Ok(current),
+        std::cmp::Ordering::Equal => Err(AttemptFailure::fatal(
+            "consolidateBatch",
+            "FRONTIER_ERROR",
+            ChainOrchestratorError::ConflictingBatchFrontier { batch_info, current, candidate },
+        )),
+        std::cmp::Ordering::Greater => Ok(candidate),
+    }
 }
 
 fn engine_request_failure(
@@ -602,7 +728,7 @@ fn invalid_status(
             method,
             block_number,
             latest_valid_hash,
-            validation_error,
+            validation_error: validation_error.into_boxed_str(),
         },
     )
 }
@@ -652,7 +778,7 @@ mod tests {
 
     fn payload(number: u64) -> ExecutionPayloadV1 {
         ExecutionPayloadV1 {
-            parent_hash: B256::ZERO,
+            parent_hash: info(SAFE, 0x11).hash,
             fee_recipient: Address::ZERO,
             state_root: B256::ZERO,
             receipts_root: B256::ZERO,
@@ -674,12 +800,20 @@ mod tests {
         Engine::new(client, ForkchoiceState::from_block_info(safe))
     }
 
+    async fn setup_database() -> Database {
+        let database = setup_test_db().await;
+        database
+            .insert_blocks(vec![info(SAFE, 0x11)], BatchInfo::new(0, B256::ZERO))
+            .await
+            .unwrap();
+        database
+    }
+
     fn batch(index: u64, target_status: BatchStatus) -> BatchDerivationResult {
+        let attributes =
+            ScrollPayloadAttributes { transactions: Some(vec![]), ..Default::default() };
         BatchDerivationResult {
-            attributes: vec![DerivedAttributes {
-                block_number: SAFE + 1,
-                attributes: ScrollPayloadAttributes::default(),
-            }],
+            attributes: vec![DerivedAttributes { block_number: SAFE + 1, attributes }],
             batch_info: BatchInfo::new(index, B256::repeat_byte(index as u8)),
             skipped_l1_messages: vec![],
             target_status,
@@ -719,8 +853,18 @@ mod tests {
         asserter: &Asserter,
         attributes: &ScrollPayloadAttributes,
     ) -> BlockInfo {
+        push_matching_empty_block_on(asserter, attributes, info(SAFE, 0x11), SAFE + 1)
+    }
+
+    fn push_matching_empty_block_on(
+        asserter: &Asserter,
+        attributes: &ScrollPayloadAttributes,
+        parent: BlockInfo,
+        number: u64,
+    ) -> BlockInfo {
         let header = ConsensusHeader {
-            number: SAFE + 1,
+            parent_hash: parent.hash,
+            number,
             timestamp: attributes.payload_attributes.timestamp,
             mix_hash: attributes.payload_attributes.prev_randao,
             beneficiary: attributes.block_data_hint.coinbase.unwrap_or_default(),
@@ -730,11 +874,28 @@ mod tests {
             ..Default::default()
         };
         let sealed = header.seal_slow();
-        let block_info = BlockInfo { number: SAFE + 1, hash: sealed.hash() };
+        let block_info = BlockInfo { number, hash: sealed.hash() };
         let rpc_header = RpcHeader::from_consensus(sealed, None, None);
         let block = RpcBlock::<ScrollRpcTransaction, _>::empty(rpc_header);
         asserter.push_success(&Some(block));
         block_info
+    }
+
+    fn rpc_block(
+        number: u64,
+        parent_hash: B256,
+        tag: u8,
+    ) -> (RpcBlock<ScrollRpcTransaction>, BlockInfo) {
+        let header = ConsensusHeader {
+            parent_hash,
+            number,
+            extra_data: Bytes::from(vec![tag]),
+            ..Default::default()
+        };
+        let sealed = header.seal_slow();
+        let block_info = BlockInfo { number, hash: sealed.hash() };
+        let block = RpcBlock::empty(RpcHeader::from_consensus(sealed, None, None));
+        (block, block_info)
     }
 
     fn make_attempt_due(driver: &mut DerivationDriver) {
@@ -757,6 +918,7 @@ mod tests {
                     PayloadStatusEnum::Valid,
                 )));
                 client.push_fork_choice_updated(ScriptedResponse::Ok(valid_fcu()));
+                client.push_fork_choice_updated(ScriptedResponse::Ok(valid_fcu()));
             }
             HoldBoundary::NewPayloadSyncing | HoldBoundary::NewPayloadAccepted => {
                 client.push_fork_choice_updated(ScriptedResponse::Ok(valid_build()));
@@ -772,6 +934,7 @@ mod tests {
                 client.push_new_payload(ScriptedResponse::Ok(payload_status(
                     PayloadStatusEnum::Valid,
                 )));
+                client.push_fork_choice_updated(ScriptedResponse::Ok(valid_fcu()));
                 client.push_fork_choice_updated(ScriptedResponse::Ok(valid_fcu()));
             }
             HoldBoundary::FinalFcuSyncing => {
@@ -790,12 +953,13 @@ mod tests {
                     PayloadStatusEnum::Valid,
                 )));
                 client.push_fork_choice_updated(ScriptedResponse::Ok(valid_fcu()));
+                client.push_fork_choice_updated(ScriptedResponse::Ok(valid_fcu()));
             }
         }
     }
 
     async fn assert_hold_then_complete(boundary: HoldBoundary) {
-        let database = setup_test_db().await;
+        let database = setup_database().await;
         insert_batch(&database, 1, 1, None).await;
         let client = Arc::new(ScriptedEngineClient::new());
         script_hold_then_success(&client, boundary);
@@ -858,11 +1022,12 @@ mod tests {
 
     #[tokio::test]
     async fn build_fcu_syncing_then_canonical_match_completes_once() {
-        let database = setup_test_db().await;
+        let database = setup_database().await;
         insert_batch(&database, 1, 1, None).await;
         let client = Arc::new(ScriptedEngineClient::new());
         client
             .push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Syncing, None)));
+        client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Valid, None)));
         client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Valid, None)));
         let mut engine = engine_at_safe(client.clone());
 
@@ -890,13 +1055,213 @@ mod tests {
         ));
         assert_eq!(*engine.fcs().head_block_info(), canonical);
         assert_eq!(*engine.fcs().safe_block_info(), canonical);
-        assert_eq!(client.fork_choice_updated_calls(), 2);
+        assert_eq!(client.fork_choice_updated_calls(), 3);
         assert_eq!(client.get_payload_calls(), 0);
         assert_eq!(client.new_payload_calls(), 0);
         assert_eq!(
             database.get_batch_status_by_hash(B256::repeat_byte(1)).await.unwrap(),
             Some(BatchStatus::Consolidated)
         );
+    }
+
+    #[tokio::test]
+    async fn already_safe_batch_replay_is_idempotent() {
+        let database = setup_database().await;
+        insert_batch(&database, 1, 1, None).await;
+        let derived = batch(1, BatchStatus::Consolidated);
+        let batch_hash = derived.batch_info.hash;
+        let asserter = Asserter::new();
+        let canonical = push_matching_empty_block(&asserter, &derived.attributes[0].attributes);
+        database.insert_blocks(vec![canonical], derived.batch_info).await.unwrap();
+        let provider = absent_block_provider(asserter);
+        let client = Arc::new(ScriptedEngineClient::new());
+        let mut engine = Engine::new(
+            client.clone(),
+            ForkchoiceState::new(canonical, canonical, info(SAFE, 0x11)),
+        );
+        let mut driver = DerivationDriver::default();
+        driver.hold_batch(derived);
+        driver.wait_for_attempt().await;
+
+        let AttemptStep::Completed(consolidated) =
+            driver.run_attempt(&provider, &mut engine, &database).await
+        else {
+            panic!("an already-safe duplicate batch must complete idempotently")
+        };
+        assert_eq!(consolidated.batch_outcome.blocks.len(), 1);
+        assert_eq!(client.fork_choice_updated_calls(), 0);
+        assert_eq!(client.get_payload_calls(), 0);
+        assert_eq!(client.new_payload_calls(), 0);
+        assert_eq!(
+            database.get_batch_status_by_hash(batch_hash).await.unwrap(),
+            Some(BatchStatus::Consolidated)
+        );
+        assert_eq!(database.get_pending_frontier_transition().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn same_height_frontier_mismatch_never_builds_on_engine_hash() {
+        let database = setup_database().await;
+        insert_batch(&database, 1, 1, None).await;
+        let database_safe = info(SAFE, 0x11);
+        let (finalized_block, finalized) = rpc_block(0, B256::ZERO, 0xf0);
+        let (engine_safe_block, engine_safe) = rpc_block(SAFE, finalized.hash, 0xb1);
+
+        let asserter = Asserter::new();
+        asserter.push_success(&Some(engine_safe_block.clone()));
+        asserter.push_success(&Some(engine_safe_block));
+        asserter.push_success(&Some(finalized_block));
+        push_absent_block(&asserter);
+        let provider = absent_block_provider(asserter);
+
+        let client = Arc::new(ScriptedEngineClient::new());
+        client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Valid, None)));
+        client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(
+            PayloadStatusEnum::Valid,
+            Some(PayloadId::new([7; 8])),
+        )));
+        client.push_get_payload(ScriptedResponse::Ok(payload(SAFE + 1)));
+        client.push_new_payload(ScriptedResponse::Ok(payload_status(PayloadStatusEnum::Valid)));
+        client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Valid, None)));
+        client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Valid, None)));
+        let mut engine =
+            Engine::new(client.clone(), ForkchoiceState::new(engine_safe, engine_safe, finalized));
+        let mut driver = DerivationDriver::default();
+        driver.hold_batch(batch(1, BatchStatus::Consolidated));
+        driver.wait_for_attempt().await;
+
+        assert!(matches!(
+            driver.run_attempt(&provider, &mut engine, &database).await,
+            AttemptStep::Completed(_)
+        ));
+
+        let build_inputs = client
+            .fork_choice_inputs()
+            .into_iter()
+            .filter(|(_, has_attributes)| *has_attributes)
+            .collect::<Vec<_>>();
+        assert_eq!(build_inputs.len(), 1);
+        assert_eq!(build_inputs[0].0.head_block_hash, database_safe.hash);
+        assert_ne!(build_inputs[0].0.head_block_hash, engine_safe.hash);
+    }
+
+    #[tokio::test]
+    async fn builder_payload_with_wrong_parent_is_rejected_before_new_payload() {
+        let database = setup_database().await;
+        insert_batch(&database, 1, 1, None).await;
+        let client = Arc::new(ScriptedEngineClient::new());
+        client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(
+            PayloadStatusEnum::Valid,
+            Some(PayloadId::new([7; 8])),
+        )));
+        let mut wrong_payload = payload(SAFE + 1);
+        wrong_payload.parent_hash = B256::repeat_byte(0x99);
+        client.push_get_payload(ScriptedResponse::Ok(wrong_payload));
+        let mut engine = engine_at_safe(client.clone());
+        let asserter = Asserter::new();
+        push_absent_block(&asserter);
+        let provider = absent_block_provider(asserter);
+        let mut driver = DerivationDriver::default();
+        driver.hold_batch(batch(1, BatchStatus::Consolidated));
+        driver.wait_for_attempt().await;
+
+        let AttemptStep::Fatal(fatal) = driver.run_attempt(&provider, &mut engine, &database).await
+        else {
+            panic!("wrong-parent builder payload must fail-stop")
+        };
+        assert_eq!(fatal.method, GET_PAYLOAD_METHOD);
+        assert_eq!(fatal.outcome, "PAYLOAD_MISMATCH");
+        assert!(matches!(*fatal.error, ChainOrchestratorError::BuiltPayloadMismatch { .. }));
+        assert_eq!(client.new_payload_calls(), 0);
+        assert_eq!(
+            database.get_batch_status_by_hash(B256::repeat_byte(1)).await.unwrap(),
+            Some(BatchStatus::Committed)
+        );
+    }
+
+    #[tokio::test]
+    async fn engine_head_ahead_after_database_failure_is_persisted_idempotently() {
+        let database = setup_database().await;
+        insert_batch(&database, 1, 1, None).await;
+        let derived = batch(1, BatchStatus::Consolidated);
+        let asserter = Asserter::new();
+        let canonical = push_matching_empty_block(&asserter, &derived.attributes[0].attributes);
+        let provider = absent_block_provider(asserter);
+        let client = Arc::new(ScriptedEngineClient::new());
+        client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Valid, None)));
+        let safe = info(SAFE, 0x11);
+        let mut engine = Engine::new(client.clone(), ForkchoiceState::new(canonical, safe, safe));
+        let mut driver = DerivationDriver::default();
+        driver.hold_batch(derived);
+        driver.wait_for_attempt().await;
+
+        let AttemptStep::Completed(consolidated) =
+            driver.run_attempt(&provider, &mut engine, &database).await
+        else {
+            panic!("verified Engine prefix must be persisted without rebuilding")
+        };
+        assert!(consolidated.batch_outcome.l2_head_updated);
+        assert_eq!(client.fork_choice_updated_calls(), 1, "only safe promotion is required");
+        assert_eq!(client.get_payload_calls(), 0);
+        assert_eq!(client.new_payload_calls(), 0);
+        assert_eq!(database.get_l2_head_block_number().await.unwrap(), canonical.number);
+        assert_eq!(*engine.fcs().safe_block_info(), canonical);
+        assert_eq!(database.get_pending_frontier_transition().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn reorg_suffix_builds_on_verified_prefix_tip() {
+        let database = setup_database().await;
+        insert_batch(&database, 1, 1, None).await;
+        let first_attributes =
+            ScrollPayloadAttributes { transactions: Some(vec![]), ..Default::default() };
+        let second_attributes =
+            ScrollPayloadAttributes { transactions: Some(vec![]), ..Default::default() };
+        let asserter = Asserter::new();
+        let prefix =
+            push_matching_empty_block_on(&asserter, &first_attributes, info(SAFE, 0x11), SAFE + 1);
+        push_absent_block(&asserter);
+        let provider = absent_block_provider(asserter);
+
+        let client = Arc::new(ScriptedEngineClient::new());
+        client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Valid, None)));
+        client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(
+            PayloadStatusEnum::Valid,
+            Some(PayloadId::new([7; 8])),
+        )));
+        let mut built_payload = payload(SAFE + 2);
+        built_payload.parent_hash = prefix.hash;
+        client.push_get_payload(ScriptedResponse::Ok(built_payload));
+        client.push_new_payload(ScriptedResponse::Ok(payload_status(PayloadStatusEnum::Valid)));
+        client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Valid, None)));
+        client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Valid, None)));
+        let mut engine = engine_at_safe(client.clone());
+        let mut driver = DerivationDriver::default();
+        driver.hold_batch(BatchDerivationResult {
+            attributes: vec![
+                DerivedAttributes { block_number: SAFE + 1, attributes: first_attributes },
+                DerivedAttributes { block_number: SAFE + 2, attributes: second_attributes },
+            ],
+            batch_info: BatchInfo::new(1, B256::repeat_byte(1)),
+            skipped_l1_messages: vec![],
+            target_status: BatchStatus::Consolidated,
+        });
+        driver.wait_for_attempt().await;
+
+        let AttemptStep::Completed(consolidated) =
+            driver.run_attempt(&provider, &mut engine, &database).await
+        else {
+            panic!("verified-prefix suffix rebuild must complete")
+        };
+        assert_eq!(consolidated.batch_outcome.blocks.len(), 2);
+        assert_eq!(consolidated.block_outcomes.len(), 2);
+        let build = client
+            .fork_choice_inputs()
+            .into_iter()
+            .find(|(_, has_attributes)| *has_attributes)
+            .expect("one payload build call");
+        assert_eq!(build.0.head_block_hash, prefix.hash);
+        assert_eq!(engine.fcs().safe_block_info().number, SAFE + 2);
     }
 
     #[tokio::test]
@@ -916,7 +1281,7 @@ mod tests {
 
     #[tokio::test]
     async fn final_fcu_syncing_then_canonical_match_advances_database_head() {
-        let database = setup_test_db().await;
+        let database = setup_database().await;
         insert_batch(&database, 1, 1, None).await;
         let mut derived = batch(1, BatchStatus::Consolidated);
         derived.attributes[0].attributes.transactions = Some(vec![]);
@@ -937,6 +1302,7 @@ mod tests {
         client.push_new_payload(ScriptedResponse::Ok(payload_status(PayloadStatusEnum::Valid)));
         client
             .push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Syncing, None)));
+        client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Valid, None)));
         client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Valid, None)));
         let mut engine = engine_at_safe(client.clone());
         let mut driver = DerivationDriver::default();
@@ -965,7 +1331,7 @@ mod tests {
             database.get_batch_status_by_hash(B256::repeat_byte(1)).await.unwrap(),
             Some(BatchStatus::Consolidated)
         );
-        assert_eq!(client.fork_choice_updated_calls(), 3);
+        assert_eq!(client.fork_choice_updated_calls(), 4);
         assert_eq!(client.get_payload_calls(), 1);
         assert_eq!(client.new_payload_calls(), 1);
     }
@@ -1113,7 +1479,7 @@ mod tests {
 
         for (offset, response) in cases.into_iter().enumerate() {
             let index = offset as u64 + 1;
-            let database = setup_test_db().await;
+            let database = setup_database().await;
             insert_batch(&database, index, 1, None).await;
             let client = Arc::new(ScriptedEngineClient::new());
             client.push_fork_choice_updated(ScriptedResponse::Ok(response));
@@ -1144,7 +1510,7 @@ mod tests {
 
     #[tokio::test]
     async fn transport_error_fail_stops_without_polling_next_batch() {
-        let database = setup_test_db().await;
+        let database = setup_database().await;
         insert_batch(&database, 1, 1, None).await;
         let client = Arc::new(ScriptedEngineClient::new());
         client.push_fork_choice_updated(ScriptedResponse::TransportFailure);
@@ -1191,7 +1557,7 @@ mod tests {
 
     #[tokio::test]
     async fn held_status_is_unsynced_and_reports_progress() {
-        let database = setup_test_db().await;
+        let database = setup_database().await;
         insert_batch(&database, 1, 1, None).await;
         let client = Arc::new(ScriptedEngineClient::new());
         client
@@ -1226,7 +1592,7 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_interrupts_held_backoff() {
-        let database = setup_test_db().await;
+        let database = setup_database().await;
         insert_batch(&database, 1, 1, None).await;
         let client = Arc::new(ScriptedEngineClient::new());
         client
@@ -1258,7 +1624,7 @@ mod tests {
 
     #[tokio::test]
     async fn l1_reorg_invalidates_origin_dependent_held_batch() {
-        let database = setup_test_db().await;
+        let database = setup_database().await;
         insert_batch(&database, 1, 10, None).await;
         let client = Arc::new(ScriptedEngineClient::new());
         client
@@ -1275,7 +1641,7 @@ mod tests {
             AttemptStep::Held
         ));
 
-        let (_, outcome) = driver.unwind_and_revalidate(&database, 5).await.unwrap();
+        let (_, outcome) = driver.unwind_and_revalidate(&database, 5, None).await.unwrap();
         assert!(matches!(
             outcome,
             HeldReorgOutcome::Invalidated { batch_info: BatchInfo { index: 1, .. }, .. }
@@ -1290,13 +1656,13 @@ mod tests {
 
     #[tokio::test]
     async fn surviving_unwind_waits_for_post_commit_repair_before_retry() {
-        let database = setup_test_db().await;
+        let database = setup_database().await;
         insert_batch(&database, 1, 1, None).await;
         let mut driver = DerivationDriver::default();
         driver.hold_batch(batch(1, BatchStatus::Consolidated));
         driver.cancel_attempt();
 
-        let (_, outcome) = driver.unwind_and_revalidate(&database, 5).await.unwrap();
+        let (_, outcome) = driver.unwind_and_revalidate(&database, 5, None).await.unwrap();
         assert!(matches!(outcome, HeldReorgOutcome::Survived { .. }));
         assert!(!driver.can_accept_batch());
         assert!(
@@ -1309,8 +1675,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn database_unwind_engine_failure_replays_durable_frontier_transition() {
+        let database = setup_database().await;
+        insert_batch(&database, 1, 10, None).await;
+        let database_safe = info(SAFE, 0x11);
+        let (finalized_block, finalized) = rpc_block(0, B256::ZERO, 0xf0);
+        let (engine_head_block, engine_head) = rpc_block(SAFE + 1, database_safe.hash, 0x22);
+        database
+            .insert_blocks(vec![engine_head], BatchInfo::new(1, B256::repeat_byte(1)))
+            .await
+            .unwrap();
+        let expected = StoredForkchoiceState { head: engine_head, safe: engine_head, finalized };
+        let mut driver = DerivationDriver::default();
+
+        let (_, outcome) =
+            driver.unwind_and_revalidate(&database, 5, Some(expected)).await.unwrap();
+        assert!(matches!(outcome, HeldReorgOutcome::NoHeldBatch));
+        let pending = database
+            .get_pending_frontier_transition()
+            .await
+            .unwrap()
+            .expect("unwind and intent must commit together");
+        assert_eq!(pending.kind, FrontierTransitionKind::UnwindL1);
+        assert_eq!(pending.expected, expected);
+        assert_eq!(pending.target.safe, database_safe);
+        assert!(database.get_batch_by_index(1).await.unwrap().is_none());
+
+        let asserter = Asserter::new();
+        asserter.push_success(&Some(engine_head_block.clone()));
+        asserter.push_success(&Some(engine_head_block));
+        asserter.push_success(&Some(finalized_block));
+        let provider = absent_block_provider(asserter);
+        let client = Arc::new(ScriptedEngineClient::new());
+        client.push_fork_choice_updated(ScriptedResponse::TransportFailure);
+        client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Valid, None)));
+        let mut engine = Engine::new(
+            client,
+            ForkchoiceState::new(expected.head, expected.safe, expected.finalized),
+        );
+
+        let error =
+            apply_pending_frontier_transition(&provider, &mut engine, &database).await.unwrap_err();
+        assert!(matches!(
+            error,
+            ChainOrchestratorError::FrontierTransitionEngineRequest {
+                kind: FrontierTransitionKind::UnwindL1,
+                ..
+            }
+        ));
+        assert!(database.get_pending_frontier_transition().await.unwrap().is_some());
+
+        assert!(apply_pending_frontier_transition(&provider, &mut engine, &database)
+            .await
+            .unwrap());
+        assert_eq!(*engine.fcs().safe_block_info(), database_safe);
+        assert_eq!(database.get_pending_frontier_transition().await.unwrap(), None);
+    }
+
+    #[tokio::test]
     async fn reverted_finalization_resets_only_its_surviving_processing_row() {
-        let database = setup_test_db().await;
+        let database = setup_database().await;
         insert_batch(&database, 1, 1, Some(10)).await;
         insert_batch(&database, 2, 1, None).await;
         database.update_batch_status(B256::repeat_byte(1), BatchStatus::Processing).await.unwrap();
@@ -1318,7 +1742,7 @@ mod tests {
         let mut driver = DerivationDriver::default();
         driver.hold_batch(batch(1, BatchStatus::Finalized));
 
-        let (_, outcome) = driver.unwind_and_revalidate(&database, 5).await.unwrap();
+        let (_, outcome) = driver.unwind_and_revalidate(&database, 5, None).await.unwrap();
         assert!(matches!(outcome, HeldReorgOutcome::Invalidated { .. }));
         assert_eq!(
             database.get_batch_status_by_hash(B256::repeat_byte(1)).await.unwrap(),
@@ -1333,7 +1757,7 @@ mod tests {
 
     #[tokio::test]
     async fn reverted_held_row_is_not_reset_to_committed() {
-        let database = setup_test_db().await;
+        let database = setup_database().await;
         insert_batch(&database, 1, 1, Some(10)).await;
         database.update_batch_status(B256::repeat_byte(1), BatchStatus::Processing).await.unwrap();
         database
@@ -1348,7 +1772,7 @@ mod tests {
         driver.hold_batch(batch(1, BatchStatus::Finalized));
         driver.cancel_attempt();
 
-        let (_, outcome) = driver.unwind_and_revalidate(&database, 5).await.unwrap();
+        let (_, outcome) = driver.unwind_and_revalidate(&database, 5, None).await.unwrap();
         assert!(matches!(outcome, HeldReorgOutcome::Invalidated { .. }));
         assert_eq!(
             database.get_batch_status_by_hash(B256::repeat_byte(1)).await.unwrap(),

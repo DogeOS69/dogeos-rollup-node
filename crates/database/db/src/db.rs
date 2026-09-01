@@ -4,7 +4,7 @@ use crate::{
     metrics::{DatabaseMetrics, DatabaseOperation, DatabaseOperationMetrics},
     service::{query::DatabaseQuery, retry::Retry, DatabaseService, DatabaseServiceError},
     DatabaseConnectionProvider, DatabaseReadOperations, DatabaseWriteOperations, L1MessageKey,
-    UnwindResult,
+    PendingFrontierTransition, UnwindResult,
 };
 use alloy_primitives::{Signature, B256};
 use dogeos_reth_engine::BlockDataHint;
@@ -148,6 +148,25 @@ macro_rules! metered {
 
 #[async_trait::async_trait]
 impl DatabaseWriteOperations for Database {
+    async fn set_pending_frontier_transition(
+        &self,
+        transition: PendingFrontierTransition,
+    ) -> Result<(), DatabaseError> {
+        metered!(
+            DatabaseOperation::SetPendingFrontierTransition,
+            self,
+            tx_mut(move |tx| async move { tx.set_pending_frontier_transition(transition).await })
+        )
+    }
+
+    async fn clear_pending_frontier_transition(&self) -> Result<(), DatabaseError> {
+        metered!(
+            DatabaseOperation::ClearPendingFrontierTransition,
+            self,
+            tx_mut(move |tx| async move { tx.clear_pending_frontier_transition().await })
+        )
+    }
+
     async fn insert_l1_block_info(&self, block_info: BlockInfo) -> Result<(), DatabaseError> {
         metered!(
             DatabaseOperation::InsertL1BlockInfo,
@@ -547,6 +566,16 @@ impl DatabaseWriteOperations for Database {
 
 #[async_trait::async_trait]
 impl DatabaseReadOperations for Database {
+    async fn get_pending_frontier_transition(
+        &self,
+    ) -> Result<Option<PendingFrontierTransition>, DatabaseError> {
+        metered!(
+            DatabaseOperation::GetPendingFrontierTransition,
+            self,
+            tx(|tx| async move { tx.get_pending_frontier_transition().await })
+        )
+    }
+
     async fn get_batch_by_index(
         &self,
         batch_index: u64,
@@ -1363,6 +1392,17 @@ mod test {
         // Should return the highest safe block (block 201)
         let latest_safe = db.get_latest_safe_l2_info().await.unwrap();
         assert_eq!(latest_safe, (safe_block_2, batch_info));
+    }
+
+    #[tokio::test]
+    async fn missing_safe_l2_frontier_is_an_error() {
+        let db = setup_test_db().await;
+        models::l2_block::Entity::delete_many().exec(db.inner().get_connection()).await.unwrap();
+
+        assert!(matches!(
+            db.get_latest_safe_l2_info().await,
+            Err(DatabaseError::MissingSafeL2Frontier)
+        ));
     }
 
     #[tokio::test]

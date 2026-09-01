@@ -108,13 +108,6 @@ fn terminal_error(msg: &'static str) -> eyre::Report {
     eyre::Report::new(TerminalSyncError).wrap_err(msg)
 }
 
-/// A closed command channel means the orchestrator is gone — terminal, not
-/// retryable.
-fn orchestrator_gone(e: tokio::sync::oneshot::error::RecvError) -> eyre::Report {
-    eyre::Report::new(TerminalSyncError)
-        .wrap_err(format!("chain orchestrator command channel closed: {e}"))
-}
-
 impl<N, P> RemoteBlockSourceAddOn<N, P>
 where
     N: FullNetwork<Primitives = DogeosNetworkPrimitives> + Send + Sync + 'static,
@@ -174,6 +167,21 @@ where
         self.pending_build_retries = 0;
     }
 
+    /// Classifies a `RecvError` on a command reply. The error is ambiguous: it
+    /// can mean the orchestrator is gone (channel closed — terminal) or that
+    /// the command's handler failed and dropped its response sender (e.g. a
+    /// transient database error — retryable). A genuine closure that races
+    /// this check is classified as transient once and terminal on the next
+    /// tick.
+    fn classify_recv_error(&self, e: tokio::sync::oneshot::error::RecvError) -> eyre::Report {
+        if self.orchestrator_handle.is_closed() {
+            eyre::Report::new(TerminalSyncError)
+                .wrap_err(format!("chain orchestrator command channel closed: {e}"))
+        } else {
+            eyre::eyre!("chain orchestrator dropped the command response (transient failure): {e}")
+        }
+    }
+
     /// Determines the last imported block by finding the highest common block
     /// between the local chain and the remote node.
     ///
@@ -185,7 +193,7 @@ where
             .orchestrator_handle
             .status()
             .await
-            .map_err(orchestrator_gone)?
+            .map_err(|e| self.classify_recv_error(e))?
             .l2
             .fcs
             .head_block_info()
@@ -411,7 +419,7 @@ where
             .orchestrator_handle
             .status()
             .await
-            .map_err(orchestrator_gone)?
+            .map_err(|e| self.classify_recv_error(e))?
             .l2
             .fcs
             .head_block_info()
@@ -533,7 +541,7 @@ where
                     return Err(eyre::eyre!("Import block failed: {}", e));
                 }
                 Err(e) => {
-                    return Err(orchestrator_gone(e));
+                    return Err(self.classify_recv_error(e));
                 }
             };
 
@@ -549,7 +557,13 @@ where
                 continue;
             }
 
-            if !self.orchestrator_handle.status().await.map_err(orchestrator_gone)?.is_synced() {
+            if !self
+                .orchestrator_handle
+                .status()
+                .await
+                .map_err(|e| self.classify_recv_error(e))?
+                .is_synced()
+            {
                 tracing::debug!(target: "scroll::remote_source", "Imported block is valid, but orchestrator is not synced, skipping build");
                 continue;
             }

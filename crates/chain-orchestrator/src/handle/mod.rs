@@ -62,6 +62,14 @@ impl<N: FullNetwork<Primitives = DogeosNetworkPrimitives>> ChainOrchestratorHand
         self
     }
 
+    /// Returns whether the command channel to the rollup manager is closed
+    /// (the orchestrator is gone). Lets callers distinguish a dead
+    /// orchestrator from a command whose handler failed and dropped its
+    /// response sender — both surface as `RecvError` on the reply.
+    pub fn is_closed(&self) -> bool {
+        self.to_manager_tx.is_closed()
+    }
+
     /// Sends a command to the rollup manager.
     pub fn send_command(&self, command: ChainOrchestratorCommand<N>) {
         if let Err(err) = self.to_manager_tx.send(command) {

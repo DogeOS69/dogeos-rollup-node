@@ -182,11 +182,13 @@ from every pass is either fixed in the PR or recorded here.
 - **`PayloadBuildingJobStarted` event to make the coalescing tests' precondition observable**
   (`crates/chain-orchestrator/src/lib.rs` start sites, `crates/node/tests/sync.rs` coalescing tests)
   - Impact/evidence: Claude pass 17 item 6 — both coalescing tests encode "a
-    job is already in flight" as a wall-clock sleep. The in-scope mitigation
-    was to drop them from the loaded soak lane (contention can legitimately
-    defeat the precondition and auto-file a false race regression); a
-    started-event notified at the two `start_payload_building` success sites
-    would remove the sleeps and let both tests run under load.
+    job is already in flight" as a wall-clock precondition. Mitigation
+    history: pass 17 dropped them from the loaded soak lane; pass 25
+    replaced the timer test's blind sleep with bounded build-request retries
+    and RE-ADDED both tests to the loaded lane (the precondition is no
+    longer a capacity assumption). A started-event notified at the two
+    `start_payload_building` success sites remains the cleaner root-cause
+    fix that would remove the retry loop entirely.
   - First/most-recent pass: Claude pass 17 (2026-09-01T08:40Z).
   - Why unaddressed: new production event surface in a stabilization PR; the
     reviewer left it as the orchestrator's call and the lane filter closes

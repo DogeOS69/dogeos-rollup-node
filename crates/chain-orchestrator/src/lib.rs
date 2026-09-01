@@ -425,6 +425,20 @@ impl<
                     })
                     .await
                 {
+                    // Fatal only while this block is still the engine head: a
+                    // stale signer result (the block was imported over or
+                    // reorged out while signing ran) failing to persist is
+                    // not a divergence of current state.
+                    if self.engine.fcs().head_block_info().hash != hash {
+                        tracing::warn!(
+                            target: "scroll::chain_orchestrator",
+                            block_number = block.header.number,
+                            %err,
+                            "Failed to persist a stale signed block (no longer the engine \
+                             head); ignoring"
+                        );
+                        return Ok(None);
+                    }
                     // The signed block sits at the engine head but its head
                     // number and signature could not be persisted — a restart
                     // would rewind past it and peers would never see it

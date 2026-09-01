@@ -511,6 +511,17 @@ where
                                 None => true,
                             };
                             if should_log {
+                                // Host/port only: the full URL's Debug output
+                                // includes basic-auth credentials and query
+                                // strings (API keys).
+                                let remote_host = self.config.url.as_ref().map(|u| {
+                                    format!(
+                                        "{}://{}:{}",
+                                        u.scheme(),
+                                        u.host_str().unwrap_or("<none>"),
+                                        u.port_or_known_default().unwrap_or(0)
+                                    )
+                                });
                                 tracing::error!(
                                     target: "scroll::remote_source",
                                     ?e,
@@ -518,7 +529,7 @@ where
                                     builds_abandoned = self.builds_abandoned,
                                     suppressed_errors = self.suppressed_errors,
                                     initialized = self.last_imported_block.is_some(),
-                                    url = ?self.config.url,
+                                    remote_host = ?remote_host,
                                     "Sync error"
                                 );
                                 self.last_error_log = Some((now, msg));

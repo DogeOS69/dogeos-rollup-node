@@ -196,7 +196,8 @@ impl ScrollRollupNodeConfig {
             tracing::warn!(
                 target: "scroll::node::args",
                 build = self.remote_block_source_args.build,
-                url = ?self.remote_block_source_args.url,
+                // Presence only: the URL may carry credentials.
+                url_set = self.remote_block_source_args.url.is_some(),
                 "remote-source flags are set but remote-source.enabled is off; they are ignored"
             );
         }

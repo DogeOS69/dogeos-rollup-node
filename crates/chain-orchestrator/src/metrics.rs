@@ -157,9 +157,8 @@ pub(crate) struct BlockBuildingMetric {
     /// The duration of the block interval include empty block
     consecutive_block_interval: Histogram,
     /// The number of payload building attempts abandoned without a duration sample:
-    /// cancelled in flight, or failed at payload start or finalization. Not 1:1 with
-    /// `PayloadBuildingJobCancelled` events: a `NewSlot` start failure counts here without
-    /// emitting (no waiter can be attached), and post-finalization failures emit without
-    /// counting (the build itself completed)
+    /// cancelled in flight, or failed at payload start or finalization. Post-finalization
+    /// failures emit `PayloadBuildingJobCancelled` without counting here (the build itself
+    /// completed and recorded its duration)
     payload_building_jobs_cancelled: Counter,
 }

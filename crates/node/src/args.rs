@@ -187,6 +187,12 @@ impl ScrollRollupNodeConfig {
         }
 
         if self.remote_block_source_args.enabled &&
+            self.remote_block_source_args.poll_interval_ms == 0
+        {
+            return Err("remote-source.poll-interval-ms must be greater than 0".to_string());
+        }
+
+        if self.remote_block_source_args.enabled &&
             self.remote_block_source_args.build &&
             self.sequencer_args.auto_start
         {

@@ -88,6 +88,15 @@ async fn test_remote_source_node_launches_when_remote_unreachable() -> eyre::Res
         fixture.build_block().expect_block_number(i).build_and_await_block().await?;
     }
 
+    // Before opening the gate, prove it actually gated: the remote-source
+    // node must still be at genesis (an ungated source would have imported
+    // the two blocks above by now). One-directional — this can only fail
+    // when the gate is broken.
+    eyre::ensure!(
+        fixture.get_block(1).await?.header.number == 0,
+        "remote-source node advanced while the remote was gated closed"
+    );
+
     // Bring the "remote" up: open the gate to the sequencer RPC.
     let sequencer_port =
         fixture.sequencer().node.rpc_url().port().expect("sequencer rpc url has a port");

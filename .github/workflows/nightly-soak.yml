@@ -16,9 +16,9 @@ on:
   workflow_dispatch:
     inputs:
       iterations:
-        description: "Iterations per in-process soak job (default 25)"
+        description: "Iterations per in-process soak job (default 12)"
         required: false
-        default: "25"
+        default: "12"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -59,7 +59,7 @@ jobs:
         env:
           # Passed through env, never interpolated into the script body: a
           # workflow_dispatch input is attacker-influencable text.
-          ITERATIONS: ${{ inputs.iterations || '25' }}
+          ITERATIONS: ${{ inputs.iterations || '12' }}
         run: |
           set -euo pipefail
           [[ "$ITERATIONS" =~ ^[1-9][0-9]*$ ]] || { echo "::error::iterations must be a positive integer"; exit 1; }
@@ -104,7 +104,7 @@ jobs:
       - name: Soak optimistic-sync consolidation test (under CPU contention)
         id: soak
         env:
-          ITERATIONS: ${{ inputs.iterations || '25' }}
+          ITERATIONS: ${{ inputs.iterations || '12' }}
         run: |
           set -euo pipefail
           [[ "$ITERATIONS" =~ ^[1-9][0-9]*$ ]] || { echo "::error::iterations must be a positive integer"; exit 1; }

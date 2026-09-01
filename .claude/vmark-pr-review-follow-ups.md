@@ -85,6 +85,48 @@ from every pass is either fixed in the PR or recorded here.
     contrast, was extracted into a pure function and table-tested in-PR.
   - Suggested Linear title: "rollup-node: unit-test the remote source's common-ancestor terminal paths"
 
+- **Widen `UpdateFcsHead`/`RevertToL1Block` replies to carry persistence failures**
+  (`crates/chain-orchestrator/src/lib.rs`, command enum + admin RPC)
+  - Impact/evidence: Claude pass 13 M3 — when the DB write after a successful
+    engine-head move fails, persisted state diverges from the engine across
+    restarts and the admin caller sees only an opaque dropped-channel error.
+    The PR now logs an explicit divergence error at the failure site; the
+    reply channels still cannot carry the failure to the caller.
+  - First/most-recent pass: Claude pass 13 (2026-09-01T04:00Z).
+  - Why unaddressed: changing the reply types is an API change across the
+    command enum, handle, and admin RPC — beyond a review-loop fix. The
+    explicit error log is the in-scope mitigation.
+  - Suggested Linear title: "chain-orchestrator: propagate head-persistence failures to UpdateFcsHead/RevertToL1Block callers"
+
+- **Integration test for the batch-reconciliation cancellation site**
+  (`crates/chain-orchestrator/src/lib.rs` batch-reconciliation arm,
+  `crates/node/tests/sync.rs`)
+  - Impact/evidence: Claude pass 13 g2 — of the cancellation sites only the
+    batch-reconciliation one sits on the routine derivation path, and it is
+    the only head-moving site without a dedicated test; a false positive
+    there would silently degrade block production on every batch.
+  - First/most-recent pass: Claude pass 13 (2026-09-01T04:00Z).
+  - Why unaddressed: deterministically holding a payload job open across a
+    batch commit needs L1 derivation traffic plus an in-flight build in one
+    fixture; none of the existing tests drive both, and building that
+    scaffolding is beyond the review loop. The site shares
+    `cancel_payload_building_job` with the six tested sites, and the head
+    snapshot logic it wraps is exercised by the settlement table test.
+  - Suggested Linear title: "rollup-node: integration test for payload-job cancellation during batch reconciliation"
+
+- **Ancestor-walk DB reads block the poll tick**
+  (`crates/node/src/add_ons/remote_block_source.rs`, `init_last_imported_block`)
+  - Impact/evidence: Claude pass 13 m6 — the synchronous `block_hash` reads
+    moved from launch onto the poll tick when resume-point derivation became
+    lazy; normally 1–2 iterations, but a deep rewind can hold the add-on's
+    task for up to `MAX_ANCESTOR_LOOKBACK` reads.
+  - First/most-recent pass: Claude pass 13 (2026-09-01T04:00Z).
+  - Why unaddressed: the add-on runs on its own spawned task, not the
+    orchestrator loop, so the stall is self-contained; moving the walk onto
+    `spawn_blocking` touches the provider's Send/lifetime bounds for a rare
+    path. Low severity per the review.
+  - Suggested Linear title: "rollup-node: move the remote source's ancestor walk off the async poll tick"
+
 - **Docker lane can hang to the 90-minute SIGKILL with no nextest summary**
   (`.github/workflows/test.yaml`, integration-docker-compose)
   - Impact/evidence: Claude pass flag — no `.config/nextest.toml`, so no

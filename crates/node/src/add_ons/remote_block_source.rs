@@ -110,8 +110,13 @@ enum SettleAction {
     /// The head moved past the expected height for another reason; the owed
     /// build is moot.
     Superseded,
-    /// The settlement budget is exhausted; abandon the build and resume
-    /// imports.
+    /// The local head rewound below the owed build's parent (reorg or
+    /// administrative rewind): the resume pointer is stale — drop the debt
+    /// and re-derive the common ancestor.
+    Resync,
+    /// The settlement budget is exhausted; abandon the build, re-derive the
+    /// resume pointer (an outcome that never arrived leaves it unreliable),
+    /// and resume imports.
     Abandon,
     /// An observed cancellation proves the job is gone; a re-issue is
     /// race-free.
@@ -122,8 +127,9 @@ enum SettleAction {
 
 /// Decides how to settle an owed build. Ordering is load-bearing:
 /// - the head checks come first (an outcome that already materialized must never be re-issued — see
-///   the `PayloadBuildingJobCancelled` contract note about the post-finalization emission sites),
-///   and
+///   the `PayloadBuildingJobCancelled` contract note about the post-finalization emission sites;
+///   and a rewound head proves the resume pointer is stale, so re-issuing against it would build
+///   unreachable heights), and
 /// - the budget check precedes the re-issue so repeated cancellations (e.g. payload creation
 ///   failing every time) cannot re-issue forever.
 const fn settlement_decision(
@@ -137,6 +143,11 @@ const fn settlement_decision(
     }
     if head > expected {
         return SettleAction::Superseded;
+    }
+    // head < expected. A build in flight sits on expected - 1; anything lower
+    // means the local head rewound and the resume pointer is stale.
+    if head.saturating_add(1) < expected {
+        return SettleAction::Resync;
     }
     if retries >= MAX_PENDING_BUILD_RETRIES {
         return SettleAction::Abandon;
@@ -627,6 +638,17 @@ where
                 self.clear_pending_build();
                 Ok(())
             }
+            SettleAction::Resync => {
+                tracing::warn!(
+                    target: "scroll::remote_source",
+                    head,
+                    expected,
+                    "Local head rewound below the owed build's parent; re-deriving the resume point"
+                );
+                self.clear_pending_build();
+                self.last_imported_block = None;
+                Ok(())
+            }
             SettleAction::Abandon => {
                 self.builds_abandoned += 1;
                 tracing::error!(
@@ -635,9 +657,11 @@ where
                     builds_abandoned = self.builds_abandoned,
                     last_imported,
                     head,
-                    "Giving up on settling an owed build; resuming imports"
+                    "Giving up on settling an owed build; re-deriving the resume point and \
+                     resuming imports"
                 );
                 self.clear_pending_build();
+                self.last_imported_block = None;
                 Ok(())
             }
             SettleAction::Reissue => {
@@ -733,10 +757,7 @@ where
             // Import the block (this will cause a reorg if we had a locally built block at this
             // height)
             let chain_import = match self.orchestrator_handle.import_block(block_with_peer).await {
-                Ok(Ok(chain_import)) => {
-                    self.last_imported_block = Some(next_block_num);
-                    chain_import
-                }
+                Ok(Ok(chain_import)) => chain_import,
                 Ok(Err(e)) => {
                     return Err(eyre::eyre!("Import block failed: {}", e));
                 }
@@ -746,11 +767,23 @@ where
             };
 
             if !chain_import.result.is_valid() {
-                tracing::info!(target: "scroll::remote_source",
+                // The block was NOT applied (e.g. SYNCING: the EL does not
+                // know the parent — a reorg or an in-progress pipeline sync).
+                // Advancing the resume pointer would skip this block forever
+                // and the pointer itself is now unreliable: force a fresh
+                // common-ancestor walk on the next tick. Erroring out also
+                // routes the fault through the rate-limited sync-error logger.
+                tracing::warn!(target: "scroll::remote_source",
                     result = ?chain_import.result,
-                    "Imported block is not valid according to forkchoice, skipping build");
-                continue;
+                    next_block_num,
+                    "Imported block was not applied by forkchoice; re-deriving the resume point");
+                self.last_imported_block = None;
+                return Err(eyre::eyre!(
+                    "block {next_block_num} was not applied by forkchoice; re-deriving the \
+                     common ancestor"
+                ));
             }
+            self.last_imported_block = Some(next_block_num);
 
             if !self.config.build {
                 tracing::debug!(target: "scroll::remote_source", "Imported block is valid, but build is disabled, skipping build");
@@ -793,6 +826,10 @@ mod tests {
             // budget exhausted or a cancellation observed.
             (7, 6, false, 0, SettleAction::Superseded),
             (9, 6, true, MAX_PENDING_BUILD_RETRIES, SettleAction::Superseded),
+            // The head rewound below the owed build's parent: the resume
+            // pointer is stale — resync, regardless of other state.
+            (4, 6, false, 0, SettleAction::Resync),
+            (0, 6, true, MAX_PENDING_BUILD_RETRIES, SettleAction::Resync),
             // Budget exhausted before anything else resolves: abandon, even
             // when a cancellation was observed (repeated cancellations must
             // not re-issue forever).

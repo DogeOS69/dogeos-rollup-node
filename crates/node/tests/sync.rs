@@ -812,7 +812,7 @@ async fn test_manual_build_block_coalesces_with_timer_job() -> eyre::Result<()> 
         .with_memory_db()
         .auto_start(true)
         .block_time(100)
-        .payload_building_duration(8000)
+        .payload_building_duration(3000)
         .allow_empty_blocks(true)
         .build()
         .await?;
@@ -820,10 +820,11 @@ async fn test_manual_build_block_coalesces_with_timer_job() -> eyre::Result<()> 
     fixture.l1().sync().await?;
 
     // The timer's first slot fires once L1 sync lands and its job runs for
-    // 8s; with a 100ms slot interval a job is in flight essentially
-    // continuously, so a manual request at t=2s lands mid-job with wide
-    // margin even on a heavily loaded runner.
-    tokio::time::sleep(tokio::time::Duration::from_millis(2000)).await;
+    // 3s (comfortably inside the engine's ~12s payload-job deadline); with a
+    // 100ms slot interval a job is in flight essentially continuously, so a
+    // manual request at t=500ms lands mid-job with seconds of margin on both
+    // sides.
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
     fixture.sequencer().rollup_manager_handle.build_block();
 
     // The manual request coalesced with the timer's in-flight job.
@@ -850,14 +851,14 @@ async fn test_chain_import_cancels_inflight_payload_job() -> eyre::Result<()> {
 
     // Node under test: a long payload building job will be in flight. The
     // duration must outlast the import below (the cancelled job never
-    // completes) with generous margin for loaded runners, but stay inside
-    // the engine's payload-job TTL (~12s) — the follow-up build at the end
-    // shares this duration and its payload must still be retrievable when
-    // finalized.
+    // completes — FIFO command ordering means milliseconds) with generous
+    // margin for loaded runners, while staying well inside the engine's
+    // ~12s payload-job deadline, which the follow-up build at the end
+    // shares.
     let mut node_a = TestFixture::builder()
         .sequencer()
         .with_memory_db()
-        .payload_building_duration(8000)
+        .payload_building_duration(3000)
         .allow_empty_blocks(true)
         .build()
         .await?;
@@ -913,17 +914,20 @@ async fn test_update_fcs_head_cancels_inflight_payload_job() -> eyre::Result<()>
     let mut fixture = TestFixture::builder()
         .sequencer()
         .with_memory_db()
-        // Long enough to be mid-flight at the head update under load, short
-        // enough that the follow-up build's payload survives the engine's
-        // payload-job TTL (~12s).
-        .payload_building_duration(8000)
+        // Long enough to be mid-flight at the head update under load (FIFO
+        // ordering means milliseconds), short enough that the follow-up
+        // build's payload survives the engine's ~12s payload-job deadline.
+        .payload_building_duration(3000)
         .allow_empty_blocks(true)
         .build()
         .await?;
 
     fixture.l1().sync().await?;
 
+    // NOTE: get_block takes a NODE INDEX and returns that node's latest
+    // block — this is genesis only because nothing has been built yet.
     let genesis = fixture.get_block(0).await?;
+    eyre::ensure!(genesis.header.number == 0, "expected genesis to still be the head");
     let genesis_info = BlockInfo { number: genesis.header.number, hash: genesis.header.hash };
 
     // Advance the head to block 1 so the administrative update below
@@ -965,7 +969,7 @@ async fn test_disable_sequencing_cancels_inflight_payload_job() -> eyre::Result<
     let mut fixture = TestFixture::builder()
         .sequencer()
         .with_memory_db()
-        .payload_building_duration(8000)
+        .payload_building_duration(3000)
         .allow_empty_blocks(true)
         .build()
         .await?;
@@ -1000,7 +1004,7 @@ async fn test_revert_to_l1_block_cancels_inflight_payload_job() -> eyre::Result<
     let mut fixture = TestFixture::builder()
         .sequencer()
         .with_memory_db()
-        .payload_building_duration(8000)
+        .payload_building_duration(3000)
         .allow_empty_blocks(true)
         .build()
         .await?;
@@ -1016,6 +1020,39 @@ async fn test_revert_to_l1_block_cancels_inflight_payload_job() -> eyre::Result<
     fixture
         .expect_event()
         .where_event(|e| matches!(e, ChainOrchestratorEvent::PayloadBuildingJobCancelled))
+        .await?;
+
+    Ok(())
+}
+
+/// A build with an empty payload and empty blocks disabled is skipped, and
+/// the skip event carries the head it sat on — the identity the remote block
+/// source's outcome attribution rests on (issue #38 review).
+#[allow(clippy::large_stack_frames)]
+#[tokio::test]
+async fn test_block_building_skipped_carries_head_number() -> eyre::Result<()> {
+    reth_tracing::init_test_tracing();
+
+    let mut fixture = TestFixture::builder()
+        .sequencer()
+        .with_memory_db()
+        .allow_empty_blocks(false)
+        .build()
+        .await?;
+
+    fixture.l1().sync().await?;
+
+    // No transactions and no L1 messages: the payload is empty and the build
+    // is skipped at head 0.
+    fixture.sequencer().rollup_manager_handle.build_block();
+    fixture
+        .expect_event()
+        .where_event(|e| {
+            matches!(
+                e,
+                ChainOrchestratorEvent::BlockBuildingSkipped { head_block_number } if *head_block_number == 0
+            )
+        })
         .await?;
 
     Ok(())

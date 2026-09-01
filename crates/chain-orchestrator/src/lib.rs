@@ -416,8 +416,12 @@ impl<
                         .await
                     {
                         // Close the recording so the failed attempt does not
-                        // pollute the next slot's duration sample.
+                        // pollute the next slot's duration sample, and notify
+                        // like the BuildBlock path — the identity gates make a
+                        // spurious cancellation event harmless, and symmetry
+                        // keeps the metric and the event stream 1:1.
                         self.metric_handler.discard_block_building_recording();
+                        self.notify(ChainOrchestratorEvent::PayloadBuildingJobCancelled);
                         return Err(err.into());
                     }
                 }
@@ -576,12 +580,27 @@ impl<
                 // it would silently undo the update.
                 self.cancel_payload_building_job("administrative FCS head update");
 
-                self.database
+                if let Err(err) = self
+                    .database
                     .tx_mut(move |tx| async move {
                         tx.purge_l1_message_to_l2_block_mappings(Some(head.number + 1)).await?;
                         tx.set_l2_head_block_number(head.number).await
                     })
-                    .await?;
+                    .await
+                {
+                    // The engine head is already at the new value but the
+                    // persisted head/mappings are not: state divergence that
+                    // survives a restart. Name it explicitly — the generic
+                    // command-error log line would hide it.
+                    tracing::error!(
+                        target: "scroll::chain_orchestrator",
+                        ?head,
+                        %err,
+                        "UpdateFcsHead persistence failed AFTER the engine head moved; \
+                         persisted head/mappings now diverge from the engine"
+                    );
+                    return Err(err.into());
+                }
 
                 // Add all reverted transactions to the transaction pool.
                 self.reinsert_txs_into_pool(reverted_transactions).await;
@@ -898,14 +917,18 @@ impl<
                 (None, Vec::new())
             };
 
-        // If the L1 reorg is before the origin of the inflight payload building job, cancel it.
-        if Some(l1_block_number) <
-            self.sequencer
-                .as_ref()
-                .and_then(|s| s.payload_building_job().map(|p| p.l1_origin()))
-                .flatten()
+        // If the inflight payload building job carries any L1 messages, cancel it: the unwind
+        // may have deleted messages the job depends on, and `l1_origin` records only the FIRST
+        // included message's L1 block, so a range comparison against it can miss messages from
+        // later L1 blocks in the same payload.
+        if self
+            .sequencer
+            .as_ref()
+            .and_then(|s| s.payload_building_job().map(|p| p.l1_origin()))
+            .flatten()
+            .is_some()
         {
-            self.cancel_payload_building_job("L1 reorg before the job's L1 origin");
+            self.cancel_payload_building_job("L1 reorg while the job carries L1 messages");
         }
 
         // TODO: Add retry logic
@@ -915,9 +938,8 @@ impl<
 
         // Cancel the inflight payload building job if the head has changed —
         // after the FCU so a failed update does not destroy a valid job (a
-        // job with L1 messages above the unwind point was already cancelled
-        // above). The single-task run loop means the job cannot complete in
-        // between.
+        // job carrying L1 messages was already cancelled above). The
+        // single-task run loop means the job cannot complete in between.
         if l2_head_block_info.is_some() {
             self.cancel_payload_building_job("L1 reorg moved the L2 head");
         }
@@ -1410,14 +1432,16 @@ impl<
             return Err(ChainOrchestratorError::InvalidBlock);
         }
 
-        // The head has moved: cancel any in-flight payload building job. Its
-        // attributes were fixed against the pre-import head, and finalizing it
-        // now would reorg the imported chain back out via a stale side chain
-        // (mirrors the cancellation in handle_l1_reorg). Done after the
-        // validity check so a rejected import does not discard a valid job;
-        // that is safe because the job future is polled only by the
-        // run_until_shutdown select arm, which is blocked while this handler
-        // runs — the job cannot complete in between.
+        // The head may have moved (and on a SYNCING result the engine's view
+        // is unknown): cancel any in-flight payload building job
+        // unconditionally once the import was not rejected. Its attributes
+        // were fixed against the pre-import head, and finalizing it now could
+        // reorg the imported chain back out via a stale side chain (mirrors
+        // the cancellation in handle_l1_reorg). Done after the invalid-check
+        // so a rejected import does not discard a valid job; that is safe
+        // because the job future is polled only by the run_until_shutdown
+        // select arm, which is blocked while this handler runs — the job
+        // cannot complete in between.
         self.cancel_payload_building_job("chain import moved the head");
 
         // If we were previously in L2 syncing mode and the FCS update resulted in a valid state, we

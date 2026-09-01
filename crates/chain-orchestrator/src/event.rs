@@ -106,8 +106,9 @@ pub enum ChainOrchestratorEvent {
     /// head moved under the job (chain import, batch reconciliation, administrative FCS
     /// head update, optimistic sync, or an L1 reorg that rewound the L2 head); an L1
     /// unwind (reorg or administrative revert); automatic sequencing was disabled; a
-    /// `BuildBlock` command failed to start a job (including when no sequencer is
-    /// configured — a permanent misconfiguration, not a transient cancellation); payload
+    /// `BuildBlock` command or a timer slot failed to start a job (including when no
+    /// sequencer is configured — a permanent misconfiguration, not a transient
+    /// cancellation); payload
     /// finalization failed; or post-finalization persistence/signing failed. CAUTION for
     /// consumers: on the two post-finalization sites the block WAS built and the FCS head
     /// has already advanced — re-check the head before re-issuing a build, or a duplicate

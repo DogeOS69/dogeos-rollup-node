@@ -1398,6 +1398,36 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_remote_source_zero_poll_interval_fails() {
+        let config = ScrollRollupNodeConfig {
+            test_args: TestArgs::default(),
+            sequencer_args: SequencerArgs { sequencer_enabled: true, ..Default::default() },
+            signer_args: SignerArgs::default(),
+            database_args: RollupNodeDatabaseArgs::default(),
+            engine_driver_args: EngineDriverArgs::default(),
+            chain_orchestrator_args: ChainOrchestratorArgs::default(),
+            l1_provider_args: L1ProviderArgs::default(),
+            blob_provider_args: BlobProviderArgs::default(),
+            network_args: RollupNodeNetworkArgs::default(),
+            gas_price_oracle_args: RollupNodeGasPriceOracleArgs::default(),
+            consensus_args: ConsensusArgs::noop(),
+            database: None,
+            rpc_args: RpcArgs::default(),
+            pprof_args: PprofArgs::default(),
+            remote_block_source_args: RemoteBlockSourceArgs {
+                enabled: true,
+                url: Some("http://localhost:8545".parse().unwrap()),
+                poll_interval_ms: 0,
+                build: true,
+            },
+            require_l1_data_fee_buffer: false,
+        };
+
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("remote-source.poll-interval-ms must be greater than 0"), "{err}");
+    }
+
+    #[test]
     fn test_validate_sequencer_enabled_with_both_signers_fails() {
         let config = ScrollRollupNodeConfig {
             test_args: TestArgs::default(),

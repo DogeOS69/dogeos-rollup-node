@@ -39,6 +39,9 @@ where
     /// `None` until the remote has been reached once and the highest common
     /// block determined — construction must not depend on the remote being up
     /// (issue #38): a connection error at startup used to abort the whole node.
+    /// Also reset to `None` whenever it can no longer be trusted (settlement's
+    /// `Resync`/`Abandon` outcomes, and an import the engine did not apply),
+    /// forcing a fresh common-ancestor walk on the next tick.
     last_imported_block: Option<u64>,
     /// The sequencer's payload building duration (milliseconds), used to size
     /// the build-outcome wait budget.
@@ -46,17 +49,21 @@ where
     /// Number of consecutive failed poll ticks, reported in the error logs.
     consecutive_failures: u64,
     /// Whether a requested build is still owed its outcome. Set before a
-    /// `BuildBlock` command and cleared once the outcome arrives (or the
-    /// settlement gives up). While set, `settle_owed_build` runs before any
-    /// import: it re-issues the build once its cancellation has been
-    /// *observed* (`pending_build_cancelled`), keeps waiting while the job
-    /// may still be in flight, and gives up after
+    /// `BuildBlock` command and cleared when the outcome arrives, when the
+    /// head proves the debt moot (`Superseded`/`Resync` clear it with no
+    /// outcome ever observed), or when the settlement gives up. While set,
+    /// `settle_owed_build` runs before any import: it re-issues the build
+    /// once its cancellation has been *observed* (`pending_build_cancelled`)
+    /// and the fresh head check plus retry budget allow it, keeps waiting
+    /// while the job may still be in flight, and gives up after
     /// [`MAX_PENDING_BUILD_RETRIES`] settlement attempts.
     pending_build: bool,
     /// Whether the owed build's cancellation has been observed
     /// (`PayloadBuildingJobCancelled` consumed). Only then is re-issuing
     /// race-free — the job is provably gone and, with a single build
-    /// requester, nothing else can have started one.
+    /// requester, nothing else can have started one. Necessary but not
+    /// sufficient: the settlement's head checks and retry budget still gate
+    /// the actual re-issue.
     pending_build_cancelled: bool,
     /// Consecutive settlement attempts for the owed build. Bounded so an
     /// outcome that never arrives does not head-of-line-block imports
@@ -408,6 +415,17 @@ where
                             // Keep last_error_log: clearing it on success
                             // would let an alternating success/failure pattern
                             // log at full poll cadence.
+                            if self.suppressed_errors > 0 {
+                                // Without this, a fault that appeared and
+                                // cleared entirely inside one suppression
+                                // window would leave zero trace.
+                                tracing::warn!(
+                                    target: "scroll::remote_source",
+                                    suppressed_errors = self.suppressed_errors,
+                                    "Recovered; some rate-limited sync errors were never logged"
+                                );
+                                self.suppressed_errors = 0;
+                            }
                             self.consecutive_failures = 0;
                         }
                         Err(e) => {
@@ -664,7 +682,14 @@ where
                 );
                 self.clear_pending_build();
                 self.last_imported_block = None;
-                Ok(())
+                // Err (not Ok) so the run loop's failure accounting sees the
+                // abandon: an Ok here would reset consecutive_failures on the
+                // very tick that gave up, understating a permanent
+                // build-failure loop to anyone watching the logs.
+                Err(eyre::eyre!(
+                    "gave up settling the owed build for block {expected} after \
+                     {MAX_PENDING_BUILD_RETRIES} settlement attempts; re-deriving the resume point"
+                ))
             }
             SettleAction::Reissue => {
                 self.pending_build_retries += 1;

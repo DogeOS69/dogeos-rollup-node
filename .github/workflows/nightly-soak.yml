@@ -24,8 +24,9 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  # Queue rather than cancel: a cancelled soak does not satisfy if: failure(),
-  # so its result would vanish without any signal.
+  # Queue rather than cancel: a concurrency-cancelled soak would post a
+  # misleading mid-soak cancellation report and drown the signal of the run
+  # that superseded it.
   cancel-in-progress: false
 
 # The failure-report steps comment on an issue; everything else is read-only.
@@ -55,7 +56,7 @@ jobs:
       - name: Build test binaries
         run: |
           cargo nextest run --all-features --workspace --locked --no-run \
-            -E 'test(test_should_consolidate_after_optimistic_sync) or test(coalesces_with) or test(cancels_inflight_payload_job)'
+            -E 'test(test_should_consolidate_after_optimistic_sync) or test(coalesces_with) or test(cancels_inflight_payload_job) or test(remote_source_node_launches_when_remote_unreachable) or test(block_building_skipped_carries_head_number)'
       - name: Soak timing-sensitive integration tests (idle)
         id: soak
         env:
@@ -67,22 +68,31 @@ jobs:
           [[ "$ITERATIONS" =~ ^[1-9][0-9]*$ ]] || { echo "::error::iterations must be a positive integer"; exit 1; }
           for i in $(seq "$ITERATIONS"); do
             echo "::group::idle iteration $i/$ITERATIONS"
-            # Same filter as the loaded job so a loaded-only failure is
+            # Superset of the loaded job's filter (this lane also soaks the
+            # coalescing tests, whose in-flight-job precondition deliberate
+            # contention can defeat), so a loaded-only failure is still
             # distinguishable from a plain regression. Single-threaded so the
             # tests' internal timing budgets are not compounded by peer load.
             cargo nextest run --all-features --workspace --locked --test-threads=1 \
-              -E 'test(test_should_consolidate_after_optimistic_sync) or test(coalesces_with) or test(cancels_inflight_payload_job)'
+              --no-tests=fail -E 'test(test_should_consolidate_after_optimistic_sync) or test(coalesces_with) or test(cancels_inflight_payload_job) or test(remote_source_node_launches_when_remote_unreachable) or test(block_building_skipped_carries_head_number)'
             echo "::endgroup::"
           done
       - name: Report failure on the tracking issue
-        # Only a soak failure is a race regression; setup/toolchain failures
-        # must not be reported as one.
-        if: failure() && steps.soak.outcome == 'failure'
+        # A soak failure is a race regression; a cancelled soak step (the
+        # job's 90-minute timeout — the likeliest shape of a reintroduced
+        # hang/livelock — or a manual cancellation) must also leave a signal,
+        # and failure() alone misses it because a timeout cancels the job.
+        # Setup/toolchain failures still must not be reported as regressions.
+        if: always() && (steps.soak.outcome == 'failure' || steps.soak.outcome == 'cancelled')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh issue comment 38 --repo "$GITHUB_REPOSITORY" --body \
-            "nightly-soak job **${{ github.job }}** failed: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} — a failure here is a regression of a race fixed in #45."
+          if [ "${{ steps.soak.outcome }}" = "cancelled" ]; then
+            body="nightly-soak job **${{ github.job }}** was cancelled mid-soak (job timeout — possible hang/livelock regression or capacity problem — or a manual cancellation): ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          else
+            body="nightly-soak job **${{ github.job }}** failed: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} — a failure here is a regression of a race fixed in #45."
+          fi
+          gh issue comment 38 --repo "$GITHUB_REPOSITORY" --body "$body"
 
   soak-integration-loaded:
     runs-on: blacksmith-8vcpu-ubuntu-2404
@@ -102,7 +112,7 @@ jobs:
       - name: Build test binaries
         run: |
           cargo nextest run --all-features --workspace --locked --no-run \
-            -E 'test(test_should_consolidate_after_optimistic_sync) or test(coalesces_with) or test(cancels_inflight_payload_job)'
+            -E 'test(test_should_consolidate_after_optimistic_sync) or test(coalesces_with) or test(cancels_inflight_payload_job) or test(remote_source_node_launches_when_remote_unreachable) or test(block_building_skipped_carries_head_number)'
       - name: Soak timing-sensitive integration tests (under CPU contention)
         id: soak
         env:
@@ -122,21 +132,31 @@ jobs:
           for c in $(seq 4); do yes > /dev/null & done
           for i in $(seq "$ITERATIONS"); do
             echo "::group::loaded iteration $i/$ITERATIONS"
-            # Also soak the wall-clock-sensitive tests this fix introduced:
-            # the two coalescing tests and the four cancellation tests.
+            # Also soak the wall-clock-sensitive tests this fix introduced —
+            # except the coalescing tests: their "a timer job is already in
+            # flight" precondition is a capacity assumption that four CPU
+            # spinners can legitimately defeat, and a false failure here would
+            # be auto-reported as a race regression. The idle job soaks them.
             cargo nextest run --all-features --workspace --locked --test-threads=1 \
-              -E 'test(test_should_consolidate_after_optimistic_sync) or test(coalesces_with) or test(cancels_inflight_payload_job)'
+              --no-tests=fail -E 'test(test_should_consolidate_after_optimistic_sync) or test(cancels_inflight_payload_job) or test(remote_source_node_launches_when_remote_unreachable) or test(block_building_skipped_carries_head_number)'
             echo "::endgroup::"
           done
       - name: Report failure on the tracking issue
-        # Only a soak failure is a race regression; setup/toolchain failures
-        # must not be reported as one.
-        if: failure() && steps.soak.outcome == 'failure'
+        # A soak failure is a race regression; a cancelled soak step (the
+        # job's 90-minute timeout — the likeliest shape of a reintroduced
+        # hang/livelock — or a manual cancellation) must also leave a signal,
+        # and failure() alone misses it because a timeout cancels the job.
+        # Setup/toolchain failures still must not be reported as regressions.
+        if: always() && (steps.soak.outcome == 'failure' || steps.soak.outcome == 'cancelled')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh issue comment 38 --repo "$GITHUB_REPOSITORY" --body \
-            "nightly-soak job **${{ github.job }}** failed: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} — a failure here is a regression of a race fixed in #45."
+          if [ "${{ steps.soak.outcome }}" = "cancelled" ]; then
+            body="nightly-soak job **${{ github.job }}** was cancelled mid-soak (job timeout — possible hang/livelock regression or capacity problem — or a manual cancellation): ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          else
+            body="nightly-soak job **${{ github.job }}** failed: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} — a failure here is a regression of a race fixed in #45."
+          fi
+          gh issue comment 38 --repo "$GITHUB_REPOSITORY" --body "$body"
 
   soak-docker-remote-source:
     runs-on: blacksmith-8vcpu-ubuntu-2404
@@ -167,21 +187,29 @@ jobs:
         id: soak
         run: |
           set -euo pipefail
-          # Deliberately NO --no-tests=pass: if a rename ever empties the
-          # filter, this guard must fail loudly instead of soaking nothing.
+          # --no-tests=fail (nextest's default, pinned explicitly since the
+          # install action is unpinned): if a rename ever empties the filter,
+          # this guard must fail loudly instead of soaking nothing.
           for i in 1 2 3; do
             echo "::group::docker iteration $i/3"
-            cargo nextest run --all-features --workspace --locked \
+            cargo nextest run --all-features --workspace --locked --no-tests=fail \
               -E 'test(docker_test_remote_block_source)' \
               --test-threads=1 --failure-output immediate --success-output never
             echo "::endgroup::"
           done
       - name: Report failure on the tracking issue
-        # Only a soak failure is a race regression; setup/toolchain failures
-        # must not be reported as one.
-        if: failure() && steps.soak.outcome == 'failure'
+        # A soak failure is a race regression; a cancelled soak step (the
+        # job's 90-minute timeout — the likeliest shape of a reintroduced
+        # hang/livelock — or a manual cancellation) must also leave a signal,
+        # and failure() alone misses it because a timeout cancels the job.
+        # Setup/toolchain failures still must not be reported as regressions.
+        if: always() && (steps.soak.outcome == 'failure' || steps.soak.outcome == 'cancelled')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh issue comment 38 --repo "$GITHUB_REPOSITORY" --body \
-            "nightly-soak job **${{ github.job }}** failed: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} — a failure here is a regression of a race fixed in #45."
+          if [ "${{ steps.soak.outcome }}" = "cancelled" ]; then
+            body="nightly-soak job **${{ github.job }}** was cancelled mid-soak (job timeout — possible hang/livelock regression or capacity problem — or a manual cancellation): ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          else
+            body="nightly-soak job **${{ github.job }}** failed: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} — a failure here is a regression of a race fixed in #45."
+          fi
+          gh issue comment 38 --repo "$GITHUB_REPOSITORY" --body "$body"

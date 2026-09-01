@@ -106,9 +106,10 @@ from every pass is either fixed in the PR or recorded here.
     (chain import, UpdateFcsHead, disable sequencing, RevertToL1Block) and
     they are the administrative ones. Untested: batch reconciliation (the
     routine derivation path — a false positive silently degrades block
-    production on every batch), the L1-reorg head move, and optimistic sync
-    including the pass-14 `!result.is_invalid()` guard, which nothing would
-    catch if inverted or dropped. These are the branches where a stale job
+    production on every batch), the L1-reorg head move, the L1-reorg
+    carries-L1-messages guard, and optimistic sync including the pass-14
+    `!result.is_invalid()` guard, which nothing would catch if inverted or
+    dropped. These are the branches where a stale job
     finalizing reorgs a derived/synced chain back out.
   - First/most-recent pass: Claude pass 13 (2026-09-01T04:00Z); Claude
     pass 15 (2026-09-01T07:30Z).
@@ -163,6 +164,20 @@ from every pass is either fixed in the PR or recorded here.
     fixture does not currently expose, and this test was already soaked
     60/60 as-is.
   - Suggested Linear title: "rollup-node: replace blind sleeps in the optimistic-sync consolidation test with observable preconditions"
+
+- **`PayloadBuildingJobStarted` event to make the coalescing tests' precondition observable**
+  (`crates/chain-orchestrator/src/lib.rs` start sites, `crates/node/tests/sync.rs` coalescing tests)
+  - Impact/evidence: Claude pass 17 item 6 — both coalescing tests encode "a
+    job is already in flight" as a wall-clock sleep. The in-scope mitigation
+    was to drop them from the loaded soak lane (contention can legitimately
+    defeat the precondition and auto-file a false race regression); a
+    started-event notified at the two `start_payload_building` success sites
+    would remove the sleeps and let both tests run under load.
+  - First/most-recent pass: Claude pass 17 (2026-09-01T08:40Z).
+  - Why unaddressed: new production event surface in a stabilization PR; the
+    reviewer left it as the orchestrator's call and the lane filter closes
+    the false-report path.
+  - Suggested Linear title: "chain-orchestrator: emit PayloadBuildingJobStarted so coalescing tests can await an in-flight job"
 
 - **Docker lane can hang to the 90-minute SIGKILL with no nextest summary**
   (`.github/workflows/test.yaml`, integration-docker-compose)

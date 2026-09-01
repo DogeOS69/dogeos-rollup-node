@@ -996,6 +996,11 @@ async fn test_disable_sequencing_cancels_inflight_payload_job() -> eyre::Result<
 
     fixture.l1().sync().await?;
 
+    // Prove the sequencer actually builds before relying on a fire-and-forget
+    // command: without this the test could pass via the start-failure
+    // cancellation event with no job ever in flight.
+    fixture.build_block().expect_block_number(1).build_and_await_block().await?;
+
     // Start a long build, then disable sequencing while it is in flight (the
     // command channel is FIFO, so the disable is processed after the build
     // command).
@@ -1031,11 +1036,19 @@ async fn test_revert_to_l1_block_cancels_inflight_payload_job() -> eyre::Result<
 
     fixture.l1().sync().await?;
 
-    // Start a long build, then revert the L1 view while it is in flight. The
-    // cancellation happens before any fallible unwind work, so the event is
-    // asserted regardless of the revert's own outcome.
+    // Prove the sequencer actually builds before relying on a fire-and-forget
+    // command: without this the test could pass via the start-failure
+    // cancellation event with no job ever in flight.
+    fixture.build_block().expect_block_number(1).build_and_await_block().await?;
+
+    // Start a long build, then revert the L1 view while it is in flight (the
+    // command channel is FIFO, so the revert is processed after the build
+    // command). The `?` proves the revert command was fully processed — a
+    // dropped reply channel would mean the handler bailed early; the
+    // cancellation itself happens before any fallible unwind work, so the
+    // event does not depend on the unwind's outcome.
     fixture.sequencer().rollup_manager_handle.build_block();
-    let _ = fixture.sequencer().rollup_manager_handle.revert_to_l1_block(0).await;
+    fixture.sequencer().rollup_manager_handle.revert_to_l1_block(0).await?;
 
     fixture
         .expect_event()

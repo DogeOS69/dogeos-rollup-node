@@ -111,9 +111,12 @@ pub enum ChainOrchestratorEvent {
     /// cancellation); payload
     /// finalization failed; or post-finalization persistence/signing failed. CAUTION for
     /// consumers: on the two post-finalization sites the block WAS built and the FCS head
-    /// has already advanced — re-check the head before re-issuing a build, or a duplicate
-    /// block one height up may be produced (the remote block source's settlement does its
-    /// head check first for exactly this reason).
+    /// has already advanced — and even a finalization-failure emission can follow a
+    /// committed head, because `finalize_payload_building` commits the head via
+    /// `update_fcs` and only then converts and validates the payload. Re-check the head
+    /// before re-issuing a build, or a duplicate block one height up may be produced (the
+    /// remote block source's settlement does its head check first for exactly this
+    /// reason).
     PayloadBuildingJobCancelled,
     /// A new block has been signed by the signer.
     SignedBlock {

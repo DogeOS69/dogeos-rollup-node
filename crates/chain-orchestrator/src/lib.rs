@@ -494,10 +494,10 @@ impl<
                 // (unsynced, or pending derivation work) is parked until the
                 // gate reopens — deliberately NOT rejected. Gates reopen (sync
                 // completes, derivation drains), after which the job is polled
-                // normally, and the gate-closing transitions that invalidate
-                // a job (optimistic sync, L1 reorg/unwind, sequencing
-                // disabled, chain import, batch reconciliation head moves)
-                // cancel it observably. A held derivation attempt keeps the
+                // normally, and the job-invalidating transitions
+                // (optimistic sync, L1 reorg/unwind, sequencing disabled,
+                // chain import, batch reconciliation head moves) cancel it
+                // observably. A held derivation attempt keeps the
                 // gate closed without cancelling; the parked job then simply
                 // resumes when the hold resolves (its head snapshot check
                 // cancels it if the head moved). Rejecting here instead was
@@ -573,6 +573,7 @@ impl<
                         self.engine.fcs().head_block_info().number,
                     )
                     .await?;
+                let previous_head = *self.engine.fcs().head_block_info();
                 self.engine.update_fcs(Some(head), None, None).await?;
 
                 // The head was moved administratively: an in-flight payload
@@ -588,21 +589,38 @@ impl<
                     })
                     .await
                 {
-                    // The engine head is already at the new value but the
-                    // persisted head/mappings are not: state divergence that
-                    // survives a restart. Name it explicitly — the generic
-                    // command-error log line would hide it.
+                    // The engine head moved but the persisted head/mappings
+                    // did not. Left as-is, a restart re-derives the head from
+                    // the persisted (old, higher) number and re-canonicalizes
+                    // exactly the blocks this command was asked to revert —
+                    // so compensate by putting the engine head back, making
+                    // engine and persisted state agree on the OLD head.
                     tracing::error!(
                         target: "scroll::chain_orchestrator",
                         ?head,
                         %err,
-                        "UpdateFcsHead persistence failed AFTER the engine head moved; \
-                         persisted head/mappings now diverge from the engine"
+                        "UpdateFcsHead persistence failed after the engine head moved; \
+                         rolling the engine head back to keep state convergent"
                     );
+                    if let Err(rollback_err) =
+                        self.engine.update_fcs(Some(previous_head), None, None).await
+                    {
+                        tracing::error!(
+                            target: "scroll::chain_orchestrator",
+                            ?previous_head,
+                            %rollback_err,
+                            "rolling the engine head back after the persistence failure \
+                             also failed; engine and persisted state remain diverged \
+                             until restart"
+                        );
+                    }
                     return Err(err.into());
                 }
 
-                // Add all reverted transactions to the transaction pool.
+                // Add all reverted transactions to the transaction pool. Done
+                // only after persistence succeeds: on the failure path above
+                // the head is rolled back, the reverted blocks stay canonical,
+                // and their transactions must not re-enter the pool.
                 self.reinsert_txs_into_pool(reverted_transactions).await;
                 self.notify(ChainOrchestratorEvent::FcsHeadUpdated(head));
                 let _ = sender.send(());

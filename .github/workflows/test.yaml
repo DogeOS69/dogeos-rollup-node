@@ -52,10 +52,11 @@ jobs:
           echo "ANVIL_BIN=$ANVIL_BIN" >> "$GITHUB_ENV"
       - name: Run integration tests
         run: |
-          # No --no-tests=pass: a rename emptying the filter must fail loudly,
-          # not exit green having run nothing.
+          # --no-tests=fail (nextest's default, pinned explicitly since the
+          # install action is unpinned): a rename emptying the filter must
+          # fail loudly, not exit green having run nothing.
           cargo nextest run --all-features --workspace --locked --no-fail-fast \
-            -E 'kind(test) and not test(docker)' \
+            --no-tests=fail -E 'kind(test) and not test(docker)' \
             -- --skip test_should_consolidate_to_block_15k
 
   integration-docker-compose:
@@ -85,10 +86,11 @@ jobs:
           fi
       - name: Run Docker Compose integration tests
         run: |
-          # No --no-tests=pass: a rename emptying the filter must fail loudly,
-          # not exit green having run nothing.
+          # --no-tests=fail (nextest's default, pinned explicitly since the
+          # install action is unpinned): a rename emptying the filter must
+          # fail loudly, not exit green having run nothing.
           cargo nextest run --all-features --workspace --locked --no-fail-fast \
-            -E 'test(docker)' --test-threads=1 \
+            --no-tests=fail -E 'test(docker)' --test-threads=1 \
             --failure-output immediate \
             --success-output never \
             --verbose

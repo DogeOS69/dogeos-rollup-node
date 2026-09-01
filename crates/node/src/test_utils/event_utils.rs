@@ -259,7 +259,10 @@ impl<'a> EventWaiter<'a> {
                     if predicate(&event) {
                         node_matched_events.push(event.clone());
                         if node_matched_events.len() >= count {
-                            return Ok(matched_events.clone());
+                            // The events live in node_matched_events; the
+                            // match arm below assigns them. Returning a value
+                            // here would hand back the previous node's list.
+                            return Ok(());
                         }
                     }
                 }

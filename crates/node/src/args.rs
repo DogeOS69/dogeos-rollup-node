@@ -334,9 +334,8 @@ impl ScrollRollupNodeConfig {
                 .await
                 .expect("failed to perform migration");
         } else {
-            // We can re use the dev migration for custom chains as data source and data hash are
-            // None for both. We overwrite the default genesis hash from ScrollDevMigrationInfo to
-            // match the custom chain.
+            // We can re-use the dev migration for custom chains as data source and data hash are
+            // None for both. The generic genesis normalization below replaces its seed.
             // This is a workaround due to the fact that sea orm migrations are static.
             // See https://github.com/scroll-tech/rollup-node/issues/297 for more details.
             scroll_migration::Migrator::<scroll_migration::ScrollDevMigrationInfo>::up(
@@ -345,14 +344,22 @@ impl ScrollRollupNodeConfig {
             )
             .await
             .expect("failed to perform migration (custom chain)");
+        }
 
-            // insert the custom chain genesis hash into the database
+        // Static migrations may carry an older development genesis, and custom chains reuse the
+        // development migration. Before any batch has advanced the safe frontier, canonicalize
+        // the single database genesis row to the Engine chain spec. This prevents startup
+        // recovery from treating two initialization defaults as a real same-height fork.
+        let (database_safe, _) = db.get_latest_safe_l2_info().await?;
+        if database_safe.number == 0 {
             let genesis_hash = chain_spec.genesis_hash();
-            db.insert_genesis_block(genesis_hash)
-                .await
-                .expect("failed to insert genesis block (custom chain)");
-
-            tracing::info!(target: "scroll::node::args", ?genesis_hash, "Overwriting genesis hash for custom chain");
+            db.insert_genesis_block(genesis_hash).await?;
+            tracing::info!(
+                target: "scroll::node::args",
+                ?genesis_hash,
+                previous_genesis_hash = ?database_safe.hash,
+                "Canonicalized database genesis from chain spec"
+            );
         }
 
         let chain_spec_fcs = || {

@@ -912,7 +912,7 @@ mod test {
     use rollup_node_primitives::{
         BatchCommitData, BatchInfo, BlockInfo, L1MessageEnvelope, L2BlockInfoWithL1Messages,
     };
-    use sea_orm::EntityTrait;
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 
     #[tokio::test]
     async fn test_database_round_trip_batch_commit() {
@@ -1392,6 +1392,22 @@ mod test {
         // Should return the highest safe block (block 201)
         let latest_safe = db.get_latest_safe_l2_info().await.unwrap();
         assert_eq!(latest_safe, (safe_block_2, batch_info));
+    }
+
+    #[tokio::test]
+    async fn insert_genesis_block_replaces_the_migration_seed() {
+        let db = setup_test_db().await;
+        let canonical_hash = B256::repeat_byte(0x42);
+
+        db.insert_genesis_block(canonical_hash).await.unwrap();
+
+        let genesis_rows = models::l2_block::Entity::find()
+            .filter(models::l2_block::Column::BlockNumber.eq(0))
+            .all(db.inner().get_connection())
+            .await
+            .unwrap();
+        assert_eq!(genesis_rows.len(), 1);
+        assert_eq!(genesis_rows[0].block_info(), BlockInfo::new(0, canonical_hash));
     }
 
     #[tokio::test]

@@ -160,7 +160,7 @@ pub trait DatabaseWriteOperations {
         batch_info: BatchInfo,
     ) -> Result<(), DatabaseError>;
 
-    /// Insert the genesis block into the database.
+    /// Replace the database genesis row with the canonical genesis hash.
     async fn insert_genesis_block(&self, genesis_hash: B256) -> Result<(), DatabaseError>;
 
     /// Update the executed L1 messages from the provided L2 blocks in the database.
@@ -799,6 +799,10 @@ impl<T: WriteConnectionProvider + ?Sized + Sync> DatabaseWriteOperations for T {
     }
 
     async fn insert_genesis_block(&self, genesis_hash: B256) -> Result<(), DatabaseError> {
+        models::l2_block::Entity::delete_many()
+            .filter(models::l2_block::Column::BlockNumber.eq(0))
+            .exec(self.get_connection())
+            .await?;
         let genesis_block = BlockInfo::new(0, genesis_hash);
         let genesis_batch = BatchInfo::new(0, B256::ZERO);
         self.insert_blocks(vec![genesis_block], genesis_batch).await

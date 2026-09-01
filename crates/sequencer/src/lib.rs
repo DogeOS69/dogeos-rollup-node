@@ -192,14 +192,16 @@ where
         } else {
             tracing::info!(target: "rollup_node::sequencer", "Built payload with id {payload_id:?}, hash: {:#x}, number: {} containing {} transactions.", payload.block_hash, payload.block_number, payload.transactions.len());
             let block_info = BlockInfo { hash: payload.block_hash, number: payload.block_number };
-            let result = engine.update_fcs(Some(block_info), None, None).await?;
+            // update_fcs_checked commits the FCS mirror only on VALID —
+            // plain update_fcs would advance it on SYNCING too, leaving
+            // status and every subsequent build based on a block the EL
+            // never adopted.
+            let result = engine.update_fcs_checked(Some(block_info), None, None).await?;
             if !result.is_valid() {
-                // The engine refused (INVALID: mirror not committed, head
-                // unchanged) or has not applied (SYNCING — which cannot
-                // legitimately happen for a payload this engine just built)
-                // the forkchoice for its own block. Proceeding would sign and
-                // gossip a block the EL rejected and mark its L1 messages
-                // consumed.
+                // INVALID, or SYNCING (which cannot legitimately happen for a
+                // payload this engine just built): nothing committed, head
+                // unchanged. Proceeding would sign and gossip a block the EL
+                // rejected and mark its L1 messages consumed.
                 return Err(SequencerError::FcuNotValid);
             }
             let expected_hash = payload.block_hash;

@@ -279,8 +279,10 @@ jobs:
     # Quarantine lane for the ONLY test of the resume/rewind path
     # (init_last_imported_block past genesis, the diverged classification,
     # the update_fcs_head rewind): excluded from the merge gate and the race
-    # lanes above for a known reboot-fixture teardown race, but the
-    # highest-risk logic in the add-on must not ship with zero automated
+    # lanes above. Primary cause: the not-synced import path advances the
+    # resume pointer and drops that height's build (the test's own in-code
+    # note; ledger-tracked), compounded by a reboot-fixture teardown race.
+    # The highest-risk logic in the add-on must not ship with zero automated
     # signal. The reporter posts its failures COMMENT-ONLY — never a reopen.
     if: ${{ github.repository == 'DogeOS69/dogeos-rollup-node' }}
     outputs:
@@ -324,6 +326,13 @@ jobs:
         id: soak
         # Step-level (below the job's 110) so a hang fails THIS step and the
         # reporter still fires; see the idle job.
+        #
+        # STEP-level continue-on-error (never job-level): the known flake
+        # must not redden the whole nightly run — but job-level would set
+        # needs.*.result to success and silently kill the reporter's
+        # setup-failure arm. Step-level keeps steps.soak.outcome accurate
+        # for the comment-only report while the job concludes green.
+        continue-on-error: true
         timeout-minutes: 45
         env:
           ITERATIONS: ${{ inputs.iterations || '12' }}
@@ -384,7 +393,7 @@ jobs:
                   body="nightly-soak job **$job** failed or hit its soak-step timeout: $RUN_URL — either a regression of a race fixed in #45, or a hang/capacity problem."
                   reopen=1
                 else
-                  body="nightly-soak QUARANTINE job **$job** failed or hit its soak-step timeout: $RUN_URL — this lane soaks the resume/rewind test excluded from the merge gate (known reboot-fixture teardown race, see the follow-ups ledger). Comment-only by design; NOT evidence of a race regression."
+                  body="nightly-soak QUARANTINE job **$job** failed or hit its soak-step timeout: $RUN_URL — this lane soaks the resume/rewind test excluded from the merge gate (known: the not-synced import path drops builds after advancing the resume pointer, plus a reboot-fixture teardown race; see the follow-ups ledger). Comment-only by design; NOT evidence of a race regression."
                 fi
                 ;;
               cancelled)

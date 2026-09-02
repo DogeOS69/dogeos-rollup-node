@@ -543,7 +543,13 @@ impl<T: WriteConnectionProvider + ?Sized + Sync> DatabaseWriteOperations for T {
                 .one(self.get_connection())
                 .await?
                 .map(|block| block.block_info())
-                .expect("Finalized batch must have at least one L2 block.");
+                // Reachable (not a code bug): delete_batch_revert_gt_block_number
+                // restores un-reverted batches to `Consolidated` even when a
+                // batch was never consolidated and so has no blocks; the
+                // widened marker filter would then replay this on every
+                // finalized notification — an error the caller can surface,
+                // never a panic loop.
+                .ok_or(DatabaseError::FinalizedBatchWithoutBlocks(batch.index as u64))?;
             models::batch_commit::Entity::update_many()
                 .filter(transition_filter)
                 .col_expr(

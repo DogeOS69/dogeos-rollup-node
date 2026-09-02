@@ -963,6 +963,11 @@ async fn test_chain_import_cancels_inflight_payload_job() -> eyre::Result<()> {
     node_a.l1().sync().await?;
     node_b.l1().sync().await?;
 
+    // Build B's block BEFORE starting A's job: it plays no part in A's
+    // in-flight job, and building it after would burn up to ~2.5s of the 3s
+    // job budget on a loaded runner before the import even lands.
+    let block = node_b.build_block().expect_block_number(1).build_and_await_block().await?;
+
     // Start a long build on A, then import B's block 1 while it is in
     // flight. No sleep is needed: the command channel is FIFO, so the import
     // is processed after the build command.
@@ -979,7 +984,6 @@ async fn test_chain_import_cancels_inflight_payload_job() -> eyre::Result<()> {
         .where_event(|e| matches!(e, ChainOrchestratorEvent::BuildBlockCoalesced))
         .await?;
 
-    let block = node_b.build_block().expect_block_number(1).build_and_await_block().await?;
     node_a
         .sequencer()
         .rollup_manager_handle

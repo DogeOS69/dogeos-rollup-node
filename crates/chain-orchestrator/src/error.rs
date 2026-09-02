@@ -26,6 +26,14 @@ pub enum ChainOrchestratorError {
     /// on would keep serving from divergent state.
     #[error("fatal state divergence: {0}")]
     FatalStateDivergence(&'static str),
+    /// A consolidation block fetch failed (transport error or a block
+    /// temporarily missing from the L2 client). Nothing was purged and no
+    /// durable state moved; `consolidate_chain_with_retry` retries these in
+    /// place, and only a persistent failure reaches the callers' fatal
+    /// escalation — with this cause preserved instead of a generic
+    /// `InvalidBlock`.
+    #[error("chain consolidation block fetch failed: {0}")]
+    ConsolidationFetchFailed(Box<Self>),
     /// The engine did not apply a forkchoice update. Which verdict raises
     /// it differs by site: at the `UpdateFcsHead` site both INVALID and
     /// SYNCING raise it (nothing has been mutated and the refusal is

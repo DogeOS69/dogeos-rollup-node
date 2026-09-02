@@ -462,7 +462,9 @@ impl DatabaseWriteOperations for Database {
         metered!(
             DatabaseOperation::DeleteMismatchedGenesisBlocks,
             self,
-            tx_mut(move |tx| async move { tx.delete_mismatched_genesis_blocks(genesis_hash).await })
+            tx_mut(
+                move |tx| async move { tx.delete_mismatched_genesis_blocks(genesis_hash).await }
+            )
         )
     }
 

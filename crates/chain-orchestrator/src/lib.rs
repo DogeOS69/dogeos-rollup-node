@@ -941,8 +941,31 @@ impl<
                 let finalized = *self.engine.fcs().finalized_block_info();
                 let mirror_head = *self.engine.fcs().head_block_info();
                 let mirror_safe = *self.engine.fcs().safe_block_info();
-                let persisted_head_number = self.database.get_l2_head_block_number().await?;
-                let (persisted_safe, _) = self.database.get_latest_safe_l2_info().await?;
+                // A failed read is RETRYABLE, not divergence — the same
+                // rationale as the head lookup below: the unwind is durably
+                // committed and nothing has been issued to the engine yet,
+                // so momentary database contention must refuse, not
+                // fail-stop.
+                let (persisted_head_number, persisted_safe) = match (
+                    self.database.get_l2_head_block_number().await,
+                    self.database.get_latest_safe_l2_info().await,
+                ) {
+                    (Ok(head_number), Ok((safe, _))) => (head_number, safe),
+                    outcome => {
+                        tracing::warn!(
+                            target: "scroll::chain_orchestrator",
+                            ?outcome,
+                            "Administrative unwind could not read the persisted head/safe; \
+                             refusing (retryable)"
+                        );
+                        self.l1_watcher.revert_to_l1_block(block_number);
+                        if matches!(held_outcome, HeldReorgOutcome::Survived { .. }) {
+                            self.derivation_driver.schedule_fresh_reconciliation();
+                        }
+                        let _ = tx.send(false);
+                        return Ok(());
+                    }
+                };
                 // Symmetric with handle_l1_reorg: a persisted head below the
                 // FINALIZED L2 block is irreconcilable once the unwind is
                 // durable (the L1-domain pre-latch check cannot rule this
@@ -1249,12 +1272,14 @@ impl<
                 tracing::info!(target: "scroll::chain_orchestrator", "L1 is now synced");
                 self.sync_state.l1_mut().set_synced();
                 if self.sync_state.is_synced() {
-                    // A consolidation failure here has already purged the
-                    // L1-message mappings and the sync state is flipped:
-                    // running on would sequence nothing (pool never opens)
-                    // while reporting healthy. Nothing re-runs consolidation.
-                    if let Err(err) = metered!(Task::ChainConsolidation, self, consolidate_chain())
-                    {
+                    // A consolidation failure that reaches this arm has
+                    // already purged the L1-message mappings (validation
+                    // failure) or failed a database write, and the sync
+                    // state is flipped: running on would sequence nothing
+                    // (pool never opens) while reporting healthy — nothing
+                    // re-runs consolidation. Transient fetch failures do NOT
+                    // get here: the retry wrapper handles those in place.
+                    if let Err(err) = self.consolidate_chain_with_retry().await {
                         tracing::error!(
                             target: "scroll::chain_orchestrator",
                             %err,
@@ -1805,8 +1830,9 @@ impl<
             // refusal — and the fatal arms below would fail-stop every
             // synced node on the same L1 event. A clamp that fires indicates
             // an L1-side violation: log it loudly and keep the fatal arms
-            // for transport errors and INVALID, the only constructible
-            // failures after clamping.
+            // for transport errors and INVALID — the only constructible
+            // failures once BOTH clamps (the finalized floor here and the
+            // head drag below) are applied.
             let finalized = *self.engine.fcs().finalized_block_info();
             let safe_target = if safe_block_info.number >= finalized.number {
                 safe_block_info
@@ -1820,6 +1846,15 @@ impl<
                 );
                 finalized
             };
+            // Preserve head >= safe (mirrors the L1-reorg and admin-unwind
+            // sites): the DB-absolute safe can exceed the mirror head after
+            // an administrative head update (which does not delete l2_block
+            // rows), and an undragged target would trip a LOCAL
+            // HeadBelowSafe refusal that the fatal arms below turn into a
+            // node-killing fail-stop on a routine L1 event.
+            let mirror_head = *self.engine.fcs().head_block_info();
+            let safe_target =
+                if safe_target.number > mirror_head.number { mirror_head } else { safe_target };
             effective_safe_head = safe_target;
             tracing::info!(target: "scroll::chain_orchestrator", ?safe_target, "Updating safe head to block after batch revert");
             // Deliberately UNCHECKED (see the finalized-head FCU in the L1
@@ -2271,8 +2306,9 @@ impl<
             // the chain.
             if self.sync_state.is_synced() {
                 // See the Synced-notification arm: a failure here is not
-                // survivable-in-place.
-                if let Err(err) = self.consolidate_chain().await {
+                // survivable-in-place; transient fetch failures are retried
+                // in place by the wrapper and never reach the fatal arm.
+                if let Err(err) = self.consolidate_chain_with_retry().await {
                     tracing::error!(
                         target: "scroll::chain_orchestrator",
                         %err,
@@ -2338,6 +2374,35 @@ impl<
     ///
     /// This involves validating the L1 messages in the blocks against the expected L1 messages
     /// synced from L1.
+    /// Runs [`Self::consolidate_chain`], retrying fetch-shaped failures
+    /// (transport error, block temporarily missing from the L2 client) a
+    /// bounded number of times: a single RPC timeout must not ride the
+    /// callers' fatal escalation and fail-stop the node, while a persistent
+    /// failure still surfaces with its real cause. Retrying in place (rather
+    /// than re-entering L2 sync) matters for the lone-sequencer topology,
+    /// where nothing external would ever flip the L2 sync state back.
+    async fn consolidate_chain_with_retry(&mut self) -> Result<(), ChainOrchestratorError> {
+        const ATTEMPTS: u32 = 3;
+        let mut attempt = 1;
+        loop {
+            match metered!(Task::ChainConsolidation, self, consolidate_chain()) {
+                Err(err @ ChainOrchestratorError::ConsolidationFetchFailed(_))
+                    if attempt < ATTEMPTS =>
+                {
+                    tracing::warn!(
+                        target: "scroll::chain_orchestrator",
+                        %err,
+                        attempt,
+                        "Consolidation block fetch failed; retrying in place"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    attempt += 1;
+                }
+                other => return other,
+            }
+        }
+    }
+
     async fn consolidate_chain(&mut self) -> Result<(), ChainOrchestratorError> {
         tracing::trace!(target: "scroll::chain_orchestrator", fcs = ?self.engine.fcs(), "Consolidating chain from safe to head");
 
@@ -2367,8 +2432,12 @@ impl<
             let mut block_chunks = block_stream.try_chunks(BATCH_SIZE);
 
             while let Some(blocks_result) = block_chunks.next().await {
-                let blocks_to_validate =
-                    blocks_result.map_err(|_| ChainOrchestratorError::InvalidBlock)?;
+                let blocks_to_validate = blocks_result.map_err(|e| {
+                    // Preserve the real cause (RPC timeout, missing block)
+                    // instead of collapsing it into InvalidBlock — the
+                    // callers' fatal policy must not fire on a transient.
+                    ChainOrchestratorError::ConsolidationFetchFailed(Box::new(e.1))
+                })?;
 
                 if let Err(e) = self.validate_l1_messages(&blocks_to_validate).await {
                     tracing::error!(
@@ -3534,6 +3603,282 @@ mod run_loop_policy_tests {
             database.delete_mismatched_genesis_blocks(B256::ZERO).await.unwrap(),
             0,
             "reconciliation is idempotent"
+        );
+    }
+
+    /// Pins the pass-40 M2 check: a DB-derived finalized marker at the SAME
+    /// height as the engine mirror but with a DIFFERENT hash is divergence
+    /// at the finality boundary and must fail-stop, not trace-skip.
+    #[tokio::test]
+    async fn l1_finalization_marker_hash_divergence_fail_stops() {
+        let database = Arc::new(setup_test_db().await);
+        database.insert_genesis_block(B256::ZERO).await.unwrap();
+        // The dev migration seeded the Scroll dev genesis row beside the
+        // test genesis; drop it so height-0 queries are deterministic.
+        database.delete_mismatched_genesis_blocks(B256::ZERO).await.unwrap();
+        let batch_info = BatchInfo::new(1, B256::repeat_byte(1));
+        database
+            .insert_batch(BatchCommitData {
+                hash: batch_info.hash,
+                index: batch_info.index,
+                block_number: 10,
+                block_timestamp: 0,
+                calldata: Arc::new(Bytes::new()),
+                blob_versioned_hash: None,
+                finalized_block_number: None,
+                reverted_block_number: None,
+            })
+            .await
+            .unwrap();
+        database.update_batch_status(batch_info.hash, BatchStatus::Processing).await.unwrap();
+        let finalized_batch = BatchInfo::new(2, B256::repeat_byte(2));
+        database
+            .insert_batch(BatchCommitData {
+                hash: finalized_batch.hash,
+                index: finalized_batch.index,
+                block_number: 6,
+                block_timestamp: 0,
+                calldata: Arc::new(Bytes::new()),
+                blob_versioned_hash: None,
+                finalized_block_number: Some(6),
+                reverted_block_number: None,
+            })
+            .await
+            .unwrap();
+        database.insert_blocks(vec![info(50, 0x22)], finalized_batch).await.unwrap();
+        // insert_batch deliberately discards the struct's
+        // finalized_block_number; set it through the real finalization API.
+        database.finalize_batches_up_to_index(2, 6).await.unwrap();
+        database.update_batch_status(finalized_batch.hash, BatchStatus::Finalized).await.unwrap();
+
+        let engine_client = Arc::new(ScriptedEngineClient::new());
+        script_syncing_hold_then_success(&engine_client);
+        let asserter = Asserter::new();
+        asserter.push_success(&Option::<()>::None);
+        asserter.push_success(&Option::<()>::None);
+        // The engine mirror's finalized block sits at the marker's height
+        // (50) with a DIFFERENT hash.
+        let (orchestrator, _handle, notification_tx) = test_orchestrator_with_fcs(
+            database.clone(),
+            engine_client.clone(),
+            asserter,
+            BatchDerivationResult {
+                attributes: vec![DerivedAttributes {
+                    block_number: SAFE + 1,
+                    attributes: ScrollPayloadAttributes::default(),
+                }],
+                batch_info,
+                skipped_l1_messages: vec![],
+                target_status: BatchStatus::Consolidated,
+            },
+            ForkchoiceState::new(info(SAFE, 0x11), info(SAFE, 0x11), info(50, 0x0f)),
+        )
+        .await;
+
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let run_task = tokio::spawn(orchestrator.run_until_shutdown(Box::pin(async move {
+            let _ = shutdown_rx.await;
+        })));
+
+        time::timeout(Duration::from_secs(2), async {
+            while engine_client.fork_choice_updated_calls() < 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first Engine SYNCING response must hold the batch");
+
+        notification_tx.send(Arc::new(L1Notification::Finalized(6))).await.unwrap();
+
+        let result = time::timeout(Duration::from_secs(5), run_task)
+            .await
+            .expect("a same-height different-hash marker must terminate the run loop")
+            .unwrap();
+        assert!(
+            matches!(result, Err(ChainOrchestratorError::FatalStateDivergence(_))),
+            "expected FatalStateDivergence, got {result:?}"
+        );
+    }
+
+    /// Pins the admin revert's safe-FCU branches: a SYNCING answer is a
+    /// retryable refusal (reply false, mirror uncommitted), the retry
+    /// reissues the SAME absolute target and converges on VALID, and a
+    /// converged third call needs no FCU. Also asserts WHAT was issued: the
+    /// genesis safe target the persisted state dictates.
+    #[tokio::test]
+    async fn admin_unwind_syncing_safe_fcu_refuses_then_converges() {
+        let database = Arc::new(setup_test_db().await);
+        database.insert_genesis_block(B256::ZERO).await.unwrap();
+        // The dev migration seeded the Scroll dev genesis row beside the
+        // test genesis; drop it so height-0 queries are deterministic.
+        database.delete_mismatched_genesis_blocks(B256::ZERO).await.unwrap();
+        let batch_info = BatchInfo::new(1, B256::repeat_byte(1));
+        database
+            .insert_batch(BatchCommitData {
+                hash: batch_info.hash,
+                index: batch_info.index,
+                block_number: 10,
+                block_timestamp: 0,
+                calldata: Arc::new(Bytes::new()),
+                blob_versioned_hash: None,
+                finalized_block_number: None,
+                reverted_block_number: None,
+            })
+            .await
+            .unwrap();
+        database.update_batch_status(batch_info.hash, BatchStatus::Processing).await.unwrap();
+        // Revert target 0 sits below batch 1's commit block, so the unwind
+        // discards the held batch (no reconciliation retry can race the
+        // scripted FCU queue) and the absolute safe falls to genesis.
+        database.set_l2_head_block_number(SAFE).await.unwrap();
+
+        let engine_client = Arc::new(ScriptedEngineClient::new());
+        engine_client
+            .push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Syncing, None)));
+        engine_client
+            .push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Syncing, None)));
+        let asserter = Asserter::new();
+        asserter.push_success(&Option::<()>::None);
+        asserter.push_success(&Option::<()>::None);
+        let (orchestrator, handle, _notification_tx) = test_orchestrator(
+            database.clone(),
+            engine_client.clone(),
+            asserter,
+            BatchDerivationResult {
+                attributes: vec![DerivedAttributes {
+                    block_number: SAFE + 1,
+                    attributes: ScrollPayloadAttributes::default(),
+                }],
+                batch_info,
+                skipped_l1_messages: vec![],
+                target_status: BatchStatus::Consolidated,
+            },
+        )
+        .await;
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let run_task = tokio::spawn(orchestrator.run_until_shutdown(Box::pin(async move {
+            let _ = shutdown_rx.await;
+        })));
+
+        time::timeout(Duration::from_secs(2), async {
+            while engine_client.fork_choice_updated_calls() < 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first Engine SYNCING response must hold the batch");
+
+        // SYNCING on the safe FCU: retryable refusal, mirror uncommitted.
+        let replied = handle.revert_to_l1_block(0).await.unwrap();
+        assert!(!replied, "SYNCING must be a retryable refusal");
+        assert_eq!(engine_client.fork_choice_updated_calls(), 2);
+        let issued = engine_client.fork_choice_updated_states();
+        assert_eq!(
+            issued[1].safe_block_hash,
+            B256::ZERO,
+            "the refused FCU must carry the persisted (genesis) safe target"
+        );
+        assert_eq!(
+            issued[1].head_block_hash,
+            B256::repeat_byte(0x11),
+            "the head must not move on a safe-only divergence"
+        );
+
+        // The retry reissues the SAME absolute target and converges.
+        engine_client
+            .push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Valid, None)));
+        let replied = handle.revert_to_l1_block(0).await.unwrap();
+        assert!(replied, "a VALID retry must succeed");
+        assert_eq!(engine_client.fork_choice_updated_calls(), 3);
+        assert_eq!(engine_client.fork_choice_updated_states()[2].safe_block_hash, B256::ZERO);
+
+        // Converged: no further FCU.
+        let replied = handle.revert_to_l1_block(0).await.unwrap();
+        assert!(replied, "a converged revert is a clean no-op success");
+        assert_eq!(engine_client.fork_choice_updated_calls(), 3);
+
+        let _ = shutdown_tx.send(());
+        assert!(run_task.await.unwrap().is_ok());
+    }
+
+    /// The INVALID counterpart: the engine actively rejects the safe target
+    /// after a durable unwind — the run loop must fail-stop via `FcuRejected`.
+    #[tokio::test]
+    async fn admin_unwind_invalid_safe_fcu_fail_stops() {
+        let database = Arc::new(setup_test_db().await);
+        database.insert_genesis_block(B256::ZERO).await.unwrap();
+        // The dev migration seeded the Scroll dev genesis row beside the
+        // test genesis; drop it so height-0 queries are deterministic.
+        database.delete_mismatched_genesis_blocks(B256::ZERO).await.unwrap();
+        let batch_info = BatchInfo::new(1, B256::repeat_byte(1));
+        database
+            .insert_batch(BatchCommitData {
+                hash: batch_info.hash,
+                index: batch_info.index,
+                block_number: 10,
+                block_timestamp: 0,
+                calldata: Arc::new(Bytes::new()),
+                blob_versioned_hash: None,
+                finalized_block_number: None,
+                reverted_block_number: None,
+            })
+            .await
+            .unwrap();
+        database.update_batch_status(batch_info.hash, BatchStatus::Processing).await.unwrap();
+        database.set_l2_head_block_number(SAFE).await.unwrap();
+
+        let engine_client = Arc::new(ScriptedEngineClient::new());
+        engine_client
+            .push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Syncing, None)));
+        engine_client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(
+            PayloadStatusEnum::Invalid { validation_error: "scripted".to_string() },
+            None,
+        )));
+        let asserter = Asserter::new();
+        asserter.push_success(&Option::<()>::None);
+        asserter.push_success(&Option::<()>::None);
+        let (orchestrator, handle, _notification_tx) = test_orchestrator(
+            database.clone(),
+            engine_client.clone(),
+            asserter,
+            BatchDerivationResult {
+                attributes: vec![DerivedAttributes {
+                    block_number: SAFE + 1,
+                    attributes: ScrollPayloadAttributes::default(),
+                }],
+                batch_info,
+                skipped_l1_messages: vec![],
+                target_status: BatchStatus::Consolidated,
+            },
+        )
+        .await;
+
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let run_task = tokio::spawn(orchestrator.run_until_shutdown(Box::pin(async move {
+            let _ = shutdown_rx.await;
+        })));
+
+        time::timeout(Duration::from_secs(2), async {
+            while engine_client.fork_choice_updated_calls() < 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first Engine SYNCING response must hold the batch");
+
+        // The reply channel is dropped by the fail-stop; ignore the error.
+        tokio::spawn(async move {
+            let _ = handle.revert_to_l1_block(0).await;
+        });
+
+        let result = time::timeout(Duration::from_secs(5), run_task)
+            .await
+            .expect("an INVALID admin safe FCU must terminate the run loop")
+            .unwrap();
+        assert!(
+            matches!(result, Err(ChainOrchestratorError::FcuRejected(_))),
+            "expected FcuRejected, got {result:?}"
         );
     }
 

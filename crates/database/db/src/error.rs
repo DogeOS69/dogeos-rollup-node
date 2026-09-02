@@ -19,6 +19,9 @@ pub enum DatabaseError {
     /// The L1 message was not found in database.
     #[error("L1 message at key [{0}] not found in database")]
     L1MessageNotFound(L1MessageKey),
+    /// A batch eligible for the finalized marker has no L2 blocks recorded.
+    #[error("batch (index {0}) is marker-eligible but has no L2 blocks recorded")]
+    FinalizedBatchWithoutBlocks(u64),
     /// Failed to commit the transaction to database.
     #[error("TXMut commit failed")]
     CommitFailed,

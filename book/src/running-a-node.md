@@ -371,7 +371,7 @@ This is the mode the docker test topology uses.
 |---|---|
 | `--remote-source.enabled` | Enable the remote block source add-on. |
 | `--remote-source.url <URL>` | The remote node's RPC endpoint. Must be `http` or `https`. |
-| `--remote-source.poll-interval-ms <MS>` | Poll cadence (must be > 0). |
+| `--remote-source.poll-interval-ms <MS>` | Poll cadence (must be > 0). Defaults to `100`. |
 | `--remote-source.build` | Build a local block on top of each imported block while the node is synced — imports made during startup or resynchronization skip the build (requires a configured sequencer). |
 
 Configuration is validated at launch (all rules below apply only when

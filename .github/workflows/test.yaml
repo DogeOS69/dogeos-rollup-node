@@ -79,8 +79,10 @@ jobs:
           # fail loudly, not exit green having run nothing. Both exclusions
           # live in the ONE filterset — not a trailing libtest --skip — so a
           # single mechanism owns them. The resume test is excluded for the
-          # same reason the nightly soak quarantines it (a known
-          # reboot-fixture teardown race — see the follow-ups ledger); a
+          # same reason the nightly soak quarantines it: the not-synced
+          # import path advances the resume pointer and drops that height's
+          # build (the test's own in-code note), compounded by a
+          # reboot-fixture teardown race — see the follow-ups ledger. A
           # known-racy test must not gate merges while issue #38 is being
           # closed.
           cargo nextest run --all-features --workspace --locked --no-fail-fast \

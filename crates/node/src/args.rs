@@ -439,10 +439,15 @@ impl ScrollRollupNodeConfig {
         // (re-)insert the real genesis — a no-op when the migration seeded
         // the right value.
         let genesis_hash = chain_spec.genesis_hash();
+        // One transaction for the delete AND the insert: a crash between
+        // them would leave l2_block with zero rows and panic
+        // get_latest_safe_l2_info's genesis expectation on the next query.
         let removed = db
-            .tx_mut(
-                move |tx| async move { tx.delete_mismatched_genesis_blocks(genesis_hash).await },
-            )
+            .tx_mut(move |tx| async move {
+                let removed = tx.delete_mismatched_genesis_blocks(genesis_hash).await?;
+                tx.insert_genesis_block(genesis_hash).await?;
+                Ok::<_, DatabaseError>(removed)
+            })
             .await
             .expect("failed to reconcile the genesis block");
         if removed > 0 {
@@ -453,7 +458,6 @@ impl ScrollRollupNodeConfig {
                 "Removed migration-seeded genesis rows that do not match the chain genesis"
             );
         }
-        db.insert_genesis_block(genesis_hash).await.expect("failed to insert genesis block");
 
         let chain_spec_fcs = || {
             ForkchoiceState::head_from_chain_spec(chain_spec.clone())

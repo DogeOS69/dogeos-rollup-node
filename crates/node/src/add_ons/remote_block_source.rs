@@ -1030,6 +1030,34 @@ where
                 // in-flight job. The remote is authoritative in this
                 // deployment shape; rewound derivation blocks are re-imported
                 // as the remote serves them.
+                // The guards above ran against a PRE-WALK snapshot, and the
+                // ancestor walk can take a long time (thousands of
+                // sequential remote RPCs). fcs.update has no
+                // head-monotonicity check, so a rewind decided on stale
+                // values could move the head FORWARD, re-canonicalizing
+                // blocks a concurrent revert or reorg removed. Re-read the
+                // head and safe immediately before the rewind: the remote
+                // source must only ever move the head DOWN.
+                let fresh = self
+                    .orchestrator_handle
+                    .status()
+                    .await
+                    .map_err(|e| self.classify_recv_error(e))?;
+                let fresh_head = fresh.l2.fcs.head_block_info().number;
+                let fresh_safe = fresh.l2.fcs.safe_block_info().number;
+                if resume < fresh_safe {
+                    return Err(eyre::eyre!(
+                        "common ancestor {resume} fell below the local safe head {fresh_safe} \
+                         while the ancestor walk ran; re-deriving next tick"
+                    ));
+                }
+                if fresh_head <= resume {
+                    return Err(eyre::eyre!(
+                        "local head moved to {fresh_head} (at or below the common ancestor \
+                         {resume}) while the ancestor walk ran; a rewind would move the head \
+                         forward — re-deriving next tick"
+                    ));
+                }
                 tracing::warn!(
                     target: "scroll::remote_source",
                     local_head,
@@ -1139,9 +1167,18 @@ where
                 .get_block_by_number(next_block_num.into())
                 .full()
                 .await?
-                .ok_or_else(|| eyre::eyre!("Block {} not found", next_block_num))?
-                .into_consensus()
-                .map_transactions(|tx| tx.inner.into_inner());
+                .ok_or_else(|| eyre::eyre!("Block {} not found", next_block_num))?;
+            // A load-balanced remote whose backend sits on another fork (or
+            // answers for the wrong height) must be caught BEFORE the import
+            // lands an FCU and the pointer advances on a block that was
+            // never the one requested.
+            eyre::ensure!(
+                block.header.number == next_block_num,
+                "remote returned block {} for request {}",
+                block.header.number,
+                next_block_num
+            );
+            let block = block.into_consensus().map_transactions(|tx| tx.inner.into_inner());
 
             // Create NewBlockWithPeer with dummy peer_id and signature (trusted source)
             let block_with_peer = NewBlockWithPeer {

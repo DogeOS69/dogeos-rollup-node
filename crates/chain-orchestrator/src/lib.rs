@@ -1011,7 +1011,11 @@ impl<
                 if safe_target.number > effective_head.number {
                     safe_target = effective_head;
                 }
-                let new_safe = (safe_target.number != mirror_safe.number).then_some(safe_target);
+                // Full-BlockInfo comparison: a same-height safe marker with
+                // a different hash is still divergence and must be reissued
+                // (the head comparison above is number-only of necessity —
+                // the persisted head is a bare number).
+                let new_safe = (safe_target != mirror_safe).then_some(safe_target);
                 if new_head.is_some() || new_safe.is_some() {
                     // Best-effort (see handle_l1_reorg): a collection failure
                     // must not abort the unwind — and on this admin path it
@@ -1788,7 +1792,11 @@ impl<
             })
             .await?;
 
-        // Update the forkchoice state to the new safe block.
+        // Update the forkchoice state to the new safe block. The emitted
+        // event carries what was actually ISSUED to the engine on the synced
+        // path (the clamped target), and the database's post-revert safe
+        // head when not synced (no FCU is issued then).
+        let mut effective_safe_head = safe_block_info;
         if self.sync_state.is_synced() {
             // Floor the target at the engine's finalized block (mirrors the
             // L1-reorg and admin-unwind sites): the revert range is not
@@ -1812,6 +1820,7 @@ impl<
                 );
                 finalized
             };
+            effective_safe_head = safe_target;
             tracing::info!(target: "scroll::chain_orchestrator", ?safe_target, "Updating safe head to block after batch revert");
             // Deliberately UNCHECKED (see the finalized-head FCU in the L1
             // finalization handler): the batch-revert database mutation is
@@ -1853,7 +1862,10 @@ impl<
             }
         }
 
-        Ok(Some(ChainOrchestratorEvent::BatchReverted { batch_info, safe_head: safe_block_info }))
+        Ok(Some(ChainOrchestratorEvent::BatchReverted {
+            batch_info,
+            safe_head: effective_safe_head,
+        }))
     }
 
     /// Handles an L1 message by inserting it into the database.
@@ -2682,6 +2694,9 @@ mod run_loop_policy_tests {
     async fn notification_waits_until_held_slot_and_pipeline_are_empty() {
         let database = Arc::new(setup_test_db().await);
         database.insert_genesis_block(B256::ZERO).await.unwrap();
+        // The dev migration seeded the Scroll dev genesis row beside the
+        // test genesis; drop it so height-0 queries are deterministic.
+        database.delete_mismatched_genesis_blocks(B256::ZERO).await.unwrap();
         database.set_processed_l1_block_number(5).await.unwrap();
         let batch_info = BatchInfo::new(1, B256::repeat_byte(1));
         database
@@ -2784,6 +2799,9 @@ mod run_loop_policy_tests {
     async fn queued_reorg_runs_after_consolidation_then_unwinds_it() {
         let database = Arc::new(setup_test_db().await);
         database.insert_genesis_block(B256::ZERO).await.unwrap();
+        // The dev migration seeded the Scroll dev genesis row beside the
+        // test genesis; drop it so height-0 queries are deterministic.
+        database.delete_mismatched_genesis_blocks(B256::ZERO).await.unwrap();
         let batch_info = BatchInfo::new(1, B256::repeat_byte(1));
         database
             .insert_batch(BatchCommitData {
@@ -2884,6 +2902,9 @@ mod run_loop_policy_tests {
     async fn l1_reorg_post_unwind_fcu_syncing_continues() {
         let database = Arc::new(setup_test_db().await);
         database.insert_genesis_block(B256::ZERO).await.unwrap();
+        // The dev migration seeded the Scroll dev genesis row beside the
+        // test genesis; drop it so height-0 queries are deterministic.
+        database.delete_mismatched_genesis_blocks(B256::ZERO).await.unwrap();
         let batch_info = BatchInfo::new(1, B256::repeat_byte(1));
         database
             .insert_batch(BatchCommitData {
@@ -2964,6 +2985,9 @@ mod run_loop_policy_tests {
     async fn l1_reorg_post_unwind_fcu_invalid_fail_stops() {
         let database = Arc::new(setup_test_db().await);
         database.insert_genesis_block(B256::ZERO).await.unwrap();
+        // The dev migration seeded the Scroll dev genesis row beside the
+        // test genesis; drop it so height-0 queries are deterministic.
+        database.delete_mismatched_genesis_blocks(B256::ZERO).await.unwrap();
         let batch_info = BatchInfo::new(1, B256::repeat_byte(1));
         database
             .insert_batch(BatchCommitData {
@@ -3038,6 +3062,9 @@ mod run_loop_policy_tests {
     async fn l1_finalization_replay_reissues_marker_fcu_once() {
         let database = Arc::new(setup_test_db().await);
         database.insert_genesis_block(B256::ZERO).await.unwrap();
+        // The dev migration seeded the Scroll dev genesis row beside the
+        // test genesis; drop it so height-0 queries are deterministic.
+        database.delete_mismatched_genesis_blocks(B256::ZERO).await.unwrap();
         let batch_info = BatchInfo::new(1, B256::repeat_byte(1));
         database
             .insert_batch(BatchCommitData {
@@ -3169,6 +3196,9 @@ mod run_loop_policy_tests {
     async fn l1_reorg_head_below_finalized_fail_stops() {
         let database = Arc::new(setup_test_db().await);
         database.insert_genesis_block(B256::ZERO).await.unwrap();
+        // The dev migration seeded the Scroll dev genesis row beside the
+        // test genesis; drop it so height-0 queries are deterministic.
+        database.delete_mismatched_genesis_blocks(B256::ZERO).await.unwrap();
         let batch_info = BatchInfo::new(1, B256::repeat_byte(1));
         database
             .insert_batch(BatchCommitData {
@@ -3245,6 +3275,9 @@ mod run_loop_policy_tests {
     async fn admin_unwind_persisted_head_below_finalized_fail_stops() {
         let database = Arc::new(setup_test_db().await);
         database.insert_genesis_block(B256::ZERO).await.unwrap();
+        // The dev migration seeded the Scroll dev genesis row beside the
+        // test genesis; drop it so height-0 queries are deterministic.
+        database.delete_mismatched_genesis_blocks(B256::ZERO).await.unwrap();
         let batch_info = BatchInfo::new(1, B256::repeat_byte(1));
         database
             .insert_batch(BatchCommitData {
@@ -3323,6 +3356,9 @@ mod run_loop_policy_tests {
     async fn admin_unwind_refusal_is_sticky_until_state_converges() {
         let database = Arc::new(setup_test_db().await);
         database.insert_genesis_block(B256::ZERO).await.unwrap();
+        // The dev migration seeded the Scroll dev genesis row beside the
+        // test genesis; drop it so height-0 queries are deterministic.
+        database.delete_mismatched_genesis_blocks(B256::ZERO).await.unwrap();
         let batch_info = BatchInfo::new(1, B256::repeat_byte(1));
         database
             .insert_batch(BatchCommitData {
@@ -3427,6 +3463,9 @@ mod run_loop_policy_tests {
     async fn finalize_consolidated_batches_recomputes_over_finalized_rows() {
         let database = Arc::new(setup_test_db().await);
         database.insert_genesis_block(B256::ZERO).await.unwrap();
+        // The dev migration seeded the Scroll dev genesis row beside the
+        // test genesis; drop it so height-0 queries are deterministic.
+        database.delete_mismatched_genesis_blocks(B256::ZERO).await.unwrap();
         // The genesis batch is marker-eligible, so the marker floor is the
         // genesis block even before any real batch finalizes (harmless in
         // production: it can never exceed the engine's finalized mirror).
@@ -3473,10 +3512,38 @@ mod run_loop_policy_tests {
         );
     }
 
+    /// The static dev migration seeds the Scroll dev genesis row; a custom
+    /// chain's real genesis is inserted separately and CANNOT overwrite it
+    /// (the insert's conflict key includes the hash). The startup
+    /// reconciliation must delete the mismatched row so highest-block
+    /// queries — the safe head among them — are deterministic.
+    #[tokio::test]
+    async fn mismatched_genesis_rows_are_reconciled() {
+        let database = Arc::new(setup_test_db().await);
+        // Two rows now sit at height 0: the migration's Scroll dev genesis
+        // and this "custom chain" genesis.
+        database.insert_genesis_block(B256::ZERO).await.unwrap();
+        assert_eq!(
+            database.delete_mismatched_genesis_blocks(B256::ZERO).await.unwrap(),
+            1,
+            "exactly the migration-seeded row must be removed"
+        );
+        let (safe, _) = database.get_latest_safe_l2_info().await.unwrap();
+        assert_eq!(safe, info(0, 0x00), "the chain's genesis must be the safe fallback");
+        assert_eq!(
+            database.delete_mismatched_genesis_blocks(B256::ZERO).await.unwrap(),
+            0,
+            "reconciliation is idempotent"
+        );
+    }
+
     #[tokio::test]
     async fn administrative_post_unwind_engine_failure_fail_stops_without_retry() {
         let database = Arc::new(setup_test_db().await);
         database.insert_genesis_block(B256::ZERO).await.unwrap();
+        // The dev migration seeded the Scroll dev genesis row beside the
+        // test genesis; drop it so height-0 queries are deterministic.
+        database.delete_mismatched_genesis_blocks(B256::ZERO).await.unwrap();
         let batch_info = BatchInfo::new(1, B256::repeat_byte(1));
         database
             .insert_batch(BatchCommitData {

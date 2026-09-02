@@ -427,15 +427,33 @@ impl ScrollRollupNodeConfig {
             )
             .await
             .expect("failed to perform migration (custom chain)");
-
-            // insert the custom chain genesis hash into the database
-            let genesis_hash = chain_spec.genesis_hash();
-            db.insert_genesis_block(genesis_hash)
-                .await
-                .expect("failed to insert genesis block (custom chain)");
-
-            tracing::info!(target: "scroll::node::args", ?genesis_hash, "Overwriting genesis hash for custom chain");
         }
+
+        // The static migrations seed a FIXED genesis row (the dev migration
+        // seeds upstream Scroll's dev genesis) which may not match this
+        // chain's actual genesis — and the insert below cannot overwrite it,
+        // because its conflict key includes the hash. A stale row shadows
+        // the real genesis nondeterministically in highest-block queries
+        // (the safe head reported by get_latest_safe_l2_info among them).
+        // Reconcile for EVERY chain: drop mismatched height-0 rows, then
+        // (re-)insert the real genesis — a no-op when the migration seeded
+        // the right value.
+        let genesis_hash = chain_spec.genesis_hash();
+        let removed = db
+            .tx_mut(
+                move |tx| async move { tx.delete_mismatched_genesis_blocks(genesis_hash).await },
+            )
+            .await
+            .expect("failed to reconcile the genesis block");
+        if removed > 0 {
+            tracing::warn!(
+                target: "scroll::node::args",
+                removed,
+                ?genesis_hash,
+                "Removed migration-seeded genesis rows that do not match the chain genesis"
+            );
+        }
+        db.insert_genesis_block(genesis_hash).await.expect("failed to insert genesis block");
 
         let chain_spec_fcs = || {
             ForkchoiceState::head_from_chain_spec(chain_spec.clone())

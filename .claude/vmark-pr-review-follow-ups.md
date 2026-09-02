@@ -346,6 +346,10 @@ from every pass is either fixed in the PR or recorded here.
   - Suggested Linear title: "rollup-node: remote block source liveness — typed import errors, resumable walk, sync-aware settlement"
 
 - **Not-synced import tick advances the resume pointer and drops that height's build**
+  (re-raised: Codex pass 40 P3, 2026-09-02 — the book's per-import build
+  promise was qualified in-loop to "while the node is synced"; actually
+  retaining the not-synced build debt remains this entry's open behavior
+  change.)
   (`crates/node/src/add_ons/remote_block_source.rs`, follow loop not-synced branch)
   - Impact/evidence: Claude pass 25 (production observation attached to M11)
     — when a tick imports a block while the node is not L1-synced, the

@@ -156,6 +156,17 @@ pub trait DatabaseWriteOperations {
     /// Insert the genesis block into the database.
     async fn insert_genesis_block(&self, genesis_hash: B256) -> Result<(), DatabaseError>;
 
+    /// Delete any genesis-height (block 0) rows whose hash does not match the chain's genesis
+    /// hash, returning how many were removed. The static dev migration seeds the Scroll dev
+    /// genesis row; on a custom chain the real genesis is inserted separately (the insert cannot
+    /// overwrite — its conflict key includes the hash), and the seeded row would otherwise shadow
+    /// the real one nondeterministically in highest-block queries such as
+    /// `get_latest_safe_l2_info`, presenting as a same-height different-hash safe divergence.
+    async fn delete_mismatched_genesis_blocks(
+        &self,
+        genesis_hash: B256,
+    ) -> Result<u64, DatabaseError>;
+
     /// Update the executed L1 messages from the provided L2 blocks in the database.
     async fn update_l1_messages_from_l2_blocks(
         &self,
@@ -766,6 +777,21 @@ impl<T: WriteConnectionProvider + ?Sized + Sync> DatabaseWriteOperations for T {
         let genesis_block = BlockInfo::new(0, genesis_hash);
         let genesis_batch = BatchInfo::new(0, B256::ZERO);
         self.insert_blocks(vec![genesis_block], genesis_batch).await
+    }
+
+    async fn delete_mismatched_genesis_blocks(
+        &self,
+        genesis_hash: B256,
+    ) -> Result<u64, DatabaseError> {
+        let result = models::l2_block::Entity::delete_many()
+            .filter(
+                Condition::all()
+                    .add(models::l2_block::Column::BlockNumber.eq(0i64))
+                    .add(models::l2_block::Column::BlockHash.ne(genesis_hash.to_vec())),
+            )
+            .exec(self.get_connection())
+            .await?;
+        Ok(result.rows_affected)
     }
 
     async fn update_l1_messages_from_l2_blocks(

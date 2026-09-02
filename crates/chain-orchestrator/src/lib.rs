@@ -392,9 +392,11 @@ impl<
                 Some(batch) = self.derivation_pipeline.next(), if self.derivation_driver.can_accept_batch() => {
                     self.derivation_driver.hold_batch(batch);
                 }
-                // Below every arm that does real work, so a background probe
-                // never preempts one. Gated so it costs nothing unless a latch
-                // is live.
+                // Below the derivation and command arms, so a background probe
+                // never preempts them. Network events and L1 notifications are
+                // polled BELOW this in the biased order — acceptable because the
+                // probe is a single forkchoice call and only runs while a latch
+                // is live, which is exactly when those two are gated anyway.
                 _ = l2_sync_recheck.tick(), if self.sync_state.l2().is_syncing() &&
                     self.l2_sync_recheck_target.is_some() =>
                 {
@@ -1235,7 +1237,6 @@ impl<
                         }
                     }
                     let result = self.engine.update_fcs_checked(new_head, new_safe, None).await?;
-                    self.l2_sync_recheck_failures = 0;
                     if result.is_invalid() {
                         // INVALID after a durable unwind: genuine divergence,
                         // fail-stops via the admin-unwind policy.
@@ -2250,7 +2251,14 @@ impl<
         // has not adopted. A transport error is not fatal here — this is an opportunistic probe,
         // and the next announcement retries it.
         let result = match self.engine.update_fcs_checked(Some(target), None, None).await {
-            Ok(result) => result,
+            Ok(result) => {
+                // Reset HERE: reaching the engine at all ends the consecutive
+                // run. Counting lifetime failures instead made every later
+                // single blip warn that the node is gated when it is not, with a
+                // monotonically growing count — destroying the signal entirely.
+                self.l2_sync_recheck_failures = 0;
+                result
+            }
             Err(err) => {
                 // While this probe keeps failing the node polls no L1 and
                 // sequences nothing — `l1_notification_receiver_may_poll` and
@@ -2321,6 +2329,13 @@ impl<
             "Execution node adopted the latched head; L2 is now synced"
         );
         self.l2_sync_recheck_target = None;
+        // Every other head-moving seam cancels, and `event.rs` documents that
+        // list as exhaustive. `BuildBlock` is deliberately NOT gated on sync
+        // state, so a job can be parked on the pre-recheck parent: left alive it
+        // would finalize a SIBLING at this height and, if the engine adopts it,
+        // reorg the imported head back out with no mapping purge, no transaction
+        // refill and no event.
+        self.cancel_payload_building_job("L2 sync recheck adopted a new head");
         self.sync_state.l2_mut().set_synced();
         if self.sync_state.is_synced() {
             // Fatal on failure, like BOTH sibling exits from sync mode: a
@@ -3368,6 +3383,11 @@ mod run_loop_policy_tests {
             let mut observed = Vec::new();
             while observed.len() < 2 {
                 match events.next().await {
+                    // A closed stream means the run loop exited: `poll_next` then
+                    // returns Ready(None) forever, so without this the loop spins
+                    // on a ready future and the enclosing timeout is never
+                    // re-polled — a hang instead of a failure.
+                    None => break,
                     Some(ChainOrchestratorEvent::BatchConsolidated(outcome))
                         if outcome.batch_info == batch_info =>
                     {
@@ -3554,7 +3574,8 @@ mod run_loop_policy_tests {
         let result = orchestrator.recheck_l2_sync_target().await;
         assert!(
             matches!(result, Err(ChainOrchestratorError::FatalStateDivergence(_))),
-            "an engine that rejects its own mirror head must fail-stop, not re-latch              the rejected block forever; got {result:?}"
+            "an engine that rejects its own mirror head must fail-stop, not re-latch \
+                         the rejected block forever; got {result:?}"
         );
     }
 

@@ -1287,3 +1287,74 @@ locally correct and has then exposed the next case. It now has five arms, an
 interval driver, six tests and a fail-stop. The wedge it closes is real, but the
 mechanism does not belong in a CI-stabilization PR on this evidence — it should
 be reviewed by a human, and probably split into its own change.
+
+## Pass 59 findings — resolution (Claude, 2026-09-02)
+
+Claude pass 59 returned 7 majors plus minors. Five majors FIXED; two recorded.
+
+- **F1 (FIXED)** The L2-sync recheck moved the engine head WITHOUT cancelling an
+  in-flight payload job — the only head-moving seam missing from a list
+  `event.rs` documents as exhaustive. `BuildBlock` is deliberately not gated on
+  sync state, so a job parked on the pre-recheck parent would finalize a SIBLING
+  at the new height and, if the engine adopted it, reorg the imported head back
+  out with no purge, no refill and no event.
+- **F3 (FIXED)** `l2_sync_recheck_failures` was a LIFETIME total. The pass-57
+  reset landed in the `RevertToL1Block` handler instead of the recheck — a
+  `replace(..., 1)` that hit the first textual match — so a normal node never
+  reset it, and after ~6 lifetime blips every later single failure warned that
+  the node was gated when it was not. That destroyed the exact signal pass 57
+  added. Reset now sits on the `Ok` arm: reaching the engine ends the run.
+- **F4 (FIXED)** Another event loop with no `None` arm, so a closed stream spins
+  on a ready future and its timeout is never re-polled. Same class as the seven
+  fixed in pass 53, in a PR whose purpose is removing CI hangs.
+- **F5 (FIXED)** The three startup refusals had ZERO coverage despite the
+  predicate having been corrected five times across this loop. Extracted
+  `startup_refusal` and table-tested it, including the `head == finalized`
+  boundary that a `<`/`<=` slip would break silently.
+- **F7 (FIXED)** The four cancellation tests allowed 2s probe + action + 2s wait
+  against a 3s job; a self-completing job early-returns with no event and reads
+  as a behavioural regression. Raised to 8000ms.
+  - NOTE: the blanket edit initially caught a FIFTH site — the coalescing test,
+    whose documented invariant is that its 3500ms pinger must EXCEED the payload
+    duration. Raising it to 8000 silently reinstated the exact bug pass 47 M5
+    fixed. Reverted to 3000ms; only the four cancellation tests were raised.
+
+- **Minors (FIXED)** Eight more malformed literals (fifth recurrence of this
+  class); the sequencer's only `error!` moved to the documented target; the probe
+  arm's biased-order comment corrected (network and L1 arms are below it); three
+  book/doc contradictions.
+
+### Recorded for a HUMAN decision, not fixed
+
+- **F2 — the admin-unwind "retryable" refusals.** Four arms reply `false`, reset
+  the watcher and return `Ok` AFTER `unwind_and_revalidate_held_batch` has
+  already committed: messages deleted, mappings purged, persisted head rewound.
+  The watcher then re-emits `Synced`, reopening the sequencer gate while the
+  engine head is still pre-unwind, and the purged messages read
+  `l2_block_number IS NULL` so they are re-selected into an out-of-order queue
+  every peer rejects. The identical failure in `handle_l1_reorg` is
+  `FatalStateDivergence` on the stated grounds that the unwind is already
+  committed.
+
+  This is NOT mechanical: refuse-rather-than-fail-stop was a deliberate pass-47
+  decision, and reversing it changes operator-facing behaviour on an admin
+  command. The reviewer verified a partial mitigation (the sequencer arm is also
+  gated on `!has_pending_derivation_work()`, so a reverted range containing
+  batches re-stamps before the gate opens; the hole is a range with none).
+  Options: make the arms fatal like their twins, or keep the refusal but skip
+  `l1_watcher.revert_to_l1_block(..)` so L1 stays latched Syncing.
+
+  The comment at that site claiming "Nothing durable has changed yet" is
+  factually wrong and is the reasoning the design rests on — it should be
+  corrected whichever way the decision goes.
+
+- **F6 — the finalized-marker query plan.** The pass-45 C1 subquery may force
+  `USE TEMP B-TREE FOR ORDER BY` on the finality hot path, inside
+  `handle_l1_finalized`'s write transaction, over a set that is never pruned.
+  Conditional on an `EXPLAIN QUERY PLAN` this loop has not run; if a temp B-tree
+  appears the fix is a correlated `EXISTS`, otherwise it is a comment fix.
+
+### Seventh consecutive pass on the L2-sync latch
+
+F1 and F3 are both in it. The standing recommendation is unchanged and
+strengthening: human review, and probably its own change.

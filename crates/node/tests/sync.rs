@@ -969,7 +969,7 @@ async fn test_chain_import_cancels_inflight_payload_job() -> eyre::Result<()> {
     let mut node_a = TestFixture::builder()
         .sequencer()
         .with_memory_db()
-        .payload_building_duration(3000)
+        .payload_building_duration(8000)
         .allow_empty_blocks(true)
         .build()
         .await?;
@@ -1063,7 +1063,7 @@ async fn test_update_fcs_head_cancels_inflight_payload_job() -> eyre::Result<()>
         // Long enough to be mid-flight at the head update under load (FIFO
         // ordering means milliseconds), short enough that the follow-up
         // build's payload survives the engine's ~12s payload-job deadline.
-        .payload_building_duration(3000)
+        .payload_building_duration(8000)
         .allow_empty_blocks(true)
         .build()
         .await?;
@@ -1147,7 +1147,7 @@ async fn test_disable_sequencing_cancels_inflight_payload_job() -> eyre::Result<
     let mut fixture = TestFixture::builder()
         .sequencer()
         .with_memory_db()
-        .payload_building_duration(3000)
+        .payload_building_duration(8000)
         .allow_empty_blocks(true)
         .build()
         .await?;
@@ -1217,7 +1217,7 @@ async fn test_revert_to_l1_block_cancels_inflight_payload_job() -> eyre::Result<
     let mut fixture = TestFixture::builder()
         .sequencer()
         .with_memory_db()
-        .payload_building_duration(3000)
+        .payload_building_duration(8000)
         .allow_empty_blocks(true)
         .build()
         .await?;

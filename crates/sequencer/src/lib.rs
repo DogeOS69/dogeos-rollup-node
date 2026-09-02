@@ -221,7 +221,7 @@ where
                 // so INVALID (genuine divergence) is distinguishable from
                 // SYNCING (transient) instead of a contentless error type.
                 tracing::error!(
-                    target: "scroll::sequencer",
+                    target: "rollup_node::sequencer",
                     ?block_info,
                     status = ?result.payload_status.status,
                     "Engine refused the freshly built block's forkchoice update"

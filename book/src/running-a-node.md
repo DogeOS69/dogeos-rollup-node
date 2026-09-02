@@ -100,7 +100,8 @@ Replace:
 
 #### L1 Provider Configuration
 
-- `--l1.url <URL>`: L1 Ethereum RPC endpoint URL (required for every node: the L1 watcher is started unconditionally)
+- `--l1.url <URL>`: L1 Ethereum RPC endpoint URL (required for every node, except a `--test` build compiled with the
+  `test-utils` feature, which substitutes a mock watcher)
 - `--l1.cups <NUMBER>`: Compute units per second for rate limiting (default: 10000)
 - `--l1.max-retries <NUMBER>`: Maximum retry attempts for L1 requests (default: 10)
 - `--l1.initial-backoff <MS>`: Initial backoff duration for retries in milliseconds (default: 100)
@@ -129,8 +130,8 @@ These can be used as reliable blob sources without requiring your own beacon nod
     - `system-contract` (default): Validates blocks against authorized signer from L1
     - `noop`: No consensus validation (testing only)
 - `--consensus.authorized-signer <ADDRESS>`: Static authorized signer address (when using
-  system-contract; `--l1.url` is required either way, so this only avoids the
-  extra L1 query)
+  system-contract; `--l1.url` is required either way, and the authorized signer
+  is queried from L1 regardless — this only pins a static fallback)
 
 #### Database Configuration
 

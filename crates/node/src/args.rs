@@ -579,48 +579,13 @@ impl ScrollRollupNodeConfig {
         // at 0 while the database knows a head above it, leaving every
         // safe-and-finalized guard vacuous for as long as it takes a finalized
         // notification to arrive. Refuse instead of starting in that state.
-        if l2_head_block_number > 0 {
-            // Both hypotheses in one message: a wiped or resynced execution-node
-            // datadir makes reth answer `null` for the safe and finalized tags,
-            // so it lands HERE rather than in the genesis arm below, and naming
-            // only reachability sends the operator after the wrong thing.
-            if provider_fcs_missing {
-                eyre::bail!(
-                    "could not read a usable forkchoice state from the L2 provider while the \
-                     database holds an L2 head at {l2_head_block_number}; refusing to start \
-                     with head, safe and finalized all at genesis. Either the execution node \
-                     is unreachable or not yet synced, or its datadir was wiped or resynced \
-                     while the rollup database was kept (resync both, or point at the matching \
-                     execution-node datadir)"
-                );
-            }
-            if fcs.is_genesis() {
-                eyre::bail!(
-                    "the L2 provider is at genesis while the database holds an L2 head at \
-                     {l2_head_block_number}; the execution node's datadir looks wiped or \
-                     resynced while the rollup database was kept (resync both, or point at \
-                     the matching execution-node datadir)"
-                );
-            }
-            // The database anchor BELOW the engine's finalized block is the
-            // state the run loop calls irreconcilable and fail-stops on
-            // (`handle_l1_reorg` and the administrative unwind both do), because
-            // `unwind()` commits the rewound head durably BEFORE those checks
-            // fire. Nothing here used to refuse it: the repair loop below is
-            // gated `while l2_head > finalized`, which is false in exactly this
-            // shape, so the node came up with the engine head above the anchor
-            // and the L1-message mappings above it already purged — and the next
-            // build re-selected consumed messages, producing a queue gap every
-            // peer rejects. Strict `<` keeps `head == finalized` launching.
-            if l2_head_block_number < fcs.finalized_block_info().number {
-                eyre::bail!(
-                    "the database L2 head {l2_head_block_number} is below the execution node's \
-                     finalized block {}; an unwind committed past finality and this cannot be \
-                     reconciled automatically (restore the database from before the unwind, or \
-                     resync this node)",
-                    fcs.finalized_block_info().number
-                );
-            }
+        if let Some(refusal) = startup_refusal(
+            l2_head_block_number,
+            provider_fcs_missing,
+            fcs.is_genesis(),
+            fcs.finalized_block_info().number,
+        ) {
+            eyre::bail!("{refusal}");
         }
 
         // Loop to find the latest block that we have in the EN and purge L1 message mappings to
@@ -1137,6 +1102,63 @@ impl std::fmt::Debug for RollupNodeNetworkArgs {
             .field("legacy_geth_header_transform", &self.legacy_geth_header_transform)
             .finish_non_exhaustive()
     }
+}
+
+/// Why this node must refuse to start, or `None` when it may proceed.
+///
+/// Extracted and table-tested because the predicate is one token wide in several places and this
+/// branch has been corrected repeatedly — flipping the final `<` to `<=` refuses every node whose
+/// anchor sits exactly at finality, and nothing else in the suite would notice.
+///
+/// - `provider_fcs_missing`: no usable forkchoice state could be read at all.
+/// - `fcs_is_genesis`: the provider answered, but from genesis.
+/// - all three refusals apply only when the database already knows a head above genesis; a fresh
+///   database must still bootstrap.
+fn startup_refusal(
+    l2_head_block_number: u64,
+    provider_fcs_missing: bool,
+    fcs_is_genesis: bool,
+    finalized: u64,
+) -> Option<String> {
+    if l2_head_block_number == 0 {
+        return None;
+    }
+    // Both hypotheses in one message: a wiped or resynced execution-node datadir makes reth answer
+    // `null` for the safe and finalized tags, so it lands HERE rather than in the genesis arm, and
+    // naming only reachability sends the operator after the wrong thing.
+    if provider_fcs_missing {
+        return Some(format!(
+            "could not read a usable forkchoice state from the L2 provider while the database \
+             holds an L2 head at {l2_head_block_number}; refusing to start with head, safe and \
+             finalized all at genesis. Either the execution node is unreachable or not yet \
+             synced, or its datadir was wiped or resynced while the rollup database was kept \
+             (resync both, or point at the matching execution-node datadir)"
+        ));
+    }
+    if fcs_is_genesis {
+        return Some(format!(
+            "the L2 provider is at genesis while the database holds an L2 head at \
+             {l2_head_block_number}; the execution node's datadir looks wiped or resynced while \
+             the rollup database was kept (resync both, or point at the matching execution-node \
+             datadir)"
+        ));
+    }
+    // The database anchor BELOW the engine's finalized block is the state the run loop calls
+    // irreconcilable and fail-stops on, because `unwind()` commits the rewound head durably BEFORE
+    // those checks fire. Nothing used to refuse it here: the repair loop is gated
+    // `while l2_head > finalized`, false in exactly this shape, so the node came up with the engine
+    // head above the anchor and the mappings above it already purged — and the next build
+    // re-selected consumed messages into a queue gap every peer rejects.
+    //
+    // Strict `<`: an anchor exactly AT finality is the ordinary steady state and must launch.
+    if l2_head_block_number < finalized {
+        return Some(format!(
+            "the database L2 head {l2_head_block_number} is below the execution node's finalized \
+             block {finalized}; an unwind committed past finality and this cannot be reconciled \
+             automatically (restore the database from before the unwind, or resync this node)"
+        ));
+    }
+    None
 }
 
 /// The arguments for the L1 provider.
@@ -1818,6 +1840,37 @@ mod tests {
             assert!(result
                 .unwrap_err()
                 .contains("sequencer.auto-start conflicts with remote-source.enabled"));
+        }
+    }
+
+    /// The startup refusals have been corrected repeatedly and had no coverage:
+    /// flipping the final `<` to `<=` refuses every node whose anchor sits
+    /// exactly at finality, and nothing else in the suite would notice.
+    #[test]
+    fn startup_refusal_table() {
+        // (l2_head, provider_missing, fcs_is_genesis, finalized) -> refuses?
+        let cases: &[(u64, bool, bool, u64, bool)] = &[
+            // A fresh database must bootstrap whatever the provider says.
+            (0, true, true, 0, false),
+            (0, false, true, 50, false),
+            // Populated, no usable forkchoice state.
+            (100, true, false, 0, true),
+            // Populated, provider answered from genesis.
+            (100, false, true, 0, true),
+            // Anchor below finality: an unwind committed past it.
+            (100, false, false, 140, true),
+            // BOUNDARY: an anchor exactly at finality is the steady state.
+            (100, false, false, 100, false),
+            // Anchor above finality is ordinary.
+            (100, false, false, 40, false),
+        ];
+        for (head, missing, genesis, finalized, want) in cases {
+            let got = startup_refusal(*head, *missing, *genesis, *finalized);
+            assert_eq!(
+                got.is_some(),
+                *want,
+                "startup_refusal({head}, {missing}, {genesis}, {finalized}) -> {got:?}"
+            );
         }
     }
 

@@ -71,10 +71,11 @@ where
     consecutive_gate_skips: u64,
     /// Number of consecutive failed poll ticks, reported in the error logs.
     consecutive_failures: u64,
-    /// Whether a requested build is still owed its outcome. Set before a
-    /// `BuildBlock` command and cleared when the outcome arrives, when the
-    /// head proves the debt moot (`Superseded`/`Resync` clear it with no
-    /// outcome ever observed), or when the settlement gives up. While set,
+    /// Whether a build is owed for the last imported block. Recorded at
+    /// IMPORT time (before any await — see `pending_build_issued`), released
+    /// by the deliberate not-synced gate skip, and otherwise cleared when
+    /// the outcome arrives, when the head proves the debt moot (`Superseded`/`Resync` clear it
+    /// with no outcome ever observed), or when the settlement gives up. While set,
     /// `settle_owed_build` runs before any import: it re-issues the build
     /// once its cancellation has been *observed* (`pending_build_cancelled`)
     /// and the fresh head check plus retry budget allow it, keeps waiting
@@ -807,8 +808,13 @@ where
 
     /// Settles a build owed from a previous tick without ever double-building.
     ///
-    /// `status()` flows through the same FIFO command channel as `BuildBlock`,
-    /// so once it returns, the owed command has been processed: the job either
+    /// (First branch: a debt recorded at import but never SENT is simply
+    /// issued — nothing was ever in flight, so no outcome is owed yet and no
+    /// budget is consumed.)
+    ///
+    /// For an ISSUED debt: `status()` flows through the same FIFO command
+    /// channel as `BuildBlock`, so once it returns, the owed command has
+    /// been processed: the job either
     /// landed (head advanced past the imported block), completed as a skipped
     /// empty build (head unchanged — only re-observing the event settles
     /// this case), was cancelled, or is still in flight. Only an *observed*

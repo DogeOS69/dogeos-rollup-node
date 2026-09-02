@@ -220,11 +220,8 @@ impl ScrollRollupNodeConfig {
             );
         }
 
-        if let Some(url) = self
-            .remote_block_source_args
-            .enabled
-            .then_some(())
-            .and(self.remote_block_source_args.url.as_ref())
+        if let (true, Some(url)) =
+            (self.remote_block_source_args.enabled, self.remote_block_source_args.url.as_ref())
         {
             // reqwest::Url happily parses ws:// or file://; the HTTP
             // transport would then fail every poll forever behind a
@@ -1476,6 +1473,41 @@ mod tests {
 
         let err = config.validate().unwrap_err();
         assert!(err.contains("remote-source.poll-interval-ms must be greater than 0"), "{err}");
+    }
+
+    #[test]
+    fn test_validate_remote_source_non_http_scheme_fails() {
+        let mut config = ScrollRollupNodeConfig {
+            test_args: TestArgs::default(),
+            sequencer_args: SequencerArgs { sequencer_enabled: true, ..Default::default() },
+            signer_args: SignerArgs::default(),
+            database_args: RollupNodeDatabaseArgs::default(),
+            engine_driver_args: EngineDriverArgs::default(),
+            chain_orchestrator_args: ChainOrchestratorArgs::default(),
+            l1_provider_args: L1ProviderArgs::default(),
+            blob_provider_args: BlobProviderArgs::default(),
+            network_args: RollupNodeNetworkArgs::default(),
+            gas_price_oracle_args: RollupNodeGasPriceOracleArgs::default(),
+            consensus_args: ConsensusArgs::noop(),
+            database: None,
+            rpc_args: RpcArgs::default(),
+            pprof_args: PprofArgs::default(),
+            remote_block_source_args: RemoteBlockSourceArgs {
+                enabled: true,
+                url: Some("ws://localhost:8545".parse().unwrap()),
+                poll_interval_ms: 100,
+                build: true,
+            },
+            require_l1_data_fee_buffer: false,
+        };
+
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("must use http or https"), "{err}");
+
+        // The same URL is ignored (warn only) when the add-on is disabled.
+        config.remote_block_source_args.enabled = false;
+        config.remote_block_source_args.build = false;
+        assert!(config.validate().is_ok());
     }
 
     #[test]

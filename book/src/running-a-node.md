@@ -374,8 +374,9 @@ This is the mode the docker test topology uses.
 | `--remote-source.poll-interval-ms <MS>` | Poll cadence (must be > 0). |
 | `--remote-source.build` | Build a local block on top of every imported block (requires a configured sequencer). |
 
-Configuration is validated at launch and the node refuses to start (with a
-clear message) when:
+Configuration is validated at launch (all rules below apply only when
+`--remote-source.enabled` is set) and a violation aborts startup — currently
+as a panic carrying the validation message — when:
 
 - `--remote-source.build` is set without `--sequencer.enabled` — no job
   could ever start, so every build request would fail.
@@ -387,5 +388,6 @@ clear message) when:
 
 Two further shapes only warn: remote-source flags set while
 `--remote-source.enabled` is off (they are ignored — a templated fleet
-layout stays valid), and `--sequencer.payload-building-duration` at or above
-reth's default 12s `--builder.deadline`.
+layout stays valid), and — with `--remote-source.build` —
+`--sequencer.payload-building-duration` at or above reth's default 12s
+`--builder.deadline`.

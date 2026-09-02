@@ -1140,6 +1140,22 @@ async fn test_disable_sequencing_cancels_inflight_payload_job() -> eyre::Result<
         .where_event(|e| matches!(e, ChainOrchestratorEvent::PayloadBuildingJobCancelled))
         .await?;
 
+    // The event alone is not the cancellation: a regression that emits it
+    // but leaves the 3s job in the slot would still sequence. Nothing may
+    // sequence within the job's remaining lifetime, and the head must still
+    // sit at the pre-built block 1.
+    let phantom = fixture
+        .expect_event()
+        .timeout(std::time::Duration::from_secs(5))
+        .label("no BlockSequenced after the cancelled job")
+        .where_event(|e| matches!(e, ChainOrchestratorEvent::BlockSequenced(_)))
+        .await;
+    eyre::ensure!(phantom.is_err(), "the cancelled job still sequenced a block: {phantom:?}");
+    eyre::ensure!(
+        fixture.get_block(0).await?.header.number == 1,
+        "unexpected head after the cancelled job"
+    );
+
     Ok(())
 }
 
@@ -1196,6 +1212,22 @@ async fn test_revert_to_l1_block_cancels_inflight_payload_job() -> eyre::Result<
         .label("PayloadBuildingJobCancelled after administrative L1 unwind")
         .where_event(|e| matches!(e, ChainOrchestratorEvent::PayloadBuildingJobCancelled))
         .await?;
+
+    // The event alone is not the cancellation: a regression that emits it
+    // but leaves the 3s job in the slot would still sequence. Nothing may
+    // sequence within the job's remaining lifetime, and the head must still
+    // sit at the pre-built block 1.
+    let phantom = fixture
+        .expect_event()
+        .timeout(std::time::Duration::from_secs(5))
+        .label("no BlockSequenced after the cancelled job")
+        .where_event(|e| matches!(e, ChainOrchestratorEvent::BlockSequenced(_)))
+        .await;
+    eyre::ensure!(phantom.is_err(), "the cancelled job still sequenced a block: {phantom:?}");
+    eyre::ensure!(
+        fixture.get_block(0).await?.header.number == 1,
+        "unexpected head after the cancelled job"
+    );
 
     Ok(())
 }

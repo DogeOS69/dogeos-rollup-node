@@ -79,11 +79,23 @@ from every pass is either fixed in the PR or recorded here.
   - Impact/evidence: Claude pass 11 — the genesis-mismatch and
     lookback-exhausted paths fail-stop the node and have no direct tests
     (absence-vs-divergence classification landed in the same pass).
-  - First/most-recent pass: Claude pass 11 (2026-09-01T01:40Z).
-  - Why unaddressed: needs a mocked BlockReader + remote RPC pair; no such
-    harness exists in the add-on today. The settlement decision logic, by
-    contrast, was extracted into a pure function and table-tested in-PR.
-  - Suggested Linear title: "rollup-node: unit-test the remote source's common-ancestor terminal paths"
+  - First/most-recent pass: Claude pass 11 (2026-09-01T01:40Z); Claude
+    pass 37 (2026-09-01, T2) escalated it: the destructive rewind path
+    (`update_fcs_head(resume)` guarded solely by `diverged`, set in one walk
+    arm) is untested EVERYWHERE — setting `diverged` on the absent-block arm,
+    or inverting the `local_head > resume + 1` comparison, silently rewinds a
+    follower's canonical head to chase a lagging replica with no error and no
+    event.
+  - Why unaddressed: full-path coverage needs a mocked BlockReader + remote
+    RPC pair; no such harness exists in the add-on today. Pass 37 sketched a
+    cheap alternative that avoids the harness: mirror the
+    `settlement_decision` pattern — extract a per-height verdict pure fn over
+    (local hash?, remote hash?) -> Match | Diverged | Absent, and a second
+    over (local_head, local_safe, resume, diverged) ->
+    Rewind | WaitForRemote | RefuseBelowSafe | Proceed, then table-test both
+    beside `settlement_decision_table`. Deferred as a refactor of freshly
+    review-hardened code at the tail of the loop.
+  - Suggested Linear title: "rollup-node: unit-test the remote source's common-ancestor terminal paths and rewind verdict"
 
 - **Widen `UpdateFcsHead`/`RevertToL1Block` replies to carry persistence failures**
   (`crates/chain-orchestrator/src/lib.rs`, command enum + admin RPC)
@@ -269,11 +281,25 @@ from every pass is either fixed in the PR or recorded here.
     teardown flake there would auto-file false race-regression reports on
     the tracking issue.
   - First/most-recent pass: orchestrator observation during Claude pass 21
-    fixes (2026-09-01T12:20Z).
-  - Why unaddressed: the fix is fixture-level (replace the sleep with an
-    observable release — poll the rocksdb lock's acquirability or await the
-    persistence task handle) and risks touching every reboot-based test in a
-    stabilization PR.
+    fixes (2026-09-01T12:20Z); Claude pass 37 (2026-09-01, T1) added the
+    coverage consequence and a second root cause. Consequence: with the test
+    skipped in test.yaml AND absent from every soak filter, the reworked
+    resume/rewind logic (`init_last_imported_block` past genesis, the
+    `diverged` classification, the `update_fcs_head` rewind) runs in NO CI
+    lane — the docker pair restarts only the sequencer and the in-process
+    tests initialize at local_head == 0. Second root cause (the hang the skip
+    papered over): `start_node` calls `get_event_listener()` only AFTER
+    relaunching the node (fixture.rs) while the add-on polls at 100ms, so the
+    `l1_synced` wait both misses early events (false-pass window: builds 2-4
+    of a broken walk can land pre-subscription) and can hang.
+  - Why unaddressed: the fix is fixture-level (subscribe before the add-on
+    starts — or a builder knob holding the first poll until Synced — plus
+    replacing the teardown sleep with an observable release: poll the rocksdb
+    lock's acquirability or await the persistence task handle) and risks
+    touching every reboot-based test in a stabilization PR. Interim option
+    from pass 37: a dedicated soak job running ONLY this test with a distinct
+    reporter message, so its flakes cannot contaminate the race-regression
+    reports.
   - Suggested Linear title: "rollup-node: make the reboot fixture's shutdown observable, then soak the resume test"
 
 - **Remote-source liveness set: typed import errors, walk resumption, settlement budget, event-lag recovery, sync-aware walk messages**

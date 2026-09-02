@@ -299,30 +299,39 @@ jobs:
         run: |
           set -euo pipefail
           report() {
-            local job="$1" outcome="$2" result="$3" body=""
+            local job="$1" outcome="$2" result="$3" body="" reopen=0
             case "$outcome" in
               failure)
                 # A soak step that exceeds its step-level timeout is ALSO
-                # recorded as 'failure', so this body must name both readings.
+                # recorded as outcome 'failure' (there is no 'cancelled'
+                # outcome for a step timeout), so this body names both
+                # readings. Only this arm reopens the issue: a genuine soak
+                # failure is the one shape that is plausibly a regression.
                 body="nightly-soak job **$job** failed or hit its soak-step timeout: $RUN_URL — either a regression of a race fixed in #45, or a hang/capacity problem."
+                reopen=1
                 ;;
               cancelled)
-                body="nightly-soak job **$job** soak step was cancelled mid-soak (step timeout — possible hang/livelock regression or capacity problem — or a manual cancellation): $RUN_URL"
+                # Reachable only via a manual RUN cancellation racing the
+                # grace period; comment-only, never reopen.
+                body="nightly-soak job **$job** soak step was cancelled: $RUN_URL"
                 ;;
               *)
-                # The soak step never reported an outcome (a setup step
-                # failed, or the JOB-level cap cancelled everything). Only a
-                # cancelled job — the shape a hang in a non-soak step takes —
-                # is worth a signal; setup failures are not race regressions.
+                # The soak step never reported an outcome: a setup step
+                # failed or the JOB-level cap cancelled everything.
+                # Comment-only in both shapes — neither is a race regression.
                 if [ "$result" = "cancelled" ]; then
                   body="nightly-soak job **$job** was cancelled before its soak step finished (job-level timeout — possible hang outside the soak step): $RUN_URL"
+                elif [ "$result" = "failure" ]; then
+                  body="nightly-soak job **$job** failed in a SETUP step, before its soak began (toolchain/cache/build problem, not a race regression): $RUN_URL"
                 fi
                 ;;
             esac
             if [ -n "$body" ]; then
-              # PR #45 closes issue 38; a comment on a closed issue notifies
-              # nobody, so reopen it first (best-effort).
-              gh issue reopen 38 --repo "$GITHUB_REPOSITORY" 2>/dev/null || true
+              if [ "$reopen" = "1" ]; then
+                # PR #45 closes issue 38; a comment on a closed issue
+                # notifies nobody, so reopen for genuine soak failures.
+                gh issue reopen 38 --repo "$GITHUB_REPOSITORY" 2>/dev/null || true
+              fi
               gh issue comment 38 --repo "$GITHUB_REPOSITORY" --body "$body"
             fi
           }

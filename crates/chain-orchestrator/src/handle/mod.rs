@@ -114,7 +114,10 @@ impl<N: FullNetwork<Primitives = DogeosNetworkPrimitives>> ChainOrchestratorHand
         rx.await
     }
 
-    /// Sends a command to the rollup manager to update the head of the FCS in the engine driver.
+    /// Update the FCS head. The outer `Result` is the command transport;
+    /// the inner one carries the handler's verdict — `Err(reason)` when the
+    /// engine refused the head or persistence failed (nothing to retry
+    /// blindly: read the reason).
     pub async fn update_fcs_head(
         &self,
         head: BlockInfo,
@@ -158,6 +161,11 @@ impl<N: FullNetwork<Primitives = DogeosNetworkPrimitives>> ChainOrchestratorHand
     }
 
     /// Revert the rollup node state to the specified L1 block number.
+    ///
+    /// `Ok(false)` means the unwind was REFUSED or could not be fully
+    /// applied (nothing to act on / retry later); the state may be
+    /// partially advanced only in the retryable-refusal cases documented on
+    /// the handler.
     pub async fn revert_to_l1_block(
         &self,
         block_number: u64,

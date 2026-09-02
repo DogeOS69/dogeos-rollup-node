@@ -194,6 +194,10 @@ impl<
     }
 
     /// Drives the [`ChainOrchestrator`] until shutdown or any held-derivation fail-stop boundary.
+    /// Fail-stops (returns `Err`, panicking the critical task) on any
+    /// [`ChainOrchestratorError::FatalStateDivergence`] from any select arm,
+    /// on any error from an administrative L1 unwind command, and on a fatal
+    /// held-derivation boundary.
     pub async fn run_until_shutdown(
         mut self,
         mut shutdown: impl std::future::Future<Output = ()> + Unpin,
@@ -429,12 +433,7 @@ impl<
                 let canonical = if hash == head.hash {
                     true
                 } else if block.header.number < head.number {
-                    match self
-                        .l2_client
-                        .get_block_by_number(block.header.number.into())
-                        .full()
-                        .await
-                    {
+                    match self.l2_client.get_block_by_number(block.header.number.into()).await {
                         // Only a returned block with a DIFFERENT hash proves
                         // the signed block was reorged out.
                         Ok(Some(canonical_block)) => canonical_block.header.hash_slow() == hash,
@@ -868,10 +867,11 @@ impl<
             },
             ChainOrchestratorCommand::RevertToL1Block((block_number, tx)) => {
                 // Pre-latch validation: refuse a target below the FINALIZED
-                // L1 block — finalized state is irreversible, and the
-                // combined FCU below would otherwise rewind the head below
-                // the finalized head (SafeBelowFinalized) and fail-stop
-                // AFTER the destructive unwind committed. No UPPER bound is
+                // L1 block. NOTE this is an L1-domain check only — it does
+                // NOT guarantee the resulting L2 head stays above the
+                // engine's finalized L2 block (independently sourced from
+                // the EL at startup); that cross-domain case is caught after
+                // the unwind and treated as irreconcilable. No UPPER bound is
                 // checked: the latest-L1 marker is not advanced by batch
                 // commits, so it would refuse legitimate reverts (and the
                 // unwind itself moves the marker to the target). Errors
@@ -885,6 +885,9 @@ impl<
                 {
                     Ok(finalized) => finalized,
                     Err(err) => {
+                        // NOTE: this arm catches connection-level errors only;
+                        // a missing metadata row panics inside the DB layer's
+                        // own expect and never reaches here.
                         tracing::warn!(
                             target: "scroll::chain_orchestrator",
                             block_number,
@@ -927,16 +930,53 @@ impl<
                 // fail-stop the node for nothing. Any genuine error still
                 // fail-stops via the admin-unwind policy.
                 let finalized = *self.engine.fcs().finalized_block_info();
+                // Symmetric with handle_l1_reorg: a rewound head below the
+                // FINALIZED L2 block is irreconcilable once the unwind is
+                // durable (the L1-domain pre-latch check cannot rule this
+                // out — the engine's finalized L2 block is independently
+                // sourced from the EL at startup).
+                if let Some(head_number) = unwind_result.l2_head_block_number {
+                    if head_number < finalized.number {
+                        tracing::error!(
+                            target: "scroll::chain_orchestrator",
+                            head_number,
+                            ?finalized,
+                            "Administrative unwind rewound the L2 head below the finalized \
+                             block"
+                        );
+                        return Err(ChainOrchestratorError::FatalStateDivergence(
+                            "administrative unwind rewound the L2 head below the finalized \
+                             block; the persisted state is irreconcilable without manual \
+                             intervention",
+                        ));
+                    }
+                }
                 let new_head = if let Some(head_number) = unwind_result.l2_head_block_number {
-                    let head_hash = self
-                        .l2_client
-                        .get_block_by_number(head_number.into())
-                        .full()
-                        .await?
-                        .ok_or(ChainOrchestratorError::L2BlockNotFoundInL2Client(head_number))?
-                        .header
-                        .hash_slow();
-                    Some(BlockInfo { number: head_number, hash: head_hash })
+                    // A failed lookup is RETRYABLE, not divergence: reset the
+                    // watcher (the database is consistently unwound to the
+                    // target, so re-scanning from it is correct), reply false
+                    // so the operator re-issues, and do not ride the
+                    // admin-unwind fail-stop.
+                    let head_block =
+                        match self.l2_client.get_block_by_number(head_number.into()).await {
+                            Ok(Some(block)) => block,
+                            outcome => {
+                                tracing::warn!(
+                                    target: "scroll::chain_orchestrator",
+                                    head_number,
+                                    ?outcome,
+                                    "Administrative unwind could not resolve the new L2 head; \
+                                     refusing (retryable)"
+                                );
+                                self.l1_watcher.revert_to_l1_block(block_number);
+                                if matches!(held_outcome, HeldReorgOutcome::Survived { .. }) {
+                                    self.derivation_driver.schedule_fresh_reconciliation();
+                                }
+                                let _ = tx.send(false);
+                                return Ok(());
+                            }
+                        };
+                    Some(BlockInfo { number: head_number, hash: head_block.header.hash_slow() })
                 } else {
                     None
                 };
@@ -984,11 +1024,38 @@ impl<
                         Vec::new()
                     };
                     let result = self.engine.update_fcs_checked(new_head, new_safe, None).await?;
-                    if !result.is_valid() {
+                    if result.is_invalid() {
+                        // INVALID after a durable unwind: genuine divergence,
+                        // fail-stops via the admin-unwind policy.
+                        tracing::error!(
+                            target: "scroll::chain_orchestrator",
+                            ?new_head,
+                            ?new_safe,
+                            ?result,
+                            "Administrative unwind FCU rejected as INVALID by the engine"
+                        );
                         return Err(ChainOrchestratorError::FcuRejected(
-                            "administrative unwind forkchoice update was not applied by \
-                             the engine (INVALID or SYNCING)",
+                            "administrative unwind forkchoice update rejected as INVALID \
+                             by the engine",
                         ));
+                    }
+                    if !result.is_valid() {
+                        // SYNCING commits nothing — RETRYABLE, not divergence:
+                        // an operator RPC must not panic the node on a
+                        // routine engine response. Reset the watcher so the
+                        // sync gate is not left latched and reply false.
+                        tracing::warn!(
+                            target: "scroll::chain_orchestrator",
+                            ?new_head,
+                            ?new_safe,
+                            "Administrative unwind FCU returned SYNCING; refusing (retryable)"
+                        );
+                        self.l1_watcher.revert_to_l1_block(block_number);
+                        if matches!(held_outcome, HeldReorgOutcome::Survived { .. }) {
+                            self.derivation_driver.schedule_fresh_reconciliation();
+                        }
+                        let _ = tx.send(false);
+                        return Ok(());
                     }
                     self.reinsert_txs_into_pool(reverted_transactions).await;
                 }
@@ -1060,7 +1127,10 @@ impl<
     /// burning their full wait timeout. Call wherever the job's inputs are
     /// invalidated — a head move; an L1 unwind (unconditionally for an
     /// administrative revert, and on an L1 reorg when the job carries L1
-    /// messages or the head moved); or sequencing being disabled.
+    /// messages or the head moved); or sequencing being disabled. One caller
+    /// is deliberately NOT an input invalidation: the re-enter-L2-sync path
+    /// after an unadopted import head cancels a still-valid job purely so its
+    /// waiters are not stranded behind the closed sync gate.
     fn cancel_payload_building_job(&mut self, reason: &'static str) {
         let Some(sequencer) = self.sequencer.as_mut() else { return };
         let Some(job) = sequencer.payload_building_job() else { return };
@@ -1160,7 +1230,22 @@ impl<
                 tracing::info!(target: "scroll::chain_orchestrator", "L1 is now synced");
                 self.sync_state.l1_mut().set_synced();
                 if self.sync_state.is_synced() {
-                    metered!(Task::ChainConsolidation, self, consolidate_chain())?;
+                    // A consolidation failure here has already purged the
+                    // L1-message mappings and the sync state is flipped:
+                    // running on would sequence nothing (pool never opens)
+                    // while reporting healthy. Nothing re-runs consolidation.
+                    if let Err(err) = metered!(Task::ChainConsolidation, self, consolidate_chain())
+                    {
+                        tracing::error!(
+                            target: "scroll::chain_orchestrator",
+                            %err,
+                            "Chain consolidation failed after the node was marked synced"
+                        );
+                        return Err(ChainOrchestratorError::FatalStateDivergence(
+                            "chain consolidation failed after the node was marked synced; \
+                             restart re-consolidates from the persisted state",
+                        ));
+                    }
                 }
                 self.notify(ChainOrchestratorEvent::L1Synced);
                 Ok(None)
@@ -1227,17 +1312,26 @@ impl<
         block_number: u64,
     ) -> Result<Option<ChainOrchestratorEvent>, ChainOrchestratorError> {
         self.derivation_driver.cancel_attempt();
-        // On failure the unwind transaction rolled back (state untouched),
-        // but cancel_attempt() above cleared the attempt timer while KEEPING
-        // the held batch — without rescheduling, reconciliation, L1
-        // ingestion, and sequencing would all gate closed forever behind a
-        // healthy-looking process. Reschedule and surface the error.
+        // On failure the unwind transaction rolled back (rows untouched) —
+        // but the NOTIFICATION is consumed and the watcher never re-emits a
+        // reorg: it resets and re-scans forward, delivering the replacement
+        // chain's blocks while our L1 index still describes the reorged-out
+        // one (duplicate batch indices, queue gaps, forever). Unreplayable:
+        // stop, rather than reschedule into a permanently inconsistent index.
         let (unwind_result, held_outcome) =
             match self.unwind_and_revalidate_held_batch(block_number).await {
                 Ok(result) => result,
                 Err(err) => {
-                    self.derivation_driver.schedule_fresh_reconciliation();
-                    return Err(err);
+                    tracing::error!(
+                        target: "scroll::chain_orchestrator",
+                        block_number,
+                        %err,
+                        "L1-reorg unwind failed with the notification consumed"
+                    );
+                    return Err(ChainOrchestratorError::FatalStateDivergence(
+                        "L1-reorg unwind failed and the reorg notification cannot be \
+                         replayed; restart re-processes L1 from a consistent index",
+                    ));
                 }
             };
         let UnwindResult { l1_block_number, queue_index, l2_head_block_number, l2_safe_block_info } =
@@ -1245,6 +1339,25 @@ impl<
 
         let (l2_head_block_info, reverted_transactions) =
             if let Some(block_number) = l2_head_block_number {
+                // FINALIZED L2 state is irreversible, and the unwind above
+                // has already durably persisted this head and purged the
+                // mappings above it — clamping only the FCU target (as an
+                // earlier revision did) would leave a divergence that even a
+                // restart cannot detect (the startup repair loop only runs
+                // while persisted head > finalized). Irreconcilable: stop.
+                let finalized_floor = self.engine.fcs().finalized_block_info().number;
+                if block_number < finalized_floor {
+                    tracing::error!(
+                        target: "scroll::chain_orchestrator",
+                        block_number,
+                        finalized_floor,
+                        "L1 reorg rewound the L2 head below the finalized block"
+                    );
+                    return Err(ChainOrchestratorError::FatalStateDivergence(
+                        "L1 reorg rewound the L2 head below the finalized block; the \
+                         persisted state is irreconcilable without manual intervention",
+                    ));
+                }
                 // The unwind above is already committed (persisted head
                 // rewound, mappings purged). A failure between here and the
                 // FCU would leave the engine on the old chain with the
@@ -1313,31 +1426,15 @@ impl<
             self.cancel_payload_building_job("L1 reorg while the job may carry L1 messages");
         }
 
-        // Preserve head >= safe >= finalized before issuing the FCU (mirrors
-        // the administrative unwind's clamping): the automatic reorg path
-        // could otherwise construct an order-violating triple — e.g. a
-        // startup-time reorg below the persisted finalized marker — that
-        // fcs.update() refuses LOCALLY after the unwind is already durable.
+        // Preserve head >= safe >= finalized before issuing the FCU: with a
+        // below-finalized head already fatal (above, and symmetrically on
+        // the administrative unwind), only the SAFE target can still violate
+        // ordering — floor it at finalized and drag it down to a rewound
+        // head, or fcs.update() would refuse LOCALLY after the unwind is
+        // already durable.
         let finalized = *self.engine.fcs().finalized_block_info();
-        // The head first: FINALIZED L2 state is irreversible by definition,
-        // so an unwind result claiming a head below it is reconciled at the
-        // finalized floor — otherwise the safe-floor + head-drag below would
-        // reconstruct safe < finalized and refuse locally AFTER the unwind
-        // committed.
-        let l2_head_block_info = l2_head_block_info.map(|head| {
-            if head.number >= finalized.number {
-                head
-            } else {
-                tracing::warn!(
-                    target: "scroll::chain_orchestrator",
-                    ?head,
-                    ?finalized,
-                    "L1 reorg computed an L2 head below the finalized block; reconciling \
-                     at the finalized floor"
-                );
-                finalized
-            }
-        });
+        // (A head below finalized was already declared fatal above, so the
+        // safe clamps below cannot reconstruct safe < finalized.)
         let l2_safe_block_info =
             l2_safe_block_info
                 .map(|safe| if safe.number >= finalized.number { safe } else { finalized });
@@ -1485,7 +1582,24 @@ impl<
             // consumed. The mirror-committed value rides every later FCU
             // until the EL adopts it. Only INVALID (never committed) is
             // surfaced.
-            let result = self.engine.update_fcs(None, None, finalized_block_info).await?;
+            let result = match self.engine.update_fcs(None, None, finalized_block_info).await {
+                Ok(result) => result,
+                Err(err) => {
+                    // The database already advanced (batch finalized,
+                    // notification consumed) — same no-retry-path argument
+                    // as the INVALID arm below.
+                    tracing::error!(
+                        target: "scroll::chain_orchestrator",
+                        ?finalized_block_info,
+                        %err,
+                        "Finalized-head FCU failed after the batch was finalized"
+                    );
+                    return Err(ChainOrchestratorError::FatalStateDivergence(
+                        "finalized-head forkchoice update failed after the batch was \
+                         finalized; restart re-converges from the persisted state",
+                    ));
+                }
+            };
             if result.is_invalid() {
                 // INVALID does not commit the mirror while the batch is
                 // already finalized in the database and the notification is
@@ -1621,7 +1735,24 @@ impl<
             // already committed, so a checked refusal on SYNCING would leave
             // the old safe head standing with no retry while imports that
             // must reorg below it get refused indefinitely.
-            let result = self.engine.update_fcs(None, Some(safe_block_info), None).await?;
+            let result = match self.engine.update_fcs(None, Some(safe_block_info), None).await {
+                Ok(result) => result,
+                Err(err) => {
+                    // See the finalized-head FCU: the revert is durable and
+                    // no retry path exists.
+                    tracing::error!(
+                        target: "scroll::chain_orchestrator",
+                        ?safe_block_info,
+                        %err,
+                        "Post-batch-revert safe-head FCU failed after the revert was \
+                         committed"
+                    );
+                    return Err(ChainOrchestratorError::FatalStateDivergence(
+                        "post-batch-revert safe-head forkchoice update failed; restart \
+                         re-converges from the persisted state",
+                    ));
+                }
+            };
             if result.is_invalid() {
                 // See the finalized-head FCU: the revert is already durable
                 // and INVALID left the mirror on the old (higher) safe head —
@@ -1781,8 +1912,20 @@ impl<
             self.sync_state.l2_mut().set_syncing();
 
             // Purge all L1 message to L2 block mappings as they may be invalid after an
-            // optimistic sync.
-            self.database.purge_l1_message_to_l2_block_mappings(None).await?;
+            // optimistic sync. The head is already committed hundreds of
+            // blocks ahead: failing to purge leaves messages marked consumed
+            // by vanished blocks, silently excluded from selection.
+            if let Err(err) = self.database.purge_l1_message_to_l2_block_mappings(None).await {
+                tracing::error!(
+                    target: "scroll::chain_orchestrator",
+                    %err,
+                    "Mapping purge failed after the optimistic-sync head committed"
+                );
+                return Err(ChainOrchestratorError::FatalStateDivergence(
+                    "L1-message mapping purge failed after optimistic sync; restart \
+                     re-converges from the persisted state",
+                ));
+            }
 
             return Ok(Some(ChainOrchestratorEvent::OptimisticSync(block_info)));
         }
@@ -2032,7 +2175,19 @@ impl<
             // If both L1 and L2 are now synced, we transition to consolidated mode by consolidating
             // the chain.
             if self.sync_state.is_synced() {
-                self.consolidate_chain().await?;
+                // See the Synced-notification arm: a failure here is not
+                // survivable-in-place.
+                if let Err(err) = self.consolidate_chain().await {
+                    tracing::error!(
+                        target: "scroll::chain_orchestrator",
+                        %err,
+                        "Chain consolidation failed after the node was marked synced"
+                    );
+                    return Err(ChainOrchestratorError::FatalStateDivergence(
+                        "chain consolidation failed after the node was marked synced; \
+                         restart re-consolidates from the persisted state",
+                    ));
+                }
             }
         }
 
@@ -2619,6 +2774,160 @@ mod run_loop_policy_tests {
 
         let _ = shutdown_tx.send(());
         assert!(run_task.await.unwrap().is_ok());
+    }
+
+    /// Pins pass-33 C1: the post-unwind L1-reorg FCU is issued through the
+    /// UNCHECKED `update_fcs`, whose mirror commits on SYNCING — engine and
+    /// database agree, so a routine SYNCING answer must NOT fail-stop the
+    /// node (an earlier revision killed it here).
+    #[tokio::test]
+    async fn l1_reorg_post_unwind_fcu_syncing_continues() {
+        let database = Arc::new(setup_test_db().await);
+        database.insert_genesis_block(B256::ZERO).await.unwrap();
+        let batch_info = BatchInfo::new(1, B256::repeat_byte(1));
+        database
+            .insert_batch(BatchCommitData {
+                hash: batch_info.hash,
+                index: batch_info.index,
+                block_number: 10,
+                block_timestamp: 0,
+                calldata: Arc::new(Bytes::new()),
+                blob_versioned_hash: None,
+                finalized_block_number: None,
+                reverted_block_number: None,
+            })
+            .await
+            .unwrap();
+        database.update_batch_status(batch_info.hash, BatchStatus::Processing).await.unwrap();
+
+        let engine_client = Arc::new(ScriptedEngineClient::new());
+        script_syncing_hold_then_success(&engine_client);
+        engine_client
+            .push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Syncing, None)));
+        let asserter = Asserter::new();
+        asserter.push_success(&Option::<()>::None);
+        asserter.push_success(&Option::<()>::None);
+        let (mut orchestrator, _handle, notification_tx) = test_orchestrator(
+            database.clone(),
+            engine_client.clone(),
+            asserter,
+            BatchDerivationResult {
+                attributes: vec![DerivedAttributes {
+                    block_number: SAFE + 1,
+                    attributes: ScrollPayloadAttributes::default(),
+                }],
+                batch_info,
+                skipped_l1_messages: vec![],
+                target_status: BatchStatus::Consolidated,
+            },
+        )
+        .await;
+        let mut events = orchestrator.event_listener();
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let run_task = tokio::spawn(orchestrator.run_until_shutdown(Box::pin(async move {
+            let _ = shutdown_rx.await;
+        })));
+
+        time::timeout(Duration::from_secs(2), async {
+            while engine_client.fork_choice_updated_calls() < 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first Engine SYNCING response must hold the batch");
+
+        notification_tx.send(Arc::new(L1Notification::Reorg(5))).await.unwrap();
+
+        // The reorg completes despite the SYNCING FCU: the event is emitted
+        // and the run loop stays alive.
+        time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(ChainOrchestratorEvent::L1Reorg { l1_block_number: 5, .. }) =
+                    events.next().await
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the reorg must complete on a SYNCING post-unwind FCU");
+        assert_eq!(database.get_latest_l1_block_number().await.unwrap(), 5);
+
+        let _ = shutdown_tx.send(());
+        assert!(run_task.await.unwrap().is_ok(), "SYNCING must not fail-stop the run loop");
+    }
+
+    /// The INVALID counterpart: the mirror did NOT commit while the unwind
+    /// is durable — the run loop must terminate with a fatal divergence.
+    #[tokio::test]
+    async fn l1_reorg_post_unwind_fcu_invalid_fail_stops() {
+        let database = Arc::new(setup_test_db().await);
+        database.insert_genesis_block(B256::ZERO).await.unwrap();
+        let batch_info = BatchInfo::new(1, B256::repeat_byte(1));
+        database
+            .insert_batch(BatchCommitData {
+                hash: batch_info.hash,
+                index: batch_info.index,
+                block_number: 10,
+                block_timestamp: 0,
+                calldata: Arc::new(Bytes::new()),
+                blob_versioned_hash: None,
+                finalized_block_number: None,
+                reverted_block_number: None,
+            })
+            .await
+            .unwrap();
+        database.update_batch_status(batch_info.hash, BatchStatus::Processing).await.unwrap();
+
+        let engine_client = Arc::new(ScriptedEngineClient::new());
+        script_syncing_hold_then_success(&engine_client);
+        engine_client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(
+            PayloadStatusEnum::Invalid { validation_error: "scripted".to_string() },
+            None,
+        )));
+        let asserter = Asserter::new();
+        asserter.push_success(&Option::<()>::None);
+        asserter.push_success(&Option::<()>::None);
+        let (orchestrator, _handle, notification_tx) = test_orchestrator(
+            database.clone(),
+            engine_client.clone(),
+            asserter,
+            BatchDerivationResult {
+                attributes: vec![DerivedAttributes {
+                    block_number: SAFE + 1,
+                    attributes: ScrollPayloadAttributes::default(),
+                }],
+                batch_info,
+                skipped_l1_messages: vec![],
+                target_status: BatchStatus::Consolidated,
+            },
+        )
+        .await;
+
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let run_task = tokio::spawn(orchestrator.run_until_shutdown(Box::pin(async move {
+            let _ = shutdown_rx.await;
+        })));
+
+        time::timeout(Duration::from_secs(2), async {
+            while engine_client.fork_choice_updated_calls() < 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first Engine SYNCING response must hold the batch");
+
+        notification_tx.send(Arc::new(L1Notification::Reorg(5))).await.unwrap();
+
+        let result = time::timeout(Duration::from_secs(5), run_task)
+            .await
+            .expect("an INVALID post-unwind FCU must terminate the run loop")
+            .unwrap();
+        assert!(
+            matches!(result, Err(ChainOrchestratorError::FatalStateDivergence(_))),
+            "expected FatalStateDivergence, got {result:?}"
+        );
     }
 
     #[tokio::test]

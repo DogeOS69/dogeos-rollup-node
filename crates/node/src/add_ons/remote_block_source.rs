@@ -44,8 +44,10 @@ where
     /// `Superseded`/`Resync`/`Abandon` outcomes — whether from settlement or
     /// from the import loop superseding a freshly issued build, an import
     /// the engine did not apply, repeated import rejections, the pre-issue
-    /// head re-check, and the follow-loop's advanced- and rewound-head
-    /// guards), forcing a fresh common-ancestor walk on the next tick.
+    /// head re-check, the follow-loop's advanced- and rewound-head guards, and
+    /// the pre-import parent-linkage check — both when the remote's next block
+    /// does not build on the local one and when the local hash is missing
+    /// entirely), forcing a fresh common-ancestor walk on the next tick.
     last_imported_block: Option<u64>,
     /// Whether `init_last_imported_block` has ever succeeded. Terminal
     /// (node-killing) escalation of the walk's divergence verdicts is
@@ -99,6 +101,13 @@ where
     /// advancing and the request going out; an unissued debt is simply
     /// issued by the next settlement, consuming no retry budget.
     pending_build_issued: bool,
+    /// Whether an import landed during the current tick. Cleared at the top of
+    /// every `follow_and_build` and set where the resume pointer advances, so a
+    /// tick that exhausts [`TICK_STALL_BUDGET`] can be told apart from a stalled
+    /// one on what it DID rather than on where the pointer started — the first
+    /// tick of a fresh follower both establishes the pointer and imports a
+    /// backlog, and no comparison of the pointer's endpoints describes that.
+    imported_this_tick: bool,
     /// Consecutive settlement attempts for the owed build. Bounded so an
     /// outcome that never arrives does not head-of-line-block imports
     /// forever.
@@ -416,6 +425,7 @@ where
             pending_build_cancelled: false,
             pending_build_issued: false,
             pending_build_retries: 0,
+            imported_this_tick: false,
             builds_abandoned: 0,
             last_error_log: None,
             suppressed_errors: 0,
@@ -604,26 +614,24 @@ where
                 _ = poll_interval.tick() => {
                     // Let shutdown preempt an in-flight tick: follow_and_build
                     // can block on multi-second waits.
-                    let pointer_before = self.last_imported_block;
                     let result = tokio::select! {
                         biased;
                         _guard = &mut shutdown => break,
                         r = tokio::time::timeout(TICK_STALL_BUDGET, self.follow_and_build()) => {
                             match r {
                                 Ok(r) => r,
-                                // A NUMERIC advance, not `Option` ordering:
-                                // `Some(_)` sorts above `None`, so comparing the
-                                // options directly classified the tick that
-                                // merely ESTABLISHES the pointer as deep
-                                // catch-up — a full stall of the budget then
-                                // logged at info, returned Ok and reset
-                                // consecutive_failures.
-                                Err(_)
-                                    if matches!(
-                                        (pointer_before, self.last_imported_block),
-                                        (Some(before), Some(now)) if now.gt(&before)
-                                    ) =>
-                                {
+                                // Whether an import actually LANDED this tick,
+                                // not a comparison of the pointer's endpoints.
+                                // Comparing options classified the tick that
+                                // merely establishes the pointer as deep
+                                // catch-up (`Some(_)` sorts above `None`);
+                                // requiring a numeric advance then flipped the
+                                // error the other way, since a fresh follower's
+                                // first tick both establishes the pointer AND
+                                // imports its backlog, so it could never match
+                                // and every bring-up with a real backlog was
+                                // reported as a black-holed connection.
+                                Err(_) if self.imported_this_tick => {
                                     // The budget elapsed while IMPORTING — a
                                     // deep catch-up, not a stall. Treat as a
                                     // healthy tick so consecutive_failures
@@ -1101,6 +1109,8 @@ where
 
     /// Follows the remote node and builds blocks on top of imported blocks.
     async fn follow_and_build(&mut self) -> eyre::Result<()> {
+        // Per-tick, so the stall classifier reads only this tick's work.
+        self.imported_this_tick = false;
         // First successful contact with the remote determines the resume point.
         if self.last_imported_block.is_none() {
             let (resume, resume_hash, local_head, local_safe, diverged) =
@@ -1178,6 +1188,21 @@ where
                             "local head moved to {fresh_head} (at or below the common ancestor \
                          {resume}) while the ancestor walk ran; a rewind would move the head \
                          forward — re-deriving next tick"
+                        ));
+                    }
+                    // The two guards above re-read only NUMBERS. `resume_hash`
+                    // still comes from the walk, which is up to
+                    // MAX_ANCESTOR_LOOKBACK sequential remote round-trips old,
+                    // and the CAS cannot close that gap: its anchor is read
+                    // after the walk, so a local reorg during the walk is
+                    // already baked into it and the CAS passes. Rewinding to a
+                    // hash reth still holds in its tree but that is no longer
+                    // canonical at that height moves the node onto an abandoned
+                    // branch, cancels the in-flight job, and purges L1-message
+                    // mappings above it.
+                    if self.provider.block_hash(resume)? != Some(resume_hash) {
+                        return Err(eyre::eyre!(
+                            "block {resume} changed locally while the ancestor walk ran;                              re-deriving next tick"
                         ));
                     }
                     tracing::warn!(
@@ -1317,7 +1342,19 @@ where
             // SYNCING, and plants a head the local EL never adopts, after which
             // every ancestor probe reads that absent head and returns
             // immediately, forever.
-            if let Some(expected_parent) = self.provider.block_hash(last_imported)? {
+            let Some(expected_parent) = self.provider.block_hash(last_imported)? else {
+                // No local hash at that height means the pointer no longer
+                // describes this node's chain. Silently skipping the check
+                // would import an unverified block on the one iteration the
+                // guard is most needed, so treat it as a stale pointer like
+                // every other unknown-state path here.
+                self.last_imported_block = None;
+                self.consecutive_import_rejections = 0;
+                return Err(eyre::eyre!(
+                    "local block {last_imported} is unknown to the provider; re-deriving the                      common ancestor"
+                ));
+            };
+            {
                 if block.header.parent_hash != expected_parent {
                     // A changed parent is the ordinary shape of a remote reorg
                     // at or below the pointer, not only a misrouted backend, so
@@ -1400,6 +1437,7 @@ where
                 ));
             }
             self.last_imported_block = Some(next_block_num);
+            self.imported_this_tick = true;
             self.consecutive_import_rejections = 0;
             if self.config.build {
                 // Record the build debt BEFORE any await: if the tick is
@@ -1476,6 +1514,41 @@ mod tests {
         assert_eq!(classify_ancestor_probe(Some(a), None, 5), AncestorProbe::Absent);
         assert_eq!(classify_ancestor_probe(None, Some((5, a)), 5), AncestorProbe::Absent);
         assert_eq!(classify_ancestor_probe(None, None, 5), AncestorProbe::Absent);
+    }
+
+    /// `redact_remote` is the only thing between a URL carrying basic-auth
+    /// credentials or a query-string API key and an `error!` line: alloy wraps
+    /// `reqwest::Error`, whose `Display` appends `for url ({url})` with both
+    /// intact. A regression here is silent by construction.
+    #[test]
+    fn redact_remote_scrubs_credentials_and_query() {
+        let url: reqwest::Url =
+            "https://ops:s3cr3t@rpc.internal:8545/v1?apikey=ABC".parse().unwrap();
+        let message = format!("error sending request for url ({url})");
+
+        let redacted = super::redact_remote(Some(&url), &message);
+        assert!(!redacted.contains("s3cr3t"), "credential survived: {redacted}");
+        assert!(!redacted.contains("ABC"), "API key survived: {redacted}");
+        assert!(!redacted.contains("ops:"), "userinfo survived: {redacted}");
+        assert!(redacted.contains("https://rpc.internal:8545"), "host lost: {redacted}");
+
+        // Without a configured URL there is nothing to scrub against, and the
+        // message must still pass through rather than be dropped.
+        assert_eq!(super::redact_remote(None, "plain failure"), "plain failure");
+        // A message that never mentions the URL is unchanged.
+        assert_eq!(super::redact_remote(Some(&url), "timed out"), "timed out");
+    }
+
+    /// The host form used both for the `remote_host` log field and as the
+    /// replacement text above: scheme, host and port only.
+    #[test]
+    fn safe_remote_host_drops_userinfo_path_and_query() {
+        let url: reqwest::Url =
+            "https://ops:s3cr3t@rpc.internal:8545/v1?apikey=ABC".parse().unwrap();
+        assert_eq!(super::safe_remote_host(&url), "https://rpc.internal:8545");
+        // Default port is filled in rather than rendered as 0.
+        let plain: reqwest::Url = "http://example.com/rpc".parse().unwrap();
+        assert_eq!(super::safe_remote_host(&plain), "http://example.com:80");
     }
 
     #[test]

@@ -160,7 +160,7 @@ pub trait DatabaseWriteOperations {
 
     /// Delete any genesis-height (block 0) rows whose hash does not match the chain's genesis
     /// hash, returning how many were removed. The static dev migration seeds the Scroll dev
-    /// genesis row; on a custom chain the real genesis is inserted separately (the insert cannot
+    /// genesis row; the real genesis is inserted by `reconcile_genesis_block` (the insert cannot
     /// overwrite — its conflict key includes the hash), and the seeded row would otherwise shadow
     /// the real one nondeterministically in highest-block queries such as
     /// `get_latest_safe_l2_info`, presenting as a same-height different-hash safe divergence.
@@ -173,6 +173,11 @@ pub trait DatabaseWriteOperations {
     /// stale rows were removed. `seeded_genesis` is the genesis the static migration for this
     /// chain writes, which is NOT always `genesis_hash` — the dev migration hardcodes upstream
     /// Scroll's dev genesis while the chain spec computes its own.
+    ///
+    /// A height-0 row that is neither this chain's genesis nor `seeded_genesis` is another chain's
+    /// data and fail-stops on BOTH paths — the check runs before the fresh/populated split, because
+    /// that split reads the `l2_head_block` metadata counter, which an unwind can drive to 0 while
+    /// foreign rows remain.
     ///
     /// On a FRESH database (nothing above genesis) the stale rows are dropped and the real genesis
     /// is (re-)inserted in the same call, so a crash between the two cannot leave `l2_block` empty.

@@ -114,7 +114,10 @@ jobs:
           do
             pat="${spec%:*}"
             want="${spec##*:}"
-            got="$(cargo nextest list --all-features --workspace --locked -E "test($pat)" | grep -c '^ ')"
+            # `|| true`: grep -c exits 1 on zero matches, and under `set -e` the
+            # assignment would then abort the step BEFORE the diagnostic below —
+            # in exactly the renamed-test case this guard exists to report.
+            got="$(cargo nextest list --all-features --workspace --locked -E "test($pat)" | grep -c '^ ' || true)"
             if [ "$got" != "$want" ]; then
               echo "::error::soak pattern '$pat' matches $got tests, expected $want; a soaked test was renamed, removed or added"
               exit 1
@@ -211,7 +214,10 @@ jobs:
           do
             pat="${spec%:*}"
             want="${spec##*:}"
-            got="$(cargo nextest list --all-features --workspace --locked -E "test($pat)" | grep -c '^ ')"
+            # `|| true`: grep -c exits 1 on zero matches, and under `set -e` the
+            # assignment would then abort the step BEFORE the diagnostic below —
+            # in exactly the renamed-test case this guard exists to report.
+            got="$(cargo nextest list --all-features --workspace --locked -E "test($pat)" | grep -c '^ ' || true)"
             if [ "$got" != "$want" ]; then
               echo "::error::soak pattern '$pat' matches $got tests, expected $want; a soaked test was renamed, removed or added"
               exit 1

@@ -21,9 +21,17 @@ pub enum ChainOrchestratorError {
     /// post-synced consolidation failure. Most sites have no compensation
     /// (the one that does — the
     /// `UpdateFcsHead` rollback — raises this only when the compensation
-    /// itself did not commit). The run loop treats this as fatal: a restart
-    /// re-derives its state from the database and converges, while running
-    /// on would keep serving from divergent state.
+    /// itself did not commit). The run loop treats this as fatal because
+    /// running on would keep serving from divergent state.
+    ///
+    /// A restart converges only where the startup repair can reach the
+    /// divergence — the head-ahead-of-anchor sites. It does NOT for the
+    /// finality-boundary sites: the repair loop is gated on
+    /// `l2_head > finalized`, which is the very condition those report as
+    /// violated, and the finalized-marker mismatch re-raises identically on the
+    /// first finalized notification after boot, so the node crash-loops. Those
+    /// sites say "irreconcilable without manual intervention" in their own
+    /// messages and mean it.
     #[error("fatal state divergence: {0}")]
     FatalStateDivergence(&'static str),
     /// A consolidation block fetch failed (transport error or a block

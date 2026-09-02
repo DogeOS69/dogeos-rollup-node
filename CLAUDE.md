@@ -81,7 +81,7 @@ cargo test -p rollup-node --test e2e
 cargo test -p rollup-node --test e2e test_custom_genesis_block_production_and_propagation
 
 # Run docker-based integration tests (excluded by default)
-cargo test --package tests --test block_propagation_multi_clients
+make test-docker
 
 # Run with debug logs
 RUST_LOG=debug cargo test <test-name>

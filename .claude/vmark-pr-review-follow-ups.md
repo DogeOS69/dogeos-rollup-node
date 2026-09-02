@@ -819,3 +819,66 @@ deferred from this pass.
   resync path in the add-on (local head advanced, local head rewound, import
   rejected `MAX_IMPORT_REJECTIONS` times), so the next tick re-walks to the new
   common ancestor.
+
+## Pass 49 findings — resolution (Claude, 2026-09-02)
+
+Claude pass 49 returned 1 major, 8 production-impacting minors and 5
+documentation-staleness items. All FIXED; nothing deferred from this pass.
+
+- **M1 (FIXED)** The `Rewind` arm re-read only NUMBERS after the ancestor walk;
+  `resume_hash` still came from the walk, up to `MAX_ANCESTOR_LOOKBACK`
+  sequential remote round-trips earlier. The CAS could not close that gap — its
+  anchor is read after the walk, so a local reorg during the walk is already
+  baked in and the CAS passes. In the shipped docker topology (remote source
+  plus gossip peers) a gossip import replacing that height makes the node rewind
+  onto an abandoned branch, cancel the in-flight job and purge L1-message
+  mappings, on a consensus path. The hash is now re-checked against the local
+  provider immediately before the FCU.
+- **Minors 2 + 3 (FIXED)** The pass-47 safe clamp composed badly with the
+  finalized floor: with `finalized > head`, clamp one raised safe to finalized
+  and clamp two lowered it to head, yielding `safe < finalized` — a state whose
+  every later `update()` returns `SafeBelowFinalized` while the repair loop
+  (gated on `l2_head > finalized`) never runs. That is strictly worse than the
+  launch failure the clamp removed. Neither reviewer could construct a reth path
+  reporting finalized above latest, so it was latent. Extracted
+  `clamp_startup_markers`, which clamps finalized FIRST, and table-tested it —
+  both halves of the pass-47 M1 fix had zero coverage, and deleting the clamp
+  left the whole workspace suite green.
+- **Minor 4 (FIXED)** The soak rename guard ran `grep -c` under `set -e`, which
+  exits 1 on zero matches, so the step aborted BEFORE printing the diagnostic it
+  exists to produce — in exactly the renamed-test case. Added `|| true`.
+- **Minor 5 (FIXED)** The stall classifier required a numeric pointer advance,
+  which a fresh follower's first tick can never satisfy (it both establishes the
+  pointer and imports the backlog), so every bring-up with a real backlog that
+  exceeded the 600s budget was logged as a black-holed connection. Now keyed on
+  an `imported_this_tick` flag: what the tick DID, not where the pointer
+  started. (Two passes running: the original bug was `Option` ordering, the
+  pass-47 fix over-corrected.)
+- **Minor 6 (FIXED)** The parent-linkage guard silently no-opped when the local
+  hash was absent, importing unverified on the one iteration it is most needed.
+  An absent local hash is now treated as a stale pointer, like every other
+  unknown-state path in the file.
+- **Minor 7 (FIXED)** `UpdateFcsHead` accepted a FORWARD head move while its
+  sibling explicitly refuses one; a forward move purges mappings only above the
+  target and then advances the anchor over blocks whose message stamping never
+  ran. Not reachable from any in-tree caller, but the handle is public API.
+- **Minor 8 (FIXED, doc-only)** `FatalStateDivergence`'s type doc promised
+  restart convergence that three of its sites cannot deliver — the repair loop
+  is gated on the very condition two of them report as violated, and the
+  finalized-marker mismatch re-raises on the first notification after boot
+  (crash-loop). Qualified.
+- **Minor 9 (FIXED)** The startup bail keyed on `fcs.is_genesis()`, which a
+  provider answering all three reads from a wiped or resynced execution-node
+  datadir also satisfies — sending the operator after reachability for no
+  reason. The fallback is now bound explicitly and the two cases have separate
+  messages.
+- **Docs (FIXED)** `CLAUDE.md` named a test target that no longer exists;
+  `Makefile`'s `test-docker` still passed `--no-tests=pass` while every other
+  lane was hardened to `fail`; the pointer-reset list omitted the parent-linkage
+  resets; `from_provider`'s doc described genesis values it does not set and
+  omitted that its `None` is load-bearing; `reconcile_genesis_block`'s doc
+  presented the foreign-row check as populated-only when it deliberately runs on
+  both paths.
+- **Also added** tests for `redact_remote`/`safe_remote_host`, which had none
+  and are the only thing between a URL carrying basic-auth credentials or an
+  API key and an `error!` line.

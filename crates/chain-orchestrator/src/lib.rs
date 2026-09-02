@@ -730,6 +730,23 @@ impl<
                         return Ok(());
                     }
                 }
+                // Only ever a REWIND, matching the administrative unwind's
+                // guard. A forward move purges L1-message mappings only ABOVE
+                // the new target and then advances the persisted anchor over
+                // blocks whose `update_l1_messages_from_l2_blocks` never ran,
+                // leaving those messages unstamped below the anchor. No
+                // in-tree caller asks for one — the remote source's rewind
+                // guards direction, and this is not exposed on the admin RPC —
+                // but the handle is public API.
+                let mirror_head = *self.engine.fcs().head_block_info();
+                if head.number > mirror_head.number {
+                    let _ = sender.send(Err(format!(
+                        "requested head {head:?} is above the current head {mirror_head:?}; \
+                         this command only rewinds"
+                    )));
+                    return Ok(());
+                }
+
                 // Collect transactions of reverted blocks from l2 client.
                 // Best-effort: a failure must neither abort the update nor
                 // drop the responder without a reply.
@@ -4226,7 +4243,7 @@ mod run_loop_policy_tests {
         let asserter = Asserter::new();
         asserter.push_success(&Option::<()>::None);
         asserter.push_success(&Option::<()>::None);
-        let (orchestrator, handle, _notification_tx) = test_orchestrator(
+        let (orchestrator, handle, _notification_tx) = test_orchestrator_with_fcs(
             database.clone(),
             engine_client.clone(),
             asserter,
@@ -4239,6 +4256,10 @@ mod run_loop_policy_tests {
                 skipped_l1_messages: vec![],
                 target_status: BatchStatus::Consolidated,
             },
+            // Head ABOVE safe, so a rewind target can still sit at or above the
+            // safe mirror: with head == safe there is no target that is both a
+            // rewind and not a HeadBelowSafe refusal.
+            ForkchoiceState::new(info(SAFE + 10, 0x11), info(SAFE, 0x11), info(0, 0x00)),
         )
         .await;
 
@@ -4264,14 +4285,24 @@ mod run_loop_policy_tests {
         assert!(refusal.contains("head moved"), "unexpected refusal text: {refusal}");
         assert_eq!(engine_client.fork_choice_updated_calls(), 1, "no FCU on a CAS refusal");
 
-        // Matching observed head: proceeds through the checked FCU. The
-        // target sits above the safe mirror — a below-safe target would be
-        // refused by the handler's own HeadBelowSafe check, which is not
-        // what this test pins.
+        // A FORWARD target is refused whatever the CAS says: this command only
+        // rewinds, and moving forward would purge mappings only above the
+        // target while advancing the anchor over blocks whose L1 messages were
+        // never stamped.
+        let refusal = handle
+            .update_fcs_head_if_unmoved(info(SAFE + 20, 0x22), Some(info(SAFE + 10, 0x11)))
+            .await
+            .unwrap()
+            .expect_err("a forward head move must refuse");
+        assert!(refusal.contains("only rewinds"), "unexpected refusal text: {refusal}");
+        assert_eq!(engine_client.fork_choice_updated_calls(), 1, "no FCU on a direction refusal");
+
+        // Matching observed head, rewinding to a target still at or above the
+        // safe mirror: proceeds through the checked FCU.
         engine_client
             .push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Valid, None)));
         handle
-            .update_fcs_head_if_unmoved(info(SAFE + 5, 0x22), Some(info(SAFE, 0x11)))
+            .update_fcs_head_if_unmoved(info(SAFE + 5, 0x22), Some(info(SAFE + 10, 0x11)))
             .await
             .unwrap()
             .expect("a matching observed head must proceed");

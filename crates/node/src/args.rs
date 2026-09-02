@@ -502,9 +502,11 @@ impl ScrollRollupNodeConfig {
         // peer-block safe-head reorg refusals, the L1-reorg finalized floor and
         // the administrative unwind's symmetric check all compare against 0 —
         // so a transient hiccup must at least be visible.
+        let mut provider_fcs_missing = false;
         let mut fcs = match ForkchoiceState::from_provider(&l2_provider).await {
             Some(fcs) => fcs,
             None => {
+                provider_fcs_missing = true;
                 tracing::warn!(
                     target: "scroll::node::args",
                     "Could not read the forkchoice state from the L2 provider; falling back to \
@@ -533,12 +535,27 @@ impl ScrollRollupNodeConfig {
         // at 0 while the database knows a head above it, leaving every
         // safe-and-finalized guard vacuous for as long as it takes a finalized
         // notification to arrive. Refuse instead of starting in that state.
-        if fcs.is_genesis() && l2_head_block_number > 0 {
-            eyre::bail!(
-                "the L2 provider reported no forkchoice state while the database holds an L2 \
-                 head at {l2_head_block_number}; refusing to start with head, safe and \
-                 finalized all at genesis (is the execution node reachable and synced?)"
-            );
+        // Gated on the fallback ACTUALLY having fired, not on `is_genesis()`:
+        // that is only `head.number == 0`, which a provider answering all three
+        // reads from a wiped or resynced execution-node datadir also satisfies.
+        // Both are refused, but they need different messages — the second sends
+        // an operator after execution-node reachability for no reason.
+        if l2_head_block_number > 0 {
+            if provider_fcs_missing {
+                eyre::bail!(
+                    "the L2 provider reported no forkchoice state while the database holds an \
+                     L2 head at {l2_head_block_number}; refusing to start with head, safe and \
+                     finalized all at genesis (is the execution node reachable and synced?)"
+                );
+            }
+            if fcs.is_genesis() {
+                eyre::bail!(
+                    "the L2 provider is at genesis while the database holds an L2 head at \
+                     {l2_head_block_number}; the execution node's datadir looks wiped or \
+                     resynced while the rollup database was kept (resync both, or point at \
+                     the matching execution-node datadir)"
+                );
+            }
         }
 
         // Loop to find the latest block that we have in the EN and purge L1 message mappings to

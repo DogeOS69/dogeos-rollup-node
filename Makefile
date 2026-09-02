@@ -83,7 +83,7 @@ test-docker:
 	--locked \
 	--all-features \
 	--no-fail-fast \
-	--no-tests=pass \
+	--no-tests=fail \
 	-E 'test(docker)' \
 	--test-threads=1 \
 	--failure-output immediate \

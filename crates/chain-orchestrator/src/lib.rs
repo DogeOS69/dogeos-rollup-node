@@ -101,6 +101,14 @@ const fn l1_notification_receiver_may_poll(
     l2_synced && derivation_pipeline_empty && derivation_driver_can_accept_batch
 }
 
+/// How often a latched L2-sync target is re-probed independently of inbound traffic.
+///
+/// The re-check used to run only from the two import paths — that is, the cure was gated on
+/// exactly the traffic whose absence creates the problem. This PR makes entry into `Syncing` far
+/// more common (any SYNCING forkchoice response on an ordinary import now latches), so a node
+/// whose chain then goes quiet needs a trigger of its own.
+const L2_SYNC_RECHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// A latched L2-sync target and the engine mirror head it was latched against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct L2SyncRecheck {
@@ -151,8 +159,10 @@ pub struct ChainOrchestrator<
     /// target describing a head that is no longer where the chain is, and
     /// re-issuing it would silently rewind the engine with none of the
     /// machinery every real rewind site pairs with — no mapping purge, no
-    /// transaction refill, no job cancellation, no event. So the latch is
-    /// dropped as soon as the mirror moves off what it was taken against.
+    /// transaction refill, no job cancellation, no event. So a latch whose
+    /// mirror has moved is REPLACED by one onto the current head, never
+    /// cleared: clearing would leave L2 marked syncing with no recovery target,
+    /// which is the same wedge from the other side.
     ///
     /// That latch has only one other exit — a LATER import returning VALID — and
     /// on a quiescent chain no later import arrives: peers re-announce blocks
@@ -241,6 +251,10 @@ impl<
         mut self,
         mut shutdown: impl std::future::Future<Output = ()> + Unpin,
     ) -> Result<(), ChainOrchestratorError> {
+        // Independent of inbound imports: see L2_SYNC_RECHECK_INTERVAL.
+        let mut l2_sync_recheck = tokio::time::interval(L2_SYNC_RECHECK_INTERVAL);
+        l2_sync_recheck.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
         loop {
             tokio::select! {
                 biased;
@@ -365,6 +379,15 @@ impl<
                 }
                 Some(batch) = self.derivation_pipeline.next(), if self.derivation_driver.can_accept_batch() => {
                     self.derivation_driver.hold_batch(batch);
+                }
+                // Last in the biased order: a background probe must never preempt
+                // real work. Gated so it costs nothing unless a latch is live.
+                _ = l2_sync_recheck.tick(), if self.sync_state.l2().is_syncing() &&
+                    self.l2_sync_recheck_target.is_some() =>
+                {
+                    // Only FatalStateDivergence escapes this helper, and that is
+                    // the run loop's fail-stop contract.
+                    self.recheck_l2_sync_target().await?;
                 }
                 Some(event) = self.network.events().next() => {
                     let res = self.handle_network_event(event).await;
@@ -2225,14 +2248,18 @@ impl<
             }
         };
         if result.is_invalid() {
-            // The engine actively rejected the latched head: it is not coming back, so stop
-            // re-issuing it. Sync mode stays closed until a real import reopens it.
+            // The engine actively rejected this target, so stop re-issuing IT — but re-latch onto
+            // the current mirror rather than clearing, for the same reason the stale arm above
+            // does: a cleared latch leaves L2 marked syncing with no recovery target at all, and
+            // on the quiescent chain this mechanism exists for, nothing reopens that gate.
             tracing::warn!(
                 target: "scroll::chain_orchestrator",
                 ?target,
-                "Latched L2 sync target rejected as INVALID; dropping the re-check"
+                ?mirror,
+                "Latched L2 sync target rejected as INVALID; re-latching onto the current head"
             );
-            self.l2_sync_recheck_target = None;
+            self.l2_sync_recheck_target =
+                Some(L2SyncRecheck { target: mirror, latched_from: mirror });
             return Ok(());
         }
         if !result.is_valid() {
@@ -3370,7 +3397,8 @@ mod run_loop_policy_tests {
         assert_eq!(
             orchestrator.l2_sync_recheck_target,
             Some(super::L2SyncRecheck { target: info(SAFE, 0x11), latched_from: info(SAFE, 0x11) }),
-            "the stale latch must be REPLACED by one onto the current mirror: clearing it would              leave L2 syncing with no recovery target, and on a quiescent chain nothing reopens              that gate"
+            "the stale latch must be REPLACED by one onto the current mirror: clearing it would \
+                         leave L2 syncing with no recovery target, and on a quiescent chain nothing reopens              that gate"
         );
         assert_eq!(
             *orchestrator.engine.fcs().head_block_info(),

@@ -51,12 +51,36 @@ impl ForkchoiceState {
     /// caller distinguishes it from a provider that answered while sitting at genesis, and refuses
     /// to start on either when the database already knows a higher head.
     pub async fn from_provider<P: Provider<Scroll>>(provider: &P) -> Option<Self> {
-        let latest_block =
-            provider.get_block(BlockId::Number(BlockNumberOrTag::Latest)).await.ok()??;
-        let mut safe_block =
-            provider.get_block(BlockId::Number(BlockNumberOrTag::Safe)).await.ok()??;
-        let finalized_block =
-            provider.get_block(BlockId::Number(BlockNumberOrTag::Finalized)).await.ok()??;
+        // Logged, not silently swallowed: the caller now HARD-BAILS the node on this `None` and
+        // offers the operator two hypotheses (unreachable/unsynced execution node, or a wiped
+        // datadir) with nothing else written down to tell them apart.
+        macro_rules! read_tag {
+            ($tag:expr, $name:literal) => {
+                match provider.get_block(BlockId::Number($tag)).await {
+                    Ok(Some(block)) => block,
+                    Ok(None) => {
+                        tracing::warn!(
+                            target: "scroll::engine",
+                            tag = $name,
+                            "Execution node reported no block for this forkchoice tag"
+                        );
+                        return None;
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            target: "scroll::engine",
+                            tag = $name,
+                            %err,
+                            "Could not read a forkchoice tag from the execution node"
+                        );
+                        return None;
+                    }
+                }
+            };
+        }
+        let latest_block = read_tag!(BlockNumberOrTag::Latest, "latest");
+        let mut safe_block = read_tag!(BlockNumberOrTag::Safe, "safe");
+        let finalized_block = read_tag!(BlockNumberOrTag::Finalized, "finalized");
 
         // Finality must never REGRESS. Clamping `finalized` down to the head would weaken the
         // orchestrator's finality floor, letting an L1 reorg or an administrative unwind commit

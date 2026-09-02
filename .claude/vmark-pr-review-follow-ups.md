@@ -1121,3 +1121,52 @@ pass 54 found that pass 53's guard reintroduced the original wedge. The
 mechanism is small but sits on the consensus path and has proven easy to get
 wrong in both directions. It deserves human review before merge regardless of
 what the next automated pass says.
+
+## Pass 55 findings — resolution (Claude, 2026-09-02)
+
+Claude pass 55 returned 6 majors and 13 minors. Majors FIXED; the remaining
+minors are recorded below.
+
+- **M1 (FIXED)** The INVALID arm of `recheck_l2_sync_target` had the SAME defect
+  pass 54 fixed twelve lines above it: it cleared the latch while leaving L2
+  marked syncing. Fixing one arm and not its sibling is exactly the failure mode
+  this mechanism keeps producing. It now re-latches onto the current mirror.
+- **M2 (FIXED — the root cause)** The re-check ran only from the two import
+  paths, so the cure was gated on precisely the traffic whose absence creates
+  the problem, and this PR makes entry into `Syncing` far more common (any
+  SYNCING forkchoice response on an ordinary import now latches). Added a
+  `L2_SYNC_RECHECK_INTERVAL` arm to the run loop, last in the biased order and
+  gated on a live latch, so recovery no longer depends on inbound traffic. This
+  is the structural fix the previous three passes were each patching around.
+- **M3 (FIXED)** The `l1.url` exemption was `cfg!(test-utils) && test_args.test`,
+  but the mock-watcher fallback it guards is keyed ONLY on the cfg.
+  `scroll-debug --bootnodes` / `--valid-signer` set `test = false` without a URL
+  and so panicked at startup — worked on `main`, and `debug_toolkit` has no tests
+  so CI stayed green. The exemption now matches the fallback exactly.
+- **M5 (FIXED)** `from_provider`'s three `.ok()??` destroyed the transport error
+  at the point this loop made it load-bearing: the caller now hard-bails and
+  offers the operator two hypotheses with nothing logged to discriminate them.
+  Each tag read now logs which one failed and why.
+- **Minors (FIXED)** Five malformed literals from lost `\` continuations (the
+  third time this class has appeared); `--blob.anvil-url` corrected to
+  `--blob.anvil_url`; the latch doc updated to describe the re-latch rather than
+  the behaviour pass 54 replaced; the book's `--l1.url` contradiction resolved.
+
+### Recorded, not fixed
+
+- **M4** `remote_block_source.rs`'s `remote_head <= last_imported` conflates
+  caught-up with remote-rewound-below-the-pointer; the `<` case returns Ok,
+  resets `consecutive_failures` and can log "Recovered" on the tick the source
+  stopped following. Every sibling stale-pointer guard clears the pointer and
+  errors. Left because changing the follow-loop's control flow at this point in
+  the loop carries more risk than the diagnostic defect it fixes; it should be
+  taken with the other remote-source work.
+- **M6** `test_remote_block_source_resumes_from_correct_head` is out of both the
+  merge gate and `make test`, leaving only the comment-only quarantine lane. Its
+  exclusion is justified by a live defect already tracked at ledger:348; the new
+  part is that its only regression test is gone. A merge decision, not a code
+  fix.
+- Pass 55's own remaining minors: three dead `Err` arms on
+  `collect_reverted_txs_in_range` (it can no longer fail after pass 51 made it
+  per-block resilient), and `GenesisMissing` not hoisted above the
+  fresh/populated split the way `GenesisMismatch` was.

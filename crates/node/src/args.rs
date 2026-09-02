@@ -282,7 +282,11 @@ impl ScrollRollupNodeConfig {
         // watcher only exists under cfg(feature = "test-utils"), so in the
         // shipped binary --test without an L1 URL reaches the very same
         // unwrap. Exempting it unconditionally would just move the panic.
-        let l1_optional = cfg!(feature = "test-utils") && self.test_args.test;
+        // Keyed ONLY on the cfg, exactly like the mock-watcher fallback it guards:
+        // `scroll-debug` sets `test = false` with no URL, so an extra
+        // `&& test_args.test` here panics those subcommands at startup — and
+        // `debug_toolkit` has no tests, so CI would stay green.
+        let l1_optional = cfg!(feature = "test-utils");
         if self.l1_provider_args.url.is_none() && !l1_optional {
             return Err("l1.url is required: without it the L1 watcher is never started".to_string());
         }
@@ -297,7 +301,7 @@ impl ScrollRollupNodeConfig {
             self.blob_provider_args.anvil_url.is_none()
         {
             return Err(
-                "--test disables the L1 watcher and this build has no test-utils fallback:                  drop --test, set --blob.anvil-url, or rebuild with --features test-utils"
+                "--test disables the L1 watcher and this build has no test-utils fallback:                  drop --test, set --blob.anvil_url, or rebuild with --features test-utils"
                     .to_string(),
             );
         }
@@ -1829,13 +1833,19 @@ mod tests {
         config.sequencer_args = SequencerArgs::default();
         config.l1_provider_args = L1ProviderArgs::default();
 
-        config.test_args = TestArgs { test: false, skip_l1_synced: false };
-        let err = config.validate().unwrap_err();
-        assert!(err.contains("l1.url is required"), "{err}");
-
-        // `--test` is exempt only on a build that carries the fallback watcher.
-        config.test_args = TestArgs { test: true, skip_l1_synced: false };
-        assert_eq!(config.validate().is_ok(), cfg!(feature = "test-utils"));
+        // The exemption is keyed ONLY on the cfg, matching the mock-watcher
+        // fallback it guards — `scroll-debug` reaches that fallback with
+        // `test = false`. So on a build carrying test-utils (this one: the unit
+        // lane builds --all-features) the URL is optional either way, and on the
+        // shipped binary it is required either way.
+        for test in [false, true] {
+            config.test_args = TestArgs { test, skip_l1_synced: false };
+            let result = config.validate();
+            assert_eq!(result.is_ok(), cfg!(feature = "test-utils"), "test={test}: {result:?}");
+            if let Err(err) = result {
+                assert!(err.contains("l1.url is required"), "{err}");
+            }
+        }
     }
 
     /// The mirror image: without `sequencer.enabled` no Sequencer is built, so

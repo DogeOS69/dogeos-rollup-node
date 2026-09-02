@@ -128,8 +128,9 @@ These can be used as reliable blob sources without requiring your own beacon nod
 - `--consensus.algorithm <ALGORITHM>`: Consensus algorithm to use
     - `system-contract` (default): Validates blocks against authorized signer from L1
     - `noop`: No consensus validation (testing only)
-- `--consensus.authorized-signer <ADDRESS>`: Static authorized signer address (when using system-contract without L1
-  provider)
+- `--consensus.authorized-signer <ADDRESS>`: Static authorized signer address (when using
+  system-contract; `--l1.url` is required either way, so this only avoids the
+  extra L1 query)
 
 #### Database Configuration
 

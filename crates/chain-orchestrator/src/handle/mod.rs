@@ -125,8 +125,22 @@ impl<N: FullNetwork<Primitives = DogeosNetworkPrimitives>> ChainOrchestratorHand
         &self,
         head: BlockInfo,
     ) -> Result<Result<(), String>, oneshot::error::RecvError> {
+        self.update_fcs_head_if_unmoved(head, None).await
+    }
+
+    /// [`Self::update_fcs_head`] with a compare-and-swap precondition: the
+    /// handler refuses (inner `Err`) when the engine's head no longer equals
+    /// `expected_head` at processing time. A caller that DECIDES a head move
+    /// from an observed head (the remote source's rewind) must use this —
+    /// the decision and the command are not atomic, and a concurrent revert
+    /// in the gap would otherwise be undone by a now-forward head move.
+    pub async fn update_fcs_head_if_unmoved(
+        &self,
+        head: BlockInfo,
+        expected_head: Option<BlockInfo>,
+    ) -> Result<Result<(), String>, oneshot::error::RecvError> {
         let (tx, rx) = oneshot::channel();
-        self.send_command(ChainOrchestratorCommand::UpdateFcsHead((head, tx)));
+        self.send_command(ChainOrchestratorCommand::UpdateFcsHead((head, expected_head, tx)));
         rx.await
     }
 

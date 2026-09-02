@@ -713,7 +713,23 @@ impl<
             ChainOrchestratorCommand::NetworkHandle(tx) => {
                 let _ = tx.send(self.network.handle().clone());
             }
-            ChainOrchestratorCommand::UpdateFcsHead((head, sender)) => {
+            ChainOrchestratorCommand::UpdateFcsHead((head, expected_head, sender)) => {
+                // Compare-and-swap precondition: a caller that decided this
+                // move from an OBSERVED head must not have the decision
+                // applied after the head moved — the gap between its status
+                // read and this command is a TOCTOU window in which a
+                // concurrent revert would otherwise be undone by a
+                // now-forward head move.
+                if let Some(expected) = expected_head {
+                    let current = *self.engine.fcs().head_block_info();
+                    if current != expected {
+                        let _ = sender.send(Err(format!(
+                            "head moved from the observed {expected:?} to {current:?}; \
+                             re-derive and retry"
+                        )));
+                        return Ok(());
+                    }
+                }
                 // Collect transactions of reverted blocks from l2 client.
                 // Best-effort: a failure must neither abort the update nor
                 // drop the responder without a reply.
@@ -1655,25 +1671,31 @@ impl<
                     ?mirror_finalized,
                     "Finalized marker already committed to the engine mirror; skipping FCU"
                 );
-            } else if finalized_block_info.number > mirror_safe {
-                // The EL's markers sit below database finality (an EL-side
-                // marker rollback): raising finalized above safe would
-                // violate the FCS invariant locally. Defer — recovery comes
-                // from NEW committed batches becoming L1-finalized: their
-                // consolidation FCU raises head+safe+finalized together
-                // (already-`Finalized` batches are never re-derived), after
-                // which the next finalized notification recomputes and
-                // reissues. On a quiescent chain this arm repeats its error
-                // until new batches arrive.
+            } else if finalized_block_info.number > self.engine.fcs().head_block_info().number {
+                // The EL's markers sit below database finality AND its head
+                // does not even cover the marker (a deep EL-side rollback):
+                // nothing can be raised safely from here — the startup
+                // head-repair path owns this shape. Retry on the next
+                // finalized notification.
                 tracing::error!(
                     target: "scroll::chain_orchestrator",
                     ?finalized_block_info,
                     mirror_safe,
-                    "Finalized marker exceeds the engine's safe mirror; deferring the marker FCU"
+                    "Finalized marker exceeds the engine's head mirror; deferring the marker FCU"
                 );
             } else {
-                tracing::info!(target: "scroll::chain_orchestrator", ?finalized_block_info, "Updating FCS with new finalized block info from L1 finalization");
-                match self.engine.update_fcs(None, None, Some(finalized_block_info)).await {
+                // When the marker also exceeds the SAFE mirror (an EL-side
+                // marker rollback with the head still covering the marker),
+                // raise safe TOGETHER with finalized: a finalized block is
+                // safe by construction, and deferring would stall forever on
+                // a quiescent chain — already-`Finalized` batches are never
+                // re-derived, so nothing else would ever advance safe and
+                // the engine would keep accepting reorgs of blocks the
+                // database holds finalized.
+                let safe_arg =
+                    (finalized_block_info.number > mirror_safe).then_some(finalized_block_info);
+                tracing::info!(target: "scroll::chain_orchestrator", ?finalized_block_info, ?safe_arg, "Updating FCS with new finalized block info from L1 finalization");
+                match self.engine.update_fcs(None, safe_arg, Some(finalized_block_info)).await {
                     Ok(result) if result.is_invalid() => {
                         // INVALID does not commit the mirror, and no retry
                         // changes the engine's verdict on a block it already
@@ -3880,6 +3902,210 @@ mod run_loop_policy_tests {
             matches!(result, Err(ChainOrchestratorError::FcuRejected(_))),
             "expected FcuRejected, got {result:?}"
         );
+    }
+
+    /// Pins the pass-42 compare-and-swap precondition on the administrative
+    /// head update: a stale observed head refuses without touching the
+    /// engine, a matching one proceeds.
+    #[tokio::test]
+    async fn update_fcs_head_precondition_rejects_moved_head() {
+        let database = Arc::new(setup_test_db().await);
+        database.insert_genesis_block(B256::ZERO).await.unwrap();
+        // The dev migration seeded the Scroll dev genesis row beside the
+        // test genesis; drop it so height-0 queries are deterministic.
+        database.delete_mismatched_genesis_blocks(B256::ZERO).await.unwrap();
+        let batch_info = BatchInfo::new(1, B256::repeat_byte(1));
+        database
+            .insert_batch(BatchCommitData {
+                hash: batch_info.hash,
+                index: batch_info.index,
+                block_number: 10,
+                block_timestamp: 0,
+                calldata: Arc::new(Bytes::new()),
+                blob_versioned_hash: None,
+                finalized_block_number: None,
+                reverted_block_number: None,
+            })
+            .await
+            .unwrap();
+        database.update_batch_status(batch_info.hash, BatchStatus::Processing).await.unwrap();
+        let engine_client = Arc::new(ScriptedEngineClient::new());
+        engine_client
+            .push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Syncing, None)));
+        let asserter = Asserter::new();
+        asserter.push_success(&Option::<()>::None);
+        asserter.push_success(&Option::<()>::None);
+        let (orchestrator, handle, _notification_tx) = test_orchestrator(
+            database.clone(),
+            engine_client.clone(),
+            asserter,
+            BatchDerivationResult {
+                attributes: vec![DerivedAttributes {
+                    block_number: SAFE + 1,
+                    attributes: ScrollPayloadAttributes::default(),
+                }],
+                batch_info,
+                skipped_l1_messages: vec![],
+                target_status: BatchStatus::Consolidated,
+            },
+        )
+        .await;
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let run_task = tokio::spawn(orchestrator.run_until_shutdown(Box::pin(async move {
+            let _ = shutdown_rx.await;
+        })));
+
+        time::timeout(Duration::from_secs(2), async {
+            while engine_client.fork_choice_updated_calls() < 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first Engine SYNCING response must hold the batch");
+
+        // Stale observed head: refused before any FCU.
+        let refusal = handle
+            .update_fcs_head_if_unmoved(info(50, 0x22), Some(info(99, 0x33)))
+            .await
+            .unwrap()
+            .expect_err("a moved head must refuse the update");
+        assert!(refusal.contains("head moved"), "unexpected refusal text: {refusal}");
+        assert_eq!(engine_client.fork_choice_updated_calls(), 1, "no FCU on a CAS refusal");
+
+        // Matching observed head: proceeds through the checked FCU. The
+        // target sits above the safe mirror — a below-safe target would be
+        // refused by the handler's own HeadBelowSafe check, which is not
+        // what this test pins.
+        engine_client
+            .push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Valid, None)));
+        handle
+            .update_fcs_head_if_unmoved(info(SAFE + 5, 0x22), Some(info(SAFE, 0x11)))
+            .await
+            .unwrap()
+            .expect("a matching observed head must proceed");
+        assert_eq!(engine_client.fork_choice_updated_calls(), 2);
+        assert_eq!(
+            engine_client.fork_choice_updated_states()[1].head_block_hash,
+            B256::repeat_byte(0x22)
+        );
+
+        let _ = shutdown_tx.send(());
+        assert!(run_task.await.unwrap().is_ok());
+    }
+
+    /// Pins the pass-42 joint raise: after an EL-side marker rollback (safe
+    /// and finalized mirrors below database finality, head still covering
+    /// the marker), a replayed finalized notification raises safe TOGETHER
+    /// with finalized — deferring would stall forever on a quiescent chain.
+    #[tokio::test]
+    async fn l1_finalization_joint_safe_raise_after_marker_regression() {
+        let database = Arc::new(setup_test_db().await);
+        database.insert_genesis_block(B256::ZERO).await.unwrap();
+        database.delete_mismatched_genesis_blocks(B256::ZERO).await.unwrap();
+        let batch_info = BatchInfo::new(1, B256::repeat_byte(1));
+        database
+            .insert_batch(BatchCommitData {
+                hash: batch_info.hash,
+                index: batch_info.index,
+                block_number: 1,
+                block_timestamp: 0,
+                calldata: Arc::new(Bytes::new()),
+                blob_versioned_hash: None,
+                finalized_block_number: None,
+                reverted_block_number: None,
+            })
+            .await
+            .unwrap();
+        database.update_batch_status(batch_info.hash, BatchStatus::Processing).await.unwrap();
+        let finalized_batch = BatchInfo::new(2, B256::repeat_byte(2));
+        database
+            .insert_batch(BatchCommitData {
+                hash: finalized_batch.hash,
+                index: finalized_batch.index,
+                block_number: 6,
+                block_timestamp: 0,
+                calldata: Arc::new(Bytes::new()),
+                blob_versioned_hash: None,
+                finalized_block_number: Some(6),
+                reverted_block_number: None,
+            })
+            .await
+            .unwrap();
+        database.insert_blocks(vec![info(50, 0x22)], finalized_batch).await.unwrap();
+        database.finalize_batches_up_to_index(2, 6).await.unwrap();
+        database.update_batch_status(finalized_batch.hash, BatchStatus::Finalized).await.unwrap();
+
+        let engine_client = Arc::new(ScriptedEngineClient::new());
+        // The held batch consolidates trivially (no attributes), so the only
+        // scripted FCU is the joint marker raise.
+        engine_client
+            .push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Valid, None)));
+        let asserter = Asserter::new();
+        asserter.push_success(&Option::<()>::None);
+        asserter.push_success(&Option::<()>::None);
+        // Safe and finalized mirrors regressed below the marker (50); the
+        // head still covers it.
+        let (mut orchestrator, _handle, notification_tx) = test_orchestrator_with_fcs(
+            database.clone(),
+            engine_client.clone(),
+            asserter,
+            BatchDerivationResult {
+                attributes: vec![],
+                batch_info,
+                skipped_l1_messages: vec![],
+                target_status: BatchStatus::Consolidated,
+            },
+            ForkchoiceState::new(info(SAFE, 0x11), info(45, 0x0d), info(40, 0x0e)),
+        )
+        .await;
+        let mut events = orchestrator.event_listener();
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let run_task = tokio::spawn(orchestrator.run_until_shutdown(Box::pin(async move {
+            let _ = shutdown_rx.await;
+        })));
+
+        notification_tx.send(Arc::new(L1Notification::Finalized(6))).await.unwrap();
+        time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(ChainOrchestratorEvent::L1BlockFinalized(6, _)) = events.next().await {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the finalized notification must complete");
+
+        assert_eq!(engine_client.fork_choice_updated_calls(), 1);
+        let issued = engine_client.fork_choice_updated_states();
+        assert_eq!(
+            issued[0].finalized_block_hash,
+            B256::repeat_byte(0x22),
+            "the marker must be raised"
+        );
+        assert_eq!(
+            issued[0].safe_block_hash,
+            B256::repeat_byte(0x22),
+            "safe must ride along with the replayed marker"
+        );
+        assert_eq!(issued[0].head_block_hash, B256::repeat_byte(0x11), "the head must not move");
+
+        // A second notification is an idempotent skip.
+        notification_tx.send(Arc::new(L1Notification::Finalized(7))).await.unwrap();
+        time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(ChainOrchestratorEvent::L1BlockFinalized(7, _)) = events.next().await {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the second finalized notification must complete");
+        assert_eq!(engine_client.fork_choice_updated_calls(), 1);
+
+        let _ = shutdown_tx.send(());
+        assert!(run_task.await.unwrap().is_ok());
     }
 
     #[tokio::test]

@@ -1043,7 +1043,8 @@ where
                     .status()
                     .await
                     .map_err(|e| self.classify_recv_error(e))?;
-                let fresh_head = fresh.l2.fcs.head_block_info().number;
+                let fresh_head_info = *fresh.l2.fcs.head_block_info();
+                let fresh_head = fresh_head_info.number;
                 let fresh_safe = fresh.l2.fcs.safe_block_info().number;
                 if resume < fresh_safe {
                     return Err(eyre::eyre!(
@@ -1064,8 +1065,15 @@ where
                     resume,
                     "Local head extends past the common ancestor; rewinding to follow the remote"
                 );
+                // The observed head rides along as a compare-and-swap
+                // precondition: the fresh read above and this command are
+                // still not atomic, and the handler refuses the rewind if
+                // the head moved in the gap.
                 self.orchestrator_handle
-                    .update_fcs_head(BlockInfo { number: resume, hash: resume_hash })
+                    .update_fcs_head_if_unmoved(
+                        BlockInfo { number: resume, hash: resume_hash },
+                        Some(fresh_head_info),
+                    )
                     .await
                     .map_err(|e| self.classify_recv_error(e))?
                     .map_err(|refusal| {

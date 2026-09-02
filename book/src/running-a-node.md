@@ -145,7 +145,7 @@ These can be used as reliable blob sources without requiring your own beacon nod
 #### Chain Orchestrator Configuration
 
 - `--chain.optimistic-sync-trigger <BLOCKS>`: Block gap that triggers optimistic sync (default: 1000)
-- `--chain.chain-buffer-size <SIZE>`: In-memory chain buffer size (default: 2000)
+- `--chain.chain-buffer-size <SIZE>`: accepted but currently inert — no component reads it (default: 2000)
 
 #### Engine Configuration
 
@@ -343,7 +343,7 @@ Look for log entries indicating successful block processing and chain advancemen
 
 **High memory usage:**
 
-- Adjust `--chain.chain-buffer-size` to reduce memory footprint
+
 - Ensure system has adequate RAM (16GB recommended)
 
 **Database errors:**
@@ -407,9 +407,10 @@ Two behaviours matter operationally beyond the flags themselves.
 
 **The add-on can rewind this node's head.** When the remote's chain diverges
 from the local one, the source walks back to the common ancestor and issues an
-administrative head update to it. The rewind is floored only at the local safe
-head — on a node that does no L1 derivation, that floor is genesis, so a
-divergent remote can rewind the node arbitrarily far. Point
+administrative head update to it. The rewind is floored at the local safe head
+and reaches no further back than the add-on's 8192-block ancestor lookback. On
+a node that does no L1 derivation the safe floor is genesis, so within that
+window a divergent remote decides this node's head. Point
 `--remote-source.url` only at a node whose chain this one should follow
 unconditionally.
 

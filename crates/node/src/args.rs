@@ -270,6 +270,16 @@ impl ScrollRollupNodeConfig {
                 .to_string());
         }
 
+        // Without an L1 provider the L1 watcher is never constructed, and the
+        // handle is unwrapped unconditionally at startup — a release build
+        // aborts naming nothing the operator typed. The test-utils fallback that
+        // hides this in every in-process test is not compiled into the shipped
+        // binary (no default features; the Dockerfile builds --release).
+        //
+        // Last, so a config violating several rules reports the specific one.
+        if self.l1_provider_args.url.is_none() && !self.test_args.test {
+            return Err("l1.url is required: without it the L1 watcher is never started".to_string());
+        }
         Ok(())
     }
 
@@ -452,12 +462,17 @@ impl ScrollRollupNodeConfig {
         // the real genesis nondeterministically in highest-block queries (the
         // safe head reported by get_latest_safe_l2_info among them).
         //
-        // Use the SAME genesis source the forkchoice state and the migrations
-        // use (hardcoded constants for the named Scroll chains, the computed
-        // header hash otherwise) — NOT chain_spec.genesis_hash(). A divergence
-        // between the two is exactly what the constants exist to express;
-        // reconciling to the wrong one would leave the engine FCS and the
-        // database disagreeing on genesis.
+        // The SAME source the forkchoice state uses: hardcoded constants for
+        // the named Scroll chains, and `chain_spec.genesis_hash()` otherwise —
+        // which returns the SEALED hash when a spec carries one, and recomputes
+        // only when it does not. NOT `genesis_header().hash_slow()`: that always
+        // recomputes, and chikyu's genesis document is byte-identical to
+        // mainnet's in every field the header is built from, so recomputing
+        // yields MAINNET's hash for chikyu and bricks the chain at startup.
+        //
+        // This is deliberately NOT the genesis the migration seeds — for dev and
+        // every custom chain the migration writes a different value, which is
+        // why `seeded_genesis` is threaded separately below.
         let genesis_hash = genesis_hash_from_chain_spec(chain_spec.clone())
             .unwrap_or_else(|| chain_spec.genesis_hash());
         // One transaction for the whole reconciliation, so a crash mid-way
@@ -479,10 +494,13 @@ impl ScrollRollupNodeConfig {
             // Dev, and every custom chain (which reuses the dev migration).
             _ => ScrollDevMigrationInfo::genesis_hash(),
         };
+        // `map_err` rather than `expect`: the genesis errors carry actionable
+        // Display text ("is the database path pointed at another chain's
+        // data?") that a Debug-formatted panic would discard.
         let removed = db
             .reconcile_genesis_block(genesis_hash, seeded_genesis)
             .await
-            .expect("failed to reconcile the genesis block");
+            .map_err(|err| eyre::eyre!("failed to reconcile the genesis block: {err}"))?;
         if removed > 0 {
             tracing::warn!(
                 target: "scroll::node::args",
@@ -496,7 +514,8 @@ impl ScrollRollupNodeConfig {
             ForkchoiceState::head_from_chain_spec(chain_spec.clone())
                 .expect("failed to derive forkchoice state from chain spec")
         };
-        // `from_provider` returns None on ANY of three swallowed RPC reads, and
+        // `from_provider` returns None on any of three swallowed RPC reads or on
+        // an internally inconsistent snapshot (finalized above latest), and
         // the genesis fallback then sets head = safe = finalized = 0. Every
         // safe/finalized guard downstream is vacuous in that state — the
         // peer-block safe-head reorg refusals, the L1-reorg finalized floor and
@@ -535,17 +554,19 @@ impl ScrollRollupNodeConfig {
         // at 0 while the database knows a head above it, leaving every
         // safe-and-finalized guard vacuous for as long as it takes a finalized
         // notification to arrive. Refuse instead of starting in that state.
-        // Gated on the fallback ACTUALLY having fired, not on `is_genesis()`:
-        // that is only `head.number == 0`, which a provider answering all three
-        // reads from a wiped or resynced execution-node datadir also satisfies.
-        // Both are refused, but they need different messages — the second sends
-        // an operator after execution-node reachability for no reason.
         if l2_head_block_number > 0 {
+            // Both hypotheses in one message: a wiped or resynced execution-node
+            // datadir makes reth answer `null` for the safe and finalized tags,
+            // so it lands HERE rather than in the genesis arm below, and naming
+            // only reachability sends the operator after the wrong thing.
             if provider_fcs_missing {
                 eyre::bail!(
-                    "the L2 provider reported no forkchoice state while the database holds an \
-                     L2 head at {l2_head_block_number}; refusing to start with head, safe and \
-                     finalized all at genesis (is the execution node reachable and synced?)"
+                    "could not read a usable forkchoice state from the L2 provider while the \
+                     database holds an L2 head at {l2_head_block_number}; refusing to start \
+                     with head, safe and finalized all at genesis. Either the execution node \
+                     is unreachable or not yet synced, or its datadir was wiped or resynced \
+                     while the rollup database was kept (resync both, or point at the matching \
+                     execution-node datadir)"
                 );
             }
             if fcs.is_genesis() {
@@ -554,6 +575,25 @@ impl ScrollRollupNodeConfig {
                      {l2_head_block_number}; the execution node's datadir looks wiped or \
                      resynced while the rollup database was kept (resync both, or point at \
                      the matching execution-node datadir)"
+                );
+            }
+            // The database anchor BELOW the engine's finalized block is the
+            // state the run loop calls irreconcilable and fail-stops on
+            // (`handle_l1_reorg` and the administrative unwind both do), because
+            // `unwind()` commits the rewound head durably BEFORE those checks
+            // fire. Nothing here used to refuse it: the repair loop below is
+            // gated `while l2_head > finalized`, which is false in exactly this
+            // shape, so the node came up with the engine head above the anchor
+            // and the L1-message mappings above it already purged — and the next
+            // build re-selected consumed messages, producing a queue gap every
+            // peer rejects. Strict `<` keeps `head == finalized` launching.
+            if l2_head_block_number < fcs.finalized_block_info().number {
+                eyre::bail!(
+                    "the database L2 head {l2_head_block_number} is below the execution node's \
+                     finalized block {}; an unwind committed past finality and this cannot be \
+                     reconciled automatically (restore the database from before the unwind, or \
+                     resync this node)",
+                    fcs.finalized_block_info().number
                 );
             }
         }
@@ -904,6 +944,11 @@ pub struct ChainOrchestratorArgs {
     #[arg(long = "chain.optimistic-sync-trigger", default_value_t = constants::BLOCK_GAP_TRIGGER)]
     pub optimistic_sync_trigger: u64,
     /// The size of the in-memory chain buffer used by the chain orchestrator.
+    /// NOTE: currently inert. `ChainOrchestratorConfig` has no corresponding
+    /// field and nothing outside the test utilities reads this, so setting it
+    /// changes no behaviour. Kept because it ships in the CLI; wire it to the
+    /// orchestrator's buffer or remove it deliberately, but do not document it
+    /// as a memory tunable until then.
     #[arg(long = "chain.chain-buffer-size", default_value_t = constants::CHAIN_BUFFER_SIZE)]
     pub chain_buffer_size: usize,
 }
@@ -977,8 +1022,77 @@ impl RollupNodeNetworkArgs {
     }
 }
 
+// Hand-written `Debug` for every argument group that can carry a secret.
+//
+// `build()` logs the whole config at INFO with `{:#?}` on every launch, and
+// `url::Url`'s own `Debug` prints userinfo, path and query verbatim — so a
+// derived impl emits the L1 provider's API key (the book's own example is an
+// Alchemy URL with the key in the path), the remote source's credentials, the
+// blob provider's signed URL and the KMS key id. That defeats the redaction the
+// remote source applies to its error logs. Host and port only, and presence
+// rather than value for everything else.
+
+fn debug_url(url: Option<&reqwest::Url>) -> String {
+    match url {
+        Some(url) => format!(
+            "{}://{}:{}",
+            url.scheme(),
+            url.host_str().unwrap_or("<none>"),
+            url.port_or_known_default().unwrap_or(0)
+        ),
+        None => "<unset>".to_string(),
+    }
+}
+
+impl std::fmt::Debug for L1ProviderArgs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("L1ProviderArgs")
+            .field("url", &debug_url(self.url.as_ref()))
+            .field("compute_units_per_second", &self.compute_units_per_second)
+            .field("max_retries", &self.max_retries)
+            .field("initial_backoff", &self.initial_backoff)
+            .field("logs_query_block_range", &self.logs_query_block_range)
+            .field("cache_max_items", &self.cache_max_items)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for BlobProviderArgs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BlobProviderArgs")
+            .field("beacon_node_urls_set", &self.beacon_node_urls.is_some())
+            .field("s3_url", &debug_url(self.s3_url.as_ref()))
+            .field("anvil_url", &debug_url(self.anvil_url.as_ref()))
+            .field("compute_units_per_second", &self.compute_units_per_second)
+            .field("max_retries", &self.max_retries)
+            .field("initial_backoff", &self.initial_backoff)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for SignerArgs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SignerArgs")
+            .field("key_file_set", &self.key_file.is_some())
+            .field("aws_kms_key_id_set", &self.aws_kms_key_id.is_some())
+            .field("private_key_set", &self.private_key.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for RemoteBlockSourceArgs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RemoteBlockSourceArgs")
+            .field("enabled", &self.enabled)
+            .field("url", &debug_url(self.url.as_ref()))
+            .field("poll_interval_ms", &self.poll_interval_ms)
+            .field("build", &self.build)
+            .finish_non_exhaustive()
+    }
+}
+
 /// The arguments for the L1 provider.
-#[derive(Debug, Clone, clap::Args)]
+#[derive(Clone, clap::Args)]
 pub struct L1ProviderArgs {
     /// The URL for the L1 RPC.
     #[arg(long = "l1.url", id = "l1_url", value_name = "L1_URL")]
@@ -1023,7 +1137,7 @@ impl Default for L1ProviderArgs {
 }
 
 /// The arguments for the Beacon provider.
-#[derive(Debug, Default, Clone, clap::Args)]
+#[derive(Default, Clone, clap::Args)]
 pub struct BlobProviderArgs {
     /// The URLs for the beacon node blob provider.
     #[arg(
@@ -1099,7 +1213,7 @@ pub struct SequencerArgs {
 }
 
 /// The arguments for the signer.
-#[derive(Debug, Default, Clone, clap::Args)]
+#[derive(Default, Clone, clap::Args)]
 pub struct SignerArgs {
     /// Path to the file containing the signer's private key
     #[arg(
@@ -1118,6 +1232,10 @@ pub struct SignerArgs {
     pub aws_kms_key_id: Option<String>,
 
     /// The private key signer, if any.
+    /// `skip`, not a positional: without this clap derives one from the field,
+    /// and a raw hex signing key on argv lands in `ps`, `/proc/<pid>/cmdline`
+    /// and shell history. Both siblings are explicitly namespaced flags.
+    #[arg(skip)]
     pub private_key: Option<PrivateKeySigner>,
 }
 
@@ -1201,7 +1319,6 @@ impl SignerArgs {
 #[derive(Debug, Default, Clone, clap::Args)]
 pub struct RollupNodeGasPriceOracleArgs {
     /// Minimum suggested priority fee (tip) in wei, default `100`
-    #[arg(long, default_value_t = 100)]
     #[arg(long = "gpo.default-suggest-priority-fee", id = "default_suggest_priority_fee", value_name = "DEFAULT_SUGGEST_PRIORITY_FEE", default_value_t = constants::DEFAULT_SUGGEST_PRIORITY_FEE)]
     pub default_suggested_priority_fee: u64,
 }
@@ -1241,7 +1358,7 @@ impl Default for PprofArgs {
 }
 
 /// The arguments for the remote block source.
-#[derive(Debug, Default, Clone, clap::Args)]
+#[derive(Default, Clone, clap::Args)]
 pub struct RemoteBlockSourceArgs {
     /// Enable the remote block source feature
     #[arg(long = "remote-source.enabled", default_value_t = false)]
@@ -1251,7 +1368,7 @@ pub struct RemoteBlockSourceArgs {
     #[arg(long = "remote-source.url", id = "remote_source_url", value_name = "URL")]
     pub url: Option<reqwest::Url>,
 
-    /// Polling interval in milliseconds (when already synced)
+    /// Polling interval in milliseconds (between polls; catch-up runs inside a single tick)
     #[arg(
         long = "remote-source.poll-interval-ms",
         default_value_t = 100,
@@ -1506,7 +1623,12 @@ mod tests {
             database_args: RollupNodeDatabaseArgs::default(),
             engine_driver_args: EngineDriverArgs::default(),
             chain_orchestrator_args: ChainOrchestratorArgs::default(),
-            l1_provider_args: L1ProviderArgs::default(),
+            l1_provider_args: L1ProviderArgs {
+                // validate() requires an L1 provider: without one the L1 watcher
+                // is never built and startup aborts.
+                url: Some("http://localhost:8545".parse().unwrap()),
+                ..Default::default()
+            },
             blob_provider_args: BlobProviderArgs::default(),
             network_args: RollupNodeNetworkArgs::default(),
             gas_price_oracle_args: RollupNodeGasPriceOracleArgs::default(),
@@ -1538,7 +1660,12 @@ mod tests {
             database_args: RollupNodeDatabaseArgs::default(),
             engine_driver_args: EngineDriverArgs::default(),
             chain_orchestrator_args: ChainOrchestratorArgs::default(),
-            l1_provider_args: L1ProviderArgs::default(),
+            l1_provider_args: L1ProviderArgs {
+                // validate() requires an L1 provider: without one the L1 watcher
+                // is never built and startup aborts.
+                url: Some("http://localhost:8545".parse().unwrap()),
+                ..Default::default()
+            },
             blob_provider_args: BlobProviderArgs::default(),
             network_args: RollupNodeNetworkArgs::default(),
             gas_price_oracle_args: RollupNodeGasPriceOracleArgs::default(),
@@ -1571,7 +1698,12 @@ mod tests {
             database_args: RollupNodeDatabaseArgs::default(),
             engine_driver_args: EngineDriverArgs::default(),
             chain_orchestrator_args: ChainOrchestratorArgs::default(),
-            l1_provider_args: L1ProviderArgs::default(),
+            l1_provider_args: L1ProviderArgs {
+                // validate() requires an L1 provider: without one the L1 watcher
+                // is never built and startup aborts.
+                url: Some("http://localhost:8545".parse().unwrap()),
+                ..Default::default()
+            },
             blob_provider_args: BlobProviderArgs::default(),
             network_args: RollupNodeNetworkArgs::default(),
             gas_price_oracle_args: RollupNodeGasPriceOracleArgs::default(),
@@ -1611,7 +1743,12 @@ mod tests {
                 database_args: RollupNodeDatabaseArgs::default(),
                 engine_driver_args: EngineDriverArgs::default(),
                 chain_orchestrator_args: ChainOrchestratorArgs::default(),
-                l1_provider_args: L1ProviderArgs::default(),
+                l1_provider_args: L1ProviderArgs {
+                    // validate() requires an L1 provider: without one the L1 watcher
+                    // is never built and startup aborts.
+                    url: Some("http://localhost:8545".parse().unwrap()),
+                    ..Default::default()
+                },
                 blob_provider_args: BlobProviderArgs::default(),
                 network_args: RollupNodeNetworkArgs::default(),
                 gas_price_oracle_args: RollupNodeGasPriceOracleArgs::default(),
@@ -1653,7 +1790,12 @@ mod tests {
             database_args: RollupNodeDatabaseArgs::default(),
             engine_driver_args: EngineDriverArgs::default(),
             chain_orchestrator_args: ChainOrchestratorArgs::default(),
-            l1_provider_args: L1ProviderArgs::default(),
+            l1_provider_args: L1ProviderArgs {
+                // validate() now requires an L1 provider: without one the L1
+                // watcher is never built and startup aborts.
+                url: Some("http://localhost:8545".parse().unwrap()),
+                ..Default::default()
+            },
             blob_provider_args: BlobProviderArgs::default(),
             network_args: RollupNodeNetworkArgs::default(),
             gas_price_oracle_args: RollupNodeGasPriceOracleArgs::default(),
@@ -1682,7 +1824,12 @@ mod tests {
             database_args: RollupNodeDatabaseArgs::default(),
             engine_driver_args: EngineDriverArgs::default(),
             chain_orchestrator_args: ChainOrchestratorArgs::default(),
-            l1_provider_args: L1ProviderArgs::default(),
+            l1_provider_args: L1ProviderArgs {
+                // validate() requires an L1 provider: without one the L1 watcher
+                // is never built and startup aborts.
+                url: Some("http://localhost:8545".parse().unwrap()),
+                ..Default::default()
+            },
             blob_provider_args: BlobProviderArgs::default(),
             network_args: RollupNodeNetworkArgs::default(),
             gas_price_oracle_args: RollupNodeGasPriceOracleArgs::default(),
@@ -1712,7 +1859,12 @@ mod tests {
             database_args: RollupNodeDatabaseArgs::default(),
             engine_driver_args: EngineDriverArgs::default(),
             chain_orchestrator_args: ChainOrchestratorArgs::default(),
-            l1_provider_args: L1ProviderArgs::default(),
+            l1_provider_args: L1ProviderArgs {
+                // validate() requires an L1 provider: without one the L1 watcher
+                // is never built and startup aborts.
+                url: Some("http://localhost:8545".parse().unwrap()),
+                ..Default::default()
+            },
             blob_provider_args: BlobProviderArgs::default(),
             network_args: RollupNodeNetworkArgs::default(),
             gas_price_oracle_args: RollupNodeGasPriceOracleArgs::default(),
@@ -1751,7 +1903,12 @@ mod tests {
             database_args: RollupNodeDatabaseArgs::default(),
             engine_driver_args: EngineDriverArgs::default(),
             chain_orchestrator_args: ChainOrchestratorArgs::default(),
-            l1_provider_args: L1ProviderArgs::default(),
+            l1_provider_args: L1ProviderArgs {
+                // validate() requires an L1 provider: without one the L1 watcher
+                // is never built and startup aborts.
+                url: Some("http://localhost:8545".parse().unwrap()),
+                ..Default::default()
+            },
             blob_provider_args: BlobProviderArgs::default(),
             network_args: RollupNodeNetworkArgs::default(),
             gas_price_oracle_args: RollupNodeGasPriceOracleArgs::default(),
@@ -1785,7 +1942,12 @@ mod tests {
             database_args: RollupNodeDatabaseArgs::default(),
             chain_orchestrator_args: ChainOrchestratorArgs::default(),
             engine_driver_args: EngineDriverArgs::default(),
-            l1_provider_args: L1ProviderArgs::default(),
+            l1_provider_args: L1ProviderArgs {
+                // validate() requires an L1 provider: without one the L1 watcher
+                // is never built and startup aborts.
+                url: Some("http://localhost:8545".parse().unwrap()),
+                ..Default::default()
+            },
             blob_provider_args: BlobProviderArgs::default(),
             network_args: RollupNodeNetworkArgs::default(),
             gas_price_oracle_args: RollupNodeGasPriceOracleArgs::default(),
@@ -1813,7 +1975,12 @@ mod tests {
             database_args: RollupNodeDatabaseArgs::default(),
             engine_driver_args: EngineDriverArgs::default(),
             chain_orchestrator_args: ChainOrchestratorArgs::default(),
-            l1_provider_args: L1ProviderArgs::default(),
+            l1_provider_args: L1ProviderArgs {
+                // validate() now requires an L1 provider: without one the L1
+                // watcher is never built and startup aborts.
+                url: Some("http://localhost:8545".parse().unwrap()),
+                ..Default::default()
+            },
             blob_provider_args: BlobProviderArgs::default(),
             network_args: RollupNodeNetworkArgs::default(),
             gas_price_oracle_args: RollupNodeGasPriceOracleArgs::default(),
@@ -1837,7 +2004,12 @@ mod tests {
             database_args: RollupNodeDatabaseArgs::default(),
             engine_driver_args: EngineDriverArgs::default(),
             chain_orchestrator_args: ChainOrchestratorArgs::default(),
-            l1_provider_args: L1ProviderArgs::default(),
+            l1_provider_args: L1ProviderArgs {
+                // validate() now requires an L1 provider: without one the L1
+                // watcher is never built and startup aborts.
+                url: Some("http://localhost:8545".parse().unwrap()),
+                ..Default::default()
+            },
             blob_provider_args: BlobProviderArgs::default(),
             network_args: RollupNodeNetworkArgs::default(),
             gas_price_oracle_args: RollupNodeGasPriceOracleArgs::default(),

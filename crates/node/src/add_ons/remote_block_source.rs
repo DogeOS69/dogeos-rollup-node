@@ -133,10 +133,22 @@ where
 /// userinfo and query intact. Anything derived from an error chain has to be
 /// scrubbed against the full URL before it reaches a log line.
 fn redact_remote(url: Option<&reqwest::Url>, message: &str) -> String {
-    match url {
-        Some(url) => message.replace(url.as_str(), &safe_remote_host(url)),
-        None => message.to_string(),
+    let Some(url) = url else { return message.to_string() };
+    let host = safe_remote_host(url);
+    let mut redacted = message.replace(url.as_str(), &host);
+    // reqwest moves userinfo into an Authorization header before it builds the
+    // request, so its error text carries the STRIPPED url — which does not match
+    // the configured string. Without this second pass, configuring credentials
+    // is precisely what turns the redaction off, and the path and query (where
+    // API keys usually live) reach the log.
+    let mut stripped = url.clone();
+    if stripped.set_username("").is_ok() && stripped.set_password(None).is_ok() {
+        let stripped = stripped.as_str();
+        if stripped != url.as_str() {
+            redacted = redacted.replace(stripped, &host);
+        }
     }
+    redacted
 }
 
 /// `scheme://host:port` for the configured remote, with no userinfo or query.
@@ -1351,7 +1363,8 @@ where
                 self.last_imported_block = None;
                 self.consecutive_import_rejections = 0;
                 return Err(eyre::eyre!(
-                    "local block {last_imported} is unknown to the provider; re-deriving the                      common ancestor"
+                    "local block {last_imported} is unknown to the provider; re-deriving the \
+                         common ancestor"
                 ));
             };
             {
@@ -1537,6 +1550,18 @@ mod tests {
         assert_eq!(super::redact_remote(None, "plain failure"), "plain failure");
         // A message that never mentions the URL is unchanged.
         assert_eq!(super::redact_remote(Some(&url), "timed out"), "timed out");
+
+        // THE path that actually occurs: reqwest strips userinfo into an
+        // Authorization header before building the request, so its error text
+        // carries the stripped URL, which never matches the configured string.
+        // Scrubbing only the configured form meant configuring credentials was
+        // what switched the redaction off.
+        let stripped = "https://rpc.internal:8545/v1?apikey=ABC";
+        let from_reqwest = format!("error sending request for url ({stripped})");
+        let redacted = super::redact_remote(Some(&url), &from_reqwest);
+        assert!(!redacted.contains("ABC"), "API key survived the stripped form: {redacted}");
+        assert!(!redacted.contains("/v1"), "path survived the stripped form: {redacted}");
+        assert!(redacted.contains("https://rpc.internal:8545"), "host lost: {redacted}");
     }
 
     /// The host form used both for the `remote_host` log field and as the

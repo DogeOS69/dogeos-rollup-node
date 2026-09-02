@@ -364,7 +364,7 @@ from every pass is either fixed in the PR or recorded here.
     removes the flake this caused in CI.
   - Suggested Linear title: "rollup-node: owed-build bookkeeping for imports that land while L1-unsynced"
 
-- **Test-fixture ergonomics follow-ups**
+- **[RESOLVED IN THIS PR — pass 51 verified: carried onto the fixture at `test_utils/fixture.rs` and `reboot.rs`]** Test-fixture ergonomics follow-ups**
   (`crates/node/src/test_utils/{event_utils,fixture}.rs`, `reboot.rs`)
   - Impact/evidence: Claude pass 25 minors — `EventWaiter::label` is
     `&'static str`, so `block_sequenced(target)` cannot carry the target
@@ -380,7 +380,7 @@ from every pass is either fixed in the PR or recorded here.
     false-pass; each touches shared fixture surface used by every suite.
   - Suggested Linear title: "rollup-node: test-fixture ergonomics — Cow labels, restart URL carry-over, unified waiter budgets"
 
-- **FcuRejected refusal is a bare RecvError to the admin caller**
+- **[RESOLVED IN THIS PR — pass 51 verified: the arm now sends `Err(String)` before returning (`lib.rs`'s administrative head-update rejection)]** FcuRejected refusal is a bare RecvError to the admin caller**
   (`crates/chain-orchestrator/src/lib.rs` UpdateFcsHead arm, `handle/mod.rs`)
   - Impact/evidence: Claude pass 25 minor — the new refusal drops the reply
     sender, so "engine refused the head" and "orchestrator is gone" are the
@@ -902,3 +902,84 @@ deferred from this pass.
     wrong repair — clamping finalized rather than rejecting the snapshot. Both
     reviewers had called the shape latent (no reth path reporting finalized
     above latest was found), which is why it survived a pass.
+
+## Pass 51 findings — resolution (Claude, 2026-09-02)
+
+Claude pass 51 returned 8 critical/major, 9 minors and 5 test gaps. All the
+code findings are FIXED; the test gaps are recorded below.
+
+- **F1 (FIXED)** Restart silently accepted the exact snapshot the run loop
+  calls irreconcilable. `unwind()` commits the rewound head durably BEFORE the
+  below-finalized fail-stops fire, so the process died with the database anchor
+  below the engine's finalized block — and on restart both new bails passed
+  while the repair loop, gated `while l2_head > finalized`, never ran. The node
+  came up healthy-looking with mappings above the anchor already purged, and the
+  next build re-selected consumed L1 messages into a queue gap every peer
+  rejects. Startup now refuses that shape explicitly.
+- **F2 (FIXED)** `collect_reverted_txs_in_range` was all-or-nothing AND
+  unbounded. One transport blip discarded every transaction already collected —
+  and this PR changed all three call sites from propagating to `warn!` + empty,
+  so a 500-block unwind silently lost 500 blocks of user transactions under a
+  log line reading like "there were none". It is also one serial full-block RPC
+  per block on the single-task run loop, and this PR made it reachable over up
+  to `MAX_ANCESTOR_LOOKBACK` blocks on any remote reorg. Now per-block
+  resilient (failures counted and reported at `error!`) and capped at
+  `MAX_REVERTED_TX_COLLECTION_BLOCKS`, logging truncation.
+- **F3 (FIXED)** The whole config was `Debug`-dumped at INFO on every launch,
+  and `url::Url`'s `Debug` prints userinfo, path and query verbatim — leaking
+  the L1 API key, the remote-source credentials, the blob provider URL and the
+  KMS key id, defeating the redaction added elsewhere in this PR. Hand-written
+  `Debug` for the four secret-carrying argument groups.
+- **F4 (FIXED)** `redact_remote` no-opped precisely when the URL carried
+  credentials: reqwest strips userinfo into an `Authorization` header before
+  building its error, so the error text carries the STRIPPED URL, which never
+  matched the configured string — and the path/query API key reached the
+  rate-limited log. The pass-49 test passed because it built its message from
+  the unstripped URL. Both forms are now scrubbed, and the test covers the
+  stripped one (verified to fail without the fix).
+- **F5 (FIXED)** `SignerArgs.private_key` had no `#[arg]` attribute inside a
+  `clap::Args` derive, making it a POSITIONAL that accepts a raw hex signing key
+  on argv — landing in `ps`, `/proc/<pid>/cmdline` and shell history. Now
+  `#[arg(skip)]`.
+- **F6 (FIXED)** The docker soak lane lacked the per-pattern count guard the
+  in-process lanes carry; its pattern covers two tests, so renaming the recovery
+  one left the nightly green — and that test is the surviving signal for a path
+  already out of the merge gate.
+- **F7 (FIXED)** Omitting `--l1.url` panics a release build (the test-utils
+  fallback is not compiled in), while `validate()` permitted it for exactly the
+  configuration the book advertises. Added as the LAST rule so more specific
+  diagnostics still fire first; eight test configs updated.
+- **F8 (FIXED)** The genesis comment still said "the computed header hash …
+  NOT `chain_spec.genesis_hash()`", both clauses false since the chikyu fix, and
+  acting on it would restore that P1.
+- **Minors (FIXED)** `.expect()` replaced with `map_err` so the genesis errors'
+  actionable Display text survives; the rewind guard now also refuses an
+  equal-height different-hash swap (the purge is a no-op for it); two live-path
+  messages regained their `\` continuations; `consolidate_chain`'s doc moved
+  back off the retry wrapper; the fourth `None` cause documented; the two
+  startup hypotheses merged into one message; a dead duplicate `#[arg]`
+  removed; the L1-reorg finalized floor now logs like its twin;
+  `--chain.chain-buffer-size` documented as inert in both the code and the book
+  (threading it through is a feature change, and deleting a shipped CLI flag
+  breaks deployments); the book's "arbitrarily far" rewind claim reconciled with
+  the 8192-block bound it states two paragraphs later.
+
+### Test gaps recorded (not closed this pass)
+
+Ranked by the reviewer; none are regressions, all are pre-existing coverage
+holes in code this PR wrote:
+
+1. `handle_signer_event`'s canonicality classification and monotone anchor
+   write — ~90 lines, four branches, zero tests. Widening `<` to `<=` demotes a
+   canonical signed block to the signature-only path and the sequencer silently
+   stops gossiping.
+2. `handle_batch_revert`'s safe clamps and fatal arms — the L1-reorg twin got a
+   test in pass 45, this site has none, and `BatchReverted.safe_head` changed
+   meaning with nothing pinning it.
+3. `ConsolidationFetchFailed` classification and in-place retry — the mechanism
+   separating one RPC timeout from killing the node, entirely uncovered.
+4. `reconcile_genesis_block`'s foreign-genesis check on a fresh-LOOKING
+   database — all four tests seed a head first, so none exercises the ordering
+   the doc calls load-bearing.
+5. `from_provider`'s inconsistent-snapshot refusal and the startup repair clamp
+   — the newest code in the PR; `clamp_startup_safe_table` reaches neither.

@@ -101,6 +101,14 @@ const fn l1_notification_receiver_may_poll(
     l2_synced && derivation_pipeline_empty && derivation_driver_can_accept_batch
 }
 
+/// Upper bound on how many blocks one reverted-transaction collection walks.
+///
+/// The collection is one serial full-block RPC per block on the single-task run loop, so an
+/// unbounded range stalls L1 notifications, gossip, derivation and sequencing for its duration —
+/// and the remote source's rewind can request up to `MAX_ANCESTOR_LOOKBACK` blocks. Losing the
+/// pool refill below the cap costs only resubmission.
+const MAX_REVERTED_TX_COLLECTION_BLOCKS: u64 = 1024;
+
 /// The [`ChainOrchestrator`] is responsible for orchestrating the progression of the L2 chain
 /// based on data consolidated from L1 and the data received over the p2p network.
 #[derive(Debug)]
@@ -739,7 +747,12 @@ impl<
                 // guards direction, and this is not exposed on the admin RPC —
                 // but the handle is public API.
                 let mirror_head = *self.engine.fcs().head_block_info();
-                if head.number > mirror_head.number {
+                // `>=` with an inequality on the full BlockInfo, not `>`: an
+                // equal-height DIFFERENT-hash swap is not a rewind either, and
+                // the purge below (`> head.number + 1`) is a no-op for it, so
+                // the superseded block's L1 messages would stay stamped consumed
+                // forever.
+                if head.number >= mirror_head.number && head != mirror_head {
                     let _ = sender.send(Err(format!(
                         "requested head {head:?} is above the current head {mirror_head:?}; \
                          this command only rewinds"
@@ -1402,23 +1415,71 @@ impl<
     }
 
     /// Collects reverted L2 transactions in [from, to], excluding L1 messages.
+    ///
+    /// Best-effort per block, and bounded. A failed block is skipped rather than discarding
+    /// everything collected so far: every caller already treats the result as advisory (a pool
+    /// refill), and losing an entire unwind's user transactions to one transport blip on the last
+    /// block — under a `warn!` that reads like "there were none" — is the worse outcome.
+    ///
+    /// The range is capped at [`MAX_REVERTED_TX_COLLECTION_BLOCKS`] nearest the head. This runs
+    /// inside `handle_command` on the single-task run loop, one full-block RPC per block, while no
+    /// L1 notification, gossip message, derivation step or sequencer slot is polled — and the
+    /// remote source's rewind can drive it over up to `MAX_ANCESTOR_LOOKBACK` blocks on any remote
+    /// reorg. Truncation is logged, and it costs only pool refill: the transactions are still in
+    /// their reverted blocks, and clients resubmit.
     async fn collect_reverted_txs_in_range(
         &self,
         from: u64,
         to: u64,
     ) -> Result<Vec<ScrollTxEnvelope>, ChainOrchestratorError> {
+        if from > to {
+            return Ok(Vec::new());
+        }
+        let span = to.saturating_sub(from).saturating_add(1);
+        let from = if span > MAX_REVERTED_TX_COLLECTION_BLOCKS {
+            let capped = to.saturating_sub(MAX_REVERTED_TX_COLLECTION_BLOCKS - 1);
+            tracing::warn!(
+                target: "scroll::chain_orchestrator",
+                requested_from = from,
+                from = capped,
+                to,
+                "Reverted-transaction collection truncated to the blocks nearest the head;                  transactions below it are not refilled into the pool"
+            );
+            capped
+        } else {
+            from
+        };
+
         let mut reverted_transactions: Vec<ScrollTxEnvelope> = Vec::new();
+        let mut failed: Vec<u64> = Vec::new();
         for number in from..=to {
-            let block = self
-                .l2_client
-                .get_block_by_number(number.into())
-                .full()
-                .await?
-                .ok_or_else(|| ChainOrchestratorError::L2BlockNotFoundInL2Client(number))?;
+            let block = match self.l2_client.get_block_by_number(number.into()).full().await {
+                Ok(Some(block)) => block,
+                outcome => {
+                    tracing::debug!(
+                        target: "scroll::chain_orchestrator",
+                        number,
+                        ?outcome,
+                        "Could not fetch a reverted block for the pool refill; skipping it"
+                    );
+                    failed.push(number);
+                    continue;
+                }
+            };
 
             let block = block.into_consensus().map_transactions(|tx| tx.inner.into_inner());
             reverted_transactions.extend(
                 block.into_body().transactions.into_iter().filter(|tx| !tx.is_l1_message()),
+            );
+        }
+        if !failed.is_empty() {
+            tracing::error!(
+                target: "scroll::chain_orchestrator",
+                failed_blocks = failed.len(),
+                first_failed = failed.first(),
+                last_failed = failed.last(),
+                collected = reverted_transactions.len(),
+                "Some reverted blocks could not be read; their transactions are not refilled                  into the pool"
             );
         }
         Ok(reverted_transactions)
@@ -1575,7 +1636,21 @@ impl<
             l2_head_block_info.unwrap_or_else(|| *self.engine.fcs().head_block_info());
         let l2_safe_block_info = match l2_safe_block_info {
             Some(safe) => {
-                let floored = if safe.number >= finalized.number { safe } else { finalized };
+                let floored = if safe.number >= finalized.number {
+                    safe
+                } else {
+                    // Same invariant violation the batch-revert twin reports at
+                    // error!: the database's post-unwind safe head sits below
+                    // the engine's finalized block, which is an L1-side problem
+                    // and must not be silently absorbed.
+                    tracing::error!(
+                        target: "scroll::chain_orchestrator",
+                        ?safe,
+                        ?finalized,
+                        "L1 reorg produced a safe head below the finalized block; flooring it"
+                    );
+                    finalized
+                };
                 Some(if floored.number > effective_head.number { effective_head } else { floored })
             }
             None if self.engine.fcs().safe_block_info().number > effective_head.number => {
@@ -2465,11 +2540,6 @@ impl<
         })
     }
 
-    /// Consolidates the chain by validating all unsafe blocks from the current safe head to the
-    /// current head.
-    ///
-    /// This involves validating the L1 messages in the blocks against the expected L1 messages
-    /// synced from L1.
     /// Runs [`Self::consolidate_chain`], retrying fetch-shaped failures
     /// (transport error, block temporarily missing from the L2 client) a
     /// bounded number of times: a single RPC timeout must not ride the
@@ -2499,6 +2569,11 @@ impl<
         }
     }
 
+    /// Consolidates the chain by validating all unsafe blocks from the current safe head to the
+    /// current head.
+    ///
+    /// This involves validating the L1 messages in the blocks against the expected L1 messages
+    /// synced from L1.
     async fn consolidate_chain(&mut self) -> Result<(), ChainOrchestratorError> {
         tracing::trace!(target: "scroll::chain_orchestrator", fcs = ?self.engine.fcs(), "Consolidating chain from safe to head");
 

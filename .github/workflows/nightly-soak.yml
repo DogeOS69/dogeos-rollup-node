@@ -307,8 +307,20 @@ jobs:
         # auto-file a FALSE regression report.
         timeout-minutes: 45
         run: |
+          set -euo pipefail
           cargo nextest run --all-features --workspace --locked --no-run \
             -E 'test(docker_test_remote_block_source)'
+          # Same hazard as the in-process lanes: this pattern covers TWO tests
+          # (_basic and _recovery), so --no-tests=fail stays satisfied by one of
+          # them if the other is renamed. That matters here — the in-process
+          # resume test is already out of the merge gate and confined to a
+          # comment-only quarantine lane, leaving the docker recovery test as
+          # the surviving signal for that path.
+          got="$(cargo nextest list --all-features --workspace --locked -E 'test(docker_test_remote_block_source)' | grep -c '^ ' || true)"
+          if [ "$got" != "2" ]; then
+            echo "::error::docker_test_remote_block_source matches $got tests, expected 2; a soaked test was renamed, removed or added"
+            exit 1
+          fi
       - name: Soak docker remote-source tests
         id: soak
         # Step-level timeout: see the idle job's soak step.

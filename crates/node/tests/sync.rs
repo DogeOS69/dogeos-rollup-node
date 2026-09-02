@@ -318,7 +318,21 @@ async fn test_should_consolidate_after_optimistic_sync() -> eyre::Result<()> {
     // already proves the Synced notification was processed. This is the
     // assertion the test is named for: the consolidated range must cover
     // the optimistically-synced blocks.
-    let consolidations = follower.expect_event().chain_consolidated().await?;
+    //
+    // Explicit budget, NOT the 30s default: automatic sequencing is running, so
+    // the slower the runner, the further the sequencer's head has advanced by
+    // the time the follower starts consolidating — and consolidate_chain makes
+    // one full get_block_by_number round-trip per block over safe+1..=head. A
+    // fixed default budget against that growing workload is a capacity race,
+    // and this test runs in the merge gate at full parallelism and in the
+    // nightly soak under four CPU spinners, where a capacity timeout is
+    // auto-reported on issue #38 as a race regression. 120s makes the wait fail
+    // on behaviour instead.
+    let consolidations = follower
+        .expect_event()
+        .timeout(std::time::Duration::from_secs(120))
+        .chain_consolidated()
+        .await?;
     // Assert the RANGE: `to` alone merely restates the head the earlier
     // optimistic_sync wait guaranteed (ChainConsolidated is emitted even on
     // the head == safe early-out); from == 0 proves validation actually

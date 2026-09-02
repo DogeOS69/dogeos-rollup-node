@@ -30,6 +30,15 @@ pub enum DatabaseError {
         /// The genesis hash already recorded in the database.
         stored: B256,
     },
+    /// A populated database carries no genesis (height-0) row.
+    #[error(
+        "database has an L2 head above genesis but no block 0 row; the database is truncated or \
+         corrupt and cannot be reconciled against configured genesis {configured}"
+    )]
+    GenesisMissing {
+        /// The genesis hash the node was configured with.
+        configured: B256,
+    },
     /// Failed to commit the transaction to database.
     #[error("TXMut commit failed")]
     CommitFailed,

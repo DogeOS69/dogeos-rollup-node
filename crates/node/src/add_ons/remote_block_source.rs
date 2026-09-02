@@ -1269,6 +1269,22 @@ where
                 block.header.number,
                 next_block_num
             );
+            // The same failure class as the height check, one field over. If the
+            // remote ignored `fullTransactions` — a proxy that drops the flag,
+            // or one that degrades to hashes above a response-size cap —
+            // `into_consensus` silently builds an EMPTY body while keeping the
+            // original header, because `BlockTransactions::into_transactions_vec`
+            // yields `vec![]` for anything that is not `Full`. The EL then
+            // recomputes a different transactions root, answers INVALID, and the
+            // source reports "invalid block", burns its rejection budget,
+            // re-walks ancestry and repeats forever — pointing the operator at a
+            // chain fork rather than at RPC serialization. A genuinely empty
+            // block deserializes to `Full(vec![])` and still passes.
+            eyre::ensure!(
+                block.transactions.is_full(),
+                "remote returned block {next_block_num} without full transactions \
+                 (fullTransactions ignored by the endpoint or a proxy)"
+            );
             let block = block.into_consensus().map_transactions(|tx| tx.inner.into_inner());
 
             // Create NewBlockWithPeer with dummy peer_id and signature (trusted source)

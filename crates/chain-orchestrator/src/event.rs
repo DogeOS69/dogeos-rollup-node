@@ -57,8 +57,10 @@ pub enum ChainOrchestratorEvent {
         /// The latest batch info after the revert.
         batch_info: BatchInfo,
         /// The new safe head: when synced, the value actually ISSUED to the
-        /// engine (floored at the finalized block); when not synced, the
-        /// database's post-revert safe head (no FCU is issued then).
+        /// engine — floored at the finalized block AND dragged down to the
+        /// engine's head mirror, so it may be BELOW the database's safe head;
+        /// when not synced, the database's post-revert safe head (no FCU is
+        /// issued then).
         safe_head: BlockInfo,
     },
     /// A new L1 block has been received returning the L1 block number.

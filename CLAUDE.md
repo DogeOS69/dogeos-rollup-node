@@ -67,7 +67,8 @@ cargo run --bin rollup-node -- node --help
 
 ### Testing Strategy
 ```bash
-# Run all tests (excluding docker tests)
+# Run all tests, excluding the docker tests and two long/quarantined ones
+# (test_should_consolidate_to_block_15k, test_remote_block_source_resumes_from_correct_head)
 make test
 
 # Test specific crate

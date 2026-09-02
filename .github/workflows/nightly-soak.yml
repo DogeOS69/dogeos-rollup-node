@@ -94,8 +94,26 @@ jobs:
         # step, not ride into the job-level cancel that skips the reporter.
         timeout-minutes: 45
         run: |
+          set -euo pipefail
           cargo nextest run --all-features --workspace --locked --no-run \
             -E 'test(test_should_consolidate_after_optimistic_sync) or test(coalesces_with) or test(cancels_inflight_payload_job) or test(remote_source_node_launches_when_remote_unreachable) or test(block_building_skipped_carries_head_number)'
+          # --no-tests=fail on the soak step below only fires when the WHOLE
+          # filterset is empty, so renaming any single soaked test would leave
+          # the other four keeping the run green while that test is silently
+          # never soaked again. Require every pattern to match on its own.
+          # `nextest list` prints nothing at all for an empty filterset.
+          for pat in \
+            test_should_consolidate_after_optimistic_sync \
+            coalesces_with \
+            cancels_inflight_payload_job \
+            remote_source_node_launches_when_remote_unreachable \
+            block_building_skipped_carries_head_number
+          do
+            if [ -z "$(cargo nextest list --all-features --workspace --locked -E "test($pat)")" ]; then
+              echo "::error::soak pattern '$pat' matches no test; it was renamed or removed"
+              exit 1
+            fi
+          done
       - name: Soak timing-sensitive integration tests (idle)
         id: soak
         # Step-level timeout, below the job's 150: a JOB-level timeout cancels
@@ -167,8 +185,26 @@ jobs:
         # step, not ride into the job-level cancel that skips the reporter.
         timeout-minutes: 45
         run: |
+          set -euo pipefail
           cargo nextest run --all-features --workspace --locked --no-run \
             -E 'test(test_should_consolidate_after_optimistic_sync) or test(coalesces_with) or test(cancels_inflight_payload_job) or test(remote_source_node_launches_when_remote_unreachable) or test(block_building_skipped_carries_head_number)'
+          # --no-tests=fail on the soak step below only fires when the WHOLE
+          # filterset is empty, so renaming any single soaked test would leave
+          # the other four keeping the run green while that test is silently
+          # never soaked again. Require every pattern to match on its own.
+          # `nextest list` prints nothing at all for an empty filterset.
+          for pat in \
+            test_should_consolidate_after_optimistic_sync \
+            coalesces_with \
+            cancels_inflight_payload_job \
+            remote_source_node_launches_when_remote_unreachable \
+            block_building_skipped_carries_head_number
+          do
+            if [ -z "$(cargo nextest list --all-features --workspace --locked -E "test($pat)")" ]; then
+              echo "::error::soak pattern '$pat' matches no test; it was renamed or removed"
+              exit 1
+            fi
+          done
       - name: Soak timing-sensitive integration tests (under CPU contention)
         id: soak
         # Step-level timeout: see the idle job's soak step. Larger than the
@@ -274,6 +310,12 @@ jobs:
               --test-threads=1 --failure-output immediate --success-output never
             echo "::endgroup::"
           done
+        env:
+          # Match the merge gate (test.yaml): the lane most likely to catch a
+          # rare flake must not auto-file issue #38 with THINNER logs than the
+          # merge run that passed.
+          RUST_LOG: trace
+          RUST_BACKTRACE: full
 
   soak-resume-quarantine:
     # Quarantine lane for the ONLY test of the resume/rewind path

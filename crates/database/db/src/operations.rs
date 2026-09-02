@@ -9,7 +9,7 @@ use rollup_node_primitives::{
 };
 use sea_orm::{
     sea_query::{CaseStatement, Expr, OnConflict},
-    ColumnTrait, Condition, DbErr, EntityTrait, QueryFilter, QueryOrder, QuerySelect,
+    ColumnTrait, Condition, DbErr, EntityTrait, QueryFilter, QueryOrder, QuerySelect, QueryTrait,
 };
 use std::fmt;
 
@@ -170,15 +170,22 @@ pub trait DatabaseWriteOperations {
     ) -> Result<u64, DatabaseError>;
 
     /// Reconcile the height-0 rows with this chain's genesis hash on startup, returning how many
-    /// stale rows were removed.
+    /// stale rows were removed. `seeded_genesis` is the genesis the static migration for this
+    /// chain writes, which is NOT always `genesis_hash` — the dev migration hardcodes upstream
+    /// Scroll's dev genesis while the chain spec computes its own.
     ///
     /// On a FRESH database (nothing above genesis) the stale rows are dropped and the real genesis
     /// is (re-)inserted in the same call, so a crash between the two cannot leave `l2_block` empty.
-    /// On a POPULATED database this chain's own genesis decides: when it is on record the other
-    /// height-0 rows are the duplicate an older custom-chain startup left behind and are dropped;
-    /// when it is absent the height-0 row and everything above it belong to another chain, which is
-    /// [`DatabaseError::GenesisMismatch`] rather than something to graft this chain's genesis onto.
-    async fn reconcile_genesis_block(&self, genesis_hash: B256) -> Result<u64, DatabaseError>;
+    /// On a POPULATED database a height-0 row is reconcilable when it is either this chain's
+    /// genesis or `seeded_genesis`: both are rows THIS node wrote, so the stale ones are dropped
+    /// and the real genesis restored. Only a height-0 row that is neither belongs to another
+    /// chain, and that is [`DatabaseError::GenesisMismatch`] rather than something to graft this
+    /// chain's genesis onto.
+    async fn reconcile_genesis_block(
+        &self,
+        genesis_hash: B256,
+        seeded_genesis: B256,
+    ) -> Result<u64, DatabaseError>;
 
     /// Update the executed L1 messages from the provided L2 blocks in the database.
     async fn update_l1_messages_from_l2_blocks(
@@ -577,24 +584,37 @@ impl<T: WriteConnectionProvider + ?Sized + Sync> DatabaseWriteOperations for T {
         // restore) simply does not contribute, instead of erroring inside the
         // caller's finalization transaction and rolling back the finalized-L1
         // marker with it — which permanently froze L1 and L2 finality.
+        //
+        // The eligible set is joined as a SUBQUERY, never materialised into an
+        // `IN (?, …)` list. `marker_filter` deliberately includes `Finalized`,
+        // so the set grows monotonically with every batch the chain ever
+        // finalizes and is never pruned; binding one parameter per row would
+        // fail permanently past SQLite's 32766-parameter ceiling, and
+        // `CanRetry` classifies that `DbErr` retryable with no retry bound —
+        // turning it into a silent finality freeze inside the caller's write
+        // transaction. `uq_l2_block_batch_hash_block_hash` leads with
+        // `batch_hash`, so the subquery stays index-driven.
         let eligible_hashes = models::batch_commit::Entity::find()
             .filter(marker_filter)
             .select_only()
             .column(models::batch_commit::Column::Hash)
-            .into_tuple::<Vec<u8>>()
-            .all(self.get_connection())
-            .await?;
-        if eligible_hashes.is_empty() {
-            return Ok(None);
-        }
+            .into_query();
         let finalized_block_info = models::l2_block::Entity::find()
-            .filter(models::l2_block::Column::BatchHash.is_in(eligible_hashes))
+            .filter(models::l2_block::Column::BatchHash.in_subquery(eligible_hashes))
             .order_by_desc(models::l2_block::Column::BlockNumber)
             .one(self.get_connection())
             .await?
             .map(|block| block.block_info());
 
-        // Only transition `Consolidated` rows once a real marker exists.
+        // Defensive: never transition rows when no marker resolved. In practice
+        // the migration seeds a genesis `batch_commit` row (index 0, hash
+        // `0x00…`, `finalized_block_number = 0`, status `finalized`) with a
+        // matching height-0 `l2_block`, so `marker_filter` always matches and
+        // the marker is `Some` from the first call — the genesis block is the
+        // marker FLOOR on a node that has finalized nothing. That floor can
+        // never exceed the engine's finalized mirror, and the named-chain
+        // genesis constants are shared with the forkchoice state, so the
+        // same-height hash check in `handle_l1_finalized` agrees on it.
         if finalized_block_info.is_some() {
             models::batch_commit::Entity::update_many()
                 .filter(transition_filter)
@@ -844,7 +864,11 @@ impl<T: WriteConnectionProvider + ?Sized + Sync> DatabaseWriteOperations for T {
         Ok(result.rows_affected)
     }
 
-    async fn reconcile_genesis_block(&self, genesis_hash: B256) -> Result<u64, DatabaseError> {
+    async fn reconcile_genesis_block(
+        &self,
+        genesis_hash: B256,
+        seeded_genesis: B256,
+    ) -> Result<u64, DatabaseError> {
         // Read the WHOLE height-0 set rather than `get_l2_block_info_by_number(0)`: that query is
         // unordered, and an older custom-chain startup left two rows here — the one the static dev
         // migration seeds and the real genesis it inserted beside it (the insert cannot overwrite,
@@ -856,22 +880,39 @@ impl<T: WriteConnectionProvider + ?Sized + Sync> DatabaseWriteOperations for T {
             .into_tuple::<Vec<u8>>()
             .all(self.get_connection())
             .await?;
-        let genesis_on_record =
-            stored_genesis_hashes.iter().any(|hash| hash.as_slice() == genesis_hash.as_slice());
+        let is = |hash: &Vec<u8>, want: B256| hash.as_slice() == want.as_slice();
 
         if DatabaseReadOperations::get_l2_head_block_number(self).await? > 0 {
-            if genesis_on_record {
-                return self.delete_mismatched_genesis_blocks(genesis_hash).await;
-            }
-            if let Some(stored) = stored_genesis_hashes.first() {
+            // Every height-0 row this node could have written is reconcilable: this chain's
+            // genesis, and the genesis its own static migration seeds. The seed is a SEPARATE
+            // value — the dev migration hardcodes upstream Scroll's dev genesis while the chain
+            // spec computes DogeOS's — so a database written before the genesis reconciliation
+            // existed carries only the seed, and rejecting it would fail every such node at
+            // startup on upgrade. Only a row that is neither is another chain's data.
+            if let Some(foreign) = stored_genesis_hashes
+                .iter()
+                .find(|hash| !is(hash, genesis_hash) && !is(hash, seeded_genesis))
+            {
                 return Err(DatabaseError::GenesisMismatch {
                     configured: genesis_hash,
-                    stored: B256::from_slice(stored),
+                    stored: B256::from_slice(foreign),
                 });
             }
-            // Populated, but with no genesis row to reconcile against. Inserting one here would
-            // graft this chain's genesis under history that never carried it.
-            return Ok(0);
+            if stored_genesis_hashes.is_empty() {
+                // Populated, but with no genesis row to reconcile against. Inserting one here
+                // would graft this chain's genesis under history that never carried it, and
+                // returning success lets startup run on into `get_latest_safe_l2_info`'s "there
+                // should always be at least the genesis block" expectation — an opaque panic, or
+                // a silently wrong safe baseline. Surface the actionable error instead.
+                return Err(DatabaseError::GenesisMissing { configured: genesis_hash });
+            }
+            let removed = self.delete_mismatched_genesis_blocks(genesis_hash).await?;
+            // Only the seeded row was on record: restore this chain's genesis in its place, in
+            // the same transaction, so the delete cannot leave `l2_block` without a height-0 row.
+            if !stored_genesis_hashes.iter().any(|hash| is(hash, genesis_hash)) {
+                self.insert_genesis_block(genesis_hash).await?;
+            }
+            return Ok(removed);
         }
 
         let removed = self.delete_mismatched_genesis_blocks(genesis_hash).await?;

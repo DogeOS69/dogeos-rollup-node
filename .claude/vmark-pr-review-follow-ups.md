@@ -559,6 +559,43 @@ from every pass is either fixed in the PR or recorded here.
     the plan doc, or relocate under a neutral `docs/` name) before merge.
   - Suggested Linear title: "rollup-node: drop the reviewer ledger / relocate the plan doc before merging PR #45"
 
+- **Remote-source imports are re-gossiped over scroll-wire with a forged
+  all-zero signature** (`crates/node/src/add_ons/remote_block_source.rs`,
+  `crates/network/src/manager.rs`)
+  - Impact/evidence: Claude pass 45 P1 (2026-09-02). Pre-existing — identical
+    on `main`. Every successful remote-source import produces a
+    `block_import_outcome(valid_block(..))`, which reaches `announce_block`.
+    The eth-wire branch is correctly gated on `verify_block_signature`, but
+    the scroll-wire branch announces unconditionally, so a follower with
+    scroll-wire peers under `--consensus.algorithm system-contract` gossips
+    `NewBlock { signature: 0x00..00 }` on every import. Each peer's
+    `recover_signer` fails, charges `BadBlock` reputation against this node,
+    and eventually disconnects it — while this node's logs show only
+    successful imports.
+  - First/most-recent pass: Claude pass 45 (2026-09-02).
+  - Why unaddressed: pre-existing, and the correct fix is a signature change —
+    adding an `announce`/`source` flag to `ChainOrchestratorCommand::ImportBlock`
+    so remote-source imports skip the announce entirely (those blocks reach
+    peers from the real sequencer anyway). The local alternative (gate the
+    scroll-wire branch on `should_announce_eth_wire`) changes announce
+    behaviour for ALL blocks, not just remote-source ones, which is too broad
+    to land unverified in this PR.
+  - Suggested Linear title: "rollup-node: do not re-announce remote-source imports over scroll-wire with a forged signature"
+
+- **`CanRetry` treats every `DbErr` as retryable with no retry bound**
+  (`crates/database/db/src/../service/retry.rs`)
+  - Impact/evidence: Claude pass 45, noted alongside C1. `CanRetry for
+    DatabaseError` classifies every `DbErr` retryable and
+    `Retry::new_with_default_config` sets `max_retries: None`, so any
+    DETERMINISTIC SQL fault becomes an invisible livelock at 20 Hz behind a
+    `debug!` rather than a crash. C1 was one route into it (fixed at the
+    source); the retry policy itself is unchanged.
+  - First/most-recent pass: Claude pass 45 (2026-09-02).
+  - Why unaddressed: classifying which `DbErr` variants are genuinely
+    transient, and choosing a retry bound and its failure behaviour, is a
+    policy decision for the database layer well beyond this PR's diff.
+  - Suggested Linear title: "rollup-node: bound database retries and stop classifying deterministic SQL faults as retryable"
+
 ## Pass 35 findings — resolution (loop resumed 2026-09-01)
 
 All five majors and eight minors from Claude pass 35 were FIXED in the
@@ -609,3 +646,58 @@ are FIXED in this PR, so nothing from this pass is deferred.
   `populated_database_reconciles_a_legacy_genesis_duplicate`.
 - Also fixed in passing: the `GenesisMismatch` message carried a run of
   stray spaces before `{stored}`.
+
+## Pass 45 findings — resolution (Claude, 2026-09-02)
+
+Claude pass 45 returned 1 critical, 3 majors introduced by the PR, 2
+pre-existing majors, 1 coverage gap and 10 minors. All are fixed except P1
+(scroll-wire re-announce) and m10 (the ledger/plan-doc merge decision), both
+recorded above.
+
+- **C1 (FIXED)** `finalize_consolidated_batches` materialised one bind
+  parameter per ever-finalized batch. The marker filter includes `Finalized`,
+  so that set only grows; past SQLite's 32766-parameter ceiling the statement
+  fails permanently, and the unbounded retry layer turns that into a silent
+  finality freeze inside the caller's write transaction. The eligible set is
+  now joined as a subquery.
+- **M1 (FIXED)** The administrative unwind was the only head-rewind site that
+  did not purge the L1-message-to-L2-block mappings. A message left stamped
+  with a rewound block number is skipped by `get_n_messages(NotIncluded(..))`,
+  so the next build takes the following queue index and the freed one lands a
+  block later — an out-of-order queue every peer rejects. Also gated the head
+  target on `<` so an anchor above the mirror can no longer make a "revert"
+  issue a forward forkchoice move.
+- **M2 (FIXED)** `validate()` accepted `remote-source.enabled` +
+  `sequencer.auto-start` without `remote-source.build`, leaving the block
+  timer running while the remote source imports the real sequencer's chain —
+  a fork from a node configured as a read-only mirror. The rule no longer
+  depends on `build`.
+- **M3 (FIXED)** `test_should_consolidate_after_optimistic_sync` gated a
+  consolidation that grows with runner slowness on the fixed 30s default
+  waiter. Given an explicit 120s budget so it fails on behaviour, not
+  capacity.
+- **P2 (FIXED)** Pre-existing but one line, in code this PR reworks and beside
+  the height check it added: a remote that ignores `fullTransactions` yields a
+  body-stripped block that the EL rejects forever as "invalid block". Now
+  checked with `BlockTransactions::is_full`.
+- **G1 (FIXED)** Added `l1_reorg_drags_the_safe_target_down_to_a_lower_head`.
+  Every other reorg test runs head == safe, where the whole safe-target match
+  is a no-op; the new test runs head BELOW safe and fails with
+  `FatalStateDivergence` when the pass-43 clamp arm is removed (verified).
+- **NEW P1 found while fixing m9 (FIXED)** The dev migration seeds upstream
+  Scroll's dev genesis (`0x14844a4f…`) while the DogeOS dev spec computes
+  `0x31ad4874…`. Pass 43's unconditional reconciliation therefore rejected
+  every EXISTING `--chain dev` database at startup as another chain's data.
+  (Pass 45 had checked this and concluded "not a brick" on the premise that
+  `dev.json` is byte-identical to upstream Scroll's; the new test disproves
+  that premise.) `reconcile_genesis_block` now takes the migration's seeded
+  genesis and treats a height-0 row matching it as a row this node wrote,
+  replacing it in place. Pinned by
+  `populated_database_reconciles_a_migration_seeded_genesis`.
+- **Minors** m1 (comment corrected — the guard is defensive; the seeded genesis
+  batch makes the marker a floor, never `None`), m2 (`GenesisMissing` instead
+  of a silent `Ok(0)`), m3 (metered wrapper), m4 (each soak pattern asserted
+  to match a test), m5 (soak docker lane logs at the merge gate's verbosity),
+  m6 (CLAUDE.md exclusions), m7 (`BatchReverted.safe_head` documents both
+  clamps), m8 (book documents the head rewind and the two fail-stops), m9
+  (`genesis_seed_pairing_holds_for_shipped_chain_specs`) — all FIXED.

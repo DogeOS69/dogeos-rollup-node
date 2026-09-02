@@ -381,12 +381,15 @@ as a panic carrying the validation message — when:
 - `--remote-source.url` is missing — the remote source has nothing to poll.
 - `--remote-source.build` is set without `--sequencer.enabled` — no job
   could ever start, so every build request would fail.
-- `--remote-source.build` is combined with `--sequencer.auto-start` — the
-  remote source must be the only build requester, or build outcomes cannot
-  be attributed to their requests. This is enforced at launch only: the
+- `--sequencer.auto-start` is set, with or without `--remote-source.build` —
+  the remote source must be the only block producer. With `build`, a second
+  requester means build outcomes cannot be attributed to their requests.
+  Without it, the sequencer's own timer still produces local blocks that each
+  remote import then reorgs out, forking a node the operator configured as a
+  read-only mirror. This is enforced at launch only: the
   `rollupNodeAdmin_enableAutomaticSequencing` RPC can still start the
-  sequencer's timer at runtime and break attribution — do not call it on a
-  node whose remote source builds.
+  sequencer's timer at runtime — do not call it on a node running a remote
+  block source.
 - `--remote-source.poll-interval-ms` is `0`.
 - `--remote-source.url` uses a scheme other than `http`/`https`.
 
@@ -396,3 +399,21 @@ ignored — a templated fleet layout stays valid; a non-default
 `--remote-source.poll-interval-ms` alone does not trigger this warning),
 and — with `--remote-source.build` — `--sequencer.payload-building-duration`
 at or above reth's default 12s `--builder.deadline`.
+
+Two behaviours matter operationally beyond the flags themselves.
+
+**The add-on can rewind this node's head.** When the remote's chain diverges
+from the local one, the source walks back to the common ancestor and issues an
+administrative head update to it. The rewind is floored only at the local safe
+head — on a node that does no L1 derivation, that floor is genesis, so a
+divergent remote can rewind the node arbitrarily far. Point
+`--remote-source.url` only at a node whose chain this one should follow
+unconditionally.
+
+**Two conditions stop the process rather than retrying.** A genesis mismatch
+between this node and the remote, and failing to find a common ancestor within
+the add-on's lookback bound, are both treated as unrecoverable: the add-on
+returns a terminal error and the node panics rather than continuing to import
+from a chain it cannot reconcile with. Both indicate the remote is a different
+chain or has diverged beyond the lookback window, and both need operator
+attention — restarting will not clear them.

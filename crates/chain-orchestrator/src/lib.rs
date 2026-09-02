@@ -1001,7 +1001,22 @@ impl<
                          intervention",
                     ));
                 }
-                let new_head = if persisted_head_number == mirror_head.number {
+                // Only ever a REWIND. Gating on `==` would make an anchor ABOVE
+                // the mirror head issue a FORWARD forkchoice move — the
+                // opposite of what this command means and of what its log line
+                // claims — so refuse that shape and leave the head alone; the
+                // safe clamp below then floors on the mirror head.
+                let new_head = if persisted_head_number >= mirror_head.number {
+                    if persisted_head_number > mirror_head.number {
+                        tracing::warn!(
+                            target: "scroll::chain_orchestrator",
+                            persisted_head_number,
+                            ?mirror_head,
+                            "Administrative unwind left the persisted L2 head ABOVE the \
+                             engine's head mirror; leaving the engine head untouched rather \
+                             than moving it forward"
+                        );
+                    }
                     None
                 } else {
                     // A failed lookup is RETRYABLE, not divergence: reset the
@@ -1081,6 +1096,25 @@ impl<
                     } else {
                         Vec::new()
                     };
+                    // Every other head-rewind site pairs the move with this
+                    // purge (`UpdateFcsHead`, startup repair, and `unwind`
+                    // itself when it removed rows). Since the head target is no
+                    // longer derived from the unwind's delta, this path rewinds
+                    // in cases `unwind` did not purge for — and a message left
+                    // stamped with a rewound block number is skipped by
+                    // `get_n_messages(NotIncluded(..))`, which filters on
+                    // `l2_block_number IS NULL`. The next build then takes the
+                    // FOLLOWING queue index, and the freed one lands a block
+                    // later: an out-of-order L1 message queue that
+                    // `validate_l1_messages` rejects on every peer.
+                    if let Some(head) = new_head {
+                        self.database
+                            .tx_mut(move |tx| async move {
+                                tx.purge_l1_message_to_l2_block_mappings(Some(head.number + 1))
+                                    .await
+                            })
+                            .await?;
+                    }
                     let result = self.engine.update_fcs_checked(new_head, new_safe, None).await?;
                     if result.is_invalid() {
                         // INVALID after a durable unwind: genuine divergence,
@@ -2621,7 +2655,7 @@ mod run_loop_policy_tests {
     use reth_network_p2p::NoopFullBlockClient;
     use rollup_node_primitives::{BatchCommitData, L1MessageEnvelope};
     use rollup_node_providers::{test_utils::MockL1Provider, ScrollRootProvider};
-    use scroll_db::test_utils::setup_test_db;
+    use scroll_db::test_utils::{seeded_test_genesis, setup_test_db};
     use scroll_derivation_pipeline::{BatchDerivationResult, DerivedAttributes};
     use scroll_engine::{
         test_utils::{ScriptedEngineClient, ScriptedResponse},
@@ -2990,6 +3024,75 @@ mod run_loop_policy_tests {
 
         let _ = shutdown_tx.send(());
         assert!(run_task.await.unwrap().is_ok());
+    }
+
+    /// Pins the pass-43 safe-target clamp — the `None if mirror_safe >
+    /// effective_head` arm. Every other reorg/unwind test runs with
+    /// head == safe, where every branch of that `match` is a no-op: delete the
+    /// whole thing and they stay green. The shape that matters is head BELOW
+    /// safe, which an earlier administrative `UpdateFcsHead` leaves behind. A
+    /// routine L1 reorg that rewinds nothing must still drag the safe target
+    /// down to the engine's head; without the drag the safe stays above the
+    /// head, `fcs.update()` refuses LOCALLY with `HeadBelowSafe` after the
+    /// unwind is already durable, and the node crash-loops on every reorg.
+    #[tokio::test]
+    async fn l1_reorg_drags_the_safe_target_down_to_a_lower_head() {
+        let database = Arc::new(setup_test_db().await);
+        database.insert_genesis_block(B256::ZERO).await.unwrap();
+        database.delete_mismatched_genesis_blocks(B256::ZERO).await.unwrap();
+
+        // No batches: the reorg unwinds nothing, so BOTH targets arrive as
+        // `None` and only the mirror-safe-vs-head comparison can produce one.
+        // Nothing derives either, so the mirror still holds the constructed
+        // head when the reorg is handled.
+        let engine_client = Arc::new(ScriptedEngineClient::new());
+        engine_client
+            .push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Valid, None)));
+        let asserter = Asserter::new();
+        asserter.push_success(&Option::<()>::None);
+        asserter.push_success(&Option::<()>::None);
+        let (orchestrator, _handle, notification_tx) = test_orchestrator_with_fcs(
+            database.clone(),
+            engine_client.clone(),
+            asserter,
+            BatchDerivationResult {
+                attributes: vec![],
+                batch_info: BatchInfo::new(1, B256::repeat_byte(1)),
+                skipped_l1_messages: vec![],
+                target_status: BatchStatus::Consolidated,
+            },
+            // Head (50) BELOW safe (100) — the shape an earlier administrative
+            // UpdateFcsHead leaves: the unwind never deletes l2_block rows, so
+            // the database still knows the higher safe.
+            ForkchoiceState::new(info(50, 0x50), info(SAFE, 0x11), info(0, 0x00)),
+        )
+        .await;
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let run_task = tokio::spawn(orchestrator.run_until_shutdown(Box::pin(async move {
+            let _ = shutdown_rx.await;
+        })));
+
+        notification_tx.send(Arc::new(L1Notification::Reorg(5))).await.unwrap();
+        time::timeout(Duration::from_secs(5), async {
+            while engine_client.fork_choice_updated_calls() < 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the reorg must issue an FCU carrying the dragged safe target");
+
+        assert_eq!(
+            engine_client.fork_choice_updated_states()[0].safe_block_hash,
+            B256::repeat_byte(0x50),
+            "the safe target must be dragged down to the engine's head, not left at the \
+             database's higher safe"
+        );
+
+        // The run loop must survive: an undragged safe comes back from the
+        // local pre-flight as FcsError(HeadBelowSafe) -> FatalStateDivergence.
+        let _ = shutdown_tx.send(());
+        assert!(run_task.await.unwrap().is_ok(), "a routine reorg must not terminate the run loop");
     }
 
     /// Pins pass-33 C1: the post-unwind L1-reorg FCU is issued through the
@@ -3650,7 +3753,7 @@ mod run_loop_policy_tests {
         database.set_l2_head_block_number(7).await.unwrap();
 
         assert_eq!(
-            database.reconcile_genesis_block(B256::ZERO).await.unwrap(),
+            database.reconcile_genesis_block(B256::ZERO, seeded_test_genesis()).await.unwrap(),
             1,
             "the legacy seeded row must be dropped, not treated as another chain's genesis"
         );
@@ -3660,17 +3763,54 @@ mod run_loop_policy_tests {
             "only this chain's genesis may remain at height 0"
         );
         assert_eq!(
-            database.reconcile_genesis_block(B256::ZERO).await.unwrap(),
+            database.reconcile_genesis_block(B256::ZERO, seeded_test_genesis()).await.unwrap(),
             0,
             "reconciliation is idempotent"
         );
 
-        // With this chain's genesis absent, the database really does belong to
-        // another chain and startup must still fail-stop.
+        // With this chain's genesis absent AND the stored row not the seed, the
+        // database really does belong to another chain: still a fail-stop.
         assert!(matches!(
-            database.reconcile_genesis_block(B256::repeat_byte(0xAB)).await,
+            database.reconcile_genesis_block(B256::repeat_byte(0xAB), seeded_test_genesis()).await,
             Err(DatabaseError::GenesisMismatch { .. })
         ));
+    }
+
+    /// The migration's seeded genesis is NOT the chain spec's genesis — the dev
+    /// migration hardcodes upstream Scroll's dev genesis while the dev chain
+    /// spec computes its own (pinned by
+    /// `genesis_seed_pairing_holds_for_shipped_chain_specs`).
+    /// A database written before the genesis reconciliation existed therefore
+    /// carries ONLY that seed at height 0, so treating an unrecognised height-0
+    /// row as another chain's data would fail every such node at startup on
+    /// upgrade. The seed must be reconciled in place instead.
+    #[tokio::test]
+    async fn populated_database_reconciles_a_migration_seeded_genesis() {
+        let database = Arc::new(setup_test_db().await);
+        // Exactly what the older binary left: the migration's seed alone,
+        // under history that has already advanced past genesis.
+        database.set_l2_head_block_number(7).await.unwrap();
+        assert_eq!(
+            database.get_l2_block_info_by_number(0).await.unwrap().map(|b| b.hash),
+            Some(seeded_test_genesis()),
+            "the fixture must start from the seeded row alone"
+        );
+
+        assert_eq!(
+            database.reconcile_genesis_block(B256::ZERO, seeded_test_genesis()).await.unwrap(),
+            1,
+            "the seeded row must be replaced, not rejected as another chain's genesis"
+        );
+        assert_eq!(
+            database.get_l2_block_info_by_number(0).await.unwrap(),
+            Some(info(0, 0x00)),
+            "this chain's genesis must be restored in the seed's place"
+        );
+        assert_eq!(
+            database.reconcile_genesis_block(B256::ZERO, seeded_test_genesis()).await.unwrap(),
+            0,
+            "reconciliation is idempotent"
+        );
     }
 
     /// Pins the pass-44 P1: an L1 reorg that removes a batch revert restores

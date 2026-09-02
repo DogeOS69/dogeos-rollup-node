@@ -46,7 +46,10 @@ use scroll_engine::{
     genesis_hash_from_chain_spec, Engine, ForkchoiceState, ScrollAuthApiEngineClient,
     ScrollEngineApi,
 };
-use scroll_migration::{traits::ScrollMigrator, MigratorTrait};
+use scroll_migration::{
+    traits::ScrollMigrator, MigrationInfo, MigratorTrait, ScrollDevMigrationInfo,
+    ScrollMainnetMigrationInfo, ScrollSepoliaMigrationInfo,
+};
 use scroll_network::{DogeosNetworkPrimitives, EthWireBlockWithPeer, ScrollNetworkManager};
 use scroll_wire::ScrollWireEvent;
 use std::{fmt, fs, path::PathBuf, sync::Arc};
@@ -243,16 +246,19 @@ impl ScrollRollupNodeConfig {
             return Err("remote-source.poll-interval-ms must be greater than 0".to_string());
         }
 
-        if self.remote_block_source_args.enabled &&
-            self.remote_block_source_args.build &&
-            self.sequencer_args.auto_start
-        {
-            // The remote source attributes build outcomes to its own requests
-            // (see RemoteBlockSourceAddOn::await_build_outcome), which is only
-            // sound when it is the sole build requester.
+        if self.remote_block_source_args.enabled && self.sequencer_args.auto_start {
+            // Two reasons, and NEITHER is gated on `remote-source.build`.
+            // With `build`, the remote source attributes build outcomes to its
+            // own requests (see RemoteBlockSourceAddOn::await_build_outcome),
+            // which is only sound when it is the sole build requester. Without
+            // it the sequencer's block timer still runs, so the node builds,
+            // signs and gossips a local block every block_time while the remote
+            // source imports the real sequencer's chain over RPC, and each
+            // import reorgs the local block out — a fork originating from a node
+            // the operator configured as a read-only mirror.
             return Err(
-                "remote-source.build conflicts with sequencer.auto-start: the remote block \
-                 source must be the only build requester"
+                "sequencer.auto-start conflicts with remote-source.enabled: the remote block \
+                 source must be the only block producer"
                     .to_string(),
             );
         }
@@ -450,9 +456,24 @@ impl ScrollRollupNodeConfig {
         // One transaction for the whole reconciliation, so a crash mid-way
         // cannot leave l2_block empty and panic the genesis expectation on the
         // next query. `reconcile_genesis_block` carries the fresh-vs-populated
-        // rules and the legacy-duplicate handling.
+        // rules and the legacy-duplicate handling. Called on `db` rather than
+        // inside a `tx_mut` closure: the Database impl already wraps it in the
+        // same transaction AND records the operation metric, which a hand-rolled
+        // `tx_mut` here would bypass.
+        // The genesis the static migration above actually seeded, which is NOT
+        // always `genesis_hash`: the dev migration hardcodes upstream Scroll's
+        // dev genesis while the chain spec computes DogeOS's. A database
+        // written before this reconciliation existed carries only that seed, so
+        // the reconciliation has to recognise it as a row THIS node wrote
+        // rather than another chain's data.
+        let seeded_genesis = match chain_spec.chain().named() {
+            Some(NamedChain::Scroll) => ScrollMainnetMigrationInfo::genesis_hash(),
+            Some(NamedChain::ScrollSepolia) => ScrollSepoliaMigrationInfo::genesis_hash(),
+            // Dev, and every custom chain (which reuses the dev migration).
+            _ => ScrollDevMigrationInfo::genesis_hash(),
+        };
         let removed = db
-            .tx_mut(move |tx| async move { tx.reconcile_genesis_block(genesis_hash).await })
+            .reconcile_genesis_block(genesis_hash, seeded_genesis)
             .await
             .expect("failed to reconcile the genesis block");
         if removed > 0 {
@@ -1194,6 +1215,57 @@ mod tests {
     use clap::Parser;
     use std::path::PathBuf;
 
+    /// The startup genesis reconciliation compares the chain spec's genesis
+    /// against the height-0 rows, so it depends on knowing which genesis the
+    /// static migration seeded — and that is NOT the same value. The dev
+    /// migration hardcodes upstream Scroll's dev genesis while every spec
+    /// shipped here computes its own, so a database written before this
+    /// reconciliation existed carries a height-0 row it must recognise as its
+    /// own rather than reject as another chain's data.
+    ///
+    /// This pins the mapping `build()` relies on: which migration each shipped
+    /// spec routes to, and that the seed really does differ from the spec's
+    /// genesis. `build()` runs `named.migrate()` for `Some(named)` and the dev
+    /// migration otherwise, so all three shipped specs seed through
+    /// `ScrollDevMigrationInfo` today. Naming mainnet or chikyu later would
+    /// route it onto a different seed, and this test is what should fail then.
+    #[test]
+    fn genesis_seed_pairing_holds_for_shipped_chain_specs() {
+        use dogeos_chainspec::{DOGEOS_CHIKYU, DOGEOS_DEV, DOGEOS_MAINNET};
+        use reth_chainspec::EthChainSpec;
+
+        for (name, chain_spec, expected_named) in [
+            ("mainnet", DOGEOS_MAINNET.clone(), None),
+            ("chikyu", DOGEOS_CHIKYU.clone(), None),
+            ("dev", DOGEOS_DEV.clone(), Some(NamedChain::Dev)),
+        ] {
+            assert_eq!(
+                chain_spec.chain().named(),
+                expected_named,
+                "{name} changed chain identity; re-check which migration build() routes it to \
+                 and which genesis that migration seeds"
+            );
+            // Every arm above falls through build()'s `_` case.
+            let seeded_genesis = match chain_spec.chain().named() {
+                Some(NamedChain::Scroll) => ScrollMainnetMigrationInfo::genesis_hash(),
+                Some(NamedChain::ScrollSepolia) => ScrollSepoliaMigrationInfo::genesis_hash(),
+                _ => ScrollDevMigrationInfo::genesis_hash(),
+            };
+            assert_eq!(
+                seeded_genesis,
+                ScrollDevMigrationInfo::genesis_hash(),
+                "{name} is expected to be seeded by the dev migration"
+            );
+            assert_ne!(
+                genesis_hash_from_chain_spec(chain_spec.clone()),
+                Some(seeded_genesis),
+                "{name}'s genesis unexpectedly EQUALS the migration seed; if the two sources \
+                 have converged, reconcile_genesis_block no longer needs the seed threaded \
+                 through and this expectation should be revisited"
+            );
+        }
+    }
+
     #[derive(Debug, Parser)]
     struct ConsensusCli {
         #[command(flatten)]
@@ -1435,41 +1507,47 @@ mod tests {
         assert!(result.unwrap_err().contains("remote-source.build requires sequencer.enabled"));
     }
 
+    /// `sequencer.auto-start` conflicts with the remote source whether or not
+    /// `remote-source.build` is set: with it the remote source is no longer the
+    /// sole build requester, and without it the sequencer's own block timer
+    /// still produces local blocks that every remote import then reorgs out.
     #[test]
-    fn test_validate_remote_source_build_with_auto_start_fails() {
-        let config = ScrollRollupNodeConfig {
-            test_args: TestArgs::default(),
-            sequencer_args: SequencerArgs {
-                sequencer_enabled: true,
-                auto_start: true,
-                ..Default::default()
-            },
-            signer_args: SignerArgs::default(),
-            database_args: RollupNodeDatabaseArgs::default(),
-            engine_driver_args: EngineDriverArgs::default(),
-            chain_orchestrator_args: ChainOrchestratorArgs::default(),
-            l1_provider_args: L1ProviderArgs::default(),
-            blob_provider_args: BlobProviderArgs::default(),
-            network_args: RollupNodeNetworkArgs::default(),
-            gas_price_oracle_args: RollupNodeGasPriceOracleArgs::default(),
-            consensus_args: ConsensusArgs::noop(),
-            database: None,
-            rpc_args: RpcArgs::default(),
-            pprof_args: PprofArgs::default(),
-            remote_block_source_args: RemoteBlockSourceArgs {
-                enabled: true,
-                url: Some("http://localhost:8545".parse().unwrap()),
-                poll_interval_ms: 100,
-                build: true,
-            },
-            require_l1_data_fee_buffer: false,
-        };
+    fn test_validate_remote_source_with_auto_start_fails() {
+        for build in [true, false] {
+            let config = ScrollRollupNodeConfig {
+                test_args: TestArgs::default(),
+                sequencer_args: SequencerArgs {
+                    sequencer_enabled: true,
+                    auto_start: true,
+                    ..Default::default()
+                },
+                signer_args: SignerArgs::default(),
+                database_args: RollupNodeDatabaseArgs::default(),
+                engine_driver_args: EngineDriverArgs::default(),
+                chain_orchestrator_args: ChainOrchestratorArgs::default(),
+                l1_provider_args: L1ProviderArgs::default(),
+                blob_provider_args: BlobProviderArgs::default(),
+                network_args: RollupNodeNetworkArgs::default(),
+                gas_price_oracle_args: RollupNodeGasPriceOracleArgs::default(),
+                consensus_args: ConsensusArgs::noop(),
+                database: None,
+                rpc_args: RpcArgs::default(),
+                pprof_args: PprofArgs::default(),
+                remote_block_source_args: RemoteBlockSourceArgs {
+                    enabled: true,
+                    url: Some("http://localhost:8545".parse().unwrap()),
+                    poll_interval_ms: 100,
+                    build,
+                },
+                require_l1_data_fee_buffer: false,
+            };
 
-        let result = config.validate();
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .contains("remote-source.build conflicts with sequencer.auto-start"));
+            let result = config.validate();
+            assert!(result.is_err(), "build={build} must be rejected");
+            assert!(result
+                .unwrap_err()
+                .contains("sequencer.auto-start conflicts with remote-source.enabled"));
+        }
     }
 
     #[test]

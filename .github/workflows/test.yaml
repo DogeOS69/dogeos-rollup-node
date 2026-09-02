@@ -76,15 +76,16 @@ jobs:
         run: |
           # --no-tests=fail (nextest's default, pinned explicitly since the
           # install action is unpinned): a rename emptying the filter must
-          # fail loudly, not exit green having run nothing. The resume test
-          # is skipped for the same reason the nightly soak excludes it (a
-          # known reboot-fixture teardown race — see the follow-ups ledger);
-          # a known-racy test must not gate merges while issue #38 is being
+          # fail loudly, not exit green having run nothing. Both exclusions
+          # live in the ONE filterset — not a trailing libtest --skip — so a
+          # single mechanism owns them. The resume test is excluded for the
+          # same reason the nightly soak quarantines it (a known
+          # reboot-fixture teardown race — see the follow-ups ledger); a
+          # known-racy test must not gate merges while issue #38 is being
           # closed.
           cargo nextest run --all-features --workspace --locked --no-fail-fast \
-            --no-tests=fail -E 'kind(test) and not test(docker)' \
-            -- --skip test_should_consolidate_to_block_15k \
-            --skip test_remote_block_source_resumes_from_correct_head
+            --no-tests=fail \
+            -E 'kind(test) and not test(docker) and not test(test_should_consolidate_to_block_15k) and not test(test_remote_block_source_resumes_from_correct_head)'
 
   integration-docker-compose:
     runs-on: blacksmith-8vcpu-ubuntu-2404

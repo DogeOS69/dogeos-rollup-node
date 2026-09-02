@@ -378,16 +378,21 @@ Configuration is validated at launch (all rules below apply only when
 `--remote-source.enabled` is set) and a violation aborts startup — currently
 as a panic carrying the validation message — when:
 
+- `--remote-source.url` is missing — the remote source has nothing to poll.
 - `--remote-source.build` is set without `--sequencer.enabled` — no job
   could ever start, so every build request would fail.
 - `--remote-source.build` is combined with `--sequencer.auto-start` — the
   remote source must be the only build requester, or build outcomes cannot
-  be attributed to their requests.
+  be attributed to their requests. This is enforced at launch only: the
+  `rollupNodeAdmin_enableAutomaticSequencing` RPC can still start the
+  sequencer's timer at runtime and break attribution — do not call it on a
+  node whose remote source builds.
 - `--remote-source.poll-interval-ms` is `0`.
 - `--remote-source.url` uses a scheme other than `http`/`https`.
 
-Two further shapes only warn: remote-source flags set while
-`--remote-source.enabled` is off (they are ignored — a templated fleet
-layout stays valid), and — with `--remote-source.build` —
-`--sequencer.payload-building-duration` at or above reth's default 12s
-`--builder.deadline`.
+Two further shapes only warn: `--remote-source.build` or
+`--remote-source.url` set while `--remote-source.enabled` is off (they are
+ignored — a templated fleet layout stays valid; a non-default
+`--remote-source.poll-interval-ms` alone does not trigger this warning),
+and — with `--remote-source.build` — `--sequencer.payload-building-duration`
+at or above reth's default 12s `--builder.deadline`.

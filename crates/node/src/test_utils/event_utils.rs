@@ -259,6 +259,11 @@ impl<'a> EventWaiter<'a> {
         mut predicate: impl FnMut(&ChainOrchestratorEvent) -> bool,
     ) -> eyre::Result<Vec<ChainOrchestratorEvent>> {
         eyre::ensure!(count > 0, "where_n_events requires count > 0");
+        eyre::ensure!(
+            !self.node_indices.is_empty(),
+            "where_n_events requires at least one node (a follower waiter on a single-node \
+             fixture selects none, and an empty wait would succeed with zero matches)"
+        );
         let mut matched_events = Vec::new();
         for node in self.node_indices {
             let Some(node_handle) = &mut self.fixture.nodes[node] else {
@@ -329,6 +334,11 @@ impl<'a> EventWaiter<'a> {
         let waited_for = self.label.unwrap_or_else(|| std::any::type_name::<T>());
         let node_indices = self.node_indices;
         let node_count = node_indices.len();
+        eyre::ensure!(
+            node_count > 0,
+            "wait_for_event_on_all requires at least one node (an empty wait burns the full \
+             timeout and reports 0/0)"
+        );
 
         // Track which nodes have found their event
         let mut results: Vec<Option<T>> = vec![None; node_count];

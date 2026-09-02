@@ -751,7 +751,7 @@ impl<
                     // a valid job. SYNCING (the EL has not adopted the head)
                     // must not proceed either: the rollback below refuses it
                     // for the same reason.
-                    // M11: keep the engine's own verdict diagnosable.
+                    // Keep the engine's own verdict diagnosable.
                     tracing::error!(
                         target: "scroll::chain_orchestrator",
                         ?head,
@@ -918,7 +918,7 @@ impl<
                 // unconditionally before any fallible work.
                 self.cancel_payload_building_job("administrative L1 unwind");
                 self.derivation_driver.cancel_attempt();
-                let (unwind_result, held_outcome) =
+                let (_unwind_result, held_outcome) =
                     self.unwind_and_revalidate_held_batch(block_number).await?;
 
                 // The unwind may rewind the persisted L2 head and/or the safe
@@ -929,74 +929,89 @@ impl<
                 // committed, so an avoidable FCS-order error here would
                 // fail-stop the node for nothing. Any genuine error still
                 // fail-stops via the admin-unwind policy.
+                //
+                // The FCU targets are derived from ABSOLUTE persisted state
+                // compared against the engine mirror — never from what this
+                // particular unwind deleted. The unwind is idempotent in its
+                // effects but not in its deltas: after a retryable refusal
+                // below, the re-issued revert deletes nothing, and a
+                // delta-derived FCU would be skipped entirely while the
+                // engine still disagrees — the very retry the refusal asked
+                // for would silently no-op and reply true.
                 let finalized = *self.engine.fcs().finalized_block_info();
-                // Symmetric with handle_l1_reorg: a rewound head below the
+                let mirror_head = *self.engine.fcs().head_block_info();
+                let mirror_safe = *self.engine.fcs().safe_block_info();
+                let persisted_head_number = self.database.get_l2_head_block_number().await?;
+                let (persisted_safe, _) = self.database.get_latest_safe_l2_info().await?;
+                // Symmetric with handle_l1_reorg: a persisted head below the
                 // FINALIZED L2 block is irreconcilable once the unwind is
                 // durable (the L1-domain pre-latch check cannot rule this
                 // out — the engine's finalized L2 block is independently
                 // sourced from the EL at startup).
-                if let Some(head_number) = unwind_result.l2_head_block_number {
-                    if head_number < finalized.number {
-                        tracing::error!(
-                            target: "scroll::chain_orchestrator",
-                            head_number,
-                            ?finalized,
-                            "Administrative unwind rewound the L2 head below the finalized \
-                             block"
-                        );
-                        return Err(ChainOrchestratorError::FatalStateDivergence(
-                            "administrative unwind rewound the L2 head below the finalized \
-                             block; the persisted state is irreconcilable without manual \
-                             intervention",
-                        ));
-                    }
+                if persisted_head_number < finalized.number {
+                    tracing::error!(
+                        target: "scroll::chain_orchestrator",
+                        persisted_head_number,
+                        ?finalized,
+                        "Administrative unwind left the persisted L2 head below the \
+                         finalized block"
+                    );
+                    return Err(ChainOrchestratorError::FatalStateDivergence(
+                        "administrative unwind rewound the L2 head below the finalized \
+                         block; the persisted state is irreconcilable without manual \
+                         intervention",
+                    ));
                 }
-                let new_head = if let Some(head_number) = unwind_result.l2_head_block_number {
+                let new_head = if persisted_head_number == mirror_head.number {
+                    None
+                } else {
                     // A failed lookup is RETRYABLE, not divergence: reset the
                     // watcher (the database is consistently unwound to the
                     // target, so re-scanning from it is correct), reply false
                     // so the operator re-issues, and do not ride the
                     // admin-unwind fail-stop.
-                    let head_block =
-                        match self.l2_client.get_block_by_number(head_number.into()).await {
-                            Ok(Some(block)) => block,
-                            outcome => {
-                                tracing::warn!(
-                                    target: "scroll::chain_orchestrator",
-                                    head_number,
-                                    ?outcome,
-                                    "Administrative unwind could not resolve the new L2 head; \
-                                     refusing (retryable)"
-                                );
-                                self.l1_watcher.revert_to_l1_block(block_number);
-                                if matches!(held_outcome, HeldReorgOutcome::Survived { .. }) {
-                                    self.derivation_driver.schedule_fresh_reconciliation();
-                                }
-                                let _ = tx.send(false);
-                                return Ok(());
+                    let head_block = match self
+                        .l2_client
+                        .get_block_by_number(persisted_head_number.into())
+                        .await
+                    {
+                        Ok(Some(block)) => block,
+                        outcome => {
+                            tracing::warn!(
+                                target: "scroll::chain_orchestrator",
+                                persisted_head_number,
+                                ?outcome,
+                                "Administrative unwind could not resolve the new L2 head; \
+                                 refusing (retryable)"
+                            );
+                            self.l1_watcher.revert_to_l1_block(block_number);
+                            if matches!(held_outcome, HeldReorgOutcome::Survived { .. }) {
+                                self.derivation_driver.schedule_fresh_reconciliation();
                             }
-                        };
-                    Some(BlockInfo { number: head_number, hash: head_block.header.hash_slow() })
-                } else {
-                    None
+                            let _ = tx.send(false);
+                            return Ok(());
+                        }
+                    };
+                    Some(BlockInfo {
+                        number: persisted_head_number,
+                        hash: head_block.header.hash_slow(),
+                    })
                 };
-                // New safe target: the unwind's value floored at finalized.
-                let mut new_safe = unwind_result.l2_safe_block_info.map(|block_info| {
-                    if block_info.number >= finalized.number {
-                        block_info
-                    } else {
-                        finalized
-                    }
-                });
-                // Preserve head >= safe: a head rewound below the (current or
-                // new) safe head must drag the safe head down with it.
-                if let Some(head) = new_head {
-                    let effective_safe =
-                        new_safe.unwrap_or_else(|| *self.engine.fcs().safe_block_info());
-                    if effective_safe.number > head.number {
-                        new_safe = Some(head);
-                    }
+                // New safe target: the persisted value floored at finalized,
+                // dragged down to the effective head (a safe target above the
+                // head waits for the head to catch up rather than tripping a
+                // local FCS refusal), and issued only when the mirror
+                // disagrees.
+                let effective_head = new_head.unwrap_or(mirror_head);
+                let mut safe_target = if persisted_safe.number >= finalized.number {
+                    persisted_safe
+                } else {
+                    finalized
+                };
+                if safe_target.number > effective_head.number {
+                    safe_target = effective_head;
                 }
+                let new_safe = (safe_target.number != mirror_safe.number).then_some(safe_target);
                 if new_head.is_some() || new_safe.is_some() {
                     // Best-effort (see handle_l1_reorg): a collection failure
                     // must not abort the unwind — and on this admin path it
@@ -1126,7 +1141,7 @@ impl<
     /// cancellation, and notifies waiters so they can fail fast instead of
     /// burning their full wait timeout. Call wherever the job's inputs are
     /// invalidated — a head move; an L1 unwind (unconditionally for an
-    /// administrative revert, and on an L1 reorg when the job carries L1
+    /// administrative revert, and on an L1 reorg when the job MAY carry L1
     /// messages or the head moved); or sequencing being disabled. One caller
     /// is deliberately NOT an input invalidation: the re-enter-L2-sync path
     /// after an unadopted import head cancels a still-valid job purely so its
@@ -1583,21 +1598,44 @@ impl<
             // is observed behind. Only INVALID (never committed; the engine
             // actively rejects a block it validated at consolidation) is a
             // fatal divergence.
-            let mirror_finalized = self.engine.fcs().finalized_block_info().number;
+            let mirror_finalized = *self.engine.fcs().finalized_block_info();
             let mirror_safe = self.engine.fcs().safe_block_info().number;
-            if finalized_block_info.number <= mirror_finalized {
+            if finalized_block_info.number <= mirror_finalized.number {
+                // The DB-derived marker and the EL-seeded mirror are
+                // independently sourced: the same height with a different
+                // hash is divergence at the finality boundary — the class
+                // this handler fail-stops on everywhere else.
+                if finalized_block_info.number == mirror_finalized.number &&
+                    finalized_block_info.hash != mirror_finalized.hash
+                {
+                    tracing::error!(
+                        target: "scroll::chain_orchestrator",
+                        ?finalized_block_info,
+                        ?mirror_finalized,
+                        "Database and engine disagree on the finalized block at the same \
+                         height"
+                    );
+                    return Err(ChainOrchestratorError::FatalStateDivergence(
+                        "database and engine disagree on the finalized block at the same \
+                         height",
+                    ));
+                }
                 tracing::trace!(
                     target: "scroll::chain_orchestrator",
                     ?finalized_block_info,
-                    mirror_finalized,
+                    ?mirror_finalized,
                     "Finalized marker already committed to the engine mirror; skipping FCU"
                 );
             } else if finalized_block_info.number > mirror_safe {
                 // The EL's markers sit below database finality (an EL-side
                 // marker rollback): raising finalized above safe would
-                // violate the FCS invariant locally. Defer — consolidation
-                // replay advances safe first, and a later finalized
-                // notification recomputes and reissues the marker.
+                // violate the FCS invariant locally. Defer — recovery comes
+                // from NEW committed batches becoming L1-finalized: their
+                // consolidation FCU raises head+safe+finalized together
+                // (already-`Finalized` batches are never re-derived), after
+                // which the next finalized notification recomputes and
+                // reissues. On a quiescent chain this arm repeats its error
+                // until new batches arrive.
                 tracing::error!(
                     target: "scroll::chain_orchestrator",
                     ?finalized_block_info,
@@ -1752,20 +1790,42 @@ impl<
 
         // Update the forkchoice state to the new safe block.
         if self.sync_state.is_synced() {
-            tracing::info!(target: "scroll::chain_orchestrator", ?safe_block_info, "Updating safe head to block after batch revert");
+            // Floor the target at the engine's finalized block (mirrors the
+            // L1-reorg and admin-unwind sites): the revert range is not
+            // guaranteed to exclude finalized batches, so an unclamped
+            // below-finalized target would trip a LOCAL SafeBelowFinalized
+            // refusal — and the fatal arms below would fail-stop every
+            // synced node on the same L1 event. A clamp that fires indicates
+            // an L1-side violation: log it loudly and keep the fatal arms
+            // for transport errors and INVALID, the only constructible
+            // failures after clamping.
+            let finalized = *self.engine.fcs().finalized_block_info();
+            let safe_target = if safe_block_info.number >= finalized.number {
+                safe_block_info
+            } else {
+                tracing::error!(
+                    target: "scroll::chain_orchestrator",
+                    ?safe_block_info,
+                    ?finalized,
+                    "Batch revert produced a safe target below the finalized block; \
+                     flooring at finalized"
+                );
+                finalized
+            };
+            tracing::info!(target: "scroll::chain_orchestrator", ?safe_target, "Updating safe head to block after batch revert");
             // Deliberately UNCHECKED (see the finalized-head FCU in the L1
             // finalization handler): the batch-revert database mutation is
             // already committed, so a checked refusal on SYNCING would leave
             // the old safe head standing with no retry while imports that
             // must reorg below it get refused indefinitely.
-            let result = match self.engine.update_fcs(None, Some(safe_block_info), None).await {
+            let result = match self.engine.update_fcs(None, Some(safe_target), None).await {
                 Ok(result) => result,
                 Err(err) => {
                     // See the finalized-head FCU: the revert is durable and
                     // no retry path exists.
                     tracing::error!(
                         target: "scroll::chain_orchestrator",
-                        ?safe_block_info,
+                        ?safe_target,
                         %err,
                         "Post-batch-revert safe-head FCU failed after the revert was \
                          committed"
@@ -1782,7 +1842,7 @@ impl<
                 // imports that must reorg below it would be refused forever.
                 tracing::error!(
                     target: "scroll::chain_orchestrator",
-                    ?safe_block_info,
+                    ?safe_target,
                     ?result,
                     "Post-batch-revert safe-head FCU rejected as INVALID by the engine"
                 );
@@ -2449,7 +2509,7 @@ mod run_loop_policy_tests {
     use dogeos_reth_engine::ScrollPayloadAttributes;
     use reth_network_api::noop::NoopNetwork;
     use reth_network_p2p::NoopFullBlockClient;
-    use rollup_node_primitives::BatchCommitData;
+    use rollup_node_primitives::{BatchCommitData, L1MessageEnvelope};
     use rollup_node_providers::{test_utils::MockL1Provider, ScrollRootProvider};
     use scroll_db::test_utils::setup_test_db;
     use scroll_derivation_pipeline::{BatchDerivationResult, DerivedAttributes};
@@ -2541,10 +2601,27 @@ mod run_loop_policy_tests {
         derived: BatchDerivationResult,
     ) -> (TestOrchestrator, ChainOrchestratorHandle<TestNetwork>, mpsc::Sender<Arc<L1Notification>>)
     {
-        let engine = Engine::new(
+        test_orchestrator_with_fcs(
+            database,
             engine_client,
+            asserter,
+            derived,
             ForkchoiceState::new(info(SAFE, 0x11), info(SAFE, 0x11), info(0, 0)),
-        );
+        )
+        .await
+    }
+
+    /// [`test_orchestrator`] with an explicit initial forkchoice state, for
+    /// tests that need a non-genesis finalized block.
+    async fn test_orchestrator_with_fcs(
+        database: Arc<Database>,
+        engine_client: Arc<ScriptedEngineClient>,
+        asserter: Asserter,
+        derived: BatchDerivationResult,
+        fcs: ForkchoiceState,
+    ) -> (TestOrchestrator, ChainOrchestratorHandle<TestNetwork>, mpsc::Sender<Arc<L1Notification>>)
+    {
+        let engine = Engine::new(engine_client, fcs);
         let l2_provider =
             ProviderBuilder::<_, _, Scroll>::default().connect_mocked_client(asserter);
         let l1_provider = MockL1Provider { db: database.clone(), blobs: Default::default() };
@@ -2994,7 +3071,13 @@ mod run_loop_policy_tests {
             })
             .await
             .unwrap();
-        database.insert_blocks(vec![info(SAFE, 0x22)], finalized_batch).await.unwrap();
+        // Height 50 sits below the initial safe head: the phantom block must
+        // not participate in the live safe-chain reconciliation (a block AT
+        // the safe height with a different hash would).
+        database.insert_blocks(vec![info(50, 0x22)], finalized_batch).await.unwrap();
+        // insert_batch deliberately discards the struct's
+        // finalized_block_number; set it through the real finalization API.
+        database.finalize_batches_up_to_index(2, 6).await.unwrap();
         database.update_batch_status(finalized_batch.hash, BatchStatus::Finalized).await.unwrap();
 
         let engine_client = Arc::new(ScriptedEngineClient::new());
@@ -3046,12 +3129,17 @@ mod run_loop_policy_tests {
         })
         .await
         .expect("the first finalized notification must complete");
-        // Consolidation consumed 2 FCUs (Syncing hold + Valid); the replayed
-        // marker is the third.
+        // Consolidation consumed 3 FCUs (Syncing hold, attributes, head
+        // commit); the replayed marker is the fourth.
         assert_eq!(
             engine_client.fork_choice_updated_calls(),
-            3,
+            4,
             "the replayed finalized marker must be reissued through one FCU"
+        );
+        assert_eq!(
+            engine_client.fork_choice_updated_states()[3].finalized_block_hash,
+            B256::repeat_byte(0x22),
+            "the reissued marker must carry the database-derived finalized hash"
         );
 
         notification_tx.send(Arc::new(L1Notification::Finalized(7))).await.unwrap();
@@ -3066,12 +3154,323 @@ mod run_loop_policy_tests {
         .expect("the second finalized notification must complete");
         assert_eq!(
             engine_client.fork_choice_updated_calls(),
-            3,
+            4,
             "a caught-up mirror must skip the marker FCU"
         );
 
         let _ = shutdown_tx.send(());
         assert!(run_task.await.unwrap().is_ok());
+    }
+
+    /// Pins the pass-37 policy at the L1-reorg site: an unwind that rewinds
+    /// the L2 head below the engine's FINALIZED block is irreconcilable —
+    /// the run loop must fail-stop, not clamp.
+    #[tokio::test]
+    async fn l1_reorg_head_below_finalized_fail_stops() {
+        let database = Arc::new(setup_test_db().await);
+        database.insert_genesis_block(B256::ZERO).await.unwrap();
+        let batch_info = BatchInfo::new(1, B256::repeat_byte(1));
+        database
+            .insert_batch(BatchCommitData {
+                hash: batch_info.hash,
+                index: batch_info.index,
+                block_number: 10,
+                block_timestamp: 0,
+                calldata: Arc::new(Bytes::new()),
+                blob_versioned_hash: None,
+                finalized_block_number: None,
+                reverted_block_number: None,
+            })
+            .await
+            .unwrap();
+        database.update_batch_status(batch_info.hash, BatchStatus::Processing).await.unwrap();
+        // An L1 message above the reorg point, executed in an L2 block below
+        // the engine's finalized block: the reorg unwind rewinds the head
+        // below finality.
+        database
+            .insert_l1_message(L1MessageEnvelope::new(Default::default(), 6, Some(1), None))
+            .await
+            .unwrap();
+
+        let engine_client = Arc::new(ScriptedEngineClient::new());
+        script_syncing_hold_then_success(&engine_client);
+        let asserter = Asserter::new();
+        asserter.push_success(&Option::<()>::None);
+        asserter.push_success(&Option::<()>::None);
+        let (orchestrator, _handle, notification_tx) = test_orchestrator_with_fcs(
+            database.clone(),
+            engine_client.clone(),
+            asserter,
+            BatchDerivationResult {
+                attributes: vec![DerivedAttributes {
+                    block_number: SAFE + 1,
+                    attributes: ScrollPayloadAttributes::default(),
+                }],
+                batch_info,
+                skipped_l1_messages: vec![],
+                target_status: BatchStatus::Consolidated,
+            },
+            ForkchoiceState::new(info(SAFE, 0x11), info(SAFE, 0x11), info(2, 0x0f)),
+        )
+        .await;
+
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let run_task = tokio::spawn(orchestrator.run_until_shutdown(Box::pin(async move {
+            let _ = shutdown_rx.await;
+        })));
+
+        time::timeout(Duration::from_secs(2), async {
+            while engine_client.fork_choice_updated_calls() < 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first Engine SYNCING response must hold the batch");
+
+        notification_tx.send(Arc::new(L1Notification::Reorg(5))).await.unwrap();
+
+        let result = time::timeout(Duration::from_secs(5), run_task)
+            .await
+            .expect("a below-finalized reorg unwind must terminate the run loop")
+            .unwrap();
+        assert!(
+            matches!(result, Err(ChainOrchestratorError::FatalStateDivergence(_))),
+            "expected FatalStateDivergence, got {result:?}"
+        );
+    }
+
+    /// The administrative-unwind counterpart: a persisted head below the
+    /// engine's finalized block fail-stops the run loop.
+    #[tokio::test]
+    async fn admin_unwind_persisted_head_below_finalized_fail_stops() {
+        let database = Arc::new(setup_test_db().await);
+        database.insert_genesis_block(B256::ZERO).await.unwrap();
+        let batch_info = BatchInfo::new(1, B256::repeat_byte(1));
+        database
+            .insert_batch(BatchCommitData {
+                hash: batch_info.hash,
+                index: batch_info.index,
+                block_number: 10,
+                block_timestamp: 0,
+                calldata: Arc::new(Bytes::new()),
+                blob_versioned_hash: None,
+                finalized_block_number: None,
+                reverted_block_number: None,
+            })
+            .await
+            .unwrap();
+        database.update_batch_status(batch_info.hash, BatchStatus::Processing).await.unwrap();
+        database.set_finalized_l1_block_number(5).await.unwrap();
+        database.set_l2_head_block_number(1).await.unwrap();
+
+        let engine_client = Arc::new(ScriptedEngineClient::new());
+        engine_client
+            .push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Syncing, None)));
+        let asserter = Asserter::new();
+        asserter.push_success(&Option::<()>::None);
+        asserter.push_success(&Option::<()>::None);
+        let (orchestrator, handle, _notification_tx) = test_orchestrator_with_fcs(
+            database.clone(),
+            engine_client.clone(),
+            asserter,
+            BatchDerivationResult {
+                attributes: vec![DerivedAttributes {
+                    block_number: SAFE + 1,
+                    attributes: ScrollPayloadAttributes::default(),
+                }],
+                batch_info,
+                skipped_l1_messages: vec![],
+                target_status: BatchStatus::Consolidated,
+            },
+            ForkchoiceState::new(info(SAFE, 0x11), info(SAFE, 0x11), info(2, 0x0f)),
+        )
+        .await;
+
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let run_task = tokio::spawn(orchestrator.run_until_shutdown(Box::pin(async move {
+            let _ = shutdown_rx.await;
+        })));
+
+        time::timeout(Duration::from_secs(2), async {
+            while engine_client.fork_choice_updated_calls() < 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first Engine SYNCING response must hold the batch");
+
+        // The reply channel is dropped by the fail-stop; ignore the RecvError.
+        tokio::spawn(async move {
+            let _ = handle.revert_to_l1_block(10).await;
+        });
+
+        let result = time::timeout(Duration::from_secs(5), run_task)
+            .await
+            .expect("a below-finalized persisted head must terminate the run loop")
+            .unwrap();
+        assert!(
+            matches!(result, Err(ChainOrchestratorError::FatalStateDivergence(_))),
+            "expected FatalStateDivergence, got {result:?}"
+        );
+    }
+
+    /// Pins pass-39 C1: the administrative unwind derives its FCU targets
+    /// from ABSOLUTE persisted state, so a retryable refusal stays a refusal
+    /// on every retry until the divergence is actually gone — the delta-
+    /// derived version replied `true` on the retry while issuing no FCU at
+    /// all.
+    #[tokio::test]
+    async fn admin_unwind_refusal_is_sticky_until_state_converges() {
+        let database = Arc::new(setup_test_db().await);
+        database.insert_genesis_block(B256::ZERO).await.unwrap();
+        let batch_info = BatchInfo::new(1, B256::repeat_byte(1));
+        database
+            .insert_batch(BatchCommitData {
+                hash: batch_info.hash,
+                index: batch_info.index,
+                block_number: 10,
+                block_timestamp: 0,
+                calldata: Arc::new(Bytes::new()),
+                blob_versioned_hash: None,
+                finalized_block_number: None,
+                reverted_block_number: None,
+            })
+            .await
+            .unwrap();
+        database.update_batch_status(batch_info.hash, BatchStatus::Processing).await.unwrap();
+        database.set_finalized_l1_block_number(5).await.unwrap();
+
+        let engine_client = Arc::new(ScriptedEngineClient::new());
+        script_syncing_hold_then_success(&engine_client);
+        let asserter = Asserter::new();
+        asserter.push_success(&Option::<()>::None);
+        asserter.push_success(&Option::<()>::None);
+        // Two head-lookup refusals: the persisted head diverges from the
+        // mirror and the L2 client cannot resolve the block.
+        asserter.push_success(&Option::<()>::None);
+        asserter.push_success(&Option::<()>::None);
+        let (mut orchestrator, handle, notification_tx) = test_orchestrator(
+            database.clone(),
+            engine_client.clone(),
+            asserter,
+            BatchDerivationResult {
+                attributes: vec![DerivedAttributes {
+                    block_number: SAFE + 1,
+                    attributes: ScrollPayloadAttributes::default(),
+                }],
+                batch_info,
+                skipped_l1_messages: vec![],
+                target_status: BatchStatus::Consolidated,
+            },
+        )
+        .await;
+        let mut events = orchestrator.event_listener();
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let run_task = tokio::spawn(orchestrator.run_until_shutdown(Box::pin(async move {
+            let _ = shutdown_rx.await;
+        })));
+
+        time::timeout(Duration::from_secs(2), async {
+            while engine_client.fork_choice_updated_calls() < 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first Engine SYNCING response must hold the batch");
+
+        // Drive the held batch to full consolidation so no scripted
+        // responses remain queued for it.
+        notification_tx.send(Arc::new(L1Notification::Finalized(1))).await.unwrap();
+        time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(ChainOrchestratorEvent::L1BlockFinalized(1, _)) = events.next().await {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("consolidation must complete");
+        assert_eq!(engine_client.fork_choice_updated_calls(), 3);
+
+        // Diverge the persisted head below the mirror (the crash-window /
+        // half-completed-unwind state C1 describes).
+        database.set_l2_head_block_number(SAFE).await.unwrap();
+
+        // First revert: the head lookup fails (mocked None) — retryable
+        // refusal, no FCU issued.
+        let replied = handle.revert_to_l1_block(10).await.unwrap();
+        assert!(!replied, "an unresolvable head must be a refusal");
+        assert_eq!(engine_client.fork_choice_updated_calls(), 3, "no FCU on a refusal");
+
+        // The re-issued revert deletes nothing, but the divergence is still
+        // there: the retry must REFUSE again, not silently reply true.
+        let replied = handle.revert_to_l1_block(10).await.unwrap();
+        assert!(!replied, "the retry must stay a refusal while the mirror disagrees");
+        assert_eq!(engine_client.fork_choice_updated_calls(), 3);
+
+        // Converge the persisted state; the next revert is a clean no-op
+        // success without any FCU.
+        database.set_l2_head_block_number(SAFE + 1).await.unwrap();
+        let replied = handle.revert_to_l1_block(10).await.unwrap();
+        assert!(replied, "a converged revert must succeed");
+        assert_eq!(engine_client.fork_choice_updated_calls(), 3, "converged state needs no FCU");
+
+        let _ = shutdown_tx.send(());
+        assert!(run_task.await.unwrap().is_ok());
+    }
+
+    /// Direct database pin for the pass-38 marker semantics: the finalized
+    /// marker is recomputed over already-`Finalized` batches (the replay
+    /// path) while only `Consolidated` rows have their status transitioned.
+    #[tokio::test]
+    async fn finalize_consolidated_batches_recomputes_over_finalized_rows() {
+        let database = Arc::new(setup_test_db().await);
+        database.insert_genesis_block(B256::ZERO).await.unwrap();
+        // The genesis batch is marker-eligible, so the marker floor is the
+        // genesis block even before any real batch finalizes (harmless in
+        // production: it can never exceed the engine's finalized mirror).
+        assert_eq!(
+            database.finalize_consolidated_batches(10).await.unwrap(),
+            Some(info(0, 0x00)),
+            "the genesis batch is the initial marker floor"
+        );
+
+        let batch_info = BatchInfo::new(1, B256::repeat_byte(1));
+        database
+            .insert_batch(BatchCommitData {
+                hash: batch_info.hash,
+                index: batch_info.index,
+                block_number: 6,
+                block_timestamp: 0,
+                calldata: Arc::new(Bytes::new()),
+                blob_versioned_hash: None,
+                finalized_block_number: Some(6),
+                reverted_block_number: None,
+            })
+            .await
+            .unwrap();
+        database.insert_blocks(vec![info(3, 0x33)], batch_info).await.unwrap();
+        // insert_batch deliberately discards the struct's
+        // finalized_block_number; set it through the real finalization API.
+        database.finalize_batches_up_to_index(1, 6).await.unwrap();
+        database.update_batch_status(batch_info.hash, BatchStatus::Consolidated).await.unwrap();
+
+        assert_eq!(
+            database.finalize_consolidated_batches(10).await.unwrap(),
+            Some(info(3, 0x33)),
+            "a consolidated batch transitions and yields the marker"
+        );
+        assert_eq!(
+            database.finalize_consolidated_batches(10).await.unwrap(),
+            Some(info(3, 0x33)),
+            "an already-finalized batch must still yield the marker on replay"
+        );
+        assert_eq!(
+            database.finalize_consolidated_batches(5).await.unwrap(),
+            Some(info(0, 0x00)),
+            "batches above the finalized L1 bound are not eligible; the floor remains"
+        );
     }
 
     #[tokio::test]
@@ -3106,6 +3505,11 @@ mod run_loop_policy_tests {
             })
             .await
             .unwrap();
+        // Align the persisted head with the engine mirror so the absolute
+        // derivation skips the head lookup and the divergence is safe-only:
+        // deleting batch 2 leaves the persisted safe at genesis, below the
+        // mirror's safe — the FCU under test.
+        database.set_l2_head_block_number(SAFE).await.unwrap();
         let engine_client = Arc::new(ScriptedEngineClient::new());
         engine_client
             .push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Syncing, None)));

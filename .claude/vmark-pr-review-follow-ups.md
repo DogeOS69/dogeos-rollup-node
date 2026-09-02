@@ -110,7 +110,15 @@ from every pass is either fixed in the PR or recorded here.
     caller still cannot distinguish "rolled back, retryable" from
     "fail-stopped" (both surface as a dropped reply channel).
   - First/most-recent pass: Claude pass 13 (2026-09-01T04:00Z); Codex pass 18
-    staleness note (2026-09-01T09:30Z).
+    staleness note (2026-09-01T09:30Z); Claude pass 39 C1-secondary
+    (2026-09-02) — `RevertToL1Block` collapses four distinct refusals (DB
+    read failure, below-finalized target, head-lookup failure, SYNCING FCU)
+    into one indistinguishable `false`; return `Result<(), String>` as
+    `UpdateFcsHead` now does so the operator learns which refusal they hit.
+    (The C1 PRIMARY — delta-derived FCU targets making the documented retry
+    a silent no-op — was FIXED in pass 39: targets are now derived from
+    absolute persisted state vs the engine mirror, pinned by
+    `admin_unwind_refusal_is_sticky_until_state_converges`.)
   - Why unaddressed: changing the reply types is an API change across the
     command enum, handle, and admin RPC — beyond a review-loop fix. The
     explicit error log is the in-scope mitigation.
@@ -296,10 +304,13 @@ from every pass is either fixed in the PR or recorded here.
     starts — or a builder knob holding the first poll until Synced — plus
     replacing the teardown sleep with an observable release: poll the rocksdb
     lock's acquirability or await the persistence task handle) and risks
-    touching every reboot-based test in a stabilization PR. Interim option
-    from pass 37: a dedicated soak job running ONLY this test with a distinct
-    reporter message, so its flakes cannot contaminate the race-regression
-    reports.
+    touching every reboot-based test in a stabilization PR. The pass-37
+    interim option WAS APPLIED in pass 39 (M6): nightly-soak now has a
+    `soak-resume-quarantine` job running only this test, with comment-only
+    reporting (never reopens the tracking issue) — the resume/rewind path
+    has nightly signal again. The fixture-level fixes (subscribe before the
+    add-on starts; observable teardown) remain open, and the test remains
+    out of the merge gate until they land.
   - Suggested Linear title: "rollup-node: make the reboot fixture's shutdown observable, then soak the resume test"
 
 - **Remote-source liveness set: typed import errors, walk resumption, settlement budget, event-lag recovery, sync-aware walk messages**
@@ -478,6 +489,36 @@ from every pass is either fixed in the PR or recorded here.
     analysis before choosing between a startup reconcile and a
     recompute-on-replay mirror of the finalized fix.
   - Suggested Linear title: "rollup-node: reconcile the EL safe marker against the database after a crash between batch revert and its FCU"
+
+- **Behavioral tests for the remaining new decision points (pass 39 M5 leftovers)**
+  (`crates/sequencer/src/lib.rs`, `crates/chain-orchestrator/src/lib.rs`)
+  - Impact/evidence: Claude pass 39 M5 (2026-09-02). Fixed in-loop: the
+    below-finalized fail-stops at both sites, the admin-unwind refusal
+    stickiness, the DB marker recompute, and `ScriptedEngineClient` now
+    records every forkchoice state it is passed. Still untested: (a)
+    `SequencerError::FcuNotValid` — the check that prevents signing and
+    gossiping a block the EL never adopted; the sequencer crate has zero
+    tests and no harness; (b) `import_chain`'s SYNCING -> re-enter-L2-sync
+    transition on the hot gossip path (needs a peer-import harness with a
+    scripted block client); (c) the `UpdateFcsHead` refusal + compensating
+    rollback pair (needs DB failure injection).
+  - First/most-recent pass: Claude pass 39 (2026-09-02).
+  - Why unaddressed: each needs a new harness (sequencer test scaffold,
+    peer-import scaffold, fault-injecting DB) — beyond a review-loop fix.
+  - Suggested Linear title: "rollup-node: harness + tests for FcuNotValid, import-SYNCING re-entry, and the UpdateFcsHead rollback"
+
+- **Pin the nextest install action by revision**
+  (`.github/workflows/test.yaml`, `nightly-soak.yml` — `taiki-e/install-action@nextest`)
+  - Impact/evidence: Claude pass 39 minor 13 (2026-09-02) — the action is
+    referenced by a floating tag; a compromised or breaking release lands in
+    every lane at once. The same pass's main concern (two exclusion
+    mechanisms in the merge gate) was fixed in-loop by folding the libtest
+    `--skip`s into the nextest filterset.
+  - First/most-recent pass: Claude pass 39 (2026-09-02).
+  - Why unaddressed: pinning needs a vetted commit SHA for every usage and a
+    renovate/dependabot story so the pin does not rot; a repo-wide action
+    audit is better done once, outside this PR.
+  - Suggested Linear title: "ci: pin third-party actions by commit SHA across workflows"
 
 ## Pass 35 findings — resolution (loop resumed 2026-09-01)
 

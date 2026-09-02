@@ -89,6 +89,7 @@ pub struct ScriptedEngineClient {
     new_payload_calls: AtomicU64,
     fork_choice_updated_calls: AtomicU64,
     get_payload_calls: AtomicU64,
+    fork_choice_states: Mutex<Vec<ForkchoiceState>>,
 }
 
 impl ScriptedEngineClient {
@@ -125,6 +126,13 @@ impl ScriptedEngineClient {
         self.fork_choice_updated_calls.load(Ordering::SeqCst)
     }
 
+    /// Returns every [`ForkchoiceState`] passed to `forkchoiceUpdated`, in
+    /// call order — so tests can assert WHAT was issued, not just how many
+    /// times.
+    pub fn fork_choice_updated_states(&self) -> Vec<ForkchoiceState> {
+        self.fork_choice_states.lock().expect("scripted response mutex poisoned").clone()
+    }
+
     /// Returns the number of `getPayload` calls.
     pub fn get_payload_calls(&self) -> u64 {
         self.get_payload_calls.load(Ordering::SeqCst)
@@ -143,10 +151,14 @@ impl ScrollEngineApi for ScriptedEngineClient {
 
     async fn fork_choice_updated_v1(
         &self,
-        _fork_choice_state: ForkchoiceState,
+        fork_choice_state: ForkchoiceState,
         _payload_attributes: Option<ScrollPayloadAttributes>,
     ) -> ScrollEngineApiResult<ForkchoiceUpdated> {
         self.fork_choice_updated_calls.fetch_add(1, Ordering::SeqCst);
+        self.fork_choice_states
+            .lock()
+            .expect("scripted response mutex poisoned")
+            .push(fork_choice_state);
         resolve(&self.fork_choice_updated, "fork_choice_updated_v1").await
     }
 

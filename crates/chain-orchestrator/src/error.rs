@@ -16,24 +16,28 @@ pub enum ChainOrchestratorError {
     /// An error occurred in the engine.
     #[error("engine error occurred: {0}")]
     EngineError(#[from] EngineError),
-    /// Engine and persisted state diverged with no in-process recovery left
-    /// (most sites have no compensation; the one that does — the
+    /// State this process can no longer reconcile in-place: engine/DB
+    /// divergence, a consumed notification that cannot be replayed, or a
+    /// post-synced consolidation failure. Most sites have no compensation
+    /// (the one that does — the
     /// `UpdateFcsHead` rollback — raises this only when the compensation
     /// itself did not commit). The run loop treats this as fatal: a restart
     /// re-derives its state from the database and converges, while running
     /// on would keep serving from divergent state.
     #[error("fatal state divergence: {0}")]
     FatalStateDivergence(&'static str),
-    /// The engine did not apply a forkchoice update (INVALID or SYNCING at
-    /// the sites that require VALID). At the `UpdateFcsHead` site nothing
-    /// has been mutated and the refusal is replied to the caller; at the
-    /// `RevertToL1Block` combined head+safe site the unwind has already run
-    /// and the run loop escalates this to a fail-stop; at the
-    /// peer-chain-import site the L2 sync state has been set back to syncing
-    /// and the error is only logged on the gossip path — while via the
-    /// `ImportBlock` command it is stringified into the reply, where the
-    /// remote block source counts it toward its bounded import-rejection
-    /// budget.
+    /// The engine did not apply a forkchoice update. Which verdict raises
+    /// it differs by site: at the `UpdateFcsHead` site both INVALID and
+    /// SYNCING raise it (nothing has been mutated and the refusal is
+    /// replied to the caller); at the `RevertToL1Block` combined head+safe
+    /// site only INVALID raises it (the unwind has already run and the run
+    /// loop escalates to a fail-stop — SYNCING there is a retryable refusal
+    /// that replies `false` instead); at the peer-chain-import site only
+    /// SYNCING raises it (INVALID is an `InvalidBlock`), the L2 sync state
+    /// has been set back to syncing, and the error is only logged on the
+    /// gossip path — while via the `ImportBlock` command it is stringified
+    /// into the reply, where the remote block source counts it toward its
+    /// bounded import-rejection budget.
     #[error("forkchoice update rejected by the engine: {0}")]
     FcuRejected(&'static str),
     /// An error occurred while trying to fetch the L2 block from the database.

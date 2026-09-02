@@ -70,7 +70,8 @@ pub enum ChainOrchestratorEvent {
     /// the L1 message queue index of the new L1 head, and optionally the L2 head and safe
     /// block info as ISSUED to the engine — the safe value is floored at the finalized
     /// block and dragged down to a rewound head, so `l2_safe_block_info` can be `Some`
-    /// (the clamped current safe) even when the unwind itself produced no new safe block.
+    /// (the current safe dragged down to the rewound head) even when the unwind itself
+    /// produced no new safe block.
     L1Reorg {
         /// The L1 block number of the new L1 head.
         l1_block_number: u64,

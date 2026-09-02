@@ -117,7 +117,10 @@ impl<N: FullNetwork<Primitives = DogeosNetworkPrimitives>> ChainOrchestratorHand
     /// Update the FCS head. The outer `Result` is the command transport;
     /// the inner one carries the handler's verdict — `Err(reason)` when the
     /// engine refused the head or persistence failed (nothing to retry
-    /// blindly: read the reason).
+    /// blindly: read the reason). An outer `Err` means no reply ever
+    /// arrived: the orchestrator is gone (see `is_closed`), or the handler
+    /// fail-stopped without replying (persistence failed AND the
+    /// compensating engine rollback did not commit).
     pub async fn update_fcs_head(
         &self,
         head: BlockInfo,

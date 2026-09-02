@@ -917,8 +917,14 @@ async fn test_manual_build_block_coalesces_with_timer_job() -> eyre::Result<()> 
     pinger.abort();
     coalesced?;
 
-    // That slot still produces its block.
-    fixture.expect_event().block_sequenced(1).await?;
+    // That slot still produces its block. The pinger's waiter above drained
+    // events on the way, possibly including the first BlockSequenced, so
+    // accept any height rather than pinning block 1 (which could hang 30s
+    // when the coalesce lands on a later ping).
+    fixture
+        .expect_event()
+        .where_event(|e| matches!(e, ChainOrchestratorEvent::BlockSequenced(_)))
+        .await?;
 
     Ok(())
 }
@@ -1082,6 +1088,22 @@ async fn test_update_fcs_head_cancels_inflight_payload_job() -> eyre::Result<()>
         .label("PayloadBuildingJobCancelled after UpdateFcsHead")
         .where_event(|e| matches!(e, ChainOrchestratorEvent::PayloadBuildingJobCancelled))
         .await?;
+
+    // The event alone is not the cancellation (mirrors the sibling
+    // cancellation tests): a regression that emits it but leaves the 3s job
+    // in the slot would still sequence. Nothing may sequence within the
+    // job's remaining lifetime, and the head must sit at the updated target.
+    let phantom = fixture
+        .expect_event()
+        .timeout(std::time::Duration::from_secs(5))
+        .label("no BlockSequenced after the cancelled job")
+        .where_event(|e| matches!(e, ChainOrchestratorEvent::BlockSequenced(_)))
+        .await;
+    eyre::ensure!(phantom.is_err(), "the cancelled job still sequenced a block: {phantom:?}");
+    eyre::ensure!(
+        fixture.get_block(0).await?.header.number == 0,
+        "unexpected head after the administrative head update"
+    );
 
     // A follow-up build proceeds cleanly from the updated head.
     fixture.build_block().expect_block_number(1).build_and_await_block().await?;

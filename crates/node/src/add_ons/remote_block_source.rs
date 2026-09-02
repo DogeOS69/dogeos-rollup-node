@@ -40,11 +40,12 @@ where
     /// `None` until the remote has been reached once and the highest common
     /// block determined — construction must not depend on the remote being up
     /// (issue #38): a connection error at startup used to abort the whole node.
-    /// Also reset to `None` whenever it can no longer be trusted (settlement's
-    /// `Superseded`/`Resync`/`Abandon` outcomes, an import the engine did not
-    /// apply, repeated import rejections, the pre-issue head re-check, and
-    /// the follow-loop's local-head guard), forcing a fresh common-ancestor
-    /// walk on the next tick.
+    /// Also reset to `None` whenever it can no longer be trusted (the
+    /// `Superseded`/`Resync`/`Abandon` outcomes — whether from settlement or
+    /// from the import loop superseding a freshly issued build, an import
+    /// the engine did not apply, repeated import rejections, the pre-issue
+    /// head re-check, and the follow-loop's advanced- and rewound-head
+    /// guards), forcing a fresh common-ancestor walk on the next tick.
     last_imported_block: Option<u64>,
     /// Whether `init_last_imported_block` has ever succeeded. Terminal
     /// (node-killing) escalation of the walk's divergence verdicts is
@@ -89,7 +90,10 @@ where
     /// sufficient: the settlement's head checks and retry budget still gate
     /// the actual re-issue.
     pending_build_cancelled: bool,
-    /// Whether the owed build's `BuildBlock` command was actually SENT.
+    /// Whether the owed build's `BuildBlock` command was ATTEMPTED (the
+    /// flag is set immediately before the send; a send failure is a
+    /// terminal orchestrator-gone stop, so attempted and sent coincide in
+    /// any run that continues).
     /// The debt itself is recorded at import time (before any await), so an
     /// aborted tick cannot lose a build in the gap between the pointer
     /// advancing and the request going out; an unissued debt is simply
@@ -121,8 +125,9 @@ where
 /// tick that ADVANCED the pointer as catch-up progress, not a stall.
 const TICK_STALL_BUDGET: Duration = Duration::from_secs(600);
 
-/// Consecutive import rejections tolerated before the resume pointer is
-/// re-derived (see `consecutive_import_rejections`).
+/// The Nth consecutive import rejection re-derives the resume pointer —
+/// i.e. N-1 rejections are tolerated (the counter is incremented before the
+/// comparison; see `consecutive_import_rejections`).
 const MAX_IMPORT_REJECTIONS: u32 = 3;
 
 /// After this many consecutive failed settlement attempts for an owed build,
@@ -478,7 +483,9 @@ where
         mut self,
         mut shutdown: impl std::future::Future<Output = ()> + Unpin,
     ) -> eyre::Result<()> {
-        // interval() panics on a zero period; clamp a misconfigured value.
+        // interval() panics on a zero period. Launch validation already
+        // rejects `--remote-source.poll-interval-ms 0`; this clamp guards
+        // programmatic construction only.
         let mut poll_interval =
             interval(Duration::from_millis(self.config.poll_interval_ms.max(1)));
         // A tick can legitimately take far longer than the interval (bounded
@@ -613,7 +620,8 @@ where
     }
 
     /// Waits (bounded) for the outcome of a requested build, without issuing
-    /// any command.
+    /// any BUILD command (the event-lag re-subscribe path does send an
+    /// `EventListener` command).
     ///
     /// A `BlockSequenced` is accepted as landed only at EXACTLY
     /// `expected_number` (stale outcomes are strictly lower-numbered and

@@ -1092,3 +1092,32 @@ The five test gaps recorded in pass 51 remain, minus none: `handle_signer_event`
 check on a fresh-looking database, and `from_provider`'s inconsistent-snapshot
 refusal. Pass 53 also suggests a `.config/nextest.toml` `terminate-after` and a
 step-level `timeout-minutes` on the `unit` job, neither of which exists.
+
+## Pass 54 findings — resolution (Codex, 2026-09-02)
+
+Codex pass 54 returned one P1, on the pass-53 staleness guard. FIXED.
+
+- **P54-1 (FIXED)** The pass-53 C1 guard dropped a stale latch by CLEARING it,
+  leaving L2 marked syncing with no recovery target at all. After a far-ahead
+  optimistic sync or a successful administrative head move, a peer re-announcing
+  the now-current block takes the already-known path and imports nothing, so on
+  a quiescent chain nothing reopens the gate and L1 processing and sequencing
+  stay disabled indefinitely — the same wedge, entered from the other side. A
+  stale latch is now REPLACED by one onto the current mirror, which is always a
+  safe target (re-issuing the head the engine already holds is not a move), so
+  the next announcement probes whether the execution node has adopted it.
+- **Also closed the related hole** pass 53 noted but left open: the
+  optimistic-sync entry called `set_syncing()` without latching at all, so that
+  route into sync mode had no recovery target either. It now latches onto the
+  head it just committed. Every route into L2 sync mode now carries one.
+- The stale-latch test's assertion had encoded the bug (`is_none()`); it now
+  pins the re-latch instead.
+
+### Loop observation, for the handoff
+
+Three consecutive passes have now found defects in this one mechanism:
+pass 52 introduced it, pass 53 found a critical backward-forkchoice hole in it,
+pass 54 found that pass 53's guard reintroduced the original wedge. The
+mechanism is small but sits on the consensus path and has proven easy to get
+wrong in both directions. It deserves human review before merge regardless of
+what the next automated pass says.

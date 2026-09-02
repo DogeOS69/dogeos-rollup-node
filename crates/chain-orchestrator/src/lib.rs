@@ -2187,15 +2187,25 @@ impl<
         // at latch time the checked FCU did not commit, so the mirror is never equal to the
         // target, and a `mirror != target` test would drop on every latch and quietly reinstate
         // the wedge this mechanism exists to close.
-        if *self.engine.fcs().head_block_info() != latched_from {
+        let mirror = *self.engine.fcs().head_block_info();
+        if mirror != latched_from {
+            // RE-LATCH onto the current mirror rather than clearing. Clearing
+            // would drop the only recovery target while leaving L2 marked
+            // syncing, and on a quiescent chain nothing reopens that gate: a
+            // peer re-announcing the now-current block takes the already-known
+            // path and imports nothing. The current mirror is always a safe
+            // target — re-issuing the head the engine already holds is not a
+            // move — so the next announcement probes whether the execution node
+            // has adopted it and exits sync mode when it has.
             tracing::debug!(
                 target: "scroll::chain_orchestrator",
-                ?target,
+                stale_target = ?target,
                 ?latched_from,
-                current = ?self.engine.fcs().head_block_info(),
-                "Engine head moved since the L2 sync latch; dropping the stale re-check"
+                ?mirror,
+                "Engine head moved since the L2 sync latch; re-latching onto the current head"
             );
-            self.l2_sync_recheck_target = None;
+            self.l2_sync_recheck_target =
+                Some(L2SyncRecheck { target: mirror, latched_from: mirror });
             return Ok(());
         }
 
@@ -2365,6 +2375,12 @@ impl<
             // into a job that can never emit an outcome.
             self.cancel_payload_building_job("optimistic sync moved the head");
             self.sync_state.l2_mut().set_syncing();
+            // Every route into L2 sync mode must carry a recovery target, or a
+            // quiescent chain leaves the gate closed forever. The optimistic
+            // sync commits its mirror even on SYNCING, so the head it just
+            // committed is what the execution node has to catch up to.
+            self.l2_sync_recheck_target =
+                Some(L2SyncRecheck { target: block_info, latched_from: block_info });
 
             // Purge all L1 message to L2 block mappings as they may be invalid after an
             // optimistic sync. The head is already committed hundreds of
@@ -3310,9 +3326,12 @@ mod run_loop_policy_tests {
     /// rewinds the engine, with none of the machinery a real rewind pairs with.
     /// The guard compares against the mirror AT LATCH TIME; comparing against
     /// the target instead would drop on every latch (the checked FCU never
-    /// committed, so mirror != target always) and reinstate the wedge.
+    /// committed, so mirror != target always) and reinstate the wedge. And a
+    /// stale latch is REPLACED rather than cleared: clearing leaves L2 marked
+    /// syncing with no recovery target, which is the same wedge from the other
+    /// side.
     #[tokio::test]
-    async fn stale_l2_sync_recheck_is_dropped_without_moving_the_head() {
+    async fn stale_l2_sync_recheck_is_relatched_without_moving_the_head() {
         let database = Arc::new(setup_test_db().await);
         database.insert_genesis_block(B256::ZERO).await.unwrap();
         database.delete_mismatched_genesis_blocks(B256::ZERO).await.unwrap();
@@ -3348,9 +3367,10 @@ mod run_loop_policy_tests {
             0,
             "a stale latch must not issue a forkchoice update at all"
         );
-        assert!(
-            orchestrator.l2_sync_recheck_target.is_none(),
-            "the stale latch must be dropped, not retried forever"
+        assert_eq!(
+            orchestrator.l2_sync_recheck_target,
+            Some(super::L2SyncRecheck { target: info(SAFE, 0x11), latched_from: info(SAFE, 0x11) }),
+            "the stale latch must be REPLACED by one onto the current mirror: clearing it would              leave L2 syncing with no recovery target, and on a quiescent chain nothing reopens              that gate"
         );
         assert_eq!(
             *orchestrator.engine.fcs().head_block_info(),

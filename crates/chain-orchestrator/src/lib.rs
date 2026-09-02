@@ -1493,21 +1493,28 @@ impl<
         // head, or fcs.update() would refuse LOCALLY after the unwind is
         // already durable.
         let finalized = *self.engine.fcs().finalized_block_info();
-        // (A head below finalized was already declared fatal above, so the
-        // safe clamps below cannot reconstruct safe < finalized.)
-        let l2_safe_block_info =
-            l2_safe_block_info
-                .map(|safe| if safe.number >= finalized.number { safe } else { finalized });
-        let l2_safe_block_info = if let Some(head) = l2_head_block_info {
-            let effective_safe =
-                l2_safe_block_info.unwrap_or_else(|| *self.engine.fcs().safe_block_info());
-            if effective_safe.number > head.number {
-                Some(head)
-            } else {
-                l2_safe_block_info
+        // The safe target must satisfy finalized <= safe <= head before the
+        // FCU, or fcs.update() refuses LOCALLY after the unwind is already
+        // durable. A below-finalized head is already fatal above, so flooring
+        // safe at finalized cannot construct safe < finalized. The head drag
+        // uses the EFFECTIVE head — the rewound head when the reorg moved it,
+        // otherwise the current mirror head, which an earlier administrative
+        // UpdateFcsHead can have left BELOW the DB-absolute safe (the unwind
+        // never deletes l2_block rows). Dragging only in the head-rewound
+        // branch (the previous behaviour) left the head-not-rewound shape
+        // (safe = Some above the mirror head, head = None) to trip
+        // HeadBelowSafe and crash-loop the node on a routine reorg.
+        let effective_head =
+            l2_head_block_info.unwrap_or_else(|| *self.engine.fcs().head_block_info());
+        let l2_safe_block_info = match l2_safe_block_info {
+            Some(safe) => {
+                let floored = if safe.number >= finalized.number { safe } else { finalized };
+                Some(if floored.number > effective_head.number { effective_head } else { floored })
             }
-        } else {
-            l2_safe_block_info
+            None if self.engine.fcs().safe_block_info().number > effective_head.number => {
+                Some(effective_head)
+            }
+            None => None,
         };
 
         if l2_head_block_info.is_some() || l2_safe_block_info.is_some() {
@@ -1680,7 +1687,7 @@ impl<
                 tracing::error!(
                     target: "scroll::chain_orchestrator",
                     ?finalized_block_info,
-                    mirror_safe,
+                    mirror_head = self.engine.fcs().head_block_info().number,
                     "Finalized marker exceeds the engine's head mirror; deferring the marker FCU"
                 );
             } else {
@@ -3673,8 +3680,9 @@ mod run_loop_policy_tests {
         database.finalize_batches_up_to_index(2, 6).await.unwrap();
         database.update_batch_status(finalized_batch.hash, BatchStatus::Finalized).await.unwrap();
 
+        // No FCU is scripted: the empty held batch consolidates without one,
+        // and the marker path fail-stops on the hash mismatch BEFORE issuing.
         let engine_client = Arc::new(ScriptedEngineClient::new());
-        script_syncing_hold_then_success(&engine_client);
         let asserter = Asserter::new();
         asserter.push_success(&Option::<()>::None);
         asserter.push_success(&Option::<()>::None);
@@ -3685,10 +3693,11 @@ mod run_loop_policy_tests {
             engine_client.clone(),
             asserter,
             BatchDerivationResult {
-                attributes: vec![DerivedAttributes {
-                    block_number: SAFE + 1,
-                    attributes: ScrollPayloadAttributes::default(),
-                }],
+                // Empty attributes: the held batch consolidates without
+                // contributing an L2 block, so the finalized_batch's
+                // block(50) is the sole marker-eligible block and the marker
+                // resolves to exactly the mirror's finalized height.
+                attributes: vec![],
                 batch_info,
                 skipped_l1_messages: vec![],
                 target_status: BatchStatus::Consolidated,
@@ -3701,14 +3710,6 @@ mod run_loop_policy_tests {
         let run_task = tokio::spawn(orchestrator.run_until_shutdown(Box::pin(async move {
             let _ = shutdown_rx.await;
         })));
-
-        time::timeout(Duration::from_secs(2), async {
-            while engine_client.fork_choice_updated_calls() < 1 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("first Engine SYNCING response must hold the batch");
 
         notification_tx.send(Arc::new(L1Notification::Finalized(6))).await.unwrap();
 

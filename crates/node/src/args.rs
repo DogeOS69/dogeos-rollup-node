@@ -42,7 +42,10 @@ use scroll_db::{
     DatabaseReadOperations, DatabaseWriteOperations,
 };
 use scroll_derivation_pipeline::DerivationPipeline;
-use scroll_engine::{Engine, ForkchoiceState, ScrollAuthApiEngineClient, ScrollEngineApi};
+use scroll_engine::{
+    genesis_hash_from_chain_spec, Engine, ForkchoiceState, ScrollAuthApiEngineClient,
+    ScrollEngineApi,
+};
 use scroll_migration::{traits::ScrollMigrator, MigratorTrait};
 use scroll_network::{DogeosNetworkPrimitives, EthWireBlockWithPeer, ScrollNetworkManager};
 use scroll_wire::ScrollWireEvent;
@@ -431,19 +434,41 @@ impl ScrollRollupNodeConfig {
 
         // The static migrations seed a FIXED genesis row (the dev migration
         // seeds upstream Scroll's dev genesis) which may not match this
-        // chain's actual genesis — and the insert below cannot overwrite it,
-        // because its conflict key includes the hash. A stale row shadows
-        // the real genesis nondeterministically in highest-block queries
-        // (the safe head reported by get_latest_safe_l2_info among them).
-        // Reconcile for EVERY chain: drop mismatched height-0 rows, then
-        // (re-)insert the real genesis — a no-op when the migration seeded
-        // the right value.
-        let genesis_hash = chain_spec.genesis_hash();
-        // One transaction for the delete AND the insert: a crash between
-        // them would leave l2_block with zero rows and panic
-        // get_latest_safe_l2_info's genesis expectation on the next query.
+        // chain's actual genesis — and insert_genesis_block cannot overwrite
+        // it, because its conflict key includes the hash. A stale row shadows
+        // the real genesis nondeterministically in highest-block queries (the
+        // safe head reported by get_latest_safe_l2_info among them).
+        //
+        // Use the SAME genesis source the forkchoice state and the migrations
+        // use (hardcoded constants for the named Scroll chains, the computed
+        // header hash otherwise) — NOT chain_spec.genesis_hash(). A divergence
+        // between the two is exactly what the constants exist to express;
+        // reconciling to the wrong one would leave the engine FCS and the
+        // database disagreeing on genesis.
+        let genesis_hash = genesis_hash_from_chain_spec(chain_spec.clone())
+            .unwrap_or_else(|| chain_spec.genesis_hash());
+        // One transaction for the whole reconciliation. On a FRESH database
+        // (nothing above genesis) drop a mismatched seeded genesis row and
+        // (re-)insert the real one — folding the delete and insert together so
+        // a crash between them cannot leave l2_block empty and panic the
+        // genesis expectation on the next query. On a POPULATED database the
+        // height-0 row and everything above it belong to a chain: never
+        // delete it — if its genesis does not match, the database path was
+        // pointed at another chain's data, which is a fatal misconfiguration,
+        // not something to silently graft this chain's genesis onto.
         let removed = db
             .tx_mut(move |tx| async move {
+                if tx.get_l2_head_block_number().await? > 0 {
+                    if let Some(stored) = tx.get_l2_block_info_by_number(0).await? {
+                        if stored.hash != genesis_hash {
+                            return Err(DatabaseError::GenesisMismatch {
+                                configured: genesis_hash,
+                                stored: stored.hash,
+                            });
+                        }
+                    }
+                    return Ok(0);
+                }
                 let removed = tx.delete_mismatched_genesis_blocks(genesis_hash).await?;
                 tx.insert_genesis_block(genesis_hash).await?;
                 Ok::<_, DatabaseError>(removed)
@@ -455,7 +480,7 @@ impl ScrollRollupNodeConfig {
                 target: "scroll::node::args",
                 removed,
                 ?genesis_hash,
-                "Removed migration-seeded genesis rows that do not match the chain genesis"
+                "Removed a stale seeded genesis row that did not match the chain genesis"
             );
         }
 

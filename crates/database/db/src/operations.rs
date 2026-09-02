@@ -530,26 +530,32 @@ impl<T: WriteConnectionProvider + ?Sized + Sync> DatabaseWriteOperations for T {
         );
         let transition_filter = eligible
             .add(models::batch_commit::Column::Status.eq(BatchStatus::Consolidated.as_str()));
-        let batch = models::batch_commit::Entity::find()
+        // The marker is the HIGHEST finalized L2 block across ALL eligible
+        // batches, computed over blocks rather than over the highest-index
+        // batch: a marker-eligible batch that carries no L2 block rows (a
+        // `Committed` batch swept to `Consolidated` by an L1 reorg's revert
+        // restore) simply does not contribute, instead of erroring inside the
+        // caller's finalization transaction and rolling back the finalized-L1
+        // marker with it — which permanently froze L1 and L2 finality.
+        let eligible_hashes = models::batch_commit::Entity::find()
             .filter(marker_filter)
-            .order_by_desc(models::batch_commit::Column::Index)
-            .one(self.get_connection())
+            .select_only()
+            .column(models::batch_commit::Column::Hash)
+            .into_tuple::<Vec<u8>>()
+            .all(self.get_connection())
             .await?;
+        if eligible_hashes.is_empty() {
+            return Ok(None);
+        }
+        let finalized_block_info = models::l2_block::Entity::find()
+            .filter(models::l2_block::Column::BatchHash.is_in(eligible_hashes))
+            .order_by_desc(models::l2_block::Column::BlockNumber)
+            .one(self.get_connection())
+            .await?
+            .map(|block| block.block_info());
 
-        if let Some(batch) = batch {
-            let finalized_block_info = models::l2_block::Entity::find()
-                .filter(models::l2_block::Column::BatchHash.eq(batch.hash.clone()))
-                .order_by_desc(models::l2_block::Column::BlockNumber)
-                .one(self.get_connection())
-                .await?
-                .map(|block| block.block_info())
-                // Reachable (not a code bug): delete_batch_revert_gt_block_number
-                // restores un-reverted batches to `Consolidated` even when a
-                // batch was never consolidated and so has no blocks; the
-                // widened marker filter would then replay this on every
-                // finalized notification — an error the caller can surface,
-                // never a panic loop.
-                .ok_or(DatabaseError::FinalizedBatchWithoutBlocks(batch.index as u64))?;
+        // Only transition `Consolidated` rows once a real marker exists.
+        if finalized_block_info.is_some() {
             models::batch_commit::Entity::update_many()
                 .filter(transition_filter)
                 .col_expr(
@@ -558,11 +564,9 @@ impl<T: WriteConnectionProvider + ?Sized + Sync> DatabaseWriteOperations for T {
                 )
                 .exec(self.get_connection())
                 .await?;
-
-            Ok(Some(finalized_block_info))
-        } else {
-            Ok(None)
         }
+
+        Ok(finalized_block_info)
     }
 
     async fn fetch_and_update_unprocessed_finalized_batches(

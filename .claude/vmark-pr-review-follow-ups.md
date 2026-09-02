@@ -524,6 +524,41 @@ from every pass is either fixed in the PR or recorded here.
     audit is better done once, outside this PR.
   - Suggested Linear title: "ci: pin third-party actions by commit SHA across workflows"
 
+- **Blocked-resume ancestor walk re-runs every tick with no backoff**
+  (`crates/node/src/add_ons/remote_block_source.rs`, `follow_and_build` /
+  `init_last_imported_block`)
+  - Impact/evidence: Claude pass 43 m3 (2026-09-02). When the resume point
+    cannot be established (`resume < local_safe`, or the `!diverged`
+    "remote trails" bail), the walk returns Err after completing and caches
+    nothing, so `last_imported_block` stays `None` and the next tick redoes
+    the full descent — up to `MAX_ANCESTOR_LOOKBACK` (8192) sequential
+    `eth_getBlockByNumber` calls, continuously, at the 100ms default, against
+    a condition that does not self-resolve until the remote itself moves.
+  - First/most-recent pass: Claude pass 43 (2026-09-02).
+  - Why unaddressed: a correct fix (cache `(resume, resume_hash, diverged)`
+    and skip the re-walk while local head/safe are unchanged, or lengthen the
+    effective interval while the pointer cannot be established) adds state to
+    the hot tick loop and must not blunt the legitimate transient-fault retry
+    at poll cadence; deferred rather than land a half-measure in an
+    already-large review round on freshly-hardened code.
+  - Suggested Linear title: "rollup-node: back off the remote-source ancestor walk while the resume point cannot be established"
+
+- **Reviewer-personal follow-up ledger and the plan doc are tracked in the PR**
+  (`.claude/vmark-pr-review-follow-ups.md`, `docs/superpowers/plans/2026-08-31-issue-38-ci-stabilization.md`)
+  - Impact/evidence: Claude pass 43 m7 (2026-09-02). `.claude/` has no
+    tracked files on `main`; this PR adds a 546-line reviewer ledger under a
+    tool-config directory plus an 866-line plan doc. Production files
+    (test.yaml, nightly-soak.yml, Makefile) previously pointed at the ledger
+    as canonical — those pointers were made self-contained in pass 44, but
+    whether either file should ship in the product repo is a merge decision
+    for the author, not the review loop.
+  - First/most-recent pass: Claude pass 43 (2026-09-02).
+  - Why unaddressed: the ledger is the review loop's live working file (it
+    tracks every deferred finding across all passes); removing it mid-loop
+    would lose that tracking. Decide at handoff whether to `git rm` it (and
+    the plan doc, or relocate under a neutral `docs/` name) before merge.
+  - Suggested Linear title: "rollup-node: drop the reviewer ledger / relocate the plan doc before merging PR #45"
+
 ## Pass 35 findings — resolution (loop resumed 2026-09-01)
 
 All five majors and eight minors from Claude pass 35 were FIXED in the

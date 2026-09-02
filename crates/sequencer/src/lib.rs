@@ -217,7 +217,15 @@ where
                 // INVALID, or SYNCING (which cannot legitimately happen for a
                 // payload this engine just built): nothing committed, head
                 // unchanged. Proceeding would sign and gossip a block the EL
-                // rejected and mark its L1 messages consumed.
+                // rejected and mark its L1 messages consumed. Log the verdict
+                // so INVALID (genuine divergence) is distinguishable from
+                // SYNCING (transient) instead of a contentless error type.
+                tracing::error!(
+                    target: "scroll::sequencer",
+                    ?block_info,
+                    status = ?result.payload_status.status,
+                    "Engine refused the freshly built block's forkchoice update"
+                );
                 return Err(SequencerError::FcuNotValid);
             }
             Ok(Some(block))

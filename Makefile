@@ -65,8 +65,8 @@ ensure-zepter:
 lint: fmt lint-toml clippy udeps codespell zepter
 
 # The exclusions mirror the merge gate (test.yaml): the 15k soak test and
-# the resume test (known reboot-fixture teardown race — see the follow-ups
-# ledger) do not run here either, so `make test` and the gate agree.
+# the resume test (known reboot-fixture teardown race) do not run here
+# either, so `make test` and the gate agree.
 .PHONY: test
 test:
 	cargo +$(NIGHTLY_TOOLCHAIN) nextest run \

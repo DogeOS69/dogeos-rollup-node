@@ -1,4 +1,5 @@
 use super::L1MessageKey;
+use alloy_primitives::B256;
 use sea_orm::sqlx::Error as SqlxError;
 
 /// The error type for database operations.
@@ -19,9 +20,16 @@ pub enum DatabaseError {
     /// The L1 message was not found in database.
     #[error("L1 message at key [{0}] not found in database")]
     L1MessageNotFound(L1MessageKey),
-    /// A batch eligible for the finalized marker has no L2 blocks recorded.
-    #[error("batch (index {0}) is marker-eligible but has no L2 blocks recorded")]
-    FinalizedBatchWithoutBlocks(u64),
+    /// The configured chain's genesis does not match a populated database.
+    #[error(
+        "configured chain genesis {configured} does not match the existing database genesis          {stored}; is the database path pointed at another chain's data?"
+    )]
+    GenesisMismatch {
+        /// The genesis hash the node was configured with.
+        configured: B256,
+        /// The genesis hash already recorded in the database.
+        stored: B256,
+    },
     /// Failed to commit the transaction to database.
     #[error("TXMut commit failed")]
     CommitFailed,

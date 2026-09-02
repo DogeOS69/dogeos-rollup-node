@@ -34,7 +34,10 @@ jobs:
           cache-on-failure: true
       - uses: taiki-e/install-action@nextest
       - name: Run unit tests
-        run: cargo nextest run --all-features --workspace --locked -E '!kind(test)'
+        # --no-tests=fail pinned explicitly (as every other lane does): the
+        # nextest install action is a floating tag, and a filter that matched
+        # nothing must fail loudly rather than exit green.
+        run: cargo nextest run --all-features --workspace --locked --no-tests=fail -E '!kind(test)'
 
   integration:
     runs-on: blacksmith-8vcpu-ubuntu-2404
@@ -81,10 +84,11 @@ jobs:
           # single mechanism owns them. The resume test is excluded for the
           # same reason the nightly soak quarantines it: the not-synced
           # import path advances the resume pointer and drops that height's
-          # build (the test's own in-code note), compounded by a
-          # reboot-fixture teardown race — see the follow-ups ledger. A
-          # known-racy test must not gate merges while issue #38 is being
-          # closed.
+          # build (the test's own in-code note at
+          # crates/node/tests/remote_block_source.rs), compounded by a
+          # reboot-fixture teardown race. A known-racy test must not gate
+          # merges while issue #38 is being closed; it soaks in the nightly
+          # soak-resume-quarantine lane instead.
           cargo nextest run --all-features --workspace --locked --no-fail-fast \
             --no-tests=fail \
             -E 'kind(test) and not test(docker) and not test(test_should_consolidate_to_block_15k) and not test(test_remote_block_source_resumes_from_correct_head)'

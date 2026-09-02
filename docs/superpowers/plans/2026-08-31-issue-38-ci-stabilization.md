@@ -624,6 +624,8 @@ cargo nextest run --all-features --locked -E 'binary(remote_block_source)'
 
 Expected: PASS — `test_remote_block_source_resumes_from_correct_head` exercises the ancestor walk at restart, now on first poll instead of at launch, with identical results.
 
+> **superseded:** this test was later excluded from the merge gate and from `make test` (a known reboot-fixture teardown race plus the not-synced pointer-advance trade-off); it now runs only in the nightly `soak-resume-quarantine` lane, whose failures are comment-only. Its merge-gate stand-ins are the pure-function table tests `classify_ancestor_probe_table` and `decide_follow_action_table`.
+
 - [ ] **Step 4: Commit**
 
 ```bash

@@ -184,6 +184,79 @@ enum SettleAction {
     Wait,
 }
 
+/// The per-height verdict of the common-ancestor walk, decided purely from
+/// the local hash, the remote's `(number, hash)` (if any), and the requested
+/// height — so the walk's classification is table-testable without a live
+/// remote. A remote that answers for a DIFFERENT height than requested (an
+/// offset or `latest`-answering load-balancer backend) is `Absent`, NOT
+/// `Diverged`: misreading a wrong-height answer as divergence would walk to
+/// genesis and drive a full administrative rewind.
+#[derive(Debug, PartialEq, Eq)]
+enum AncestorProbe {
+    /// Both sides have the requested height with equal hashes: common block.
+    Match(alloy_primitives::B256),
+    /// Both sides have the requested height with different hashes: a real fork.
+    Diverged,
+    /// One side lacks the block, or the remote answered a different height:
+    /// transient, retry the walk (never proof of divergence).
+    Absent,
+}
+
+/// Classifies one common-ancestor probe. See [`AncestorProbe`].
+fn classify_ancestor_probe(
+    local_hash: Option<alloy_primitives::B256>,
+    remote: Option<(u64, alloy_primitives::B256)>,
+    requested: u64,
+) -> AncestorProbe {
+    match (local_hash, remote) {
+        (Some(lh), Some((rn, rh))) if rn == requested && lh == rh => AncestorProbe::Match(lh),
+        (Some(_), Some((rn, _))) if rn == requested => AncestorProbe::Diverged,
+        _ => AncestorProbe::Absent,
+    }
+}
+
+/// What `follow_and_build` does once a common ancestor `resume` is derived,
+/// decided purely from `(local_head, local_safe, resume, diverged)` so the
+/// destructive-rewind guard is table-testable without fixtures.
+#[derive(Debug, PartialEq, Eq)]
+enum FollowAction {
+    /// The common ancestor is below the local safe head: importing over it
+    /// would send an FCU whose safe hash is no ancestor of the head. Wait.
+    RefuseBelowSafe,
+    /// The local head is 2+ past the ancestor but no divergence was observed:
+    /// the remote merely trails a canonical local chain. Wait, do not rewind.
+    WaitForRemote,
+    /// The local head is 2+ past the ancestor AND divergence was observed: the
+    /// local chain sits on a fork the remote no longer serves — rewind the
+    /// head down to the ancestor (down-only, guarded by a fresh re-read).
+    Rewind,
+    /// The local head is at or one past the ancestor: import forward normally.
+    Proceed,
+}
+
+/// Decides the follow action from the resume point. Ordering is load-bearing:
+/// the below-safe refusal precedes the head-distance checks, and the
+/// divergence split inside them decides rewind vs wait. Inverting the
+/// `local_head > resume + 1` comparison or dropping the `diverged` split would
+/// silently rewind a follower's canonical head to chase a lagging replica.
+const fn decide_follow_action(
+    local_head: u64,
+    local_safe: u64,
+    resume: u64,
+    diverged: bool,
+) -> FollowAction {
+    if resume < local_safe {
+        return FollowAction::RefuseBelowSafe;
+    }
+    if local_head > resume.saturating_add(1) {
+        if diverged {
+            return FollowAction::Rewind;
+        }
+        return FollowAction::WaitForRemote;
+    }
+    FollowAction::Proceed
+}
+
 /// Decides how to settle an owed build. Ordering is load-bearing:
 /// - the head checks come first (an outcome that already materialized must never be re-issued — see
 ///   the `PayloadBuildingJobCancelled` contract note about the post-finalization emission sites;
@@ -383,15 +456,16 @@ where
                 // prove divergence.
                 let local_genesis = self.provider.block_hash(0)?;
                 let remote_genesis = self.remote.get_block_by_number(0u64.into()).await?;
-                match (local_genesis, remote_genesis) {
-                    (Some(lh), Some(rb)) if lh == rb.header.hash => {
+                let remote = remote_genesis.map(|rb| (rb.header.number, rb.header.hash));
+                match classify_ancestor_probe(local_genesis, remote, 0) {
+                    AncestorProbe::Match(lh) => {
                         resume_hash = lh;
                     }
-                    (Some(lh), Some(rb)) => {
+                    AncestorProbe::Diverged => {
                         tracing::error!(
                             target: "scroll::remote_source",
-                            local = ?lh,
-                            remote = ?rb.header.hash,
+                            local = ?local_genesis,
+                            remote = ?remote,
                             "Remote genesis hash does not match the local chain"
                         );
                         if self.initialized_once {
@@ -408,9 +482,13 @@ where
                              --remote-source.url?",
                         ));
                     }
-                    _ => {
+                    AncestorProbe::Absent => {
+                        // Includes a remote that answered a NON-genesis block
+                        // for the height-0 request (an offset backend): a
+                        // transient retry, not a wrong-URL fail-stop.
                         return Err(eyre::eyre!(
-                            "genesis block unavailable locally or remotely; retrying"
+                            "genesis block unavailable or mismatched locally or remotely; \
+                             retrying"
                         ));
                     }
                 }
@@ -436,15 +514,16 @@ where
             }
             let local_hash = self.provider.block_hash(search)?;
             let remote_block = self.remote.get_block_by_number(search.into()).await?;
-            match (local_hash, remote_block) {
-                (Some(lh), Some(rb)) if lh == rb.header.hash => {
+            let remote = remote_block.map(|rb| (rb.header.number, rb.header.hash));
+            match classify_ancestor_probe(local_hash, remote, search) {
+                AncestorProbe::Match(lh) => {
                     last_imported_block = search;
                     resume_hash = lh;
                     break;
                 }
-                (Some(_), Some(_)) => {
-                    // Both present, hashes differ: genuinely divergent at this
-                    // height — walk down.
+                AncestorProbe::Diverged => {
+                    // Both present at the requested height, hashes differ:
+                    // genuinely divergent — walk down.
                     diverged = true;
                     if search.is_multiple_of(256) {
                         tracing::info!(
@@ -456,13 +535,14 @@ where
                     }
                     search = search.saturating_sub(1);
                 }
-                _ => {
+                AncestorProbe::Absent => {
                     // One side lacks the block (pruned, lagging, or a fresh
-                    // load-balancer backend): transient — retry the whole walk
-                    // on the next tick rather than misreading absence as
-                    // divergence.
+                    // load-balancer backend), OR the remote answered a
+                    // DIFFERENT height than requested: transient — retry the
+                    // whole walk rather than misreading it as divergence
+                    // (which could walk to genesis and drive a full rewind).
                     return Err(eyre::eyre!(
-                        "block {search} unavailable locally or remotely during the common-ancestor \
+                        "block {search} unavailable or mismatched during the common-ancestor \
                          walk; retrying"
                     ));
                 }
@@ -999,15 +1079,15 @@ where
             // resume is S-1 and the head is exactly resume+1 — importing over
             // it would send an FCU whose safe hash is no ancestor of the
             // head, which the EL refuses forever (a permanent import wedge).
-            if resume < local_safe {
-                return Err(eyre::eyre!(
-                    "common ancestor {resume} is below the local safe head {local_safe}; \
-                     waiting for the remote to catch up instead of importing over safe \
-                     state"
-                ));
-            }
-            if local_head > resume.saturating_add(1) {
-                if !diverged {
+            match decide_follow_action(local_head, local_safe, resume, diverged) {
+                FollowAction::RefuseBelowSafe => {
+                    return Err(eyre::eyre!(
+                        "common ancestor {resume} is below the local safe head {local_safe}; \
+                         waiting for the remote to catch up instead of importing over safe \
+                         state"
+                    ));
+                }
+                FollowAction::WaitForRemote => {
                     // No present-but-different hash pair was observed: the
                     // remote is merely BEHIND the local chain (lagging
                     // replica, resyncing backend), not on another fork.
@@ -1019,66 +1099,69 @@ where
                          remote to catch up"
                     ));
                 }
-                // The local chain extends past the freshly derived common
-                // ancestor by more than our own single build: it sits on a
-                // fork the remote no longer serves (remote reorg), or the
-                // remote lags far behind. Refusing forever would wedge the
-                // follower (the next walk returns the same ancestor), and
-                // importing over it would silently reorg blocks out — so
-                // rewind through the administrative path, which collects
-                // reverted transactions, uses a checked FCU, and cancels any
-                // in-flight job. The remote is authoritative in this
-                // deployment shape; rewound derivation blocks are re-imported
-                // as the remote serves them.
-                // The guards above ran against a PRE-WALK snapshot, and the
-                // ancestor walk can take a long time (thousands of
-                // sequential remote RPCs). fcs.update has no
-                // head-monotonicity check, so a rewind decided on stale
-                // values could move the head FORWARD, re-canonicalizing
-                // blocks a concurrent revert or reorg removed. Re-read the
-                // head and safe immediately before the rewind: the remote
-                // source must only ever move the head DOWN.
-                let fresh = self
-                    .orchestrator_handle
-                    .status()
-                    .await
-                    .map_err(|e| self.classify_recv_error(e))?;
-                let fresh_head_info = *fresh.l2.fcs.head_block_info();
-                let fresh_head = fresh_head_info.number;
-                let fresh_safe = fresh.l2.fcs.safe_block_info().number;
-                if resume < fresh_safe {
-                    return Err(eyre::eyre!(
-                        "common ancestor {resume} fell below the local safe head {fresh_safe} \
+                FollowAction::Proceed => {}
+                FollowAction::Rewind => {
+                    // The local chain extends past the freshly derived common
+                    // ancestor by more than our own single build: it sits on a
+                    // fork the remote no longer serves (remote reorg), or the
+                    // remote lags far behind. Refusing forever would wedge the
+                    // follower (the next walk returns the same ancestor), and
+                    // importing over it would silently reorg blocks out — so
+                    // rewind through the administrative path, which collects
+                    // reverted transactions, uses a checked FCU, and cancels any
+                    // in-flight job. The remote is authoritative in this
+                    // deployment shape; rewound derivation blocks are re-imported
+                    // as the remote serves them.
+                    // The guards above ran against a PRE-WALK snapshot, and the
+                    // ancestor walk can take a long time (thousands of
+                    // sequential remote RPCs). fcs.update has no
+                    // head-monotonicity check, so a rewind decided on stale
+                    // values could move the head FORWARD, re-canonicalizing
+                    // blocks a concurrent revert or reorg removed. Re-read the
+                    // head and safe immediately before the rewind: the remote
+                    // source must only ever move the head DOWN.
+                    let fresh = self
+                        .orchestrator_handle
+                        .status()
+                        .await
+                        .map_err(|e| self.classify_recv_error(e))?;
+                    let fresh_head_info = *fresh.l2.fcs.head_block_info();
+                    let fresh_head = fresh_head_info.number;
+                    let fresh_safe = fresh.l2.fcs.safe_block_info().number;
+                    if resume < fresh_safe {
+                        return Err(eyre::eyre!(
+                            "common ancestor {resume} fell below the local safe head {fresh_safe} \
                          while the ancestor walk ran; re-deriving next tick"
-                    ));
-                }
-                if fresh_head <= resume {
-                    return Err(eyre::eyre!(
-                        "local head moved to {fresh_head} (at or below the common ancestor \
+                        ));
+                    }
+                    if fresh_head <= resume {
+                        return Err(eyre::eyre!(
+                            "local head moved to {fresh_head} (at or below the common ancestor \
                          {resume}) while the ancestor walk ran; a rewind would move the head \
                          forward — re-deriving next tick"
-                    ));
+                        ));
+                    }
+                    tracing::warn!(
+                        target: "scroll::remote_source",
+                        local_head,
+                        resume,
+                        "Local head extends past the common ancestor; rewinding to follow the remote"
+                    );
+                    // The observed head rides along as a compare-and-swap
+                    // precondition: the fresh read above and this command are
+                    // still not atomic, and the handler refuses the rewind if
+                    // the head moved in the gap.
+                    self.orchestrator_handle
+                        .update_fcs_head_if_unmoved(
+                            BlockInfo { number: resume, hash: resume_hash },
+                            Some(fresh_head_info),
+                        )
+                        .await
+                        .map_err(|e| self.classify_recv_error(e))?
+                        .map_err(|refusal| {
+                            eyre::eyre!("rewind to the common ancestor was refused: {refusal}")
+                        })?;
                 }
-                tracing::warn!(
-                    target: "scroll::remote_source",
-                    local_head,
-                    resume,
-                    "Local head extends past the common ancestor; rewinding to follow the remote"
-                );
-                // The observed head rides along as a compare-and-swap
-                // precondition: the fresh read above and this command are
-                // still not atomic, and the handler refuses the rewind if
-                // the head moved in the gap.
-                self.orchestrator_handle
-                    .update_fcs_head_if_unmoved(
-                        BlockInfo { number: resume, hash: resume_hash },
-                        Some(fresh_head_info),
-                    )
-                    .await
-                    .map_err(|e| self.classify_recv_error(e))?
-                    .map_err(|refusal| {
-                        eyre::eyre!("rewind to the common ancestor was refused: {refusal}")
-                    })?;
             }
             self.last_imported_block = Some(resume);
         }
@@ -1292,6 +1375,53 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classify_ancestor_probe_table() {
+        use alloy_primitives::B256;
+        let a = B256::repeat_byte(0xaa);
+        let b = B256::repeat_byte(0xbb);
+        // Both sides at the requested height, equal hashes: common block.
+        assert_eq!(classify_ancestor_probe(Some(a), Some((5, a)), 5), AncestorProbe::Match(a));
+        // Both sides at the requested height, different hashes: divergence.
+        assert_eq!(classify_ancestor_probe(Some(a), Some((5, b)), 5), AncestorProbe::Diverged);
+        // Remote answered a DIFFERENT height than requested (offset / latest
+        // backend): Absent, never Diverged — this is the height guard that
+        // stops a misbehaving remote from driving a rewind to genesis.
+        assert_eq!(classify_ancestor_probe(Some(a), Some((4, b)), 5), AncestorProbe::Absent);
+        assert_eq!(classify_ancestor_probe(Some(a), Some((4, a)), 5), AncestorProbe::Absent);
+        // One side lacks the block.
+        assert_eq!(classify_ancestor_probe(Some(a), None, 5), AncestorProbe::Absent);
+        assert_eq!(classify_ancestor_probe(None, Some((5, a)), 5), AncestorProbe::Absent);
+        assert_eq!(classify_ancestor_probe(None, None, 5), AncestorProbe::Absent);
+    }
+
+    #[test]
+    fn decide_follow_action_table() {
+        // (local_head, local_safe, resume, diverged) -> action
+        let cases: &[(u64, u64, u64, bool, FollowAction)] = &[
+            // Ancestor below the local safe head: refuse regardless of divergence.
+            (100, 50, 40, false, FollowAction::RefuseBelowSafe),
+            (100, 50, 40, true, FollowAction::RefuseBelowSafe),
+            // Head 2+ past the ancestor, no divergence: the remote merely
+            // trails — wait, never rewind.
+            (100, 0, 10, false, FollowAction::WaitForRemote),
+            // Head 2+ past the ancestor WITH divergence: rewind to follow.
+            (100, 0, 10, true, FollowAction::Rewind),
+            // Head exactly one past the ancestor (a build in flight): proceed,
+            // divergence or not.
+            (11, 0, 10, false, FollowAction::Proceed),
+            (11, 0, 10, true, FollowAction::Proceed),
+            // Head at the ancestor: proceed.
+            (10, 0, 10, false, FollowAction::Proceed),
+            // Below-safe takes precedence over the head-distance rewind.
+            (100, 50, 10, true, FollowAction::RefuseBelowSafe),
+        ];
+        for (head, safe, resume, diverged, want) in cases {
+            let got = decide_follow_action(*head, *safe, *resume, *diverged);
+            assert_eq!(&got, want, "decide_follow_action({head}, {safe}, {resume}, {diverged})");
+        }
+    }
 
     #[test]
     fn settlement_decision_table() {

@@ -9,7 +9,7 @@ name: nightly-soak
 #     original race only fired on contended runners). The resume test is
 #     skipped in the merge lane and kept OUT of these race lanes (its own
 #     comment documents an unfixed first-tick race and its restart fixture
-#     retains a teardown race — see the follow-ups ledger); it soaks in its
+#     retains a teardown race); it soaks in its
 #     own QUARANTINE job below whose failures are comment-only, so the known
 #     flake cannot be auto-filed as a regression of a fixed race. And
 #   - the docker remote-source pair (follow/import parity, and recovery
@@ -393,7 +393,7 @@ jobs:
                   body="nightly-soak job **$job** failed or hit its soak-step timeout: $RUN_URL — either a regression of a race fixed in #45, or a hang/capacity problem."
                   reopen=1
                 else
-                  body="nightly-soak QUARANTINE job **$job** failed or hit its soak-step timeout: $RUN_URL — this lane soaks the resume/rewind test excluded from the merge gate (known: the not-synced import path drops builds after advancing the resume pointer, plus a reboot-fixture teardown race; see the follow-ups ledger). Comment-only by design; NOT evidence of a race regression."
+                  body="nightly-soak QUARANTINE job **$job** failed or hit its soak-step timeout: $RUN_URL — this lane soaks the resume/rewind test excluded from the merge gate (known: the not-synced import path drops builds after advancing the resume pointer, plus a reboot-fixture teardown race). Comment-only by design; NOT evidence of a race regression."
                 fi
                 ;;
               cancelled)

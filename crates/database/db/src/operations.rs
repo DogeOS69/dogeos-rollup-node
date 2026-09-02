@@ -11,7 +11,7 @@ use sea_orm::{
     sea_query::{CaseStatement, Expr, OnConflict},
     ColumnTrait, Condition, DbErr, EntityTrait, QueryFilter, QueryOrder, QuerySelect, QueryTrait,
 };
-use std::fmt;
+use std::{collections::HashSet, fmt};
 
 /// The [`DatabaseWriteOperations`] trait provides write methods for interacting with the
 /// database.
@@ -389,8 +389,16 @@ impl<T: WriteConnectionProvider + ?Sized + Sync> DatabaseWriteOperations for T {
             .into_tuple::<Vec<u8>>()
             .all(self.get_connection())
             .await?;
-        let blockless_hashes: Vec<Vec<u8>> =
-            batch_hashes.iter().filter(|hash| !derived_hashes.contains(hash)).cloned().collect();
+        // Set membership, not a linear scan: a `BatchRevertRange` can span
+        // thousands of batches, and a `contains` per hash would be quadratic in
+        // byte comparisons inside this transaction, stalling reorg processing.
+        let derived_set: HashSet<&[u8]> =
+            derived_hashes.iter().map(|hash| hash.as_slice()).collect();
+        let blockless_hashes: Vec<Vec<u8>> = batch_hashes
+            .iter()
+            .filter(|hash| !derived_set.contains(hash.as_slice()))
+            .cloned()
+            .collect();
 
         for (hashes, status) in [
             (&derived_hashes, BatchStatus::Consolidated),

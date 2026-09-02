@@ -701,3 +701,29 @@ recorded above.
   m6 (CLAUDE.md exclusions), m7 (`BatchReverted.safe_head` documents both
   clamps), m8 (book documents the head rewind and the two fail-stops), m9
   (`genesis_seed_pairing_holds_for_shipped_chain_specs`) — all FIXED.
+
+## Pass 46 findings — resolution (Codex, 2026-09-02)
+
+Codex pass 46 returned three findings, all on the pass-44/45 changes
+themselves. All FIXED; nothing deferred from this pass.
+
+- **P46-1 (FIXED)** The pass-45 M2 rule over-rejected: it aborted startup on
+  `remote-source.enabled` + `sequencer.auto-start` even with
+  `sequencer.enabled` unset, where `build()` constructs no Sequencer at all, so
+  `auto-start` starts no timer and there is no second producer. That broke the
+  templated fleet layout the adjacent warn arm explicitly blesses — one flag
+  set across roles, toggled per role. The rule is now gated on
+  `sequencer_enabled`, which is exactly the condition the hazard needs. Pinned
+  from both sides by `test_validate_remote_source_with_auto_start_fails` and
+  the new `test_validate_remote_source_with_inert_auto_start_is_accepted`.
+- **P46-2 (FIXED)** The pass-44 restore classified blockless batches with a
+  linear `derived_hashes.contains()` per reverted hash — quadratic byte
+  comparisons inside the reorg transaction, and a `BatchRevertRange` can span
+  thousands of batches. Now a `HashSet` lookup.
+- **P46-3 (FIXED)** The pass-45 book section (m8) overstated the add-on's
+  fail-stop: a genesis mismatch and an exhausted lookback are terminal only
+  before the FIRST successful initialization. After one success
+  `init_last_imported_block` converts both to ordinary retryable errors and
+  the node stays up, re-walking at poll cadence. The section now says so, and
+  points operators at the repeated sync-error logs, since a follower stuck in
+  that loop imports nothing while looking healthy.

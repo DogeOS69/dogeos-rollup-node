@@ -246,7 +246,10 @@ impl ScrollRollupNodeConfig {
             return Err("remote-source.poll-interval-ms must be greater than 0".to_string());
         }
 
-        if self.remote_block_source_args.enabled && self.sequencer_args.auto_start {
+        if self.remote_block_source_args.enabled &&
+            self.sequencer_args.sequencer_enabled &&
+            self.sequencer_args.auto_start
+        {
             // Two reasons, and NEITHER is gated on `remote-source.build`.
             // With `build`, the remote source attributes build outcomes to its
             // own requests (see RemoteBlockSourceAddOn::await_build_outcome),
@@ -256,11 +259,15 @@ impl ScrollRollupNodeConfig {
             // source imports the real sequencer's chain over RPC, and each
             // import reorgs the local block out — a fork originating from a node
             // the operator configured as a read-only mirror.
-            return Err(
-                "sequencer.auto-start conflicts with remote-source.enabled: the remote block \
-                 source must be the only block producer"
-                    .to_string(),
-            );
+            //
+            // Gated on `sequencer_enabled` because `build()` only constructs a
+            // Sequencer when it is set: without one there is no timer and no
+            // second producer, so `auto-start` starts nothing. Rejecting it
+            // anyway would break the templated fleet layout the adjacent warn
+            // arm explicitly blesses — one flag set, toggled per role.
+            return Err("sequencer.auto-start conflicts with remote-source.enabled on a node with \
+                 sequencer.enabled: the remote block source must be the only block producer"
+                .to_string());
         }
 
         Ok(())
@@ -1548,6 +1555,43 @@ mod tests {
                 .unwrap_err()
                 .contains("sequencer.auto-start conflicts with remote-source.enabled"));
         }
+    }
+
+    /// The mirror image: without `sequencer.enabled` no Sequencer is built, so
+    /// `auto-start` starts nothing and the pair is inert. A templated fleet
+    /// layout that sets it for every role must stay valid on the read-only
+    /// followers — the same shape the adjacent warn arm blesses.
+    #[test]
+    fn test_validate_remote_source_with_inert_auto_start_is_accepted() {
+        let config = ScrollRollupNodeConfig {
+            test_args: TestArgs::default(),
+            sequencer_args: SequencerArgs {
+                sequencer_enabled: false,
+                auto_start: true,
+                ..Default::default()
+            },
+            signer_args: SignerArgs::default(),
+            database_args: RollupNodeDatabaseArgs::default(),
+            engine_driver_args: EngineDriverArgs::default(),
+            chain_orchestrator_args: ChainOrchestratorArgs::default(),
+            l1_provider_args: L1ProviderArgs::default(),
+            blob_provider_args: BlobProviderArgs::default(),
+            network_args: RollupNodeNetworkArgs::default(),
+            gas_price_oracle_args: RollupNodeGasPriceOracleArgs::default(),
+            consensus_args: ConsensusArgs::noop(),
+            database: None,
+            rpc_args: RpcArgs::default(),
+            pprof_args: PprofArgs::default(),
+            remote_block_source_args: RemoteBlockSourceArgs {
+                enabled: true,
+                url: Some("http://localhost:8545".parse().unwrap()),
+                poll_interval_ms: 100,
+                build: false,
+            },
+            require_l1_data_fee_buffer: false,
+        };
+
+        assert!(config.validate().is_ok(), "an inert auto-start must not block a read-only mirror");
     }
 
     #[test]

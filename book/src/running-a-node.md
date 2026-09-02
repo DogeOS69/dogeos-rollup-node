@@ -410,10 +410,18 @@ divergent remote can rewind the node arbitrarily far. Point
 `--remote-source.url` only at a node whose chain this one should follow
 unconditionally.
 
-**Two conditions stop the process rather than retrying.** A genesis mismatch
-between this node and the remote, and failing to find a common ancestor within
-the add-on's lookback bound, are both treated as unrecoverable: the add-on
-returns a terminal error and the node panics rather than continuing to import
-from a chain it cannot reconcile with. Both indicate the remote is a different
-chain or has diverged beyond the lookback window, and both need operator
-attention — restarting will not clear them.
+**Two conditions stop the process, but only before the first successful
+initialization.** A genesis mismatch between this node and the remote, and
+failing to find a common ancestor within the add-on's lookback bound, are
+treated as unrecoverable while the resume point has never been established:
+the add-on returns a terminal error and the node panics rather than importing
+from a chain it cannot reconcile with. Both point at a misconfigured
+`--remote-source.url`, and restarting will not clear them.
+
+Once the add-on has initialized successfully once, those same two verdicts
+become ordinary retryable errors — after a first success they are far more
+likely a misrouted or lagging remote backend than a wrong URL, so the node
+stays up and re-walks at the poll interval instead of fail-stopping a healthy
+node. A follower stuck in that loop imports nothing while still looking
+healthy, so watch the add-on's repeated sync-error logs rather than expecting
+the process to exit.

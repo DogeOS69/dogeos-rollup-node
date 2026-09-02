@@ -1251,3 +1251,39 @@ plus any busy-wait is a hang, not a failure.
 `tokio`'s `test-util` feature was added as a dev-dependency of
 `rollup-node-chain-orchestrator` for the paused clock, so the interval is
 provable without a real 10s wait in the unit lane.
+
+## Pass 58 findings — resolution (Codex, 2026-09-02)
+
+Codex pass 58 returned one P1, again on the L2-sync latch. FIXED.
+
+- **P58-1 (FIXED)** The pass-57 INVALID re-latch had a hole precisely where the
+  latch comes from the optimistic-sync entry. That entry latches with
+  `target == latched_from == mirror` (it commits its target even on SYNCING, so
+  the target already IS the mirror), so re-latching onto the mirror re-latched
+  the very block just rejected: every later probe answered INVALID and the node
+  stayed L2-syncing forever, polling no L1 and sequencing nothing. When the
+  rejected target is the mirror, the engine is rejecting the head it itself
+  holds — irreconcilable in place — so that now fail-stops with
+  `FatalStateDivergence` rather than looping. Pinned by
+  `invalid_recheck_of_the_mirror_itself_fail_stops`.
+
+### The pass-57 interval test was flaky, and this pass caught it
+
+`the_interval_arm_recovers_sync_mode_without_any_inbound_traffic` failed once in
+a combined run and passed alone; three re-runs then passed. `tokio::spawn` does
+not poll the task, so the entire advance budget could elapse before the run loop
+created its interval — roughly a one-in-six failure. It now yields before each
+advance and is bounded by a REAL-time deadline (a paused clock cannot bound
+itself). Six consecutive combined runs clean.
+
+That is a test I added, to a PR whose purpose is removing flaky tests, two passes
+after fixing seven hanging waits of a related kind.
+
+### Standing recommendation, restated
+
+This is the SIXTH consecutive pass to find a defect in this ~60-line mechanism
+(52 introduced it, 53/54/55/57/58 each found another hole). Every fix has been
+locally correct and has then exposed the next case. It now has five arms, an
+interval driver, six tests and a fail-stop. The wedge it closes is real, but the
+mechanism does not belong in a CI-stabilization PR on this evidence — it should
+be reviewed by a human, and probably split into its own change.

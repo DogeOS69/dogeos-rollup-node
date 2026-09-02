@@ -2280,10 +2280,27 @@ impl<
             }
         };
         if result.is_invalid() {
-            // The engine actively rejected this target, so stop re-issuing IT — but re-latch onto
-            // the current mirror rather than clearing, for the same reason the stale arm above
-            // does: a cleared latch leaves L2 marked syncing with no recovery target at all, and
-            // on the quiescent chain this mechanism exists for, nothing reopens that gate.
+            // Rejecting the head the engine ITSELF holds is not recoverable here. The optimistic
+            // sync latches with `target == latched_from == mirror` (it commits its target even on
+            // SYNCING, so the target already is the mirror), and re-latching onto the mirror there
+            // would re-latch the very block just rejected — every later probe answers INVALID and
+            // the node stays L2-syncing forever, polling no L1 and sequencing nothing. There is no
+            // better target to fall back to: the engine and this node disagree about a head the
+            // engine committed.
+            if target == mirror {
+                tracing::error!(
+                    target: "scroll::chain_orchestrator",
+                    ?target,
+                    "Engine rejected as INVALID the head it currently holds;                      engine and node disagree on committed state"
+                );
+                return Err(ChainOrchestratorError::FatalStateDivergence(
+                    "engine rejected the head it holds as its own mirror;                      restart re-derives the head from the persisted state",
+                ));
+            }
+
+            // Otherwise stop re-issuing THIS target but keep a recovery path, for the same reason
+            // the stale arm above does: a cleared latch leaves L2 marked syncing with no target at
+            // all, and on the quiescent chain this mechanism exists for, nothing reopens that gate.
             tracing::warn!(
                 target: "scroll::chain_orchestrator",
                 ?target,
@@ -3494,6 +3511,53 @@ mod run_loop_policy_tests {
         );
     }
 
+    /// P58: an INVALID answer for a target that IS the mirror must fail-stop,
+    /// not re-latch. The optimistic-sync entry latches with
+    /// `target == latched_from == mirror` (it commits its target even on
+    /// SYNCING), so re-latching onto the mirror there re-latches the very block
+    /// just rejected — every later probe answers INVALID and the node stays
+    /// L2-syncing forever, polling no L1 and sequencing nothing.
+    #[tokio::test]
+    async fn invalid_recheck_of_the_mirror_itself_fail_stops() {
+        let database = Arc::new(setup_test_db().await);
+        database.insert_genesis_block(B256::ZERO).await.unwrap();
+        database.delete_mismatched_genesis_blocks(B256::ZERO).await.unwrap();
+
+        let engine_client = Arc::new(ScriptedEngineClient::new());
+        engine_client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(
+            PayloadStatusEnum::Invalid { validation_error: "scripted".to_string() },
+            None,
+        )));
+        let asserter = Asserter::new();
+        asserter.push_success(&Option::<()>::None);
+        asserter.push_success(&Option::<()>::None);
+        let (mut orchestrator, _handle, _notification_tx) = test_orchestrator_with_fcs(
+            database.clone(),
+            engine_client.clone(),
+            asserter,
+            BatchDerivationResult {
+                attributes: vec![],
+                batch_info: BatchInfo::new(1, B256::repeat_byte(1)),
+                skipped_l1_messages: vec![],
+                target_status: BatchStatus::Consolidated,
+            },
+            ForkchoiceState::new(info(SAFE, 0x11), info(SAFE, 0x11), info(0, 0x00)),
+        )
+        .await;
+
+        orchestrator.sync_state.l1_mut().set_syncing();
+        orchestrator.sync_state.l2_mut().set_syncing();
+        // Exactly the shape the optimistic-sync entry produces.
+        orchestrator.l2_sync_recheck_target =
+            Some(super::L2SyncRecheck { target: info(SAFE, 0x11), latched_from: info(SAFE, 0x11) });
+
+        let result = orchestrator.recheck_l2_sync_target().await;
+        assert!(
+            matches!(result, Err(ChainOrchestratorError::FatalStateDivergence(_))),
+            "an engine that rejects its own mirror head must fail-stop, not re-latch              the rejected block forever; got {result:?}"
+        );
+    }
+
     /// M3: a transport failure must leave the latch in place for the next
     /// attempt, and must not fabricate a synced state.
     #[tokio::test]
@@ -3593,11 +3657,19 @@ mod run_loop_policy_tests {
         // input. Advanced EXPLICITLY: a yield loop keeps the runtime busy, so a
         // paused clock never auto-advances and the wait spins forever (the same
         // hazard as the event loops pass 53 rewrote).
-        for _ in 0..20 {
+        // Yield BEFORE each advance: `tokio::spawn` does not poll the task, so
+        // without this the whole advance budget can elapse before the run loop
+        // has even created its interval — which made this test fail about one
+        // run in six. Bounded by a REAL-time deadline as well, since the paused
+        // clock cannot bound itself.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while engine_client.fork_choice_updated_calls() < 1 {
+            tokio::task::yield_now().await;
             tokio::time::advance(super::L2_SYNC_RECHECK_INTERVAL).await;
-            if engine_client.fork_choice_updated_calls() >= 1 {
-                break;
-            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the interval arm never probed the latch"
+            );
         }
         assert!(
             engine_client.fork_choice_updated_calls() >= 1,

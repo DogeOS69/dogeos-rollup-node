@@ -910,17 +910,24 @@ async fn test_manual_build_block_coalesces_with_timer_job() -> eyre::Result<()> 
     // lands mid-job with seconds of margin.
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
-    // Bounded retry instead of a single blind request: this test also runs
-    // in the merge-gating lane at full parallelism, where a starved
-    // orchestrator could let one request start the job itself. Every ping
-    // either coalesces with an in-flight job (emitting the event) or starts
-    // a job for the next ping to coalesce with — the contract under test is
-    // coalesce-not-replace, whichever job is in flight.
+    // Bounded retry instead of a single blind request: this test also runs in
+    // the merge-gating lane at full parallelism, where a starved orchestrator
+    // could let one request start the job itself.
+    //
+    // The interval MUST exceed the payload duration, or this test stops
+    // testing what it is named for. At a shorter interval a ping that finds no
+    // job in flight starts a MANUAL one, and the next ping coalesces with
+    // that — `BuildBlockCoalesced` fires without a timer job ever being
+    // involved, which the sibling manual-manual test already covers. Waiting
+    // longer than the payload duration guarantees any job a ping started has
+    // finished before the next one, so the only job left to coalesce with is
+    // the timer's (slots fire every 100ms and each runs 3s, so one is in
+    // flight essentially continuously).
     let pinger_handle = fixture.sequencer().rollup_manager_handle.clone();
     let pinger = tokio::spawn(async move {
         loop {
             pinger_handle.build_block();
-            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(3500)).await;
         }
     });
     let coalesced = fixture

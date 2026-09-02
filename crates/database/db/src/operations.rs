@@ -180,7 +180,10 @@ pub trait DatabaseWriteOperations {
     /// genesis or `seeded_genesis`: both are rows THIS node wrote, so the stale ones are dropped
     /// and the real genesis restored. Only a height-0 row that is neither belongs to another
     /// chain, and that is [`DatabaseError::GenesisMismatch`] rather than something to graft this
-    /// chain's genesis onto.
+    /// chain's genesis onto. A populated database with NO height-0 row at all is
+    /// [`DatabaseError::GenesisMissing`]: there is nothing to reconcile against, and inserting a
+    /// genesis under history that never carried it would hide a truncated or corrupt database.
+    /// Both are fatal at startup.
     async fn reconcile_genesis_block(
         &self,
         genesis_hash: B256,
@@ -890,22 +893,28 @@ impl<T: WriteConnectionProvider + ?Sized + Sync> DatabaseWriteOperations for T {
             .await?;
         let is = |hash: &Vec<u8>, want: B256| hash.as_slice() == want.as_slice();
 
+        // Every height-0 row this node could have written is reconcilable: this chain's genesis,
+        // and the genesis its own static migration seeds. The seed is a SEPARATE value — the dev
+        // migration hardcodes upstream Scroll's dev genesis while the chain spec carries its own —
+        // so a database written before the genesis reconciliation existed holds only the seed, and
+        // rejecting it would fail every such node at startup on upgrade. A row that is neither is
+        // another chain's data.
+        //
+        // Checked BEFORE the fresh/populated split, because that split reads the `l2_head_block`
+        // METADATA counter rather than `l2_block`: `unwind()` can drive that counter to 0 while
+        // another chain's rows remain, and the fresh branch would then delete the foreign genesis
+        // and graft this chain's in — bypassing exactly the fail-stop this check exists for.
+        if let Some(foreign) = stored_genesis_hashes
+            .iter()
+            .find(|hash| !is(hash, genesis_hash) && !is(hash, seeded_genesis))
+        {
+            return Err(DatabaseError::GenesisMismatch {
+                configured: genesis_hash,
+                stored: B256::from_slice(foreign),
+            });
+        }
+
         if DatabaseReadOperations::get_l2_head_block_number(self).await? > 0 {
-            // Every height-0 row this node could have written is reconcilable: this chain's
-            // genesis, and the genesis its own static migration seeds. The seed is a SEPARATE
-            // value — the dev migration hardcodes upstream Scroll's dev genesis while the chain
-            // spec computes DogeOS's — so a database written before the genesis reconciliation
-            // existed carries only the seed, and rejecting it would fail every such node at
-            // startup on upgrade. Only a row that is neither is another chain's data.
-            if let Some(foreign) = stored_genesis_hashes
-                .iter()
-                .find(|hash| !is(hash, genesis_hash) && !is(hash, seeded_genesis))
-            {
-                return Err(DatabaseError::GenesisMismatch {
-                    configured: genesis_hash,
-                    stored: B256::from_slice(foreign),
-                });
-            }
             if stored_genesis_hashes.is_empty() {
                 // Populated, but with no genesis row to reconcile against. Inserting one here
                 // would graft this chain's genesis under history that never carried it, and

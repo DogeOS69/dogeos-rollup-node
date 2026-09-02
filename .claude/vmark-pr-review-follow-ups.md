@@ -727,3 +727,78 @@ themselves. All FIXED; nothing deferred from this pass.
   the node stays up, re-walking at poll cadence. The section now says so, and
   points operators at the repeated sync-error logs, since a follower stuck in
   that loop imports nothing while looking healthy.
+
+## Pass 47 findings — resolution (Claude, 2026-09-02)
+
+Claude pass 47 returned 1 critical, 5 majors and 12 minors. All FIXED;
+nothing deferred from this pass beyond the standing ledger entries.
+
+- **C1 (FIXED)** `--chain dogeos-chikyu` was bricked at startup. Pass 43
+  switched the reconciliation's genesis source from `chain_spec.genesis_hash()`
+  to `genesis_hash_from_chain_spec()`, and the two differ: the former returns
+  the SEALED hash a spec carries, the latter RECOMPUTES the header hash.
+  Chikyu's genesis document is byte-identical to mainnet's in every field the
+  header is built from, so recomputing yields MAINNET's genesis hash for
+  chikyu. An existing chikyu database then failed `GenesisMismatch` on every
+  start; a fresh one recorded mainnet's hash and diverged at the first
+  finalized notification. `fcs.rs`'s `Dev | None` arm now returns
+  `chain_spec.genesis_hash()` — a no-op for dev, custom chains and mainnet,
+  where sealed and recomputed agree.
+  - The pass-45 guard test passed for the WRONG reason: its only chikyu
+    assertion was `assert_ne!(recomputed, seed)`, true because the recomputed
+    value was mainnet's hash. It now asserts
+    `genesis_hash_from_chain_spec(spec) == Some(spec.genesis_hash())`, verified
+    to fail on the pre-fix code.
+- **M1 (FIXED)** A crash between an unwind's durable database commit and the
+  FCU that lowers the engine's safe marker left the EL holding safe above the
+  resumed head. `from_provider` clamped `safe >= finalized` but never
+  `safe <= head`, and the startup repair propagated the resulting
+  `HeadBelowSafe` — so the node failed to launch on every subsequent restart,
+  with nothing to lower the marker. Added the clamp, and made the repair loop
+  drag safe down rather than propagate.
+- **M2 (FIXED)** `from_provider` swallows three RPC reads and the genesis
+  fallback set head = safe = finalized = 0 with no log line, leaving every
+  safe/finalized guard vacuous until the next finalized notification. The
+  fallback now logs, and a genesis mirror on a populated database is refused
+  outright.
+- **M3 (FIXED)** `?e` rendered the full eyre chain, and alloy's transport
+  appends `for url ({url})` with basic-auth credentials and query-string API
+  keys intact — defeating the host/port redaction on the same line. Both log
+  sites now scrub the message against the configured URL before logging it,
+  and the scrub happens before the string is stored in the rate limiter.
+- **M4 (FIXED)** Imported remote blocks were never checked for parent linkage,
+  though the comment claimed the fork case was covered. A forked backend
+  answers the right height with a wrong parent; the engine returns SYNCING for
+  an unknown parent, which drops a healthy follower out of synced mode, and the
+  next tick commits the mirror on SYNCING to a head the local EL never adopts —
+  after which every ancestor probe returns immediately, forever. Now compared
+  against the local block hash before import.
+- **M5 (FIXED)** Commit 8555993's message claimed the timer-coalescing test's
+  pinger interval had been raised above the payload duration; `sync.rs` was not
+  in that commit and the tree still had a 200ms pinger against a 3000ms
+  payload. Ping N started a manual job and ping N+1 coalesced with THAT, so the
+  test could pass without a timer job ever being involved — while being one of
+  five patterns soaked nightly as recurrence protection. Interval raised to
+  3500ms, above the payload duration.
+- **Minors (all FIXED)** `reconcile_genesis_block`'s foreign-row check hoisted
+  above the fresh/populated split (that split reads the `l2_head_block`
+  METADATA counter, which `unwind()` can drive to 0 with another chain's rows
+  still present, so the fresh branch would have grafted this chain's genesis
+  over foreign data); the stall classifier now requires a NUMERIC advance
+  (`Some(_)` sorts above `None`, so the tick that merely establishes the
+  pointer counted as healthy deep catch-up); the admin-unwind purge refuses
+  instead of fail-stopping, matching the two database reads above it; the
+  stale pre-pass-43 clamp comment deleted; the `L1Reorg` and `BatchReverted`
+  event docs corrected; the `reconcile_genesis_block` doc now names
+  `GenesisMissing`; the book's auto-start rule and terminal-error section
+  corrected (the lookback bound is 8192 blocks and does NOT imply a
+  misconfigured URL); the soak rename guard is now COUNT-granular, not
+  pattern-granular (`coalesces_with` covers 2 tests and
+  `cancels_inflight_payload_job` covers 4, so a non-empty match was not
+  proof); "both in-process soak jobs" corrected to three.
+- **Test gaps (FIXED)** `decide_follow_action_table` gained the
+  `resume == local_safe` boundary rows (widening the guard to `<=` passed the
+  whole table while turning the steady state into a permanent refusal), and
+  `populated_database_without_a_genesis_row_is_reported_missing` covers the
+  fourth `reconcile_genesis_block` outcome, including that the check runs
+  before any write.

@@ -381,12 +381,15 @@ as a panic carrying the validation message — when:
 - `--remote-source.url` is missing — the remote source has nothing to poll.
 - `--remote-source.build` is set without `--sequencer.enabled` — no job
   could ever start, so every build request would fail.
-- `--sequencer.auto-start` is set, with or without `--remote-source.build` —
-  the remote source must be the only block producer. With `build`, a second
-  requester means build outcomes cannot be attributed to their requests.
-  Without it, the sequencer's own timer still produces local blocks that each
-  remote import then reorgs out, forking a node the operator configured as a
-  read-only mirror. This is enforced at launch only: the
+- `--sequencer.enabled` and `--sequencer.auto-start` are both set, with or
+  without `--remote-source.build` — the remote source must be the only block
+  producer. With `build`, a second requester means build outcomes cannot be
+  attributed to their requests. Without it, the sequencer's own timer still
+  produces local blocks that each remote import then reorgs out, forking a node
+  the operator configured as a read-only mirror. `--sequencer.auto-start`
+  WITHOUT `--sequencer.enabled` is accepted: no sequencer is constructed, so it
+  starts nothing, and a templated fleet layout stays valid on the followers.
+  This is enforced at launch only: the
   `rollupNodeAdmin_enableAutomaticSequencing` RPC can still start the
   sequencer's timer at runtime — do not call it on a node running a remote
   block source.
@@ -413,10 +416,14 @@ unconditionally.
 **Two conditions stop the process, but only before the first successful
 initialization.** A genesis mismatch between this node and the remote, and
 failing to find a common ancestor within the add-on's lookback bound, are
-treated as unrecoverable while the resume point has never been established:
-the add-on returns a terminal error and the node panics rather than importing
-from a chain it cannot reconcile with. Both point at a misconfigured
-`--remote-source.url`, and restarting will not clear them.
+treated as unrecoverable until the add-on has completed one initialization:
+it returns a terminal error and the node panics rather than importing from a
+chain it cannot reconcile with. A genesis mismatch means the remote is a
+different chain — check `--remote-source.url`. Exhausted lookback does not: the
+walk searches 8192 blocks below the lower of the two heads, so a correctly
+configured remote that diverged deeper produces the same error. Resynchronize
+this node from a source the two chains still share, or point it at a remote
+closer to its own history; restarting alone will not clear either.
 
 Once the add-on has initialized successfully once, those same two verdicts
 become ordinary retryable errors — after a first success they are far more

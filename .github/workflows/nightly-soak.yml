@@ -75,7 +75,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
-          # One shared entry for both in-process soak jobs: three extra
+          # One shared entry for all three soak jobs: three extra
           # nightly writers against the repo's 10 GB cache LRU would evict
           # the PR lanes' entries.
           shared-key: soak-integration
@@ -100,17 +100,23 @@ jobs:
           # --no-tests=fail on the soak step below only fires when the WHOLE
           # filterset is empty, so renaming any single soaked test would leave
           # the other four keeping the run green while that test is silently
-          # never soaked again. Require every pattern to match on its own.
-          # `nextest list` prints nothing at all for an empty filterset.
-          for pat in \
-            test_should_consolidate_after_optimistic_sync \
-            coalesces_with \
-            cancels_inflight_payload_job \
-            remote_source_node_launches_when_remote_unreachable \
-            block_building_skipped_carries_head_number
+          # never soaked again. Require every pattern to match, and to match the
+          # EXPECTED NUMBER of tests: two of these are substring patterns
+          # covering several tests each, so a non-empty result alone would still
+          # let one of them drop out unnoticed.
+          # `nextest list` prints one indented line per test under each binary.
+          for spec in \
+            test_should_consolidate_after_optimistic_sync:1 \
+            coalesces_with:2 \
+            cancels_inflight_payload_job:4 \
+            remote_source_node_launches_when_remote_unreachable:1 \
+            block_building_skipped_carries_head_number:1
           do
-            if [ -z "$(cargo nextest list --all-features --workspace --locked -E "test($pat)")" ]; then
-              echo "::error::soak pattern '$pat' matches no test; it was renamed or removed"
+            pat="${spec%:*}"
+            want="${spec##*:}"
+            got="$(cargo nextest list --all-features --workspace --locked -E "test($pat)" | grep -c '^ ')"
+            if [ "$got" != "$want" ]; then
+              echo "::error::soak pattern '$pat' matches $got tests, expected $want; a soaked test was renamed, removed or added"
               exit 1
             fi
           done
@@ -166,7 +172,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
-          # One shared entry for both in-process soak jobs: three extra
+          # One shared entry for all three soak jobs: three extra
           # nightly writers against the repo's 10 GB cache LRU would evict
           # the PR lanes' entries.
           shared-key: soak-integration
@@ -191,17 +197,23 @@ jobs:
           # --no-tests=fail on the soak step below only fires when the WHOLE
           # filterset is empty, so renaming any single soaked test would leave
           # the other four keeping the run green while that test is silently
-          # never soaked again. Require every pattern to match on its own.
-          # `nextest list` prints nothing at all for an empty filterset.
-          for pat in \
-            test_should_consolidate_after_optimistic_sync \
-            coalesces_with \
-            cancels_inflight_payload_job \
-            remote_source_node_launches_when_remote_unreachable \
-            block_building_skipped_carries_head_number
+          # never soaked again. Require every pattern to match, and to match the
+          # EXPECTED NUMBER of tests: two of these are substring patterns
+          # covering several tests each, so a non-empty result alone would still
+          # let one of them drop out unnoticed.
+          # `nextest list` prints one indented line per test under each binary.
+          for spec in \
+            test_should_consolidate_after_optimistic_sync:1 \
+            coalesces_with:2 \
+            cancels_inflight_payload_job:4 \
+            remote_source_node_launches_when_remote_unreachable:1 \
+            block_building_skipped_carries_head_number:1
           do
-            if [ -z "$(cargo nextest list --all-features --workspace --locked -E "test($pat)")" ]; then
-              echo "::error::soak pattern '$pat' matches no test; it was renamed or removed"
+            pat="${spec%:*}"
+            want="${spec##*:}"
+            got="$(cargo nextest list --all-features --workspace --locked -E "test($pat)" | grep -c '^ ')"
+            if [ "$got" != "$want" ]; then
+              echo "::error::soak pattern '$pat' matches $got tests, expected $want; a soaked test was renamed, removed or added"
               exit 1
             fi
           done

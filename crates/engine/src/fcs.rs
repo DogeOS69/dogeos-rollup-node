@@ -1,7 +1,7 @@
 use crate::FcsError;
 use alloy_chains::NamedChain;
 use alloy_eips::{BlockId, BlockNumberOrTag};
-use alloy_primitives::{Sealable, B256};
+use alloy_primitives::B256;
 use alloy_provider::Provider;
 use alloy_rpc_types_engine::ForkchoiceState as AlloyForkchoiceState;
 use dogeos_chainspec::{DOGEOS_CHIKYU_GENESIS_HASH, DOGEOS_MAINNET_GENESIS_HASH};
@@ -56,6 +56,17 @@ impl ForkchoiceState {
         // Ensure safe is at least finalized.
         if safe_block.header.number < finalized_block.header.number {
             safe_block = finalized_block.clone();
+        }
+        // ...and at most the head. A crash between an unwind's durable database
+        // commit and the FCU that lowers the engine's safe marker leaves the EL
+        // holding a safe block ABOVE the head this node will resume from, and
+        // every `fcs.update()` on the startup repair path then refuses with
+        // `HeadBelowSafe` — the same failure on every restart, since nothing
+        // else lowers that marker. The runtime reorg and admin-unwind paths
+        // already drag the safe target down to the effective head; startup is
+        // the seam that never did.
+        if safe_block.header.number > latest_block.header.number {
+            safe_block = latest_block.clone();
         }
 
         Some(Self {
@@ -178,7 +189,15 @@ pub fn genesis_hash_from_chain_spec<CS: EthChainSpec<Header: BlockHeader>>(
     match chain_spec.chain().named() {
         Some(NamedChain::Scroll) => Some(DOGEOS_MAINNET_GENESIS_HASH),
         Some(NamedChain::ScrollSepolia) => Some(DOGEOS_CHIKYU_GENESIS_HASH),
-        Some(NamedChain::Dev) | None => Some(chain_spec.genesis_header().hash_slow()),
+        // `genesis_hash()` returns the SEALED hash when the spec carries one and
+        // recomputes only otherwise. `genesis_header().hash_slow()` always
+        // recomputes, and the two differ: chikyu's genesis document is
+        // byte-identical to mainnet's in every field the header is built from,
+        // so recomputing yields MAINNET's genesis hash for chikyu. Using it
+        // made the database, the forkchoice fallback and the EL disagree on
+        // chikyu's block 0 — a fresh node diverged at the first finalized
+        // notification and an existing one failed startup outright.
+        Some(NamedChain::Dev) | None => Some(chain_spec.genesis_hash()),
         _ => None,
     }
 }

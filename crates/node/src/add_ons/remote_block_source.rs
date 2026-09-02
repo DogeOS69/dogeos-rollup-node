@@ -116,6 +116,30 @@ where
     suppressed_errors: u64,
 }
 
+/// The remote endpoint reduced to `scheme://host:port`, safe to log.
+///
+/// The configured URL can carry basic-auth credentials and query-string API
+/// keys, and those survive into transport error messages: alloy wraps
+/// `reqwest::Error`, whose `Display` appends `for url ({url})` with the
+/// userinfo and query intact. Anything derived from an error chain has to be
+/// scrubbed against the full URL before it reaches a log line.
+fn redact_remote(url: Option<&reqwest::Url>, message: &str) -> String {
+    match url {
+        Some(url) => message.replace(url.as_str(), &safe_remote_host(url)),
+        None => message.to_string(),
+    }
+}
+
+/// `scheme://host:port` for the configured remote, with no userinfo or query.
+fn safe_remote_host(url: &reqwest::Url) -> String {
+    format!(
+        "{}://{}:{}",
+        url.scheme(),
+        url.host_str().unwrap_or("<none>"),
+        url.port_or_known_default().unwrap_or(0)
+    )
+}
+
 /// Upper bound on one poll tick — the outer backstop behind the client's
 /// 30s per-request timeout: a long catch-up or settlement chain can outlast
 /// the poll interval, and the poll timer (Delay behavior) cannot fire while
@@ -587,7 +611,19 @@ where
                         r = tokio::time::timeout(TICK_STALL_BUDGET, self.follow_and_build()) => {
                             match r {
                                 Ok(r) => r,
-                                Err(_) if self.last_imported_block > pointer_before => {
+                                // A NUMERIC advance, not `Option` ordering:
+                                // `Some(_)` sorts above `None`, so comparing the
+                                // options directly classified the tick that
+                                // merely ESTABLISHES the pointer as deep
+                                // catch-up — a full stall of the budget then
+                                // logged at info, returned Ok and reset
+                                // consecutive_failures.
+                                Err(_)
+                                    if matches!(
+                                        (pointer_before, self.last_imported_block),
+                                        (Some(before), Some(now)) if now.gt(&before)
+                                    ) =>
+                                {
                                     // The budget elapsed while IMPORTING — a
                                     // deep catch-up, not a stall. Treat as a
                                     // healthy tick so consecutive_failures
@@ -640,7 +676,9 @@ where
                             // at poll cadence forever; surface them so the
                             // node fail-stops visibly.
                             if e.chain().any(|c| c.downcast_ref::<TerminalSyncError>().is_some()) {
-                                tracing::error!(target: "scroll::remote_source", ?e, "Terminal sync error; stopping remote block source");
+                                let redacted =
+                                    redact_remote(self.config.url.as_ref(), &format!("{e:#}"));
+                                tracing::error!(target: "scroll::remote_source", error = %redacted, "Terminal sync error; stopping remote block source");
                                 return Err(e);
                             }
                             self.consecutive_failures += 1;
@@ -649,7 +687,11 @@ where
                             // remote would otherwise emit ~10 identical
                             // lines/second), but always log a changed error
                             // immediately.
-                            let msg = format!("{e:#}");
+                            // Scrubbed BEFORE it is stored or compared: this
+                            // string is both the log payload and the
+                            // rate-limiter's memory.
+                            let msg =
+                                redact_remote(self.config.url.as_ref(), &format!("{e:#}"));
                             let now = std::time::Instant::now();
                             let should_log = match &self.last_error_log {
                                 Some((at, prev)) => {
@@ -664,20 +706,16 @@ where
                                 None => true,
                             };
                             if should_log {
-                                // Host/port only: the full URL's Debug output
-                                // includes basic-auth credentials and query
-                                // strings (API keys).
-                                let remote_host = self.config.url.as_ref().map(|u| {
-                                    format!(
-                                        "{}://{}:{}",
-                                        u.scheme(),
-                                        u.host_str().unwrap_or("<none>"),
-                                        u.port_or_known_default().unwrap_or(0)
-                                    )
-                                });
+                                // Host/port only: the full URL carries
+                                // basic-auth credentials and query strings
+                                // (API keys). `?e` is NOT logged for the same
+                                // reason — the transport's Display appends the
+                                // full URL — so the scrubbed `msg` stands in.
+                                let remote_host =
+                                    self.config.url.as_ref().map(safe_remote_host);
                                 tracing::error!(
                                     target: "scroll::remote_source",
-                                    ?e,
+                                    error = %msg,
                                     consecutive_failures = self.consecutive_failures,
                                     builds_abandoned = self.builds_abandoned,
                                     suppressed_errors = self.suppressed_errors,
@@ -714,7 +752,8 @@ where
     /// successful import (after its validity checks), so by the time a build
     /// is requested here the job slot is empty. Config-level violations of
     /// the single-requester assumption are rejected by `validate()` (no
-    /// `sequencer.auto-start` with `remote-source.build`), but the
+    /// `sequencer.auto-start` on a node with `sequencer.enabled`, whether or
+    /// not `remote-source.build` is set), but the
     /// `rollupNodeAdmin_enableAutomaticSequencing` RPC can still start the
     /// timer at runtime and break it — do not enable it on a remote-source
     /// node.
@@ -1259,9 +1298,8 @@ where
                 .full()
                 .await?
                 .ok_or_else(|| eyre::eyre!("Block {} not found", next_block_num))?;
-            // A load-balanced remote whose backend sits on another fork (or
-            // answers for the wrong height) must be caught BEFORE the import
-            // lands an FCU and the pointer advances on a block that was
+            // A remote answering for the wrong HEIGHT must be caught BEFORE the
+            // import lands an FCU and the pointer advances on a block that was
             // never the one requested.
             eyre::ensure!(
                 block.header.number == next_block_num,
@@ -1269,6 +1307,23 @@ where
                 block.header.number,
                 next_block_num
             );
+            // ...and a load-balanced remote whose backend sits on another FORK
+            // answers the right height with a wrong parent. The ancestry walk
+            // pins the resume hash once at initialization and never re-checks
+            // during catch-up, so without this the fork is only discovered by
+            // the engine — which answers SYNCING, not INVALID, for an unknown
+            // parent. That drops a healthy follower out of synced mode; the
+            // next tick then takes the optimistic branch, commits the mirror on
+            // SYNCING, and plants a head the local EL never adopts, after which
+            // every ancestor probe reads that absent head and returns
+            // immediately, forever.
+            if let Some(expected_parent) = self.provider.block_hash(last_imported)? {
+                eyre::ensure!(
+                    block.header.parent_hash == expected_parent,
+                    "remote block {next_block_num} does not build on local block                      {last_imported}: parent {} != {expected_parent} (the remote is on a                      different fork)",
+                    block.header.parent_hash
+                );
+            }
             // The same failure class as the height check, one field over. If the
             // remote ignored `fullTransactions` — a proxy that drops the flag,
             // or one that degrades to hashes above a response-size cap —
@@ -1419,6 +1474,12 @@ mod tests {
             // Ancestor below the local safe head: refuse regardless of divergence.
             (100, 50, 40, false, FollowAction::RefuseBelowSafe),
             (100, 50, 40, true, FollowAction::RefuseBelowSafe),
+            // Ancestor exactly AT the local safe head: the steady state, and
+            // the boundary the refusal must not swallow. Widening the guard to
+            // `<=` leaves every other row in this table green while turning
+            // normal operation into a permanent RefuseBelowSafe.
+            (50, 50, 50, false, FollowAction::Proceed),
+            (100, 50, 50, true, FollowAction::Rewind),
             // Head 2+ past the ancestor, no divergence: the remote merely
             // trails — wait, never rewind.
             (100, 0, 10, false, FollowAction::WaitForRemote),

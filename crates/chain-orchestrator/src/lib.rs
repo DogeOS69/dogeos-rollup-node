@@ -1108,12 +1108,34 @@ impl<
                     // later: an out-of-order L1 message queue that
                     // `validate_l1_messages` rejects on every peer.
                     if let Some(head) = new_head {
-                        self.database
+                        // Refuse, do not fail-stop: the two database reads above
+                        // this arm deliberately reply `false` and return Ok on
+                        // error, because momentary contention must not kill the
+                        // node. Propagating here would make this one write the
+                        // exception. Nothing durable has changed yet — the FCU
+                        // has not been issued — so the operator re-issues.
+                        if let Err(err) = self
+                            .database
                             .tx_mut(move |tx| async move {
                                 tx.purge_l1_message_to_l2_block_mappings(Some(head.number + 1))
                                     .await
                             })
-                            .await?;
+                            .await
+                        {
+                            tracing::warn!(
+                                target: "scroll::chain_orchestrator",
+                                ?head,
+                                %err,
+                                "Could not purge L1 message mappings for the administrative \
+                                 unwind; refusing (retryable)"
+                            );
+                            self.l1_watcher.revert_to_l1_block(block_number);
+                            if matches!(held_outcome, HeldReorgOutcome::Survived { .. }) {
+                                self.derivation_driver.schedule_fresh_reconciliation();
+                            }
+                            let _ = tx.send(false);
+                            return Ok(());
+                        }
                     }
                     let result = self.engine.update_fcs_checked(new_head, new_safe, None).await?;
                     if result.is_invalid() {
@@ -1520,12 +1542,6 @@ impl<
             self.cancel_payload_building_job("L1 reorg while the job may carry L1 messages");
         }
 
-        // Preserve head >= safe >= finalized before issuing the FCU: with a
-        // below-finalized head already fatal (above, and symmetrically on
-        // the administrative unwind), only the SAFE target can still violate
-        // ordering — floor it at finalized and drag it down to a rewound
-        // head, or fcs.update() would refuse LOCALLY after the unwind is
-        // already durable.
         let finalized = *self.engine.fcs().finalized_block_info();
         // The safe target must satisfy finalized <= safe <= head before the
         // FCU, or fcs.update() refuses LOCALLY after the unwind is already
@@ -3811,6 +3827,32 @@ mod run_loop_policy_tests {
             0,
             "reconciliation is idempotent"
         );
+    }
+
+    /// The fourth `reconcile_genesis_block` outcome: a populated database with
+    /// no height-0 row at all. Pass-45 m2 replaced a silent `Ok(0)` here
+    /// precisely because returning success let startup run on into
+    /// `get_latest_safe_l2_info`'s "there should always be at least the genesis
+    /// block" expectation — an opaque panic, or a silently wrong safe baseline.
+    #[tokio::test]
+    async fn populated_database_without_a_genesis_row_is_reported_missing() {
+        let database = Arc::new(setup_test_db().await);
+        // Drop every height-0 row, including the migration's seed, then claim
+        // history above it — a truncated or corrupt database.
+        database.delete_mismatched_genesis_blocks(B256::repeat_byte(0xCD)).await.unwrap();
+        database.set_l2_head_block_number(7).await.unwrap();
+        assert_eq!(database.get_l2_block_info_by_number(0).await.unwrap(), None);
+
+        assert!(
+            matches!(
+                database.reconcile_genesis_block(B256::ZERO, seeded_test_genesis()).await,
+                Err(DatabaseError::GenesisMissing { .. })
+            ),
+            "a populated database with no genesis row must be reported, not silently accepted"
+        );
+        // Load-bearing ordering: the check runs BEFORE
+        // delete_mismatched_genesis_blocks, so the failure leaves no writes.
+        assert_eq!(database.get_l2_head_block_number().await.unwrap(), 7);
     }
 
     /// Pins the pass-44 P1: an L1 reorg that removes a batch revert restores

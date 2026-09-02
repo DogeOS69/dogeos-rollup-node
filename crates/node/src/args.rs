@@ -496,8 +496,24 @@ impl ScrollRollupNodeConfig {
             ForkchoiceState::head_from_chain_spec(chain_spec.clone())
                 .expect("failed to derive forkchoice state from chain spec")
         };
-        let mut fcs =
-            ForkchoiceState::from_provider(&l2_provider).await.unwrap_or_else(chain_spec_fcs);
+        // `from_provider` returns None on ANY of three swallowed RPC reads, and
+        // the genesis fallback then sets head = safe = finalized = 0. Every
+        // safe/finalized guard downstream is vacuous in that state — the
+        // peer-block safe-head reorg refusals, the L1-reorg finalized floor and
+        // the administrative unwind's symmetric check all compare against 0 —
+        // so a transient hiccup must at least be visible.
+        let mut fcs = match ForkchoiceState::from_provider(&l2_provider).await {
+            Some(fcs) => fcs,
+            None => {
+                tracing::warn!(
+                    target: "scroll::node::args",
+                    "Could not read the forkchoice state from the L2 provider; falling back to \
+                     the chain spec genesis. Safe and finalized start at 0 until the first \
+                     finalized notification."
+                );
+                chain_spec_fcs()
+            }
+        };
 
         let (l1_block_startup_info, mut l2_head_block_number) = db
             .tx_mut(move |tx| async move {
@@ -511,6 +527,19 @@ impl ScrollRollupNodeConfig {
                 Ok::<_, DatabaseError>((l1_block_startup_info, l2_head_block_number))
             })
             .await?;
+
+        // A genesis mirror on a POPULATED database is not a transient read
+        // failure this node can run through: head/safe/finalized would all sit
+        // at 0 while the database knows a head above it, leaving every
+        // safe-and-finalized guard vacuous for as long as it takes a finalized
+        // notification to arrive. Refuse instead of starting in that state.
+        if fcs.is_genesis() && l2_head_block_number > 0 {
+            eyre::bail!(
+                "the L2 provider reported no forkchoice state while the database holds an L2 \
+                 head at {l2_head_block_number}; refusing to start with head, safe and \
+                 finalized all at genesis (is the execution node reachable and synced?)"
+            );
+        }
 
         // Loop to find the latest block that we have in the EN and purge L1 message mappings to
         // account for the startup block
@@ -531,7 +560,27 @@ impl ScrollRollupNodeConfig {
             {
                 tracing::info!(target: "scroll::node::args", ?l2_head_block_number, "Found L2 head block in EN");
                 let block_info: BlockInfo = (&block).into();
-                fcs.update(Some(block_info), None, None)?;
+                // A stale safe marker ABOVE the head we are resuming from is
+                // exactly what a crash between an unwind's database commit and
+                // its FCU leaves behind. Propagating the resulting
+                // `HeadBelowSafe` would fail this startup and every one after
+                // it, since nothing else lowers the engine's marker. Drag safe
+                // down to the head instead — the same rule the runtime reorg
+                // and admin-unwind paths already apply. `finalized` needs no
+                // clamp: the loop condition guarantees it is at or below this
+                // block.
+                if fcs.safe_block_info().number > block_info.number {
+                    tracing::warn!(
+                        target: "scroll::node::args",
+                        safe = ?fcs.safe_block_info(),
+                        ?block_info,
+                        "Engine safe marker sits above the resumed L2 head; clamping it down \
+                         (an unwind's forkchoice update was likely lost to a crash)"
+                    );
+                    fcs = ForkchoiceState::new(block_info, block_info, *fcs.finalized_block_info());
+                } else {
+                    fcs.update(Some(block_info), None, None)?;
+                }
                 db.tx_mut(move |tx| async move {
                     tx.set_l2_head_block_number(l2_head_block_number).await?;
                     tx.purge_l1_message_to_l2_block_mappings(Some(l2_head_block_number + 1)).await
@@ -1262,6 +1311,19 @@ mod tests {
                 seeded_genesis,
                 ScrollDevMigrationInfo::genesis_hash(),
                 "{name} is expected to be seeded by the dev migration"
+            );
+            // THE load-bearing assertion, and the one the first version of this
+            // test missed. It compared against the migration seed only, which
+            // passed for chikyu for the wrong reason: the recomputed header
+            // hash was MAINNET's genesis, unequal to the seed but also unequal
+            // to chikyu's own sealed genesis. `genesis_hash()` returns the
+            // sealed value when a spec carries one, and that is what the EL
+            // stores at block 0, so the reconciliation must agree with it.
+            assert_eq!(
+                genesis_hash_from_chain_spec(chain_spec.clone()),
+                Some(chain_spec.genesis_hash()),
+                "{name}'s forkchoice genesis must be the chain spec's own genesis; a recomputed \
+                 header hash diverges from the sealed one and bricks the chain at startup"
             );
             assert_ne!(
                 genesis_hash_from_chain_spec(chain_spec.clone()),

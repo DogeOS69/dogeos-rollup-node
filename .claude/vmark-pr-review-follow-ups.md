@@ -458,6 +458,27 @@ from every pass is either fixed in the PR or recorded here.
   - Why unaddressed: requires repo-admin visibility.
   - Suggested Linear title: "repo settings: verify no required status check references the sync workflow"
 
+- **Post-batch-revert safe-marker FCU has the finalized-marker's crash window, stale-high direction**
+  (`crates/chain-orchestrator/src/lib.rs`, batch-revert handler's safe FCU)
+  - Impact/evidence: orchestrator observation while fixing the Codex pass 38
+    P1 (2026-09-02). The finalized marker got a replay path (marker
+    recomputed over already-`Finalized` batches on every finalized
+    notification; FCU reissued when the mirror is behind). The batch-revert
+    safe marker shares the ordering — durable database revert first, safe
+    FCU second — so a crash between them restarts with the EL's safe marker
+    stale HIGH relative to the database. Consequences differ from the
+    finalized case: a too-high safe floor makes below-safe rewind refusals
+    over-aggressive rather than under-protective, and consolidation replay
+    naturally re-advances safe, so the window is self-limiting but not
+    self-healing on its own.
+  - First/most-recent pass: orchestrator observation after Codex pass 38
+    (2026-09-02).
+  - Why unaddressed: not reviewer-flagged; the recovery dynamics (stale-high,
+    partially self-correcting via consolidation replay) need their own
+    analysis before choosing between a startup reconcile and a
+    recompute-on-replay mirror of the finalized fix.
+  - Suggested Linear title: "rollup-node: reconcile the EL safe marker against the database after a crash between batch revert and its FCU"
+
 ## Pass 35 findings — resolution (loop resumed 2026-09-01)
 
 All five majors and eight minors from Claude pass 35 were FIXED in the

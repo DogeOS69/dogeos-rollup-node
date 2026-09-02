@@ -1573,48 +1573,71 @@ impl<
             })
             .await?;
 
-        if finalized_block_info.is_some() {
-            tracing::info!(target: "scroll::chain_orchestrator", ?finalized_block_info, "Updating FCS with new finalized block info from L1 finalization");
+        if let Some(finalized_block_info) = finalized_block_info {
             // Deliberately UNCHECKED: SYNCING is routine while the EL catches
-            // up, and refusing to commit the mirror would leave the finalized
-            // marker stale with NO retry path — the batch is already
-            // finalized in the database above and the notification is
-            // consumed. The mirror-committed value rides every later FCU
-            // until the EL adopts it. Only INVALID (never committed) is
-            // surfaced.
-            let result = match self.engine.update_fcs(None, None, finalized_block_info).await {
-                Ok(result) => result,
-                Err(err) => {
-                    // The database already advanced (batch finalized,
-                    // notification consumed) — same no-retry-path argument
-                    // as the INVALID arm below.
-                    tracing::error!(
-                        target: "scroll::chain_orchestrator",
-                        ?finalized_block_info,
-                        %err,
-                        "Finalized-head FCU failed after the batch was finalized"
-                    );
-                    return Err(ChainOrchestratorError::FatalStateDivergence(
-                        "finalized-head forkchoice update failed after the batch was \
-                         finalized; restart re-converges from the persisted state",
-                    ));
-                }
-            };
-            if result.is_invalid() {
-                // INVALID does not commit the mirror while the batch is
-                // already finalized in the database and the notification is
-                // consumed — no retry path exists, so this is the same
-                // divergence class the head updates treat as fatal.
+            // up, and the mirror-committed value rides every later FCU until
+            // the EL adopts it. Failures here are RETRYABLE, not fatal: the
+            // marker is recomputed from the database (already-`Finalized`
+            // batches included) on every finalized notification — and on the
+            // startup replay — so a lost FCU is reissued whenever the mirror
+            // is observed behind. Only INVALID (never committed; the engine
+            // actively rejects a block it validated at consolidation) is a
+            // fatal divergence.
+            let mirror_finalized = self.engine.fcs().finalized_block_info().number;
+            let mirror_safe = self.engine.fcs().safe_block_info().number;
+            if finalized_block_info.number <= mirror_finalized {
+                tracing::trace!(
+                    target: "scroll::chain_orchestrator",
+                    ?finalized_block_info,
+                    mirror_finalized,
+                    "Finalized marker already committed to the engine mirror; skipping FCU"
+                );
+            } else if finalized_block_info.number > mirror_safe {
+                // The EL's markers sit below database finality (an EL-side
+                // marker rollback): raising finalized above safe would
+                // violate the FCS invariant locally. Defer — consolidation
+                // replay advances safe first, and a later finalized
+                // notification recomputes and reissues the marker.
                 tracing::error!(
                     target: "scroll::chain_orchestrator",
                     ?finalized_block_info,
-                    ?result,
-                    "Finalized-head FCU rejected as INVALID by the engine"
+                    mirror_safe,
+                    "Finalized marker exceeds the engine's safe mirror; deferring the marker FCU"
                 );
-                return Err(ChainOrchestratorError::FatalStateDivergence(
-                    "finalized-head forkchoice update rejected as INVALID after the \
-                     batch was finalized; restart re-converges from the persisted state",
-                ));
+            } else {
+                tracing::info!(target: "scroll::chain_orchestrator", ?finalized_block_info, "Updating FCS with new finalized block info from L1 finalization");
+                match self.engine.update_fcs(None, None, Some(finalized_block_info)).await {
+                    Ok(result) if result.is_invalid() => {
+                        // INVALID does not commit the mirror, and no retry
+                        // changes the engine's verdict on a block it already
+                        // validated — the same divergence class the head
+                        // updates treat as fatal.
+                        tracing::error!(
+                            target: "scroll::chain_orchestrator",
+                            ?finalized_block_info,
+                            ?result,
+                            "Finalized-head FCU rejected as INVALID by the engine"
+                        );
+                        return Err(ChainOrchestratorError::FatalStateDivergence(
+                            "finalized-head forkchoice update rejected as INVALID for a \
+                             previously consolidated block",
+                        ));
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        // The mirror is untouched on any error (local
+                        // validation and transport alike), so the next
+                        // finalized notification recomputes the marker and
+                        // retries.
+                        tracing::error!(
+                            target: "scroll::chain_orchestrator",
+                            ?finalized_block_info,
+                            %err,
+                            "Finalized-head FCU failed; the marker will be reissued on a later \
+                             finalized notification"
+                        );
+                    }
+                }
             }
         }
 
@@ -2928,6 +2951,127 @@ mod run_loop_policy_tests {
             matches!(result, Err(ChainOrchestratorError::FatalStateDivergence(_))),
             "expected FatalStateDivergence, got {result:?}"
         );
+    }
+
+    /// A batch already `Finalized` in the database (the marker FCU was lost
+    /// to a crash or transport error) must have its finalized marker
+    /// recomputed and reissued when a finalized notification replays — and a
+    /// second replay must be an idempotent skip once the mirror caught up.
+    #[tokio::test]
+    async fn l1_finalization_replay_reissues_marker_fcu_once() {
+        let database = Arc::new(setup_test_db().await);
+        database.insert_genesis_block(B256::ZERO).await.unwrap();
+        let batch_info = BatchInfo::new(1, B256::repeat_byte(1));
+        database
+            .insert_batch(BatchCommitData {
+                hash: batch_info.hash,
+                index: batch_info.index,
+                block_number: 10,
+                block_timestamp: 0,
+                calldata: Arc::new(Bytes::new()),
+                blob_versioned_hash: None,
+                finalized_block_number: None,
+                reverted_block_number: None,
+            })
+            .await
+            .unwrap();
+        database.update_batch_status(batch_info.hash, BatchStatus::Processing).await.unwrap();
+
+        // The crash-window state: a batch whose rows are already `Finalized`
+        // (database committed) while the engine's finalized mirror is still
+        // at genesis (the marker FCU never landed).
+        let finalized_batch = BatchInfo::new(2, B256::repeat_byte(2));
+        database
+            .insert_batch(BatchCommitData {
+                hash: finalized_batch.hash,
+                index: finalized_batch.index,
+                block_number: 6,
+                block_timestamp: 0,
+                calldata: Arc::new(Bytes::new()),
+                blob_versioned_hash: None,
+                finalized_block_number: Some(6),
+                reverted_block_number: None,
+            })
+            .await
+            .unwrap();
+        database.insert_blocks(vec![info(SAFE, 0x22)], finalized_batch).await.unwrap();
+        database.update_batch_status(finalized_batch.hash, BatchStatus::Finalized).await.unwrap();
+
+        let engine_client = Arc::new(ScriptedEngineClient::new());
+        script_syncing_hold_then_success(&engine_client);
+        // One extra Valid FCU for the reissued finalized marker; the second
+        // finalized notification must not consume anything.
+        engine_client
+            .push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Valid, None)));
+        let asserter = Asserter::new();
+        asserter.push_success(&Option::<()>::None);
+        asserter.push_success(&Option::<()>::None);
+        let (mut orchestrator, _handle, notification_tx) = test_orchestrator(
+            database.clone(),
+            engine_client.clone(),
+            asserter,
+            BatchDerivationResult {
+                attributes: vec![DerivedAttributes {
+                    block_number: SAFE + 1,
+                    attributes: ScrollPayloadAttributes::default(),
+                }],
+                batch_info,
+                skipped_l1_messages: vec![],
+                target_status: BatchStatus::Consolidated,
+            },
+        )
+        .await;
+        let mut events = orchestrator.event_listener();
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let run_task = tokio::spawn(orchestrator.run_until_shutdown(Box::pin(async move {
+            let _ = shutdown_rx.await;
+        })));
+
+        time::timeout(Duration::from_secs(2), async {
+            while engine_client.fork_choice_updated_calls() < 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first Engine SYNCING response must hold the batch");
+
+        notification_tx.send(Arc::new(L1Notification::Finalized(6))).await.unwrap();
+        time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(ChainOrchestratorEvent::L1BlockFinalized(6, _)) = events.next().await {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the first finalized notification must complete");
+        // Consolidation consumed 2 FCUs (Syncing hold + Valid); the replayed
+        // marker is the third.
+        assert_eq!(
+            engine_client.fork_choice_updated_calls(),
+            3,
+            "the replayed finalized marker must be reissued through one FCU"
+        );
+
+        notification_tx.send(Arc::new(L1Notification::Finalized(7))).await.unwrap();
+        time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(ChainOrchestratorEvent::L1BlockFinalized(7, _)) = events.next().await {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the second finalized notification must complete");
+        assert_eq!(
+            engine_client.fork_choice_updated_calls(),
+            3,
+            "a caught-up mirror must skip the marker FCU"
+        );
+
+        let _ = shutdown_tx.send(());
+        assert!(run_task.await.unwrap().is_ok());
     }
 
     #[tokio::test]

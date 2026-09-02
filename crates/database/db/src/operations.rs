@@ -90,8 +90,10 @@ pub trait DatabaseWriteOperations {
         block_number: u64,
     ) -> Result<u64, DatabaseError>;
 
-    /// Finalize consolidated batches by updating their status in the database and returning the new
-    /// finalized head.
+    /// Finalize consolidated batches by updating their status in the database and returning the
+    /// finalized L2 head marker. The marker is recomputed over already-`Finalized` batches too, so
+    /// a finalized-head FCU lost to a crash or transport error can be reissued when the finalized
+    /// notification replays; only `Consolidated` rows have their status transitioned.
     async fn finalize_consolidated_batches(
         &self,
         finalized_l1_block_number: u64,
@@ -504,12 +506,21 @@ impl<T: WriteConnectionProvider + ?Sized + Sync> DatabaseWriteOperations for T {
         finalized_l1_block_number: u64,
     ) -> Result<Option<BlockInfo>, DatabaseError> {
         tracing::trace!(target: "scroll::db", finalized_l1_block_number, "Finalizing consolidated batches in the database.");
-        let filter = Condition::all()
+        let eligible = Condition::all()
             .add(models::batch_commit::Column::FinalizedBlockNumber.is_not_null())
-            .add(models::batch_commit::Column::FinalizedBlockNumber.lte(finalized_l1_block_number))
+            .add(models::batch_commit::Column::FinalizedBlockNumber.lte(finalized_l1_block_number));
+        // The marker is computed over already-`Finalized` batches too: a
+        // finalized-head FCU lost to a crash or transport error must be
+        // recomputable when the finalized notification replays. Only
+        // `Consolidated` rows have their status transitioned below.
+        let marker_filter = eligible.clone().add(
+            models::batch_commit::Column::Status
+                .is_in([BatchStatus::Consolidated.as_str(), BatchStatus::Finalized.as_str()]),
+        );
+        let transition_filter = eligible
             .add(models::batch_commit::Column::Status.eq(BatchStatus::Consolidated.as_str()));
         let batch = models::batch_commit::Entity::find()
-            .filter(filter.clone())
+            .filter(marker_filter)
             .order_by_desc(models::batch_commit::Column::Index)
             .one(self.get_connection())
             .await?;
@@ -523,7 +534,7 @@ impl<T: WriteConnectionProvider + ?Sized + Sync> DatabaseWriteOperations for T {
                 .map(|block| block.block_info())
                 .expect("Finalized batch must have at least one L2 block.");
             models::batch_commit::Entity::update_many()
-                .filter(filter)
+                .filter(transition_filter)
                 .col_expr(
                     models::batch_commit::Column::Status,
                     Expr::value(BatchStatus::Finalized.as_str()),

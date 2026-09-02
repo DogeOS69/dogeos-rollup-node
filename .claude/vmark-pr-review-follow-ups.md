@@ -1170,3 +1170,44 @@ minors are recorded below.
   `collect_reverted_txs_in_range` (it can no longer fail after pass 51 made it
   per-block resilient), and `GenesisMissing` not hoisted above the
   fresh/populated split the way `GenesisMismatch` was.
+
+## Pass 56 findings — resolution (Codex, 2026-09-02)
+
+Codex pass 56 returned two findings, both on the database layer. Both FIXED and
+pinned by tests verified to fail without the fix.
+
+Notably NEITHER is on the L2-sync latch: the pass-55 M2 structural change
+(interval-driven recheck) appears to have settled the area that the previous
+four passes each found a defect in.
+
+- **P56-1 (FIXED)** The UPGRADE path of the pass-44 defect. Pass 44 stopped the
+  revert restore from producing blockless `Consolidated` rows, but a database
+  written by the OLD logic already holds them — and `finalize_consolidated_batches`
+  swept such a row to `Finalized` while the derivation query selects only
+  `Committed`, so that batch's payload was omitted from the finalized chain
+  permanently. The transition now splits on whether the batch actually
+  contributed block rows: only those may finalize.
+
+  Codex offered two remedies — normalise legacy rows to `Committed`, or restrict
+  the transition. The first was tried FIRST and is wrong: a batch whose
+  derivation legitimately yields zero blocks is indistinguishable here from a
+  legacy underived one, so re-queueing re-derives it on every finalized
+  notification forever. The existing test
+  `l1_finalization_joint_safe_raise_after_marker_regression` caught that
+  immediately (its held batch consolidates with no attributes). The shipped fix
+  is the conservative one: blockless rows stay `Consolidated` — not falsely
+  marked final, and still visible.
+
+  KNOWN LIMIT, recorded rather than hidden: this stops a legacy underived batch
+  being recorded as finalized, but does NOT get its payload derived. The
+  derivation query selects only `Committed`, and nothing can safely tell that row
+  apart from an empty batch. Repairing genuinely underived legacy rows needs a
+  migration, which is out of scope here. Pinned by
+  `legacy_blockless_consolidated_batches_are_not_finalized`.
+- **P56-2 (FIXED)** `reconcile_genesis_block` decided fresh-vs-populated from the
+  `l2_head_block` METADATA anchor alone, and `unwind()` can leave that at 0 with
+  real history still stored. With no height-0 row the fresh path then inserted
+  this chain's genesis BENEATH the retained history, masking exactly the
+  truncated-or-corrupt state `GenesisMissing` exists to report. Populated is now
+  decided from stored rows as well as the counter. Pinned by
+  `a_zero_anchor_with_stored_history_is_still_populated`.

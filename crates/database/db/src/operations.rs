@@ -633,8 +633,31 @@ impl<T: WriteConnectionProvider + ?Sized + Sync> DatabaseWriteOperations for T {
         // genesis constants are shared with the forkchoice state, so the
         // same-height hash check in `handle_l1_finalized` agrees on it.
         if finalized_block_info.is_some() {
+            // Only batches that actually contributed block rows may finalize.
+            //
+            // Pass 44 stopped the revert restore from producing blockless `Consolidated` rows,
+            // but a database written by the OLD logic can already hold one, and sweeping it to
+            // `Finalized` records as final a batch whose payload never entered the chain — the
+            // derivation query selects only `Committed`, so it can never be derived afterwards.
+            //
+            // Blockless rows are LEFT `Consolidated` rather than pushed back to `Committed`: a
+            // batch whose derivation legitimately yields zero blocks is indistinguishable here
+            // from a legacy underived one, and re-queueing it would re-derive it on every
+            // finalized notification forever. Leaving it `Consolidated` is the conservative
+            // choice — it is not falsely marked final, and it stays visible. Repairing a genuinely
+            // underived legacy row needs a migration, which is out of scope for this change.
+            let has_blocks = models::l2_block::Entity::find()
+                .filter(
+                    Expr::col(models::l2_block::Column::BatchHash)
+                        .equals((models::batch_commit::Entity, models::batch_commit::Column::Hash)),
+                )
+                .select_only()
+                .column(models::l2_block::Column::BlockHash)
+                .into_query();
+
             models::batch_commit::Entity::update_many()
                 .filter(transition_filter)
+                .filter(Expr::exists(has_blocks))
                 .col_expr(
                     models::batch_commit::Column::Status,
                     Expr::value(BatchStatus::Finalized.as_str()),
@@ -920,7 +943,19 @@ impl<T: WriteConnectionProvider + ?Sized + Sync> DatabaseWriteOperations for T {
             });
         }
 
-        if DatabaseReadOperations::get_l2_head_block_number(self).await? > 0 {
+        // Populated per the METADATA anchor or per the rows themselves: `unwind()` lowers the
+        // anchor and can leave it at 0 with real history still stored, and taking the fresh path
+        // there would insert this chain's genesis BENEATH that history — masking exactly the
+        // truncated-or-corrupt state `GenesisMissing` exists to report.
+        let rows_above_genesis = models::l2_block::Entity::find()
+            .filter(models::l2_block::Column::BlockNumber.gt(0i64))
+            .select_only()
+            .column(models::l2_block::Column::BlockHash)
+            .into_tuple::<Vec<u8>>()
+            .one(self.get_connection())
+            .await?
+            .is_some();
+        if DatabaseReadOperations::get_l2_head_block_number(self).await? > 0 || rows_above_genesis {
             if stored_genesis_hashes.is_empty() {
                 // Populated, but with no genesis row to reconcile against. Inserting one here
                 // would graft this chain's genesis under history that never carried it, and

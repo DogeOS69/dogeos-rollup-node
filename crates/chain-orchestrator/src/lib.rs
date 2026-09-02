@@ -4308,6 +4308,109 @@ mod run_loop_policy_tests {
         assert_eq!(database.get_l2_head_block_number().await.unwrap(), 7);
     }
 
+    /// The UPGRADE path of the pass-44 defect. Pass 44 stopped the revert
+    /// restore from producing blockless `Consolidated` rows, but a database
+    /// written by the old logic already holds them — and finalizing one omits
+    /// its payload from the finalized chain permanently, since derivation
+    /// selects only `Committed`. Legacy rows must be normalised back into the
+    /// chain, so it must not be swept to `Finalized`.
+    ///
+    /// It is left `Consolidated` rather than pushed back to `Committed`: a batch
+    /// whose derivation legitimately yields zero blocks looks identical here, and
+    /// re-queueing would re-derive it on every finalized notification forever —
+    /// which `l1_finalization_joint_safe_raise_after_marker_regression` catches.
+    #[tokio::test]
+    async fn legacy_blockless_consolidated_batches_are_not_finalized() {
+        let database = Arc::new(setup_test_db().await);
+        database.insert_genesis_block(B256::ZERO).await.unwrap();
+        database.delete_mismatched_genesis_blocks(B256::ZERO).await.unwrap();
+
+        // Exactly what the old restore left behind: Consolidated with no L2
+        // block rows, beside a normal derived batch.
+        let derived = BatchInfo::new(1, B256::repeat_byte(1));
+        let legacy = BatchInfo::new(2, B256::repeat_byte(2));
+        for batch in [derived, legacy] {
+            database
+                .insert_batch(BatchCommitData {
+                    hash: batch.hash,
+                    index: batch.index,
+                    block_number: 6,
+                    block_timestamp: 0,
+                    calldata: Arc::new(Bytes::new()),
+                    blob_versioned_hash: None,
+                    finalized_block_number: Some(6),
+                    reverted_block_number: None,
+                })
+                .await
+                .unwrap();
+        }
+        database.insert_blocks(vec![info(3, 0x33)], derived).await.unwrap();
+        database.finalize_batches_up_to_index(2, 6).await.unwrap();
+        database.update_batch_status(derived.hash, BatchStatus::Consolidated).await.unwrap();
+        database.update_batch_status(legacy.hash, BatchStatus::Consolidated).await.unwrap();
+
+        assert_eq!(
+            database.finalize_consolidated_batches(10).await.unwrap(),
+            Some(info(3, 0x33)),
+            "the derived batch still yields the marker"
+        );
+        assert_eq!(
+            database.get_batch_status_by_hash(derived.hash).await.unwrap(),
+            Some(BatchStatus::Finalized),
+            "a batch that contributed blocks finalizes"
+        );
+        assert_eq!(
+            database.get_batch_status_by_hash(legacy.hash).await.unwrap(),
+            Some(BatchStatus::Consolidated),
+            "a blockless row must NOT be recorded as finalized: its payload never entered the              chain and the derivation query can never pick it up again"
+        );
+        assert!(
+            database.fetch_and_update_unprocessed_finalized_batches(10).await.unwrap().is_empty(),
+            "and it must not be re-queued either, or an empty batch re-derives forever"
+        );
+    }
+
+    /// `unwind()` lowers the metadata anchor and can leave it at 0 with real
+    /// history still stored. Deciding fresh-vs-populated on that counter alone
+    /// took the fresh path and grafted this chain's genesis BENEATH the retained
+    /// history — masking the very state `GenesisMissing` exists to report.
+    #[tokio::test]
+    async fn a_zero_anchor_with_stored_history_is_still_populated() {
+        let database = Arc::new(setup_test_db().await);
+        // History above genesis, no height-0 row, anchor at 0.
+        database.delete_mismatched_genesis_blocks(B256::repeat_byte(0xCD)).await.unwrap();
+        let batch = BatchInfo::new(1, B256::repeat_byte(1));
+        database
+            .insert_batch(BatchCommitData {
+                hash: batch.hash,
+                index: batch.index,
+                block_number: 6,
+                block_timestamp: 0,
+                calldata: Arc::new(Bytes::new()),
+                blob_versioned_hash: None,
+                finalized_block_number: None,
+                reverted_block_number: None,
+            })
+            .await
+            .unwrap();
+        database.insert_blocks(vec![info(42, 0x42)], batch).await.unwrap();
+        assert_eq!(database.get_l2_head_block_number().await.unwrap(), 0);
+        assert_eq!(database.get_l2_block_info_by_number(0).await.unwrap(), None);
+
+        assert!(
+            matches!(
+                database.reconcile_genesis_block(B256::ZERO, seeded_test_genesis()).await,
+                Err(DatabaseError::GenesisMissing { .. })
+            ),
+            "stored history must count as populated even with the anchor at zero"
+        );
+        assert_eq!(
+            database.get_l2_block_info_by_number(0).await.unwrap(),
+            None,
+            "and no genesis may be grafted beneath it"
+        );
+    }
+
     /// Pins the pass-44 P1: an L1 reorg that removes a batch revert restores
     /// each batch to the status its own rows can prove. A batch that had not
     /// been derived when the revert landed carries no L2 blocks and must

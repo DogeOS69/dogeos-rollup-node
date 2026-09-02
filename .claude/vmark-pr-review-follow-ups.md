@@ -1211,3 +1211,43 @@ four passes each found a defect in.
   truncated-or-corrupt state `GenesisMissing` exists to report. Populated is now
   decided from stored rows as well as the counter. Pinned by
   `a_zero_anchor_with_stored_history_is_still_populated`.
+
+## Pass 57 findings — resolution (Claude, 2026-09-02)
+
+Claude pass 57 returned 4 majors and 7 minors. All FIXED.
+
+- **M1 (FIXED)** `CLAUDE.md`'s documented dev command panics at startup: the
+  binary builds without `test-utils` (no default feature), so both new `l1.url`
+  rules reject it and `validate()` is `.expect()`ed. The PR had updated the book
+  for these rules but missed CLAUDE.md, which it also edits.
+- **M2 (FIXED)** The transport-error arm of the re-check wedged the node behind a
+  single `debug!` every 10s: while the latch is stuck the node polls no L1 and
+  sequences nothing, reporting healthy. That was tolerable when the probe was
+  opportunistic; pass 55 made it the PRIMARY recovery path. It now counts
+  consecutive failures and escalates to `warn!`.
+- **M3 (FIXED)** Three of the re-check's five arms were untested — reverting the
+  INVALID re-latch to `= None`, exactly what it said before pass 55, left the
+  suite green while wedging the node. Added tests for the INVALID arm and the
+  transport arm.
+- **M4 (FIXED)** The interval arm had ZERO coverage: `L2_SYNC_RECHECK_INTERVAL`
+  appeared at exactly two sites, its definition and its `interval()`. The pass-55
+  claim that recovery no longer depends on inbound traffic was entirely
+  unverified. Now pinned by a paused-clock test that drives the run loop with NO
+  inputs at all and asserts the latched head is probed — verified to fail when
+  the arm is removed.
+- **Minors (FIXED)** Six more malformed literals from lost `\` continuations
+  (fourth appearance); the "Last in the biased order" comment was wrong (two arms
+  follow it); the field doc predated the interval arm.
+
+### Note on the test work itself
+
+The first version of the interval test used a `yield_now` loop under a paused
+clock, which keeps the runtime busy so the clock never advances — it spun for
+599s before being killed. That is the SAME hazard pass 53 fixed across seven
+event-wait loops, reintroduced while writing a test for something else. The
+shipped version advances the clock explicitly. Worth remembering: a paused clock
+plus any busy-wait is a hang, not a failure.
+
+`tokio`'s `test-util` feature was added as a dev-dependency of
+`rollup-node-chain-orchestrator` for the paused clock, so the interval is
+provable without a real 10s wait in the unit lane.

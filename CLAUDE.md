@@ -56,7 +56,9 @@ The system follows this critical data flow pattern:
 cargo build --bin rollup-node
 
 # Run sequencer with test signer (bypasses signing requirements)
-cargo run --bin rollup-node -- node --chain dev -d --sequencer.enabled --test --http --http.api admin,debug,eth,net,trace,txpool,web3,rpc,reth,ots,flashbots,miner,mev
+# `--test` skips the L1 watcher, and the fallback that stands in for it only
+# exists under `test-utils` — without the feature this is rejected at startup.
+cargo run --features test-utils --bin rollup-node -- node --chain dev -d --sequencer.enabled --test --consensus.algorithm noop --http --http.api admin,debug,eth,net,trace,txpool,web3,rpc,reth,ots,flashbots,miner,mev
 
 # Production build
 cargo build --release --bin rollup-node

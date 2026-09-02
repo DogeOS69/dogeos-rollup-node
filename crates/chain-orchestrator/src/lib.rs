@@ -109,6 +109,12 @@ const fn l1_notification_receiver_may_poll(
 /// whose chain then goes quiet needs a trigger of its own.
 const L2_SYNC_RECHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// How many consecutive re-check transport failures before the node says so at `warn!`.
+///
+/// Roughly a minute at [`L2_SYNC_RECHECK_INTERVAL`]: long enough to ride out a restarting
+/// execution node, short enough that a node gated on L1 and sequencing does not stay silent.
+const L2_SYNC_RECHECK_WARN_AFTER: u32 = 6;
+
 /// A latched L2-sync target and the engine mirror head it was latched against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct L2SyncRecheck {
@@ -150,7 +156,9 @@ pub struct ChainOrchestrator<
     /// The current sync state of the [`ChainOrchestrator`].
     sync_state: SyncState,
     /// The head that latched L2 sync mode, paired with the engine's mirror head
-    /// at the moment it was latched, re-checked on every later import.
+    /// at the moment it was latched, re-checked on every later import AND on the
+    /// [`L2_SYNC_RECHECK_INTERVAL`] tick — the interval is what makes recovery
+    /// independent of inbound traffic, which is the case that motivated it.
     ///
     /// The mirror is recorded because `ForkchoiceState::update` enforces
     /// monotonicity only on `finalized` — a BACKWARD head move is legal and
@@ -171,6 +179,9 @@ pub struct ChainOrchestrator<
     /// then stays internally syncing forever with L1 notifications and
     /// sequencing gated, while the execution node has long since caught up.
     l2_sync_recheck_target: Option<L2SyncRecheck>,
+    /// Consecutive transport failures of the L2-sync re-check, so a probe that
+    /// can never reach the engine stops being invisible.
+    l2_sync_recheck_failures: u32,
     /// A handle for the [`rollup_node_watcher::L1Watcher`].
     l1_watcher: L1WatcherHandle,
     /// The network manager that manages the scroll p2p network.
@@ -226,6 +237,7 @@ impl<
                 config,
                 sync_state: SyncState::default(),
                 l2_sync_recheck_target: None,
+                l2_sync_recheck_failures: 0,
                 l1_watcher,
                 network,
                 consensus,
@@ -380,8 +392,9 @@ impl<
                 Some(batch) = self.derivation_pipeline.next(), if self.derivation_driver.can_accept_batch() => {
                     self.derivation_driver.hold_batch(batch);
                 }
-                // Last in the biased order: a background probe must never preempt
-                // real work. Gated so it costs nothing unless a latch is live.
+                // Below every arm that does real work, so a background probe
+                // never preempts one. Gated so it costs nothing unless a latch
+                // is live.
                 _ = l2_sync_recheck.tick(), if self.sync_state.l2().is_syncing() &&
                     self.l2_sync_recheck_target.is_some() =>
                 {
@@ -1222,6 +1235,7 @@ impl<
                         }
                     }
                     let result = self.engine.update_fcs_checked(new_head, new_safe, None).await?;
+                    self.l2_sync_recheck_failures = 0;
                     if result.is_invalid() {
                         // INVALID after a durable unwind: genuine divergence,
                         // fail-stops via the admin-unwind policy.
@@ -2238,12 +2252,30 @@ impl<
         let result = match self.engine.update_fcs_checked(Some(target), None, None).await {
             Ok(result) => result,
             Err(err) => {
-                tracing::debug!(
-                    target: "scroll::chain_orchestrator",
-                    ?target,
-                    %err,
-                    "L2 sync re-check could not reach the engine; will retry"
-                );
+                // While this probe keeps failing the node polls no L1 and
+                // sequences nothing — `l1_notification_receiver_may_poll` and
+                // the sequencer arm both require a synced L2 — while reporting
+                // healthy. That was tolerable when the probe was opportunistic;
+                // pass 55 made it the PRIMARY recovery path, so a persistent
+                // failure has to become visible rather than sit at debug.
+                self.l2_sync_recheck_failures = self.l2_sync_recheck_failures.saturating_add(1);
+                if self.l2_sync_recheck_failures >= L2_SYNC_RECHECK_WARN_AFTER {
+                    tracing::warn!(
+                        target: "scroll::chain_orchestrator",
+                        ?target,
+                        %err,
+                        consecutive_failures = self.l2_sync_recheck_failures,
+                        "L2 sync re-check keeps failing; the node is gated on L1 and \
+                         sequencing until it succeeds"
+                    );
+                } else {
+                    tracing::debug!(
+                        target: "scroll::chain_orchestrator",
+                        ?target,
+                        %err,
+                        "L2 sync re-check could not reach the engine; will retry"
+                    );
+                }
                 return Ok(());
             }
         };
@@ -3411,6 +3443,177 @@ mod run_loop_policy_tests {
         );
     }
 
+    /// M3: the INVALID arm. Reverting it to `= None` — what it said before
+    /// pass 55 — left the whole suite green while wedging the node, because a
+    /// cleared latch leaves L2 marked syncing with no recovery target.
+    #[tokio::test]
+    async fn invalid_l2_sync_recheck_relatches_onto_the_current_head() {
+        let database = Arc::new(setup_test_db().await);
+        database.insert_genesis_block(B256::ZERO).await.unwrap();
+        database.delete_mismatched_genesis_blocks(B256::ZERO).await.unwrap();
+
+        let engine_client = Arc::new(ScriptedEngineClient::new());
+        engine_client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(
+            PayloadStatusEnum::Invalid { validation_error: "scripted".to_string() },
+            None,
+        )));
+        let asserter = Asserter::new();
+        asserter.push_success(&Option::<()>::None);
+        asserter.push_success(&Option::<()>::None);
+        let (mut orchestrator, _handle, _notification_tx) = test_orchestrator_with_fcs(
+            database.clone(),
+            engine_client.clone(),
+            asserter,
+            BatchDerivationResult {
+                attributes: vec![],
+                batch_info: BatchInfo::new(1, B256::repeat_byte(1)),
+                skipped_l1_messages: vec![],
+                target_status: BatchStatus::Consolidated,
+            },
+            ForkchoiceState::new(info(SAFE, 0x11), info(SAFE, 0x11), info(0, 0x00)),
+        )
+        .await;
+
+        orchestrator.sync_state.l1_mut().set_syncing();
+        orchestrator.sync_state.l2_mut().set_syncing();
+        orchestrator.l2_sync_recheck_target = Some(super::L2SyncRecheck {
+            target: info(SAFE + 1, 0x22),
+            latched_from: info(SAFE, 0x11),
+        });
+
+        orchestrator.recheck_l2_sync_target().await.unwrap();
+
+        assert_eq!(
+            orchestrator.l2_sync_recheck_target,
+            Some(super::L2SyncRecheck { target: info(SAFE, 0x11), latched_from: info(SAFE, 0x11) }),
+            "a rejected target must be replaced by one onto the current head, never cleared:              clearing leaves L2 syncing with no way back"
+        );
+        assert!(
+            orchestrator.sync_state.l2().is_syncing(),
+            "an INVALID answer must not mark synced"
+        );
+    }
+
+    /// M3: a transport failure must leave the latch in place for the next
+    /// attempt, and must not fabricate a synced state.
+    #[tokio::test]
+    async fn transport_failure_keeps_the_l2_sync_latch() {
+        let database = Arc::new(setup_test_db().await);
+        database.insert_genesis_block(B256::ZERO).await.unwrap();
+        database.delete_mismatched_genesis_blocks(B256::ZERO).await.unwrap();
+
+        let engine_client = Arc::new(ScriptedEngineClient::new());
+        engine_client.push_fork_choice_updated(ScriptedResponse::TransportFailure);
+        let asserter = Asserter::new();
+        asserter.push_success(&Option::<()>::None);
+        asserter.push_success(&Option::<()>::None);
+        let (mut orchestrator, _handle, _notification_tx) = test_orchestrator_with_fcs(
+            database.clone(),
+            engine_client.clone(),
+            asserter,
+            BatchDerivationResult {
+                attributes: vec![],
+                batch_info: BatchInfo::new(1, B256::repeat_byte(1)),
+                skipped_l1_messages: vec![],
+                target_status: BatchStatus::Consolidated,
+            },
+            ForkchoiceState::new(info(SAFE, 0x11), info(SAFE, 0x11), info(0, 0x00)),
+        )
+        .await;
+
+        orchestrator.sync_state.l1_mut().set_syncing();
+        orchestrator.sync_state.l2_mut().set_syncing();
+        let latch =
+            super::L2SyncRecheck { target: info(SAFE + 1, 0x22), latched_from: info(SAFE, 0x11) };
+        orchestrator.l2_sync_recheck_target = Some(latch);
+
+        orchestrator.recheck_l2_sync_target().await.unwrap();
+
+        assert_eq!(
+            orchestrator.l2_sync_recheck_target,
+            Some(latch),
+            "a transport failure must leave the latch for the next attempt"
+        );
+        assert!(orchestrator.sync_state.l2().is_syncing());
+        assert_eq!(
+            orchestrator.l2_sync_recheck_failures, 1,
+            "and must count toward the escalation that makes a stuck probe visible"
+        );
+    }
+
+    /// M4: the interval arm. Pass 55 claimed recovery no longer depends on
+    /// inbound traffic; nothing pinned that. This drives the run loop with NO
+    /// inputs at all — no peer announcement, no command, no notification — and
+    /// asserts the latch is still probed and sync mode still exits.
+    #[tokio::test]
+    async fn the_interval_arm_recovers_sync_mode_without_any_inbound_traffic() {
+        let database = Arc::new(setup_test_db().await);
+        database.insert_genesis_block(B256::ZERO).await.unwrap();
+        database.delete_mismatched_genesis_blocks(B256::ZERO).await.unwrap();
+
+        let engine_client = Arc::new(ScriptedEngineClient::new());
+        engine_client
+            .push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Valid, None)));
+        let asserter = Asserter::new();
+        asserter.push_success(&Option::<()>::None);
+        asserter.push_success(&Option::<()>::None);
+        let (mut orchestrator, _handle, _notification_tx) = test_orchestrator_with_fcs(
+            database.clone(),
+            engine_client.clone(),
+            asserter,
+            BatchDerivationResult {
+                attributes: vec![],
+                batch_info: BatchInfo::new(1, B256::repeat_byte(1)),
+                skipped_l1_messages: vec![],
+                target_status: BatchStatus::Consolidated,
+            },
+            ForkchoiceState::new(info(SAFE, 0x11), info(SAFE, 0x11), info(0, 0x00)),
+        )
+        .await;
+
+        // L1 left syncing so the exit does not pull consolidation in.
+        orchestrator.sync_state.l1_mut().set_syncing();
+        orchestrator.sync_state.l2_mut().set_syncing();
+        orchestrator.l2_sync_recheck_target = Some(super::L2SyncRecheck {
+            target: info(SAFE + 1, 0x22),
+            latched_from: info(SAFE, 0x11),
+        });
+
+        // Paused only now: a paused clock during setup breaks the temp database.
+        // From here the runtime auto-advances whenever it is idle, so the 10s
+        // interval elapses without a real wait.
+        tokio::time::pause();
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let run_task = tokio::spawn(orchestrator.run_until_shutdown(Box::pin(async move {
+            let _ = shutdown_rx.await;
+        })));
+
+        // Nothing is sent to the orchestrator at all — the clock is the only
+        // input. Advanced EXPLICITLY: a yield loop keeps the runtime busy, so a
+        // paused clock never auto-advances and the wait spins forever (the same
+        // hazard as the event loops pass 53 rewrote).
+        for _ in 0..20 {
+            tokio::time::advance(super::L2_SYNC_RECHECK_INTERVAL).await;
+            if engine_client.fork_choice_updated_calls() >= 1 {
+                break;
+            }
+        }
+        assert!(
+            engine_client.fork_choice_updated_calls() >= 1,
+            "the interval arm must probe the latch with no inbound traffic whatsoever"
+        );
+
+        assert_eq!(
+            engine_client.fork_choice_updated_states()[0].head_block_hash,
+            B256::repeat_byte(0x22),
+            "and must probe the LATCHED head"
+        );
+
+        let _ = shutdown_tx.send(());
+        assert!(run_task.await.unwrap().is_ok());
+    }
+
     /// The live half: a latch still matching the mirror re-issues, and a VALID
     /// answer leaves sync mode. Without this the node stays gated forever on a
     /// quiescent chain, since the only other exit is a LATER import.
@@ -4362,7 +4565,8 @@ mod run_loop_policy_tests {
         assert_eq!(
             database.get_batch_status_by_hash(legacy.hash).await.unwrap(),
             Some(BatchStatus::Consolidated),
-            "a blockless row must NOT be recorded as finalized: its payload never entered the              chain and the derivation query can never pick it up again"
+            "a blockless row must NOT be recorded as finalized: its payload never entered the \
+                         chain and the derivation query can never pick it up again"
         );
         assert!(
             database.fetch_and_update_unprocessed_finalized_batches(10).await.unwrap().is_empty(),

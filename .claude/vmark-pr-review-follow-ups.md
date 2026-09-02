@@ -882,3 +882,23 @@ documentation-staleness items. All FIXED; nothing deferred from this pass.
 - **Also added** tests for `redact_remote`/`safe_remote_host`, which had none
   and are the only thing between a URL carrying basic-auth credentials or an
   API key and an `error!` line.
+
+## Pass 50 findings — resolution (Codex, 2026-09-02)
+
+Codex pass 50 returned one P1, on the pass-49 clamp itself. FIXED; nothing
+deferred from this pass.
+
+- **P50-1 (FIXED)** The pass-49 clamp lowered `finalized` down to `latest` when
+  a provider snapshot reported finalized above latest. That silently REGRESSES
+  the finality floor: an L1 reorg or administrative unwind could then commit
+  database state below the execution node's actual finalized block before the
+  engine rejected the forkchoice update, leaving persistent divergence that
+  needs manual repair — worse than not starting. `from_provider` now refuses an
+  inconsistent snapshot (logging the three heights and returning `None`, which
+  the caller already handles), and `clamp_startup_markers` became
+  `clamp_startup_safe`, which moves only `safe`. Finality is never lowered.
+  - Worth noting how this arrived: pass-49 finding 2 correctly identified that
+    clamping safe alone could produce `safe < finalized`, and the fix chose the
+    wrong repair — clamping finalized rather than rejecting the snapshot. Both
+    reviewers had called the shape latent (no reth path reporting finalized
+    above latest was found), which is why it survived a pass.

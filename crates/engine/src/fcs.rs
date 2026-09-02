@@ -43,12 +43,13 @@ impl ForkchoiceState {
         )
     }
 
-    /// Reads the `latest`, `safe` and `finalized` tags from the provider and returns them clamped
-    /// into `finalized <= safe <= head` (see [`clamp_startup_markers`]).
+    /// Reads the `latest`, `safe` and `finalized` tags from the provider and returns them with
+    /// `safe` clamped into `finalized <= safe <= head` (see [`clamp_startup_safe`]).
     ///
-    /// Returns `None` if ANY of the three reads fails or is absent. That `None` is load-bearing:
-    /// the caller distinguishes it from a provider that answered while sitting at genesis, and
-    /// refuses to start on either when the database already knows a higher head.
+    /// Returns `None` if ANY of the three reads fails or is absent, and also when the snapshot is
+    /// internally inconsistent (`finalized` above `latest`). That `None` is load-bearing: the
+    /// caller distinguishes it from a provider that answered while sitting at genesis, and refuses
+    /// to start on either when the database already knows a higher head.
     pub async fn from_provider<P: Provider<Scroll>>(provider: &P) -> Option<Self> {
         let latest_block =
             provider.get_block(BlockId::Number(BlockNumberOrTag::Latest)).await.ok()??;
@@ -57,7 +58,25 @@ impl ForkchoiceState {
         let finalized_block =
             provider.get_block(BlockId::Number(BlockNumberOrTag::Finalized)).await.ok()??;
 
-        let (safe_number, finalized_number) = clamp_startup_markers(
+        // Finality must never REGRESS. Clamping `finalized` down to the head would weaken the
+        // orchestrator's finality floor, letting an L1 reorg or an administrative unwind commit
+        // database state BELOW the execution node's actual finalized block before the engine
+        // rejects the forkchoice update — persistent divergence needing manual repair, which is
+        // worse than not starting. A snapshot with `finalized` above `latest` is inconsistent
+        // (mismatched load-balanced backends, or a read torn across a reorg), so it is refused
+        // and the caller decides.
+        if finalized_block.header.number > latest_block.header.number {
+            tracing::error!(
+                target: "scroll::engine",
+                latest = latest_block.header.number,
+                safe = safe_block.header.number,
+                finalized = finalized_block.header.number,
+                "Execution node reported a finalized block above its latest block; refusing the \
+                 inconsistent forkchoice snapshot"
+            );
+            return None;
+        }
+        let safe_number = clamp_startup_safe(
             latest_block.header.number,
             safe_block.header.number,
             finalized_block.header.number,
@@ -69,11 +88,6 @@ impl ForkchoiceState {
                 latest_block.clone()
             };
         }
-        let finalized_block = if finalized_number == finalized_block.header.number {
-            finalized_block
-        } else {
-            latest_block.clone()
-        };
 
         Some(Self {
             head: BlockInfo { number: latest_block.header.number, hash: latest_block.header.hash },
@@ -188,33 +202,29 @@ impl ForkchoiceState {
     }
 }
 
-/// Clamps the startup safe and finalized markers read from the execution node into
-/// `finalized <= safe <= head`, returning `(safe, finalized)`.
+/// Clamps the startup `safe` marker read from the execution node into `finalized <= safe <= head`.
 ///
 /// [`ForkchoiceState`] documents that ordering, and every later `update()` refuses with
 /// `HeadBelowSafe`/`SafeBelowFinalized` when it does not hold — after the database is already
 /// unwound, with nothing on the restart path to lower either marker. So a violation here is not a
 /// transient state to run through, it is a node that never launches again.
 ///
-/// Two shapes reach this. A crash between an unwind's durable database commit and the FCU that
-/// lowers the safe marker leaves the execution node holding safe ABOVE the head this node resumes
-/// from. And a finalized marker above the head would, if only safe were clamped, produce
-/// `safe < finalized` — trading the launch failure for a node that starts, reads healthy, and can
-/// never issue another forkchoice update. Finalized is therefore clamped FIRST, and safe is
-/// floored on the clamped value.
+/// The shape that reaches this: a crash between an unwind's durable database commit and the
+/// forkchoice update that lowers the safe marker leaves the execution node holding safe ABOVE the
+/// head this node resumes from. The runtime reorg and administrative-unwind paths already drag
+/// their safe target down to the effective head; startup is the seam that never did.
 ///
-/// The runtime reorg and administrative-unwind paths already drag their safe target down to the
-/// effective head; startup is the seam that never did.
-pub(crate) const fn clamp_startup_markers(head: u64, safe: u64, finalized: u64) -> (u64, u64) {
-    let finalized = if finalized > head { head } else { finalized };
-    let safe = if safe < finalized {
+/// Only `safe` is clamped. `finalized` is never moved — lowering it would regress the finality
+/// floor — so callers must reject a snapshot with `finalized > head` before calling this, and the
+/// head floor below is what keeps that precondition from producing `safe < finalized`.
+pub(crate) const fn clamp_startup_safe(head: u64, safe: u64, finalized: u64) -> u64 {
+    if safe < finalized {
         finalized
     } else if safe > head {
         head
     } else {
         safe
-    };
-    (safe, finalized)
+    }
 }
 
 /// Returns the genesis hash for the given chain spec.
@@ -239,41 +249,36 @@ pub fn genesis_hash_from_chain_spec<CS: EthChainSpec<Header: BlockHeader>>(
 
 #[cfg(test)]
 mod tests {
-    use super::clamp_startup_markers;
+    use super::clamp_startup_safe;
 
     /// Pins the startup clamp that keeps a node launchable after a crash between
     /// an unwind's database commit and its safe-lowering forkchoice update.
-    /// Without it the execution node's stale markers propagate a `HeadBelowSafe`
-    /// (or, clamping only safe, a `SafeBelowFinalized`) out of `build()` on every
-    /// restart, with nothing left to lower them.
+    /// Without it the execution node's stale safe marker propagates a
+    /// `HeadBelowSafe` out of `build()` on every restart, with nothing left to
+    /// lower it.
+    ///
+    /// `finalized > head` is deliberately absent: that snapshot is refused by
+    /// `from_provider` rather than clamped, because lowering `finalized` would
+    /// regress the finality floor.
     #[test]
-    fn clamp_startup_markers_table() {
-        // (head, safe, finalized) -> (safe, finalized)
-        let cases: &[(u64, u64, u64, u64, u64)] = &[
+    fn clamp_startup_safe_table() {
+        // (head, safe, finalized) -> safe
+        let cases: &[(u64, u64, u64, u64)] = &[
             // Safe stranded above the head by a lost unwind FCU: drag it down.
-            (100, 150, 40, 100, 40),
+            (100, 150, 40, 100),
             // Safe below finalized: raise it to the floor.
-            (100, 30, 40, 40, 40),
-            // Finalized above the head clamps FIRST, so safe cannot be floored
-            // onto a value above the head and end up below finalized.
-            (100, 150, 200, 100, 100),
-            (100, 30, 200, 100, 100),
+            (100, 30, 40, 40),
             // Boundaries are already ordered and must pass through untouched.
-            (100, 100, 40, 100, 40),
-            (100, 40, 40, 40, 40),
-            (100, 100, 100, 100, 100),
+            (100, 100, 40, 100),
+            (100, 40, 40, 40),
+            (100, 100, 100, 100),
             // The ordinary case.
-            (100, 80, 40, 80, 40),
+            (100, 80, 40, 80),
         ];
-        for (head, safe, finalized, want_safe, want_finalized) in cases {
-            let got = clamp_startup_markers(*head, *safe, *finalized);
-            assert_eq!(
-                got,
-                (*want_safe, *want_finalized),
-                "clamp_startup_markers({head}, {safe}, {finalized})"
-            );
-            let (safe, finalized) = got;
-            assert!(finalized <= safe && safe <= *head, "ordering violated: {got:?}");
+        for (head, safe, finalized, want) in cases {
+            let got = clamp_startup_safe(*head, *safe, *finalized);
+            assert_eq!(got, *want, "clamp_startup_safe({head}, {safe}, {finalized})");
+            assert!(*finalized <= got && got <= *head, "ordering violated: {got}");
         }
     }
 }

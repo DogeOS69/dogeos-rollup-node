@@ -277,7 +277,13 @@ impl ScrollRollupNodeConfig {
         // binary (no default features; the Dockerfile builds --release).
         //
         // Last, so a config violating several rules reports the specific one.
-        if self.l1_provider_args.url.is_none() && !self.test_args.test {
+        //
+        // The --test exemption is itself gated on the feature: the fallback
+        // watcher only exists under cfg(feature = "test-utils"), so in the
+        // shipped binary --test without an L1 URL reaches the very same
+        // unwrap. Exempting it unconditionally would just move the panic.
+        let l1_optional = cfg!(feature = "test-utils") && self.test_args.test;
+        if self.l1_provider_args.url.is_none() && !l1_optional {
             return Err("l1.url is required: without it the L1 watcher is never started".to_string());
         }
         Ok(())

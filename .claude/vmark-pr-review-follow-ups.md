@@ -983,3 +983,44 @@ holes in code this PR wrote:
    the doc calls load-bearing.
 5. `from_provider`'s inconsistent-snapshot refusal and the startup repair clamp
    — the newest code in the PR; `clamp_startup_safe_table` reaches neither.
+
+## Pass 52 findings — resolution (Codex, 2026-09-02)
+
+Codex pass 52 returned two findings, both on code this PR wrote. Both FIXED.
+
+- **P52-1 (FIXED)** The peer-import site latches L2 sync mode when the engine
+  answers SYNCING for a head a previously-synced node imported, and the only
+  exit was a LATER import returning VALID. On a quiescent chain no later import
+  arrives — peers re-announce blocks this node already knows, and the remote
+  source short-circuits once its head is not behind — so nothing re-issued the
+  forkchoice update and the node stayed internally syncing forever with L1
+  notifications and sequencing gated, while the execution node had long since
+  caught up. The latched head is now remembered and re-checked at the top of
+  every peer announcement, before any short-circuit: an already-known block is
+  the only signal a quiescent chain still produces. VALID leaves sync mode (and
+  consolidates, like the original exit); INVALID drops the re-check rather than
+  re-issuing a head the engine rejected; a transport error is left for the next
+  announcement.
+- **P52-2 (FIXED)** The pass-51 `--test` exemption from the new `l1.url` rule
+  was ungated, but the fallback watcher only exists under
+  `cfg(feature = "test-utils")` — so in the shipped no-default-features binary
+  the documented `--test` invocation without `--l1.url` passed validation and
+  then hit the very same unwrap. The exemption is now gated on the feature, so
+  it only applies to builds that actually carry the fallback.
+
+### Test gap recorded (pass 52)
+
+`recheck_l2_sync_target` is UNTESTED, and it is the largest structural change
+made during this review loop — a new orchestrator field plus a helper on the
+consensus path. The chain-orchestrator test module has no harness for driving
+`handle_block_from_peer` (no test constructs a `NewBlockWithPeer`), so covering
+it means building one: signed block construction, consensus checks and a network
+event path. That is more than a review-loop fix should take on mid-pass, and a
+hastily built harness risks adding a flaky test to the PR that exists to remove
+flakiness. It joins the five gaps recorded in pass 51 and should be closed
+before merge, ranked alongside `handle_signer_event`.
+
+Specifically worth pinning: SYNCING latches and records the target; a later
+announcement of an ALREADY-KNOWN block re-issues and, on VALID, leaves sync mode
+and consolidates; INVALID drops the re-check instead of re-issuing forever; a
+transport error leaves the target in place for the next announcement.

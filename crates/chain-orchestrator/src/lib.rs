@@ -131,6 +131,16 @@ pub struct ChainOrchestrator<
     database: Arc<Database>,
     /// The current sync state of the [`ChainOrchestrator`].
     sync_state: SyncState,
+    /// The head that latched L2 sync mode at the peer-import site, re-checked on
+    /// every later peer announcement.
+    ///
+    /// That latch has only one other exit — a LATER import returning VALID — and
+    /// on a quiescent chain no later import arrives: peers re-announce blocks
+    /// this node already knows, and the remote source short-circuits once its
+    /// head is not behind, so nothing re-issues the forkchoice update. The node
+    /// then stays internally syncing forever with L1 notifications and
+    /// sequencing gated, while the execution node has long since caught up.
+    l2_sync_recheck_target: Option<BlockInfo>,
     /// A handle for the [`rollup_node_watcher::L1Watcher`].
     l1_watcher: L1WatcherHandle,
     /// The network manager that manages the scroll p2p network.
@@ -185,6 +195,7 @@ impl<
                 database,
                 config,
                 sync_state: SyncState::default(),
+                l2_sync_recheck_target: None,
                 l1_watcher,
                 network,
                 consensus,
@@ -2131,12 +2142,73 @@ impl<
         }
     }
 
+    /// Re-issues the forkchoice update for the head that latched L2 sync mode, and leaves sync
+    /// mode when the execution node has adopted it.
+    ///
+    /// See [`Self::l2_sync_recheck_target`]: without this, a node that received SYNCING for a head
+    /// it already knows stays gated until some NEWER block arrives, which never happens on a
+    /// quiescent chain.
+    async fn recheck_l2_sync_target(&mut self) -> Result<(), ChainOrchestratorError> {
+        if !self.sync_state.l2().is_syncing() {
+            return Ok(());
+        }
+        let Some(target) = self.l2_sync_recheck_target else { return Ok(()) };
+
+        // Checked, like the site that latched: the mirror must not advance to a head the engine
+        // has not adopted. A transport error is not fatal here — this is an opportunistic probe,
+        // and the next announcement retries it.
+        let result = match self.engine.update_fcs_checked(Some(target), None, None).await {
+            Ok(result) => result,
+            Err(err) => {
+                tracing::debug!(
+                    target: "scroll::chain_orchestrator",
+                    ?target,
+                    %err,
+                    "L2 sync re-check could not reach the engine; will retry"
+                );
+                return Ok(());
+            }
+        };
+        if result.is_invalid() {
+            // The engine actively rejected the latched head: it is not coming back, so stop
+            // re-issuing it. Sync mode stays closed until a real import reopens it.
+            tracing::warn!(
+                target: "scroll::chain_orchestrator",
+                ?target,
+                "Latched L2 sync target rejected as INVALID; dropping the re-check"
+            );
+            self.l2_sync_recheck_target = None;
+            return Ok(());
+        }
+        if !result.is_valid() {
+            return Ok(());
+        }
+
+        tracing::info!(
+            target: "scroll::chain_orchestrator",
+            ?target,
+            "Execution node adopted the latched head; L2 is now synced"
+        );
+        self.l2_sync_recheck_target = None;
+        self.sync_state.l2_mut().set_synced();
+        if self.sync_state.is_synced() {
+            self.consolidate_chain_with_retry().await?;
+        }
+        Ok(())
+    }
+
     /// Handles a new block received from a peer.
     async fn handle_block_from_peer(
         &mut self,
         block_with_peer: NewBlockWithPeer,
     ) -> Result<Option<ChainOrchestratorEvent>, ChainOrchestratorError> {
         tracing::debug!(target: "scroll::chain_orchestrator", block_hash = ?block_with_peer.block.header.hash_slow(), block_number = ?block_with_peer.block.number, peer_id = ?block_with_peer.peer_id, "Received new block from peer");
+
+        // Before any short-circuit: an announcement of a block this node ALREADY
+        // knows is the only signal a quiescent chain still produces, and it is
+        // exactly what the latched sync state needs to notice the engine caught
+        // up. A no-op unless the import site latched.
+        self.recheck_l2_sync_target().await?;
 
         // Check we are not handling a finalized block.
         if block_with_peer.block.header.number <= self.engine.fcs().finalized_block_info().number {
@@ -2450,6 +2522,9 @@ impl<
             // not stale — this is about not stranding waiters.
             self.cancel_payload_building_job("EL has not adopted the imported head");
             self.sync_state.l2_mut().set_syncing();
+            // Remember what to re-check: the EL may catch up to this exact head
+            // without any newer block ever arriving.
+            self.l2_sync_recheck_target = Some(head);
             return Err(ChainOrchestratorError::FcuRejected(
                 "peer chain import forkchoice update was not applied by the engine",
             ));
@@ -2471,6 +2546,7 @@ impl<
         // transition the L2 sync state to synced and consolidate the chain.
         if result.is_valid() && self.sync_state.l2().is_syncing() {
             tracing::info!(target: "scroll::chain_orchestrator", "L2 is now synced");
+            self.l2_sync_recheck_target = None;
             self.sync_state.l2_mut().set_synced();
 
             // If both L1 and L2 are now synced, we transition to consolidated mode by consolidating

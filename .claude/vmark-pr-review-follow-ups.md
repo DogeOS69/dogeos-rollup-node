@@ -549,7 +549,7 @@ from every pass is either fixed in the PR or recorded here.
     tracked files on `main`; this PR adds a 546-line reviewer ledger under a
     tool-config directory plus an 866-line plan doc. Production files
     (test.yaml, nightly-soak.yml, Makefile) previously pointed at the ledger
-    as canonical — those pointers were made self-contained in pass 44, but
+    as canonical — those pointers were made self-contained in pass 43, but
     whether either file should ship in the product repo is a merge decision
     for the author, not the review loop.
   - First/most-recent pass: Claude pass 43 (2026-09-02).
@@ -579,3 +579,33 @@ book section + PR-body rule list). Remaining from that pass:
   - Suggested Linear title: "rollup-node: validate that an enabled sequencer has a signer source under non-noop AND noop consensus"
 - (P35-i2, the linear non-resumable ancestor walk, is already covered by
   the remote-source liveness entry above.)
+
+## Pass 44 findings — resolution (Codex, 2026-09-02)
+
+Codex pass 44 returned two P1s, both fallout from the pass-43 changes; both
+are FIXED in this PR, so nothing from this pass is deferred.
+
+- **P44-1 (FIXED)** A batch restored by an L1 reorg that removed its revert
+  came back as `Consolidated` regardless of whether it had ever been derived.
+  Pass 43 made `finalize_consolidated_batches` tolerate a batch with no L2
+  block rows (instead of erroring and freezing finality), which turned that
+  restore into a silent skip: the underived batch was marked `Finalized`,
+  and only `Committed` rows are ever queued for derivation, so its blocks
+  never entered the finalized chain. `delete_batch_revert_gt_block_number`
+  now restores each batch to the status its own rows can prove —
+  `Consolidated` with L2 blocks on record, `Committed` (the derivation
+  queue) without. Pinned by
+  `reverted_batches_restore_to_a_derivable_status`.
+- **P44-2 (FIXED)** The pass-43 genesis reconciliation aborted startup on a
+  populated custom-chain database written by `origin/main`. That startup
+  inserted the real genesis without removing the migration-seeded row (the
+  insert cannot overwrite — its conflict key is the block hash), so height 0
+  holds TWO rows, and `get_l2_block_info_by_number(0)` returns either one.
+  Upgrading such a node hit `GenesisMismatch` and panicked. The
+  reconciliation is now a single `reconcile_genesis_block` operation that
+  reads the whole height-0 set and decides on this chain's own genesis:
+  present means the rows beside it are the legacy duplicate and are dropped;
+  absent stays fatal. Pinned by
+  `populated_database_reconciles_a_legacy_genesis_duplicate`.
+- Also fixed in passing: the `GenesisMismatch` message carried a run of
+  stray spaces before `{stored}`.

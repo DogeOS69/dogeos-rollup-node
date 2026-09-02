@@ -84,7 +84,9 @@ pub trait DatabaseWriteOperations {
     ) -> Result<(), DatabaseError>;
 
     /// Delete all batch reverts with a block number greater than the provided block number and
-    /// returns the number of deleted reverts.
+    /// returns the number of deleted reverts. Each restored batch returns to the status its own
+    /// rows can prove it reached — `Consolidated` when its L2 blocks are still on record,
+    /// `Committed` (the derivation queue) when it has none.
     async fn delete_batch_revert_gt_block_number(
         &self,
         block_number: u64,
@@ -166,6 +168,17 @@ pub trait DatabaseWriteOperations {
         &self,
         genesis_hash: B256,
     ) -> Result<u64, DatabaseError>;
+
+    /// Reconcile the height-0 rows with this chain's genesis hash on startup, returning how many
+    /// stale rows were removed.
+    ///
+    /// On a FRESH database (nothing above genesis) the stale rows are dropped and the real genesis
+    /// is (re-)inserted in the same call, so a crash between the two cannot leave `l2_block` empty.
+    /// On a POPULATED database this chain's own genesis decides: when it is on record the other
+    /// height-0 rows are the duplicate an older custom-chain startup left behind and are dropped;
+    /// when it is absent the height-0 row and everything above it belong to another chain, which is
+    /// [`DatabaseError::GenesisMismatch`] rather than something to graft this chain's genesis onto.
+    async fn reconcile_genesis_block(&self, genesis_hash: B256) -> Result<u64, DatabaseError>;
 
     /// Update the executed L1 messages from the provided L2 blocks in the database.
     async fn update_l1_messages_from_l2_blocks(
@@ -353,15 +366,42 @@ impl<T: WriteConnectionProvider + ?Sized + Sync> DatabaseWriteOperations for T {
             .await?;
         let num_batches = batch_hashes.len() as u64;
 
-        models::batch_commit::Entity::update_many()
-            .filter(models::batch_commit::Column::Hash.is_in(batch_hashes.iter().cloned()))
-            .col_expr(models::batch_commit::Column::RevertedBlockNumber, Expr::value(None::<i64>))
-            .col_expr(
-                models::batch_commit::Column::Status,
-                Expr::value(BatchStatus::Consolidated.as_str()),
-            )
-            .exec(self.get_connection())
+        // A restored batch goes back to the status its own rows can prove it
+        // reached: `Consolidated` when its L2 blocks are still on record,
+        // `Committed` when it has none. Derivation only ever picks up
+        // `Committed` rows, so a batch that had not been derived when the
+        // revert landed has to rejoin that queue — restoring it as
+        // `Consolidated` instead would let `finalize_consolidated_batches`
+        // mark it `Finalized` while its blocks were never derived, silently
+        // dropping it from the finalized chain.
+        let derived_hashes = models::l2_block::Entity::find()
+            .select_only()
+            .column(models::l2_block::Column::BatchHash)
+            .distinct()
+            .filter(models::l2_block::Column::BatchHash.is_in(batch_hashes.iter().cloned()))
+            .into_tuple::<Vec<u8>>()
+            .all(self.get_connection())
             .await?;
+        let blockless_hashes: Vec<Vec<u8>> =
+            batch_hashes.iter().filter(|hash| !derived_hashes.contains(hash)).cloned().collect();
+
+        for (hashes, status) in [
+            (&derived_hashes, BatchStatus::Consolidated),
+            (&blockless_hashes, BatchStatus::Committed),
+        ] {
+            if hashes.is_empty() {
+                continue;
+            }
+            models::batch_commit::Entity::update_many()
+                .filter(models::batch_commit::Column::Hash.is_in(hashes.iter().cloned()))
+                .col_expr(
+                    models::batch_commit::Column::RevertedBlockNumber,
+                    Expr::value(None::<i64>),
+                )
+                .col_expr(models::batch_commit::Column::Status, Expr::value(status.as_str()))
+                .exec(self.get_connection())
+                .await?;
+        }
 
         models::l2_block::Entity::update_many()
             .filter(models::l2_block::Column::BatchHash.is_in(batch_hashes.iter().cloned()))
@@ -802,6 +842,41 @@ impl<T: WriteConnectionProvider + ?Sized + Sync> DatabaseWriteOperations for T {
             .exec(self.get_connection())
             .await?;
         Ok(result.rows_affected)
+    }
+
+    async fn reconcile_genesis_block(&self, genesis_hash: B256) -> Result<u64, DatabaseError> {
+        // Read the WHOLE height-0 set rather than `get_l2_block_info_by_number(0)`: that query is
+        // unordered, and an older custom-chain startup left two rows here — the one the static dev
+        // migration seeds and the real genesis it inserted beside it (the insert cannot overwrite,
+        // its conflict key is the block hash) — so the single-row query returns either one.
+        let stored_genesis_hashes = models::l2_block::Entity::find()
+            .select_only()
+            .column(models::l2_block::Column::BlockHash)
+            .filter(models::l2_block::Column::BlockNumber.eq(0i64))
+            .into_tuple::<Vec<u8>>()
+            .all(self.get_connection())
+            .await?;
+        let genesis_on_record =
+            stored_genesis_hashes.iter().any(|hash| hash.as_slice() == genesis_hash.as_slice());
+
+        if DatabaseReadOperations::get_l2_head_block_number(self).await? > 0 {
+            if genesis_on_record {
+                return self.delete_mismatched_genesis_blocks(genesis_hash).await;
+            }
+            if let Some(stored) = stored_genesis_hashes.first() {
+                return Err(DatabaseError::GenesisMismatch {
+                    configured: genesis_hash,
+                    stored: B256::from_slice(stored),
+                });
+            }
+            // Populated, but with no genesis row to reconcile against. Inserting one here would
+            // graft this chain's genesis under history that never carried it.
+            return Ok(0);
+        }
+
+        let removed = self.delete_mismatched_genesis_blocks(genesis_hash).await?;
+        self.insert_genesis_block(genesis_hash).await?;
+        Ok(removed)
     }
 
     async fn update_l1_messages_from_l2_blocks(

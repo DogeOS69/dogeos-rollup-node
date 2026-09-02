@@ -3635,6 +3635,114 @@ mod run_loop_policy_tests {
         );
     }
 
+    /// Pins the pass-44 P1: a POPULATED database written by the older
+    /// custom-chain startup carries BOTH height-0 rows (that startup inserted
+    /// the real genesis without removing the migration's). Upgrading such a
+    /// node must drop the legacy duplicate and start, not abort as a
+    /// wrong-chain database — `get_l2_block_info_by_number(0)` is unordered,
+    /// so deciding on it would brick the upgrade nondeterministically.
+    #[tokio::test]
+    async fn populated_database_reconciles_a_legacy_genesis_duplicate() {
+        let database = Arc::new(setup_test_db().await);
+        // Both height-0 rows, exactly as the older startup left them, under
+        // history that has already advanced past genesis.
+        database.insert_genesis_block(B256::ZERO).await.unwrap();
+        database.set_l2_head_block_number(7).await.unwrap();
+
+        assert_eq!(
+            database.reconcile_genesis_block(B256::ZERO).await.unwrap(),
+            1,
+            "the legacy seeded row must be dropped, not treated as another chain's genesis"
+        );
+        assert_eq!(
+            database.get_l2_block_info_by_number(0).await.unwrap(),
+            Some(info(0, 0x00)),
+            "only this chain's genesis may remain at height 0"
+        );
+        assert_eq!(
+            database.reconcile_genesis_block(B256::ZERO).await.unwrap(),
+            0,
+            "reconciliation is idempotent"
+        );
+
+        // With this chain's genesis absent, the database really does belong to
+        // another chain and startup must still fail-stop.
+        assert!(matches!(
+            database.reconcile_genesis_block(B256::repeat_byte(0xAB)).await,
+            Err(DatabaseError::GenesisMismatch { .. })
+        ));
+    }
+
+    /// Pins the pass-44 P1: an L1 reorg that removes a batch revert restores
+    /// each batch to the status its own rows can prove. A batch that had not
+    /// been derived when the revert landed carries no L2 blocks and must
+    /// return to `Committed` — the only status derivation ever picks up.
+    /// Restoring it as `Consolidated` let `finalize_consolidated_batches` mark
+    /// it `Finalized` while its blocks were never derived, silently dropping
+    /// it from the finalized chain.
+    #[tokio::test]
+    async fn reverted_batches_restore_to_a_derivable_status() {
+        let database = Arc::new(setup_test_db().await);
+        database.insert_genesis_block(B256::ZERO).await.unwrap();
+        database.delete_mismatched_genesis_blocks(B256::ZERO).await.unwrap();
+
+        // A derived batch (its L2 block is on record) and a committed-only
+        // batch (never derived, no L2 rows), both reverted at L1 block 20.
+        let derived = BatchInfo::new(1, B256::repeat_byte(1));
+        let blockless = BatchInfo::new(2, B256::repeat_byte(2));
+        for batch in [derived, blockless] {
+            database
+                .insert_batch(BatchCommitData {
+                    hash: batch.hash,
+                    index: batch.index,
+                    block_number: 6,
+                    block_timestamp: 0,
+                    calldata: Arc::new(Bytes::new()),
+                    blob_versioned_hash: None,
+                    finalized_block_number: Some(6),
+                    reverted_block_number: None,
+                })
+                .await
+                .unwrap();
+        }
+        database.insert_blocks(vec![info(3, 0x33)], derived).await.unwrap();
+        // insert_batch deliberately discards the struct's
+        // finalized_block_number; set it through the real finalization API.
+        database.finalize_batches_up_to_index(2, 6).await.unwrap();
+        database.set_batch_revert_block_number_for_batch_range(1, 2, info(20, 0x20)).await.unwrap();
+
+        // The reorg removes the revert.
+        assert_eq!(database.delete_batch_revert_gt_block_number(10).await.unwrap(), 2);
+        assert_eq!(
+            database.get_batch_status_by_hash(derived.hash).await.unwrap(),
+            Some(BatchStatus::Consolidated),
+            "a batch whose L2 blocks are on record returns to Consolidated"
+        );
+        assert_eq!(
+            database.get_batch_status_by_hash(blockless.hash).await.unwrap(),
+            Some(BatchStatus::Committed),
+            "a batch with no L2 blocks returns to the derivation queue"
+        );
+
+        // Finalization must not swallow the underived batch...
+        assert_eq!(
+            database.finalize_consolidated_batches(10).await.unwrap(),
+            Some(info(3, 0x33)),
+            "the derived batch still yields the marker"
+        );
+        assert_eq!(
+            database.get_batch_status_by_hash(blockless.hash).await.unwrap(),
+            Some(BatchStatus::Committed),
+            "the underived batch must NOT be marked Finalized"
+        );
+        // ...and the same finalization pass must queue it for derivation.
+        assert_eq!(
+            database.fetch_and_update_unprocessed_finalized_batches(10).await.unwrap(),
+            vec![blockless],
+            "the restored batch is picked up for derivation"
+        );
+    }
+
     /// Pins the pass-40 M2 check: a DB-derived finalized marker at the SAME
     /// height as the engine mirror but with a DIFFERENT hash is divergence
     /// at the finality boundary and must fail-stop, not trace-skip.

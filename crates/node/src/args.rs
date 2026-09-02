@@ -447,32 +447,12 @@ impl ScrollRollupNodeConfig {
         // database disagreeing on genesis.
         let genesis_hash = genesis_hash_from_chain_spec(chain_spec.clone())
             .unwrap_or_else(|| chain_spec.genesis_hash());
-        // One transaction for the whole reconciliation. On a FRESH database
-        // (nothing above genesis) drop a mismatched seeded genesis row and
-        // (re-)insert the real one — folding the delete and insert together so
-        // a crash between them cannot leave l2_block empty and panic the
-        // genesis expectation on the next query. On a POPULATED database the
-        // height-0 row and everything above it belong to a chain: never
-        // delete it — if its genesis does not match, the database path was
-        // pointed at another chain's data, which is a fatal misconfiguration,
-        // not something to silently graft this chain's genesis onto.
+        // One transaction for the whole reconciliation, so a crash mid-way
+        // cannot leave l2_block empty and panic the genesis expectation on the
+        // next query. `reconcile_genesis_block` carries the fresh-vs-populated
+        // rules and the legacy-duplicate handling.
         let removed = db
-            .tx_mut(move |tx| async move {
-                if tx.get_l2_head_block_number().await? > 0 {
-                    if let Some(stored) = tx.get_l2_block_info_by_number(0).await? {
-                        if stored.hash != genesis_hash {
-                            return Err(DatabaseError::GenesisMismatch {
-                                configured: genesis_hash,
-                                stored: stored.hash,
-                            });
-                        }
-                    }
-                    return Ok(0);
-                }
-                let removed = tx.delete_mismatched_genesis_blocks(genesis_hash).await?;
-                tx.insert_genesis_block(genesis_hash).await?;
-                Ok::<_, DatabaseError>(removed)
-            })
+            .tx_mut(move |tx| async move { tx.reconcile_genesis_block(genesis_hash).await })
             .await
             .expect("failed to reconcile the genesis block");
         if removed > 0 {

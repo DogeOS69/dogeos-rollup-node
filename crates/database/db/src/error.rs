@@ -22,7 +22,7 @@ pub enum DatabaseError {
     L1MessageNotFound(L1MessageKey),
     /// The configured chain's genesis does not match a populated database.
     #[error(
-        "configured chain genesis {configured} does not match the existing database genesis          {stored}; is the database path pointed at another chain's data?"
+        "configured chain genesis {configured} does not match the existing database genesis {stored}; is the database path pointed at another chain's data?"
     )]
     GenesisMismatch {
         /// The genesis hash the node was configured with.

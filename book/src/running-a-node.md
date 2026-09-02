@@ -100,7 +100,7 @@ Replace:
 
 #### L1 Provider Configuration
 
-- `--l1.url <URL>`: L1 Ethereum RPC endpoint URL (required for follower nodes)
+- `--l1.url <URL>`: L1 Ethereum RPC endpoint URL (required for every node: the L1 watcher is started unconditionally)
 - `--l1.cups <NUMBER>`: Compute units per second for rate limiting (default: 10000)
 - `--l1.max-retries <NUMBER>`: Maximum retry attempts for L1 requests (default: 10)
 - `--l1.initial-backoff <MS>`: Initial backoff duration for retries in milliseconds (default: 100)

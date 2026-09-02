@@ -286,6 +286,21 @@ impl ScrollRollupNodeConfig {
         if self.l1_provider_args.url.is_none() && !l1_optional {
             return Err("l1.url is required: without it the L1 watcher is never started".to_string());
         }
+
+        // Supplying the URL is not enough under `--test`: the watcher is skipped
+        // whenever `--test` is set without an anvil provider, so on a build
+        // without the test-utils fallback the node passes validation and then
+        // panics on the unwrapped handle — naming nothing the operator typed.
+        // Additive, so the rule above and its tests are untouched.
+        if !cfg!(feature = "test-utils") &&
+            self.test_args.test &&
+            self.blob_provider_args.anvil_url.is_none()
+        {
+            return Err(
+                "--test disables the L1 watcher and this build has no test-utils fallback:                  drop --test, set --blob.anvil-url, or rebuild with --features test-utils"
+                    .to_string(),
+            );
+        }
         Ok(())
     }
 
@@ -969,7 +984,7 @@ impl Default for ChainOrchestratorArgs {
 }
 
 /// The network arguments.
-#[derive(Debug, Clone, clap::Args)]
+#[derive(Clone, clap::Args)]
 pub struct RollupNodeNetworkArgs {
     /// A bool to represent if new blocks should be bridged from the eth wire protocol to the
     /// scroll wire protocol.
@@ -1093,6 +1108,29 @@ impl std::fmt::Debug for RemoteBlockSourceArgs {
             .field("url", &debug_url(self.url.as_ref()))
             .field("poll_interval_ms", &self.poll_interval_ms)
             .field("build", &self.build)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for RollupNodeNetworkArgs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `sequencer_url` is a plain String and prints verbatim, so a follower
+        // configured with credentials in it would emit them to stdout through
+        // the config dump at startup. Same reason as the other four groups.
+        f.debug_struct("RollupNodeNetworkArgs")
+            .field("enable_eth_scroll_wire_bridge", &self.enable_eth_scroll_wire_bridge)
+            .field("enable_scroll_wire", &self.enable_scroll_wire)
+            .field(
+                "sequencer_url",
+                &self
+                    .sequencer_url
+                    .as_deref()
+                    .and_then(|url| url.parse::<reqwest::Url>().ok())
+                    .as_ref()
+                    .map_or_else(|| "<unset>".to_string(), |url| debug_url(Some(url))),
+            )
+            .field("signer_address", &self.signer_address)
+            .field("legacy_geth_header_transform", &self.legacy_geth_header_transform)
             .finish_non_exhaustive()
     }
 }
@@ -1777,6 +1815,27 @@ mod tests {
                 .unwrap_err()
                 .contains("sequencer.auto-start conflicts with remote-source.enabled"));
         }
+    }
+
+    /// The `l1.url` rule is otherwise untested: every other config in this
+    /// module sets a URL in order to SATISFY it, so deleting the rule would
+    /// leave the whole suite green. The second case pins the pass-52 gating —
+    /// note the unit lane builds `--all-features`, so `test-utils` is live here
+    /// and the exemption applies.
+    #[test]
+    fn test_validate_requires_l1_url() {
+        let mut config = rotation_watchdog_config();
+        config.consensus_args = ConsensusArgs::noop();
+        config.sequencer_args = SequencerArgs::default();
+        config.l1_provider_args = L1ProviderArgs::default();
+
+        config.test_args = TestArgs { test: false, skip_l1_synced: false };
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("l1.url is required"), "{err}");
+
+        // `--test` is exempt only on a build that carries the fallback watcher.
+        config.test_args = TestArgs { test: true, skip_l1_synced: false };
+        assert_eq!(config.validate().is_ok(), cfg!(feature = "test-utils"));
     }
 
     /// The mirror image: without `sequencer.enabled` no Sequencer is built, so

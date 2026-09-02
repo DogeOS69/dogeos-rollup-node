@@ -20,7 +20,11 @@ pub enum DatabaseError {
     /// The L1 message was not found in database.
     #[error("L1 message at key [{0}] not found in database")]
     L1MessageNotFound(L1MessageKey),
-    /// The configured chain's genesis does not match a populated database.
+    /// The configured chain's genesis matches no height-0 row in the database.
+    ///
+    /// Raised on fresh and populated databases alike: the check deliberately runs before
+    /// the fresh/populated split, because that split reads a metadata counter an unwind can
+    /// drive to zero while another chain's rows remain.
     #[error(
         "configured chain genesis {configured} does not match the existing database genesis {stored}; is the database path pointed at another chain's data?"
     )]

@@ -1024,3 +1024,71 @@ Specifically worth pinning: SYNCING latches and records the target; a later
 announcement of an ALREADY-KNOWN block re-issues and, on VALID, leaves sync mode
 and consolidates; INVALID drops the re-check instead of re-issuing forever; a
 transport error leaves the target in place for the next announcement.
+
+## Pass 53 findings — resolution (Claude, 2026-09-02)
+
+Claude pass 53 returned 2 critical, 6 majors and 11 minors. All FIXED.
+
+**Four of them — C1, M1, M2, M3 — were defects in the ~50 lines added by pass
+52, which the ledger had already recorded as untested. That gap is now closed.**
+
+- **C1 (FIXED)** `recheck_l2_sync_target` re-issued the latched head with no
+  comparison against the current mirror, and `ForkchoiceState::update` enforces
+  monotonicity only on `finalized` — so a BACKWARD head move is legal and
+  commits on VALID. Any other site that moved the mirror first (an optimistic
+  sync jumping ahead and purging all mappings, an administrative unwind, an L1
+  reorg) left the target stale, and the next announcement silently rewound the
+  engine with none of the machinery a real rewind pairs with. The latch now
+  records the mirror it was taken against and is dropped as soon as the mirror
+  moves off it.
+  - Deliberately NOT the `mirror != target` variant one reviewer proposed: at
+    latch time the checked FCU never committed, so the mirror is never equal to
+    the target and that test drops on every latch, reinstating the wedge pass 52
+    existed to close. Both behaviours are now pinned by tests.
+- **M1 (FIXED)** The latch exit was the only route out of L2 sync that did not
+  fail-stop on a consolidation failure — a plain `?` that `handle_outcome`
+  swallows, while both siblings escalate. A validation failure purges every
+  L1-to-L2 mapping before returning, so the node would run on marked synced with
+  the pool never opening and nothing re-running consolidation.
+- **M2 (FIXED)** The latch exit never persisted the L2 anchor. The latch is
+  taken because `import_chain` returned early, BEFORE its own persistence block,
+  so nothing had written the head the recheck commits. On the quiescent chain
+  this feature exists for, the startup repair would rewind the engine by the size
+  of the latched import on every restart, and once derivation's finalized marker
+  passed that height, startup would refuse outright.
+- **M3 (FIXED)** The recheck was unreachable from the `ImportBlock` command
+  path, so a remote-block-source node — which imports through that command and
+  has no gossip — kept the wedge intact, for precisely the topology this PR
+  exists to stabilize.
+- **C2 (FIXED)** Seven orchestrator tests used
+  `loop { if let Some(X) = events.next().await { break } }`. `EventStream`
+  returns `Ready(None)` permanently once the run loop exits, so the loop spins
+  on a ready future, never yields `Pending`, and the enclosing timeout is never
+  re-polled: the test hangs at 100% CPU instead of failing, in exactly the
+  regression it pins. All seven now use the `while let` shape and assert the
+  stream did not close.
+- **M4 (FIXED)** `RollupNodeNetworkArgs` was missed by the pass-51 redaction
+  pass and holds `sequencer_url` as a plain `String`, printed verbatim by the
+  startup config dump.
+- **M5 (FIXED)** The `l1.url` rule steered operators into a second panic: the
+  watcher is skipped whenever `--test` is set without an anvil URL, so supplying
+  the URL satisfied validation and then hit the same unwrap.
+- **M6 (FIXED)** The quarantine soak lane's build step had no count guard, and
+  its soak step carries `continue-on-error` — so a rename would end green with
+  the ordinary quarantine comment, silently losing the only automated signal for
+  the resume/rewind path.
+- **Minors (FIXED)** A test for the `l1.url` rule (the only `validate()` rule
+  with none — deleting it left the suite green); book wording for the
+  now-unconditional L1 requirement; the signer error no longer offers a private
+  key that has no CLI flag; three log literals regained their continuations; the
+  finalize tolerance no longer cites a shape pass 44 removed; `GenesisMismatch`
+  documented as fresh-and-populated; the rate-limiter comment reconciled with
+  `ERROR_LOG_MIN_INTERVAL`.
+
+### Still open from earlier passes
+
+The five test gaps recorded in pass 51 remain, minus none: `handle_signer_event`,
+`handle_batch_revert`'s clamps, `ConsolidationFetchFailed`, the foreign-genesis
+check on a fresh-looking database, and `from_provider`'s inconsistent-snapshot
+refusal. Pass 53 also suggests a `.config/nextest.toml` `terminate-after` and a
+step-level `timeout-minutes` on the `unit` job, neither of which exists.

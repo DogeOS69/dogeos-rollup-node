@@ -101,6 +101,16 @@ const fn l1_notification_receiver_may_poll(
     l2_synced && derivation_pipeline_empty && derivation_driver_can_accept_batch
 }
 
+/// A latched L2-sync target and the engine mirror head it was latched against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct L2SyncRecheck {
+    /// The head the execution node had not adopted when the latch was taken.
+    target: BlockInfo,
+    /// The engine's mirror head at that moment. When the mirror no longer
+    /// matches this, some other site moved it and the target is stale.
+    latched_from: BlockInfo,
+}
+
 /// Upper bound on how many blocks one reverted-transaction collection walks.
 ///
 /// The collection is one serial full-block RPC per block on the single-task run loop, so an
@@ -131,8 +141,18 @@ pub struct ChainOrchestrator<
     database: Arc<Database>,
     /// The current sync state of the [`ChainOrchestrator`].
     sync_state: SyncState,
-    /// The head that latched L2 sync mode at the peer-import site, re-checked on
-    /// every later peer announcement.
+    /// The head that latched L2 sync mode, paired with the engine's mirror head
+    /// at the moment it was latched, re-checked on every later import.
+    ///
+    /// The mirror is recorded because `ForkchoiceState::update` enforces
+    /// monotonicity only on `finalized` — a BACKWARD head move is legal and
+    /// commits on VALID. Any other site that moves the mirror (an optimistic
+    /// sync jumping ahead, an administrative unwind, an L1 reorg) leaves this
+    /// target describing a head that is no longer where the chain is, and
+    /// re-issuing it would silently rewind the engine with none of the
+    /// machinery every real rewind site pairs with — no mapping purge, no
+    /// transaction refill, no job cancellation, no event. So the latch is
+    /// dropped as soon as the mirror moves off what it was taken against.
     ///
     /// That latch has only one other exit — a LATER import returning VALID — and
     /// on a quiescent chain no later import arrives: peers re-announce blocks
@@ -140,7 +160,7 @@ pub struct ChainOrchestrator<
     /// head is not behind, so nothing re-issues the forkchoice update. The node
     /// then stays internally syncing forever with L1 notifications and
     /// sequencing gated, while the execution node has long since caught up.
-    l2_sync_recheck_target: Option<BlockInfo>,
+    l2_sync_recheck_target: Option<L2SyncRecheck>,
     /// A handle for the [`rollup_node_watcher::L1Watcher`].
     l1_watcher: L1WatcherHandle,
     /// The network manager that manages the scroll p2p network.
@@ -1226,6 +1246,12 @@ impl<
                 let _ = tx.send(true);
             }
             ChainOrchestratorCommand::ImportBlock { block_with_peer, response } => {
+                // Same reason as the gossip path, and the deployment that
+                // actually needs it: a remote-block-source node imports through
+                // this command and has no gossip at all, so without this the
+                // latch has no exit for it — the very wedge the mechanism was
+                // added to close, for the topology this PR exists to stabilize.
+                self.recheck_l2_sync_target().await?;
                 let result =
                     self.import_chain(vec![block_with_peer.block.clone()], block_with_peer).await;
                 match result {
@@ -1490,7 +1516,8 @@ impl<
                 first_failed = failed.first(),
                 last_failed = failed.last(),
                 collected = reverted_transactions.len(),
-                "Some reverted blocks could not be read; their transactions are not refilled                  into the pool"
+                "Some reverted blocks could not be read; their transactions are not refilled \
+                         into the pool"
             );
         }
         Ok(reverted_transactions)
@@ -2152,7 +2179,25 @@ impl<
         if !self.sync_state.l2().is_syncing() {
             return Ok(());
         }
-        let Some(target) = self.l2_sync_recheck_target else { return Ok(()) };
+        let Some(L2SyncRecheck { target, latched_from }) = self.l2_sync_recheck_target else {
+            return Ok(())
+        };
+
+        // Staleness guard. Compared against the MIRROR AT LATCH TIME, never against the target:
+        // at latch time the checked FCU did not commit, so the mirror is never equal to the
+        // target, and a `mirror != target` test would drop on every latch and quietly reinstate
+        // the wedge this mechanism exists to close.
+        if *self.engine.fcs().head_block_info() != latched_from {
+            tracing::debug!(
+                target: "scroll::chain_orchestrator",
+                ?target,
+                ?latched_from,
+                current = ?self.engine.fcs().head_block_info(),
+                "Engine head moved since the L2 sync latch; dropping the stale re-check"
+            );
+            self.l2_sync_recheck_target = None;
+            return Ok(());
+        }
 
         // Checked, like the site that latched: the mirror must not advance to a head the engine
         // has not adopted. A transport error is not fatal here — this is an opportunistic probe,
@@ -2192,7 +2237,44 @@ impl<
         self.l2_sync_recheck_target = None;
         self.sync_state.l2_mut().set_synced();
         if self.sync_state.is_synced() {
-            self.consolidate_chain_with_retry().await?;
+            // Fatal on failure, like BOTH sibling exits from sync mode: a
+            // validation failure purges every L1-to-L2 mapping before
+            // returning, and running on marked synced would sequence nothing
+            // (the pool never opens) while reporting healthy, with nothing
+            // that re-runs consolidation.
+            if let Err(err) = self.consolidate_chain_with_retry().await {
+                tracing::error!(
+                    target: "scroll::chain_orchestrator",
+                    %err,
+                    "Chain consolidation failed after the latched L2 sync target was adopted"
+                );
+                return Err(ChainOrchestratorError::FatalStateDivergence(
+                    "chain consolidation failed after the node was marked synced;                      restart re-consolidates from the persisted state",
+                ));
+            }
+        }
+
+        // Persist the anchor. The latch was taken because `import_chain` returned early with
+        // `FcuRejected`, BEFORE its own persistence block ran, so nothing has written the head
+        // this recheck just committed to the engine. On the quiescent chain this exists for,
+        // nothing else advances it either: the startup repair would rewind the engine by the size
+        // of the latched import on every restart, and once derivation's finalized marker passes
+        // that height, startup refuses outright.
+        if let Err(err) = self
+            .database
+            .tx_mut(move |tx| async move { tx.set_l2_head_block_number(target.number).await })
+            .await
+        {
+            tracing::error!(
+                target: "scroll::chain_orchestrator",
+                ?target,
+                %err,
+                "Could not persist the L2 head after the latched target was adopted"
+            );
+            return Err(ChainOrchestratorError::FatalStateDivergence(
+                "engine adopted the latched head but it could not be persisted; \
+                 restart re-converges from the persisted state",
+            ));
         }
         Ok(())
     }
@@ -2522,9 +2604,14 @@ impl<
             // not stale — this is about not stranding waiters.
             self.cancel_payload_building_job("EL has not adopted the imported head");
             self.sync_state.l2_mut().set_syncing();
-            // Remember what to re-check: the EL may catch up to this exact head
-            // without any newer block ever arriving.
-            self.l2_sync_recheck_target = Some(head);
+            // Remember what to re-check, and what the mirror was when we did:
+            // the EL may catch up to this exact head without any newer block
+            // ever arriving, but if anything else moves the mirror first this
+            // target must be abandoned rather than re-issued.
+            self.l2_sync_recheck_target = Some(L2SyncRecheck {
+                target: head,
+                latched_from: *self.engine.fcs().head_block_info(),
+            });
             return Err(ChainOrchestratorError::FcuRejected(
                 "peer chain import forkchoice update was not applied by the engine",
             ));
@@ -3082,19 +3169,24 @@ mod run_loop_policy_tests {
             "the watcher channel must retain the notification while derivation is held"
         );
 
-        time::timeout(Duration::from_secs(5), async {
-            loop {
-                if matches!(
-                    events.next().await,
-                    Some(ChainOrchestratorEvent::BatchConsolidated(outcome))
-                        if outcome.batch_info == batch_info
-                ) {
-                    break
+        let seen = time::timeout(Duration::from_secs(5), async {
+            while let Some(event) = events.next().await {
+                if matches!(event, ChainOrchestratorEvent::BatchConsolidated(outcome) if outcome.batch_info == batch_info) {
+                    return true;
                 }
             }
+            // A closed stream is a terminated run loop. `poll_next` then returns
+            // Ready(None) forever, so a `loop` here spins on a ready future, never
+            // yields Pending, and the timeout above is never re-polled — the test
+            // hangs at 100% CPU instead of failing, in exactly the regression it pins.
+            false
         })
         .await
         .expect("the held batch must consolidate");
+        assert!(
+            seen,
+            "the held batch must consolidate — the event stream closed, so the run loop terminated"
+        );
 
         time::timeout(Duration::from_secs(2), async {
             while database.get_processed_l1_block_number().await.unwrap() != 10 {
@@ -3208,6 +3300,126 @@ mod run_loop_policy_tests {
 
         let _ = shutdown_tx.send(());
         assert!(run_task.await.unwrap().is_ok());
+    }
+
+    /// Pins the pass-53 C1 staleness guard on the pass-52 L2-sync latch.
+    ///
+    /// `ForkchoiceState::update` enforces monotonicity only on `finalized`, so
+    /// re-issuing a latched head after something else moved the mirror is a
+    /// legal BACKWARD forkchoice update — it commits on VALID and silently
+    /// rewinds the engine, with none of the machinery a real rewind pairs with.
+    /// The guard compares against the mirror AT LATCH TIME; comparing against
+    /// the target instead would drop on every latch (the checked FCU never
+    /// committed, so mirror != target always) and reinstate the wedge.
+    #[tokio::test]
+    async fn stale_l2_sync_recheck_is_dropped_without_moving_the_head() {
+        let database = Arc::new(setup_test_db().await);
+        database.insert_genesis_block(B256::ZERO).await.unwrap();
+        database.delete_mismatched_genesis_blocks(B256::ZERO).await.unwrap();
+
+        let engine_client = Arc::new(ScriptedEngineClient::new());
+        let asserter = Asserter::new();
+        asserter.push_success(&Option::<()>::None);
+        asserter.push_success(&Option::<()>::None);
+        let (mut orchestrator, _handle, _notification_tx) = test_orchestrator_with_fcs(
+            database.clone(),
+            engine_client.clone(),
+            asserter,
+            BatchDerivationResult {
+                attributes: vec![],
+                batch_info: BatchInfo::new(1, B256::repeat_byte(1)),
+                skipped_l1_messages: vec![],
+                target_status: BatchStatus::Consolidated,
+            },
+            ForkchoiceState::new(info(SAFE, 0x11), info(SAFE, 0x11), info(0, 0x00)),
+        )
+        .await;
+
+        // Latched against a mirror the engine has since moved off: the recorded
+        // `latched_from` (99) is not the current mirror (SAFE).
+        orchestrator.sync_state.l2_mut().set_syncing();
+        orchestrator.l2_sync_recheck_target =
+            Some(super::L2SyncRecheck { target: info(50, 0x50), latched_from: info(99, 0x99) });
+
+        orchestrator.recheck_l2_sync_target().await.unwrap();
+
+        assert_eq!(
+            engine_client.fork_choice_updated_calls(),
+            0,
+            "a stale latch must not issue a forkchoice update at all"
+        );
+        assert!(
+            orchestrator.l2_sync_recheck_target.is_none(),
+            "the stale latch must be dropped, not retried forever"
+        );
+        assert_eq!(
+            *orchestrator.engine.fcs().head_block_info(),
+            info(SAFE, 0x11),
+            "the engine head must not move"
+        );
+        assert!(
+            orchestrator.sync_state.l2().is_syncing(),
+            "dropping a stale latch must not fabricate a synced state"
+        );
+    }
+
+    /// The live half: a latch still matching the mirror re-issues, and a VALID
+    /// answer leaves sync mode. Without this the node stays gated forever on a
+    /// quiescent chain, since the only other exit is a LATER import.
+    #[tokio::test]
+    async fn matching_l2_sync_recheck_reissues_and_exits_sync_mode() {
+        let database = Arc::new(setup_test_db().await);
+        database.insert_genesis_block(B256::ZERO).await.unwrap();
+        database.delete_mismatched_genesis_blocks(B256::ZERO).await.unwrap();
+
+        let engine_client = Arc::new(ScriptedEngineClient::new());
+        engine_client
+            .push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Valid, None)));
+        let asserter = Asserter::new();
+        asserter.push_success(&Option::<()>::None);
+        asserter.push_success(&Option::<()>::None);
+        let (mut orchestrator, _handle, _notification_tx) = test_orchestrator_with_fcs(
+            database.clone(),
+            engine_client.clone(),
+            asserter,
+            BatchDerivationResult {
+                attributes: vec![],
+                batch_info: BatchInfo::new(1, B256::repeat_byte(1)),
+                skipped_l1_messages: vec![],
+                target_status: BatchStatus::Consolidated,
+            },
+            ForkchoiceState::new(info(SAFE, 0x11), info(SAFE, 0x11), info(0, 0x00)),
+        )
+        .await;
+
+        // L2 syncing, L1 explicitly NOT synced: the fixture marks L1 synced, and
+        // leaving it so would pull consolidation (and its own engine scripting)
+        // into a test about the latch exit. The sibling exits already cover
+        // consolidation.
+        orchestrator.sync_state.l1_mut().set_syncing();
+        orchestrator.sync_state.l2_mut().set_syncing();
+        orchestrator.l2_sync_recheck_target = Some(super::L2SyncRecheck {
+            target: info(SAFE + 1, 0x22),
+            latched_from: info(SAFE, 0x11),
+        });
+
+        orchestrator.recheck_l2_sync_target().await.unwrap();
+
+        assert_eq!(
+            engine_client.fork_choice_updated_calls(),
+            1,
+            "a matching latch must re-issue exactly once"
+        );
+        assert!(
+            !orchestrator.sync_state.l2().is_syncing(),
+            "an adopted target must leave L2 sync mode"
+        );
+        assert!(orchestrator.l2_sync_recheck_target.is_none(), "the latch must be cleared");
+        assert_eq!(
+            database.get_l2_head_block_number().await.unwrap(),
+            SAFE + 1,
+            "the anchor must be persisted: the latching import returned before its own write"
+        );
     }
 
     /// Pins the pass-43 safe-target clamp — the `None if mirror_safe >
@@ -3347,17 +3559,21 @@ mod run_loop_policy_tests {
 
         // The reorg completes despite the SYNCING FCU: the event is emitted
         // and the run loop stays alive.
-        time::timeout(Duration::from_secs(5), async {
-            loop {
-                if let Some(ChainOrchestratorEvent::L1Reorg { l1_block_number: 5, .. }) =
-                    events.next().await
-                {
-                    break;
+        let seen = time::timeout(Duration::from_secs(5), async {
+            while let Some(event) = events.next().await {
+                if matches!(event, ChainOrchestratorEvent::L1Reorg { l1_block_number: 5, .. }) {
+                    return true;
                 }
             }
+            // A closed stream is a terminated run loop. `poll_next` then returns
+            // Ready(None) forever, so a `loop` here spins on a ready future, never
+            // yields Pending, and the timeout above is never re-polled — the test
+            // hangs at 100% CPU instead of failing, in exactly the regression it pins.
+            false
         })
         .await
         .expect("the reorg must complete on a SYNCING post-unwind FCU");
+        assert!(seen, "the reorg must complete on a SYNCING post-unwind FCU — the event stream closed, so the run loop terminated");
         assert_eq!(database.get_latest_l1_block_number().await.unwrap(), 5);
 
         let _ = shutdown_tx.send(());
@@ -3532,15 +3748,21 @@ mod run_loop_policy_tests {
         .expect("first Engine SYNCING response must hold the batch");
 
         notification_tx.send(Arc::new(L1Notification::Finalized(6))).await.unwrap();
-        time::timeout(Duration::from_secs(5), async {
-            loop {
-                if let Some(ChainOrchestratorEvent::L1BlockFinalized(6, _)) = events.next().await {
-                    break;
+        let seen = time::timeout(Duration::from_secs(5), async {
+            while let Some(event) = events.next().await {
+                if matches!(event, ChainOrchestratorEvent::L1BlockFinalized(6, _)) {
+                    return true;
                 }
             }
+            // A closed stream is a terminated run loop. `poll_next` then returns
+            // Ready(None) forever, so a `loop` here spins on a ready future, never
+            // yields Pending, and the timeout above is never re-polled — the test
+            // hangs at 100% CPU instead of failing, in exactly the regression it pins.
+            false
         })
         .await
         .expect("the first finalized notification must complete");
+        assert!(seen, "the first finalized notification must complete — the event stream closed, so the run loop terminated");
         // Consolidation consumed 3 FCUs (Syncing hold, attributes, head
         // commit); the replayed marker is the fourth.
         assert_eq!(
@@ -3555,15 +3777,21 @@ mod run_loop_policy_tests {
         );
 
         notification_tx.send(Arc::new(L1Notification::Finalized(7))).await.unwrap();
-        time::timeout(Duration::from_secs(5), async {
-            loop {
-                if let Some(ChainOrchestratorEvent::L1BlockFinalized(7, _)) = events.next().await {
-                    break;
+        let seen = time::timeout(Duration::from_secs(5), async {
+            while let Some(event) = events.next().await {
+                if matches!(event, ChainOrchestratorEvent::L1BlockFinalized(7, _)) {
+                    return true;
                 }
             }
+            // A closed stream is a terminated run loop. `poll_next` then returns
+            // Ready(None) forever, so a `loop` here spins on a ready future, never
+            // yields Pending, and the timeout above is never re-polled — the test
+            // hangs at 100% CPU instead of failing, in exactly the regression it pins.
+            false
         })
         .await
         .expect("the second finalized notification must complete");
+        assert!(seen, "the second finalized notification must complete — the event stream closed, so the run loop terminated");
         assert_eq!(
             engine_client.fork_choice_updated_calls(),
             4,
@@ -3803,15 +4031,24 @@ mod run_loop_policy_tests {
         // Drive the held batch to full consolidation so no scripted
         // responses remain queued for it.
         notification_tx.send(Arc::new(L1Notification::Finalized(1))).await.unwrap();
-        time::timeout(Duration::from_secs(5), async {
-            loop {
-                if let Some(ChainOrchestratorEvent::L1BlockFinalized(1, _)) = events.next().await {
-                    break;
+        let seen = time::timeout(Duration::from_secs(5), async {
+            while let Some(event) = events.next().await {
+                if matches!(event, ChainOrchestratorEvent::L1BlockFinalized(1, _)) {
+                    return true;
                 }
             }
+            // A closed stream is a terminated run loop. `poll_next` then returns
+            // Ready(None) forever, so a `loop` here spins on a ready future, never
+            // yields Pending, and the timeout above is never re-polled — the test
+            // hangs at 100% CPU instead of failing, in exactly the regression it pins.
+            false
         })
         .await
         .expect("consolidation must complete");
+        assert!(
+            seen,
+            "consolidation must complete — the event stream closed, so the run loop terminated"
+        );
         assert_eq!(engine_client.fork_choice_updated_calls(), 3);
 
         // Diverge the persisted head below the mirror (the crash-window /
@@ -4540,15 +4777,21 @@ mod run_loop_policy_tests {
         })));
 
         notification_tx.send(Arc::new(L1Notification::Finalized(6))).await.unwrap();
-        time::timeout(Duration::from_secs(5), async {
-            loop {
-                if let Some(ChainOrchestratorEvent::L1BlockFinalized(6, _)) = events.next().await {
-                    break;
+        let seen = time::timeout(Duration::from_secs(5), async {
+            while let Some(event) = events.next().await {
+                if matches!(event, ChainOrchestratorEvent::L1BlockFinalized(6, _)) {
+                    return true;
                 }
             }
+            // A closed stream is a terminated run loop. `poll_next` then returns
+            // Ready(None) forever, so a `loop` here spins on a ready future, never
+            // yields Pending, and the timeout above is never re-polled — the test
+            // hangs at 100% CPU instead of failing, in exactly the regression it pins.
+            false
         })
         .await
         .expect("the finalized notification must complete");
+        assert!(seen, "the finalized notification must complete — the event stream closed, so the run loop terminated");
 
         assert_eq!(engine_client.fork_choice_updated_calls(), 1);
         let issued = engine_client.fork_choice_updated_states();
@@ -4566,15 +4809,21 @@ mod run_loop_policy_tests {
 
         // A second notification is an idempotent skip.
         notification_tx.send(Arc::new(L1Notification::Finalized(7))).await.unwrap();
-        time::timeout(Duration::from_secs(5), async {
-            loop {
-                if let Some(ChainOrchestratorEvent::L1BlockFinalized(7, _)) = events.next().await {
-                    break;
+        let seen = time::timeout(Duration::from_secs(5), async {
+            while let Some(event) = events.next().await {
+                if matches!(event, ChainOrchestratorEvent::L1BlockFinalized(7, _)) {
+                    return true;
                 }
             }
+            // A closed stream is a terminated run loop. `poll_next` then returns
+            // Ready(None) forever, so a `loop` here spins on a ready future, never
+            // yields Pending, and the timeout above is never re-polled — the test
+            // hangs at 100% CPU instead of failing, in exactly the regression it pins.
+            false
         })
         .await
         .expect("the second finalized notification must complete");
+        assert!(seen, "the second finalized notification must complete — the event stream closed, so the run loop terminated");
         assert_eq!(engine_client.fork_choice_updated_calls(), 1);
 
         let _ = shutdown_tx.send(());

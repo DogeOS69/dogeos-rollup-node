@@ -595,11 +595,12 @@ impl<T: WriteConnectionProvider + ?Sized + Sync> DatabaseWriteOperations for T {
             .add(models::batch_commit::Column::Status.eq(BatchStatus::Consolidated.as_str()));
         // The marker is the HIGHEST finalized L2 block across ALL eligible
         // batches, computed over blocks rather than over the highest-index
-        // batch: a marker-eligible batch that carries no L2 block rows (a
-        // `Committed` batch swept to `Consolidated` by an L1 reorg's revert
-        // restore) simply does not contribute, instead of erroring inside the
-        // caller's finalization transaction and rolling back the finalized-L1
-        // marker with it — which permanently froze L1 and L2 finality.
+        // batch: a marker-eligible batch that carries no L2 block rows simply
+        // does not contribute, instead of erroring inside the caller's
+        // finalization transaction and rolling back the finalized-L1 marker
+        // with it — which permanently froze L1 and L2 finality. Defensive now
+        // rather than reachable: the revert restore that used to produce such a
+        // row returns blockless batches to `Committed`, not `Consolidated`.
         //
         // The eligible set is joined as a SUBQUERY, never materialised into an
         // `IN (?, …)` list. `marker_filter` deliberately includes `Finalized`,

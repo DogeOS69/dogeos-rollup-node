@@ -705,8 +705,9 @@ where
                             // Rate-limit identical errors by elapsed time (at
                             // the default 100ms poll interval an unreachable
                             // remote would otherwise emit ~10 identical
-                            // lines/second), but always log a changed error
-                            // immediately.
+                            // lines/second), but log a changed error ahead of the
+                            // interval, but no sooner than ERROR_LOG_MIN_INTERVAL after
+                            // the last emitted line.
                             // Scrubbed BEFORE it is stored or compared: this
                             // string is both the log payload and the
                             // rate-limiter's memory.

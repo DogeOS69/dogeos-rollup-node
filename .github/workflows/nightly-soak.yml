@@ -392,8 +392,20 @@ jobs:
       - name: Build test binaries
         timeout-minutes: 45
         run: |
+          set -euo pipefail
           cargo nextest run --all-features --workspace --locked --no-run \
             -E 'test(test_remote_block_source_resumes_from_correct_head)'
+          # This lane is the ONLY automated signal for the resume/rewind path —
+          # the test is excluded from `make test` and the merge gate. The soak
+          # step carries continue-on-error, so a rename that empties the filter
+          # would end green with the ordinary quarantine comment, indistinguishable
+          # from a known-flake night. The build step is not continue-on-error, so
+          # the guard belongs here.
+          got="$(cargo nextest list --all-features --workspace --locked -E 'test(test_remote_block_source_resumes_from_correct_head)' | grep -c '^ ' || true)"
+          if [ "$got" != "1" ]; then
+            echo "::error::test_remote_block_source_resumes_from_correct_head matches $got tests, expected 1; the quarantined test was renamed or removed"
+            exit 1
+          fi
       - name: Soak the quarantined resume test
         id: soak
         # Step-level (below the job's 110) so a hang fails THIS step and the

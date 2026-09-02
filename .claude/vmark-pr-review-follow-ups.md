@@ -802,3 +802,20 @@ nothing deferred from this pass beyond the standing ledger entries.
   `populated_database_without_a_genesis_row_is_reported_missing` covers the
   fourth `reconcile_genesis_block` outcome, including that the check runs
   before any write.
+
+## Pass 48 findings — resolution (Codex, 2026-09-02)
+
+Codex pass 48 returned one P1, on the pass-47 M4 fix itself. FIXED; nothing
+deferred from this pass.
+
+- **P48-1 (FIXED)** The new parent-linkage check returned an error without
+  clearing `last_imported_block`. A changed parent is the ORDINARY shape of a
+  remote reorg at or below the pointer, not only the misrouted-backend case the
+  check was written for, so failing while keeping the pointer re-fetched the
+  same block on every poll and wedged the follower on the old fork — the
+  permanent no-import state the check exists to prevent, reached by a different
+  route. The mismatch now clears the pointer and resets
+  `consecutive_import_rejections` before returning, matching every other
+  resync path in the add-on (local head advanced, local head rewound, import
+  rejected `MAX_IMPORT_REJECTIONS` times), so the next tick re-walks to the new
+  common ancestor.

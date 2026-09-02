@@ -1318,11 +1318,22 @@ where
             // every ancestor probe reads that absent head and returns
             // immediately, forever.
             if let Some(expected_parent) = self.provider.block_hash(last_imported)? {
-                eyre::ensure!(
-                    block.header.parent_hash == expected_parent,
-                    "remote block {next_block_num} does not build on local block                      {last_imported}: parent {} != {expected_parent} (the remote is on a                      different fork)",
-                    block.header.parent_hash
-                );
+                if block.header.parent_hash != expected_parent {
+                    // A changed parent is the ordinary shape of a remote reorg
+                    // at or below the pointer, not only a misrouted backend, so
+                    // the POINTER is what went stale: clear it and let the next
+                    // tick re-walk to the new common ancestor. Returning an
+                    // error without clearing it would re-fetch this same block
+                    // on every poll and wedge the follower on the old fork.
+                    let stale = block.header.parent_hash;
+                    self.last_imported_block = None;
+                    self.consecutive_import_rejections = 0;
+                    return Err(eyre::eyre!(
+                        "remote block {next_block_num} does not build on local block \
+                         {last_imported} (parent {stale} != {expected_parent}); re-deriving \
+                         the common ancestor"
+                    ));
+                }
             }
             // The same failure class as the height check, one field over. If the
             // remote ignored `fullTransactions` — a proxy that drops the flag,

@@ -100,7 +100,10 @@ Replace:
 
 #### L1 Provider Configuration
 
-- `--l1.url <URL>`: L1 Ethereum RPC endpoint URL (required for follower nodes)
+- `--l1.url <URL>`: L1 Ethereum RPC endpoint URL (required for every node, except in a build
+  compiled with the `test-utils` feature, which substitutes a mock watcher). Separately, a
+  `--test` run in a build WITHOUT the `test-utils` feature requires
+  `--blob.anvil_url` and aborts at launch without it.
 - `--l1.cups <NUMBER>`: Compute units per second for rate limiting (default: 10000)
 - `--l1.max-retries <NUMBER>`: Maximum retry attempts for L1 requests (default: 10)
 - `--l1.initial-backoff <MS>`: Initial backoff duration for retries in milliseconds (default: 100)
@@ -128,8 +131,11 @@ These can be used as reliable blob sources without requiring your own beacon nod
 - `--consensus.algorithm <ALGORITHM>`: Consensus algorithm to use
     - `system-contract` (default): Validates blocks against authorized signer from L1
     - `noop`: No consensus validation (testing only)
-- `--consensus.authorized-signer <ADDRESS>`: Static authorized signer address (when using system-contract without L1
-  provider)
+- `--consensus.authorized-signer <ADDRESS>`: Static authorized signer address (when using
+  system-contract; `--l1.url` is required either way). The L1 signer IS re-read on every L1
+  block, but when this flag is set it **overrides** that value every time — so the node will
+  NOT honor an on-chain signer rotation while the flag is present, which is why
+  `--consensus.exit-on-signer-rotation` is rejected alongside it.
 
 #### Database Configuration
 
@@ -145,7 +151,7 @@ These can be used as reliable blob sources without requiring your own beacon nod
 #### Chain Orchestrator Configuration
 
 - `--chain.optimistic-sync-trigger <BLOCKS>`: Block gap that triggers optimistic sync (default: 1000)
-- `--chain.chain-buffer-size <SIZE>`: In-memory chain buffer size (default: 2000)
+- `--chain.chain-buffer-size <SIZE>`: accepted but currently inert — no component reads it (default: 2000)
 
 #### Engine Configuration
 
@@ -343,7 +349,6 @@ Look for log entries indicating successful block processing and chain advancemen
 
 **High memory usage:**
 
-- Adjust `--chain.chain-buffer-size` to reduce memory footprint
 - Ensure system has adequate RAM (16GB recommended)
 
 **Database errors:**
@@ -360,3 +365,80 @@ Look for log entries indicating successful block processing and chain advancemen
 
 For additional support and detailed implementation information, refer to the project's CLAUDE.md and source code
 documentation.
+
+## Remote Block Source
+
+A node can follow another node's chain over RPC instead of (or in addition
+to) P2P gossip, optionally building its own block on top of every import.
+This is the mode the docker test topology uses.
+
+| Flag | Meaning |
+|---|---|
+| `--remote-source.enabled` | Enable the remote block source add-on. |
+| `--remote-source.url <URL>` | The remote node's RPC endpoint. Must be `http` or `https`. |
+| `--remote-source.poll-interval-ms <MS>` | Poll cadence (must be > 0). Defaults to `100`. |
+| `--remote-source.build` | Build a local block on top of each imported block while the node is synced — imports made during startup or resynchronization skip the build (requires a configured sequencer). |
+
+Configuration is validated at launch (all rules below apply only when
+`--remote-source.enabled` is set) and a violation aborts startup — currently
+as a panic carrying the validation message — when:
+
+- `--remote-source.url` is missing — the remote source has nothing to poll.
+- `--remote-source.build` is set without `--sequencer.enabled` — no job
+  could ever start, so every build request would fail.
+- `--sequencer.enabled` and `--sequencer.auto-start` are both set, with or
+  without `--remote-source.build` — the remote source must be the only block
+  producer. With `build`, a second requester means build outcomes cannot be
+  attributed to their requests. Without it, the sequencer's own timer still
+  produces local blocks that each remote import then reorgs out, forking a node
+  the operator configured as a read-only mirror. `--sequencer.auto-start`
+  WITHOUT `--sequencer.enabled` is accepted: no sequencer is constructed, so it
+  starts nothing, and a templated fleet layout stays valid on the followers.
+  This is enforced at launch only: the
+  `rollupNodeAdmin_enableAutomaticSequencing` RPC can still start the
+  sequencer's timer at runtime — do not call it on a node running a remote
+  block source.
+- `--remote-source.poll-interval-ms` is `0`.
+- `--remote-source.url` uses a scheme other than `http`/`https`.
+
+Two further shapes only warn: `--remote-source.build` or
+`--remote-source.url` set while `--remote-source.enabled` is off (they are
+ignored — a templated fleet layout stays valid; a non-default
+`--remote-source.poll-interval-ms` alone does not trigger this warning),
+and — with `--remote-source.build` — `--sequencer.payload-building-duration`
+at or above reth's default 12s `--builder.deadline`.
+
+Two behaviours matter operationally beyond the flags themselves.
+
+**The add-on can rewind this node's head.** When the remote's chain diverges
+from the local one, the source walks back to the common ancestor and issues an
+administrative head update to it. The rewind is floored at the local safe head
+and reaches no further back than the add-on's 8192-block ancestor lookback. On
+a node that does no L1 derivation the safe floor is genesis, so within that
+window a divergent remote decides this node's head. Point
+`--remote-source.url` only at a node whose chain this one should follow
+unconditionally.
+
+**Two conditions stop the process, but only before the first successful
+initialization.** A genesis mismatch between this node and the remote, and
+failing to find a common ancestor within the add-on's lookback bound, are
+treated as unrecoverable until the add-on has completed one initialization:
+it returns a terminal error and the node panics rather than importing from a
+chain it cannot reconcile with. A genesis mismatch means the remote is a
+different chain — check `--remote-source.url`. Exhausted lookback does not: the
+walk searches 8192 blocks below the lower of the two heads, so a correctly
+configured remote that diverged deeper produces the same error. Resynchronize
+this node from a source the two chains still share, or point it at a remote
+closer to its own history; restarting alone will not clear either.
+
+Once the add-on has initialized successfully once, those same two verdicts
+become ordinary retryable errors — after a first success they are far more
+likely a misrouted or lagging remote backend than a wrong URL, so the node
+stays up and re-walks at the poll interval instead of fail-stopping a healthy
+node. A follower stuck in that loop imports nothing while still looking
+healthy, so watch the add-on's repeated sync-error logs rather than expecting
+the process to exit. While it is stuck the retry cadence is not the configured
+poll interval: after each failed tick the next poll is delayed by an
+exponential backoff (doubling from the poll interval, capped at 30 seconds and
+reset on the next success), so the sync-error logs grow sparser over time —
+that widening gap is the backoff working, not a second fault.

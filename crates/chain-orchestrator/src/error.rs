@@ -16,6 +16,47 @@ pub enum ChainOrchestratorError {
     /// An error occurred in the engine.
     #[error("engine error occurred: {0}")]
     EngineError(#[from] EngineError),
+    /// State this process can no longer reconcile in-place: engine/DB
+    /// divergence, a consumed notification that cannot be replayed, or a
+    /// post-synced consolidation failure. Most sites have no compensation
+    /// (the one that does — the
+    /// `UpdateFcsHead` rollback — raises this only when the compensation
+    /// itself did not commit). The run loop treats this as fatal because
+    /// running on would keep serving from divergent state.
+    ///
+    /// A restart converges only where the startup repair can reach the
+    /// divergence — the head-ahead-of-anchor sites. It does NOT for the
+    /// finality-boundary sites: the repair loop is gated on
+    /// `l2_head > finalized`, which is the very condition those report as
+    /// violated, and the finalized-marker mismatch re-raises identically on the
+    /// first finalized notification after boot, so the node crash-loops. Those
+    /// sites say "irreconcilable without manual intervention" in their own
+    /// messages and mean it.
+    #[error("fatal state divergence: {0}")]
+    FatalStateDivergence(&'static str),
+    /// A consolidation block fetch failed (transport error or a block
+    /// temporarily missing from the L2 client). Nothing was purged and no
+    /// durable state moved; `consolidate_chain_with_retry` retries these in
+    /// place, and only a persistent failure reaches the callers' fatal
+    /// escalation — with this cause preserved instead of a generic
+    /// `InvalidBlock`.
+    #[error("chain consolidation block fetch failed: {0}")]
+    ConsolidationFetchFailed(Box<Self>),
+    /// The engine did not apply a forkchoice update. Which verdict raises
+    /// it differs by site: at the `UpdateFcsHead` site both INVALID and
+    /// SYNCING raise it (nothing has been mutated and the refusal is
+    /// replied to the caller); at the `RevertToL1Block` combined head+safe
+    /// site only INVALID raises it (the unwind has already run and the run
+    /// loop escalates to a fail-stop); SYNCING there no longer replies a
+    /// retryable `false` — every post-latch failure, SYNCING included, now
+    /// fail-stops via `FatalStateDivergence`; at the peer-chain-import site only
+    /// SYNCING raises it (INVALID is an `InvalidBlock`), the L2 sync state
+    /// has been set back to syncing, and the error is only logged on the
+    /// gossip path — while via the `ImportBlock` command it is stringified
+    /// into the reply, where the remote block source counts it toward its
+    /// bounded import-rejection budget.
+    #[error("forkchoice update rejected by the engine: {0}")]
+    FcuRejected(&'static str),
     /// An error occurred while trying to fetch the L2 block from the database.
     #[error("L2 block not found - block number: {0}")]
     L2BlockNotFoundInDatabase(u64),

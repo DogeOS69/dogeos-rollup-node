@@ -192,8 +192,13 @@ where
         } else {
             tracing::info!(target: "rollup_node::sequencer", "Built payload with id {payload_id:?}, hash: {:#x}, number: {} containing {} transactions.", payload.block_hash, payload.block_number, payload.transactions.len());
             let block_info = BlockInfo { hash: payload.block_hash, number: payload.block_number };
-            engine.update_fcs(Some(block_info), None, None).await?;
             let expected_hash = payload.block_hash;
+            // Convert and validate BEFORE committing the head: both are pure
+            // functions of the payload, so a failure here is recoverable
+            // (nothing moved). Ordered the other way, a DETERMINISTIC
+            // conversion failure (e.g. an unmodeled header field after an EL
+            // upgrade) would land after the head commit and crash-loop the
+            // node as an unrecoverable divergence.
             let ExecutionData { payload, sidecar } =
                 ExecutionData { payload: payload.into(), sidecar: Default::default() };
             let mut block: DogeosBlock = payload
@@ -203,6 +208,26 @@ where
             if block.hash_slow() != expected_hash {
                 return Err(SequencerError::PayloadError)
             }
+            // update_fcs_checked commits the FCS mirror only on VALID —
+            // plain update_fcs would advance it on SYNCING too, leaving
+            // status and every subsequent build based on a block the EL
+            // never adopted.
+            let result = engine.update_fcs_checked(Some(block_info), None, None).await?;
+            if !result.is_valid() {
+                // INVALID, or SYNCING (which cannot legitimately happen for a
+                // payload this engine just built): nothing committed, head
+                // unchanged. Proceeding would sign and gossip a block the EL
+                // rejected and mark its L1 messages consumed. Log the verdict
+                // so INVALID (genuine divergence) is distinguishable from
+                // SYNCING (transient) instead of a contentless error type.
+                tracing::error!(
+                    target: "rollup_node::sequencer",
+                    ?block_info,
+                    status = ?result.payload_status.status,
+                    "Engine refused the freshly built block's forkchoice update"
+                );
+                return Err(SequencerError::FcuNotValid);
+            }
             Ok(Some(block))
         }
     }
@@ -210,7 +235,8 @@ where
 
 /// A job that builds a new payload.
 pub struct PayloadBuildingJob {
-    /// The L1 origin block number of the first included L1 message, if any.
+    /// The L1 origin block number of the first CANDIDATE L1 message (recorded before the gas
+    /// filter, so it may not have been included), if any.
     l1_origin: Option<u64>,
     /// The future that resolves to the payload ID once the job is complete.
     future: PayloadBuildingJobFuture,
@@ -226,7 +252,8 @@ impl fmt::Debug for PayloadBuildingJob {
 }
 
 impl PayloadBuildingJob {
-    /// Returns the L1 origin block number of the first included L1 message, if any.
+    /// Returns the L1 origin block number of the first CANDIDATE L1 message (recorded before the
+    /// gas filter, so it may not have been included), if any.
     pub const fn l1_origin(&self) -> Option<u64> {
         self.l1_origin
     }

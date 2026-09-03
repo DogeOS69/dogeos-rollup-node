@@ -1,5 +1,10 @@
 name: test
 
+# Build scripts and proc macros of the whole workspace run in these jobs;
+# they must not see a write-capable token.
+permissions:
+  contents: read
+
 on:
   pull_request:
   push:
@@ -29,11 +34,17 @@ jobs:
           cache-on-failure: true
       - uses: taiki-e/install-action@nextest
       - name: Run unit tests
-        run: cargo nextest run --all-features --workspace --locked -E '!kind(test)'
+        # --no-tests=fail pinned explicitly (as every other lane does): the
+        # nextest install action is a floating tag, and a filter that matched
+        # nothing must fail loudly rather than exit green.
+        run: cargo nextest run --all-features --workspace --locked --no-tests=fail -E '!kind(test)'
 
   integration:
     runs-on: blacksmith-8vcpu-ubuntu-2404
-    timeout-minutes: 60
+    # Above the sum of the step budgets (45-minute build + 50-minute run)
+    # plus setup, or the job-level cap cancels the active step and discards
+    # the output the step caps exist to preserve.
+    timeout-minutes: 110
     env:
       RUST_BACKTRACE: 1
     steps:
@@ -48,17 +59,45 @@ jobs:
       - uses: taiki-e/install-action@nextest
       - name: Install pinned Anvil
         run: |
+          set -euo pipefail
           ANVIL_BIN="$(.github/assets/install_anvil.sh "$RUNNER_TEMP/anvil" | tail -n1)"
+          [ -x "$ANVIL_BIN" ] || { echo "::error::Anvil install produced no executable at '$ANVIL_BIN'"; exit 1; }
           echo "ANVIL_BIN=$ANVIL_BIN" >> "$GITHUB_ENV"
-      - name: Run integration tests
+      - name: Build test binaries
+        # Separate step so the run cap below bounds TESTS, not a cold
+        # compile (25-40 min), and a hung build fails here with its own
+        # output preserved.
+        timeout-minutes: 45
         run: |
-          cargo nextest run --all-features --workspace --locked \
-            --no-tests=pass -E 'kind(test) and not test(docker)' \
-            -- --skip test_should_consolidate_to_block_15k
+          cargo nextest run --all-features --workspace --locked --no-run \
+            -E 'kind(test) and not test(docker)'
+      - name: Run integration tests
+        # Step-level: with --no-fail-fast a broadly-broken build burns the
+        # full budget, and only a step timeout preserves the step's output
+        # (a job-level cancel discards it).
+        timeout-minutes: 50
+        run: |
+          # --no-tests=fail (nextest's default, pinned explicitly since the
+          # install action is unpinned): a rename emptying the filter must
+          # fail loudly, not exit green having run nothing. Both exclusions
+          # live in the ONE filterset — not a trailing libtest --skip — so a
+          # single mechanism owns them. The resume test is excluded for the
+          # same reason the nightly soak quarantines it: the not-synced
+          # import path advances the resume pointer and drops that height's
+          # build (the test's own in-code note at
+          # crates/node/tests/remote_block_source.rs), compounded by a
+          # reboot-fixture teardown race. A known-racy test must not gate
+          # merges while issue #38 is being closed; it soaks in the nightly
+          # soak-resume-quarantine lane instead.
+          cargo nextest run --all-features --workspace --locked --no-fail-fast \
+            --no-tests=fail \
+            -E 'kind(test) and not test(docker) and not test(test_should_consolidate_to_block_15k) and not test(test_remote_block_source_resumes_from_correct_head)'
 
   integration-docker-compose:
     runs-on: blacksmith-8vcpu-ubuntu-2404
-    timeout-minutes: 90
+    # Above the sum of the step budgets (45-minute build + 75-minute run)
+    # plus setup: see the integration job.
+    timeout-minutes: 135
     env:
       RUST_BACKTRACE: 1
     steps:
@@ -81,10 +120,21 @@ jobs:
             echo "Docker Compose tests require at least 32 GiB free; available_kib=$available_kib" >&2
             exit 1
           fi
-      - name: Run Docker Compose integration tests
+      - name: Build test binaries
+        # Separate step: see the integration lane's rationale.
+        timeout-minutes: 45
         run: |
-          cargo nextest run --all-features --workspace --locked \
-            --no-tests=pass -E 'test(docker)' --test-threads=1 \
+          cargo nextest run --all-features --workspace --locked --no-run \
+            -E 'test(docker)'
+      - name: Run Docker Compose integration tests
+        # Step-level: see the integration lane's rationale.
+        timeout-minutes: 75
+        run: |
+          # --no-tests=fail (nextest's default, pinned explicitly since the
+          # install action is unpinned): a rename emptying the filter must
+          # fail loudly, not exit green having run nothing.
+          cargo nextest run --all-features --workspace --locked --no-fail-fast \
+            --no-tests=fail -E 'test(docker)' --test-threads=1 \
             --failure-output immediate \
             --success-output never \
             --verbose

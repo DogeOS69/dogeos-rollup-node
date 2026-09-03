@@ -65,6 +65,10 @@ pub struct TestFixture {
     pub chain_spec: Arc<<ScrollRollupNode as NodeTypes>::ChainSpec>,
     /// L1 provider for making L1 RPC calls (if connected to real L1).
     pub l1_provider: Option<L1Provider>,
+    /// The builder's remote-source URL override, carried so restarts keep
+    /// pointing at the overridden endpoint instead of silently reconnecting
+    /// to the live sequencer.
+    pub remote_source_url_override: Option<reqwest::Url>,
     /// Optional Anvil instance for L1 simulation.
     ///
     /// Owns the external `anvil` child process; dropping the fixture terminates it.
@@ -413,6 +417,10 @@ pub struct TestFixtureBuilder {
     config: ScrollRollupNodeConfig,
     num_nodes: usize,
     has_remote_source_node: bool,
+    /// Overrides the URL the remote source node connects to (defaults to the
+    /// local sequencer's RPC URL). Lets tests point the remote source at an
+    /// unreachable or delayed endpoint.
+    remote_source_url_override: Option<reqwest::Url>,
     chain_spec: Option<Arc<<ScrollRollupNode as NodeTypes>::ChainSpec>>,
     is_dev: bool,
     no_local_transactions_propagation: bool,
@@ -448,6 +456,7 @@ impl TestFixtureBuilder {
             config: Self::default_config(),
             num_nodes: 0,
             has_remote_source_node: false,
+            remote_source_url_override: None,
             chain_spec: None,
             is_dev: false,
             no_local_transactions_propagation: false,
@@ -515,6 +524,13 @@ impl TestFixtureBuilder {
     /// Must be used together with `.sequencer()`.
     pub const fn remote_source_node(mut self) -> Self {
         self.has_remote_source_node = true;
+        self
+    }
+
+    /// Override the URL the remote source node connects to (defaults to the
+    /// local sequencer's RPC URL).
+    pub fn remote_source_url(mut self, url: reqwest::Url) -> Self {
+        self.remote_source_url_override = Some(url);
         self
     }
 
@@ -765,9 +781,13 @@ impl TestFixtureBuilder {
 
         // Launch remote source node if requested
         if self.has_remote_source_node {
-            // Get sequencer's RPC URL
-            let sequencer_url: reqwest::Url =
-                format!("http://localhost:{}", nodes[0].rpc_url().port().unwrap()).parse()?;
+            // Get sequencer's RPC URL (unless a test overrides the remote URL)
+            let sequencer_url: reqwest::Url = match self.remote_source_url_override.clone() {
+                Some(url) => url,
+                None => {
+                    format!("http://localhost:{}", nodes[0].rpc_url().port().unwrap()).parse()?
+                }
+            };
 
             // Configure remote source node
             let mut remote_config = self.config.clone();
@@ -813,6 +833,7 @@ impl TestFixtureBuilder {
             wallet: Arc::new(Mutex::new(wallet)),
             chain_spec,
             l1_provider: self.l1_provider,
+            remote_source_url_override: self.remote_source_url_override,
             anvil,
             config: self.config,
             has_remote_source_node: self.has_remote_source_node,

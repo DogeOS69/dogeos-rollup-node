@@ -435,6 +435,7 @@ async fn can_forward_tx_to_sequencer() -> eyre::Result<()> {
 
     // assert that the follower node has received the block from the peer
     wait_n_events(
+        "follower ChainExtended",
         &mut follower_events,
         |e| matches!(e, ChainOrchestratorEvent::ChainExtended(_)),
         1,
@@ -460,6 +461,7 @@ async fn can_forward_tx_to_sequencer() -> eyre::Result<()> {
 
     // wait for the sequencer to build a block with transactions
     wait_n_events(
+        "sequencer block 2 with 1 tx",
         &mut sequencer_events,
         |e| {
             if let ChainOrchestratorEvent::BlockSequenced(block) = e {
@@ -475,6 +477,7 @@ async fn can_forward_tx_to_sequencer() -> eyre::Result<()> {
 
     // assert that the follower node has received the block from the peer
     wait_n_events(
+        "follower NewBlockReceived with 1 tx",
         &mut follower_events,
         |e| {
             if let ChainOrchestratorEvent::NewBlockReceived(block_with_peer) = e {
@@ -490,6 +493,7 @@ async fn can_forward_tx_to_sequencer() -> eyre::Result<()> {
 
     // assert that a chain extension is triggered on the follower node
     wait_n_events(
+        "follower ChainExtended",
         &mut follower_events,
         |e| matches!(e, ChainOrchestratorEvent::ChainExtended(_)),
         1,
@@ -1172,7 +1176,10 @@ async fn can_revert_to_l1_block() -> eyre::Result<()> {
     assert_eq!(status.l2.fcs.safe_block_info().number, 57);
 
     // Now send a revert to L1 block 18318210
-    fixture.follower(0).rollup_manager_handle.revert_to_l1_block(18318210).await?;
+    eyre::ensure!(
+        fixture.follower(0).rollup_manager_handle.revert_to_l1_block(18318210).await?,
+        "administrative unwind was refused"
+    );
 
     // Wait for the chain to be unwound
     fixture.expect_event().revert_to_l1_block().await?;
@@ -1605,7 +1612,8 @@ async fn requeues_transactions_after_update_fcs_head() -> eyre::Result<()> {
         .rollup_manager_handle
         .update_fcs_head(head)
         .await
-        .expect("update_fcs_head should succeed");
+        .expect("update_fcs_head reply channel dropped")
+        .map_err(|refusal| eyre::eyre!("head update refused: {refusal}"))?;
 
     // Build the next block – the reverted transaction should have been requeued and included.
     sequencer
@@ -2105,19 +2113,33 @@ fn empty_batch_calldata(first_block: u64, block_count: u8, timestamp: u64) -> By
 
 /// Waits for n events to be emitted.
 async fn wait_n_events(
+    label: &str,
     events: &mut EventStream<ChainOrchestratorEvent>,
     mut matches: impl FnMut(ChainOrchestratorEvent) -> bool,
     mut n: u64,
 ) {
     // TODO: refactor using `wait_for_event_predicate`
-    while let Some(event) = events.next().await {
-        if matches(event) {
-            n -= 1;
+    //
+    // Bounded like the sync.rs copy: an unmet expectation must fail with a
+    // diagnosis instead of hanging the binary for the whole job timeout, and
+    // an early stream end must not pass silently (issue #38).
+    assert!(n > 0, "wait_n_events requires n > 0");
+    let total = n;
+    tokio::time::timeout(tokio::time::Duration::from_secs(60), async {
+        while let Some(event) = events.next().await {
+            if matches(event) {
+                n -= 1;
+            }
+            if n == 0 {
+                break
+            }
         }
-        if n == 0 {
-            break
-        }
-    }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!("[{label}] Timeout (60s) waiting for {total} matching events ({n} still missing)")
+    });
+    assert_eq!(n, 0, "[{label}] event stream ended with {n}/{total} matching events still missing");
 }
 
 /// Helper function to wait until a predicate is true or a timeout occurs.

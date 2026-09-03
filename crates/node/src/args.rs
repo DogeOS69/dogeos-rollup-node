@@ -42,8 +42,14 @@ use scroll_db::{
     DatabaseReadOperations, DatabaseWriteOperations,
 };
 use scroll_derivation_pipeline::DerivationPipeline;
-use scroll_engine::{Engine, ForkchoiceState, ScrollAuthApiEngineClient, ScrollEngineApi};
-use scroll_migration::{traits::ScrollMigrator, MigratorTrait};
+use scroll_engine::{
+    genesis_hash_from_chain_spec, Engine, ForkchoiceState, ScrollAuthApiEngineClient,
+    ScrollEngineApi,
+};
+use scroll_migration::{
+    traits::ScrollMigrator, MigrationInfo, MigratorTrait, ScrollDevMigrationInfo,
+    ScrollMainnetMigrationInfo, ScrollSepoliaMigrationInfo,
+};
 use scroll_network::{DogeosNetworkPrimitives, EthWireBlockWithPeer, ScrollNetworkManager};
 use scroll_wire::ScrollWireEvent;
 use std::{fmt, fs, path::PathBuf, sync::Arc};
@@ -165,13 +171,171 @@ impl ScrollRollupNodeConfig {
             self.consensus_args.authorized_signer.is_none() &&
             self.l1_provider_args.url.is_none()
         {
-            return Err("System contract consensus requires either an authorized signer or a L1 provider URL".to_string());
+            return Err("System contract consensus requires --l1.url (the authorized signer is \
+                 read from L1); a static --consensus.authorized-signer only overrides it and \
+                 does not remove the --l1.url requirement"
+                .to_string());
         }
 
         if self.remote_block_source_args.enabled && self.remote_block_source_args.url.is_none() {
             return Err("Remote source URL required when remote source is enabled".to_string());
         }
 
+        if self.remote_block_source_args.enabled &&
+            self.remote_block_source_args.build &&
+            !self.sequencer_args.sequencer_enabled
+        {
+            // Without a sequencer no job can ever start; every remote-source
+            // build request would fail (PayloadBuildingJobCancelled) until
+            // the settlement budget is exhausted and the build abandoned.
+            return Err(
+                "remote-source.build requires sequencer.enabled: building on top of imported \
+                 blocks needs a configured sequencer (which itself requires a signer key \
+                 source under non-noop consensus)"
+                    .to_string(),
+            );
+        }
+
+        if !self.remote_block_source_args.enabled &&
+            (self.remote_block_source_args.build || self.remote_block_source_args.url.is_some())
+        {
+            // Remote-source flags templated into every node role with only
+            // `enabled` toggled per role are a common, harmless deployment
+            // shape — warn, never break the launch.
+            tracing::warn!(
+                target: "scroll::node::args",
+                build = self.remote_block_source_args.build,
+                // Presence only: the URL may carry credentials.
+                url_set = self.remote_block_source_args.url.is_some(),
+                "remote-source flags are set but remote-source.enabled is off; they are ignored"
+            );
+        }
+
+        if self.remote_block_source_args.enabled &&
+            self.remote_block_source_args.build &&
+            self.sequencer_args.payload_building_duration >= 12_000
+        {
+            // 12s is reth's DEFAULT --builder.deadline, which is
+            // runtime-configurable — this config cannot see the actual
+            // value, so a hard error here would reject valid deployments
+            // that raised the deadline (and could not catch ones that
+            // lowered it). Warn about the likely misconfiguration instead.
+            tracing::warn!(
+                target: "scroll::node::args",
+                payload_building_duration = self.sequencer_args.payload_building_duration,
+                "sequencer.payload-building-duration is at or above reth's default 12s \
+                 builder deadline; unless --builder.deadline was raised to match, every \
+                 remote-source build will lose its payload and expire into the retry path"
+            );
+        }
+
+        if let (true, Some(url)) =
+            (self.remote_block_source_args.enabled, self.remote_block_source_args.url.as_ref())
+        {
+            // reqwest::Url happily parses ws:// or file://; the HTTP
+            // transport would then fail every poll forever behind a
+            // healthy-looking launch.
+            if url.scheme() != "http" && url.scheme() != "https" {
+                return Err(format!(
+                    "remote-source.url must use http or https (got '{}')",
+                    url.scheme()
+                ));
+            }
+            // Warn (do not reject) on PLAINTEXT http to a non-loopback host:
+            // remote-source imports bypass consensus/signer validation
+            // (import_chain never calls consensus.validate_new_block) and can
+            // now drive an administrative head rewind, so a MITM on the wire
+            // could steer this node's head. https, or a loopback dev remote, is
+            // fine.
+            if url.scheme() == "http" {
+                let host = url.host_str().unwrap_or_default();
+                // Classify by the PARSED address, not a string prefix: a prefix
+                // check treats DNS names like `127.rpc.example` as loopback even
+                // though they resolve to arbitrary addresses, silencing the very
+                // warning that matters. `host_str()` brackets IPv6 literals, so
+                // strip those before parsing; only the exact `localhost` name is
+                // exempt among domains.
+                let host_ip =
+                    host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host);
+                let loopback = match host_ip.parse::<std::net::IpAddr>() {
+                    Ok(ip) => ip.is_loopback(),
+                    Err(_) => host.eq_ignore_ascii_case("localhost"),
+                };
+                if !loopback {
+                    tracing::warn!(
+                        target: "scroll::node::args",
+                        host,
+                        "remote-source.url is plaintext http to a non-loopback host; remote-source imports bypass consensus/signer validation and can rewind the local head — prefer https"
+                    );
+                }
+            }
+        }
+
+        if self.remote_block_source_args.enabled &&
+            self.remote_block_source_args.poll_interval_ms == 0
+        {
+            return Err("remote-source.poll-interval-ms must be greater than 0".to_string());
+        }
+
+        if self.remote_block_source_args.enabled &&
+            self.sequencer_args.sequencer_enabled &&
+            self.sequencer_args.auto_start
+        {
+            // Two reasons, and NEITHER is gated on `remote-source.build`.
+            // With `build`, the remote source attributes build outcomes to its
+            // own requests (see RemoteBlockSourceAddOn::await_build_outcome),
+            // which is only sound when it is the sole build requester. Without
+            // it the sequencer's block timer still runs, so the node builds,
+            // signs and gossips a local block every block_time while the remote
+            // source imports the real sequencer's chain over RPC, and each
+            // import reorgs the local block out — a fork originating from a node
+            // the operator configured as a read-only mirror.
+            //
+            // Gated on `sequencer_enabled` because `build()` only constructs a
+            // Sequencer when it is set: without one there is no timer and no
+            // second producer, so `auto-start` starts nothing. Rejecting it
+            // anyway would break the templated fleet layout the adjacent warn
+            // arm explicitly blesses — one flag set, toggled per role.
+            return Err("sequencer.auto-start conflicts with remote-source.enabled on a node with \
+                 sequencer.enabled: the remote block source must be the only block producer"
+                .to_string());
+        }
+
+        // Without an L1 provider the L1 watcher is never constructed, and the
+        // handle is unwrapped unconditionally at startup — a release build
+        // aborts naming nothing the operator typed. The test-utils fallback that
+        // hides this in every in-process test is not compiled into the shipped
+        // binary (no default features; the Dockerfile builds --release).
+        //
+        // Last, so a config violating several rules reports the specific one.
+        //
+        // The --test exemption is itself gated on the feature: the fallback
+        // watcher only exists under cfg(feature = "test-utils"), so in the
+        // shipped binary --test without an L1 URL reaches the very same
+        // unwrap. Exempting it unconditionally would just move the panic.
+        // Keyed ONLY on the cfg, exactly like the mock-watcher fallback it guards:
+        // `scroll-debug` sets `test = false` with no URL, so an extra
+        // `&& test_args.test` here panics those subcommands at startup — and
+        // `debug_toolkit` has no tests, so CI would stay green.
+        let l1_optional = cfg!(feature = "test-utils");
+        if self.l1_provider_args.url.is_none() && !l1_optional {
+            return Err("l1.url is required: without it the L1 watcher is never started".to_string());
+        }
+
+        // Supplying the URL is not enough under `--test`: the watcher is skipped
+        // whenever `--test` is set without an anvil provider, so on a build
+        // without the test-utils fallback the node passes validation and then
+        // panics on the unwrapped handle — naming nothing the operator typed.
+        // Additive, so the rule above and its tests are untouched.
+        if !cfg!(feature = "test-utils") &&
+            self.test_args.test &&
+            self.blob_provider_args.anvil_url.is_none()
+        {
+            return Err(
+                "--test disables the L1 watcher and this build has no test-utils fallback: drop --test, set --blob.anvil_url, or rebuild with --features test-utils"
+                    .to_string(),
+            );
+        }
         Ok(())
     }
 
@@ -345,22 +509,88 @@ impl ScrollRollupNodeConfig {
             )
             .await
             .expect("failed to perform migration (custom chain)");
+        }
 
-            // insert the custom chain genesis hash into the database
-            let genesis_hash = chain_spec.genesis_hash();
-            db.insert_genesis_block(genesis_hash)
-                .await
-                .expect("failed to insert genesis block (custom chain)");
-
-            tracing::info!(target: "scroll::node::args", ?genesis_hash, "Overwriting genesis hash for custom chain");
+        // The static migrations seed a FIXED genesis row (the dev migration
+        // seeds upstream Scroll's dev genesis) which may not match this
+        // chain's actual genesis — and insert_genesis_block cannot overwrite
+        // it, because its conflict key includes the hash. A stale row shadows
+        // the real genesis nondeterministically in highest-block queries (the
+        // safe head reported by get_latest_safe_l2_info among them).
+        //
+        // The SAME source the forkchoice state uses: hardcoded constants for
+        // the named Scroll chains, and `chain_spec.genesis_hash()` otherwise —
+        // which returns the SEALED hash when a spec carries one, and recomputes
+        // only when it does not. NOT `genesis_header().hash_slow()`: that always
+        // recomputes, and chikyu's genesis document is byte-identical to
+        // mainnet's in every field the header is built from, so recomputing
+        // yields MAINNET's hash for chikyu and bricks the chain at startup.
+        //
+        // This is deliberately NOT the genesis the migration seeds — for dev and
+        // every custom chain the migration writes a different value, which is
+        // why `seeded_genesis` is threaded separately below.
+        let genesis_hash = genesis_hash_from_chain_spec(chain_spec.clone())
+            .unwrap_or_else(|| chain_spec.genesis_hash());
+        // One transaction for the whole reconciliation, so a crash mid-way
+        // cannot leave l2_block empty and panic the genesis expectation on the
+        // next query. `reconcile_genesis_block` carries the fresh-vs-populated
+        // rules and the legacy-duplicate handling. Called on `db` rather than
+        // inside a `tx_mut` closure: the Database impl already wraps it in the
+        // same transaction AND records the operation metric, which a hand-rolled
+        // `tx_mut` here would bypass.
+        // The genesis the static migration above actually seeded, which is NOT
+        // always `genesis_hash`: the dev migration hardcodes upstream Scroll's
+        // dev genesis while the chain spec computes DogeOS's. A database
+        // written before this reconciliation existed carries only that seed, so
+        // the reconciliation has to recognise it as a row THIS node wrote
+        // rather than another chain's data.
+        let seeded_genesis = match chain_spec.chain().named() {
+            Some(NamedChain::Scroll) => ScrollMainnetMigrationInfo::genesis_hash(),
+            Some(NamedChain::ScrollSepolia) => ScrollSepoliaMigrationInfo::genesis_hash(),
+            // Dev, and every custom chain (which reuses the dev migration).
+            _ => ScrollDevMigrationInfo::genesis_hash(),
+        };
+        // `map_err` rather than `expect`: the genesis errors carry actionable
+        // Display text ("is the database path pointed at another chain's
+        // data?") that a Debug-formatted panic would discard.
+        let removed = db
+            .reconcile_genesis_block(genesis_hash, seeded_genesis)
+            .await
+            .map_err(|err| eyre::eyre!("failed to reconcile the genesis block: {err}"))?;
+        if removed > 0 {
+            tracing::warn!(
+                target: "scroll::node::args",
+                removed,
+                ?genesis_hash,
+                "Removed a stale seeded genesis row that did not match the chain genesis"
+            );
         }
 
         let chain_spec_fcs = || {
             ForkchoiceState::head_from_chain_spec(chain_spec.clone())
                 .expect("failed to derive forkchoice state from chain spec")
         };
-        let mut fcs =
-            ForkchoiceState::from_provider(&l2_provider).await.unwrap_or_else(chain_spec_fcs);
+        // `from_provider` returns None on any of three swallowed RPC reads or on
+        // an internally inconsistent snapshot (finalized above latest), and
+        // the genesis fallback then sets head = safe = finalized = 0. Every
+        // safe/finalized guard downstream is vacuous in that state — the
+        // peer-block safe-head reorg refusals, the L1-reorg finalized floor and
+        // the administrative unwind's symmetric check all compare against 0 —
+        // so a transient hiccup must at least be visible.
+        let mut provider_fcs_missing = false;
+        let mut fcs = match ForkchoiceState::from_provider(&l2_provider).await {
+            Some(fcs) => fcs,
+            None => {
+                provider_fcs_missing = true;
+                tracing::warn!(
+                    target: "scroll::node::args",
+                    "Could not read the forkchoice state from the L2 provider; falling back to \
+                     the chain spec genesis. Safe and finalized start at 0 until the first \
+                     finalized notification."
+                );
+                chain_spec_fcs()
+            }
+        };
 
         let (l1_block_startup_info, mut l2_head_block_number) = db
             .tx_mut(move |tx| async move {
@@ -374,6 +604,20 @@ impl ScrollRollupNodeConfig {
                 Ok::<_, DatabaseError>((l1_block_startup_info, l2_head_block_number))
             })
             .await?;
+
+        // A genesis mirror on a POPULATED database is not a transient read
+        // failure this node can run through: head/safe/finalized would all sit
+        // at 0 while the database knows a head above it, leaving every
+        // safe-and-finalized guard vacuous for as long as it takes a finalized
+        // notification to arrive. Refuse instead of starting in that state.
+        if let Some(refusal) = startup_refusal(
+            l2_head_block_number,
+            provider_fcs_missing,
+            fcs.is_genesis(),
+            fcs.finalized_block_info().number,
+        ) {
+            eyre::bail!("{refusal}");
+        }
 
         // Loop to find the latest block that we have in the EN and purge L1 message mappings to
         // account for the startup block
@@ -394,7 +638,27 @@ impl ScrollRollupNodeConfig {
             {
                 tracing::info!(target: "scroll::node::args", ?l2_head_block_number, "Found L2 head block in EN");
                 let block_info: BlockInfo = (&block).into();
-                fcs.update(Some(block_info), None, None)?;
+                // A stale safe marker ABOVE the head we are resuming from is
+                // exactly what a crash between an unwind's database commit and
+                // its FCU leaves behind. Propagating the resulting
+                // `HeadBelowSafe` would fail this startup and every one after
+                // it, since nothing else lowers the engine's marker. Drag safe
+                // down to the head instead — the same rule the runtime reorg
+                // and admin-unwind paths already apply. `finalized` needs no
+                // clamp: the loop condition guarantees it is at or below this
+                // block.
+                if fcs.safe_block_info().number > block_info.number {
+                    tracing::warn!(
+                        target: "scroll::node::args",
+                        safe = ?fcs.safe_block_info(),
+                        ?block_info,
+                        "Engine safe marker sits above the resumed L2 head; clamping it down \
+                         (an unwind's forkchoice update was likely lost to a crash)"
+                    );
+                    fcs = ForkchoiceState::new(block_info, block_info, *fcs.finalized_block_info());
+                } else {
+                    fcs.update(Some(block_info), None, None)?;
+                }
                 db.tx_mut(move |tx| async move {
                     tx.set_l2_head_block_number(l2_head_block_number).await?;
                     tx.purge_l1_message_to_l2_block_mappings(Some(l2_head_block_number + 1)).await
@@ -701,6 +965,11 @@ pub struct ChainOrchestratorArgs {
     #[arg(long = "chain.optimistic-sync-trigger", default_value_t = constants::BLOCK_GAP_TRIGGER)]
     pub optimistic_sync_trigger: u64,
     /// The size of the in-memory chain buffer used by the chain orchestrator.
+    /// NOTE: currently inert. `ChainOrchestratorConfig` has no corresponding
+    /// field and nothing outside the test utilities reads this, so setting it
+    /// changes no behaviour. Kept because it ships in the CLI; wire it to the
+    /// orchestrator's buffer or remove it deliberately, but do not document it
+    /// as a memory tunable until then.
     #[arg(long = "chain.chain-buffer-size", default_value_t = constants::CHAIN_BUFFER_SIZE)]
     pub chain_buffer_size: usize,
 }
@@ -715,7 +984,7 @@ impl Default for ChainOrchestratorArgs {
 }
 
 /// The network arguments.
-#[derive(Debug, Clone, clap::Args)]
+#[derive(Clone, clap::Args)]
 pub struct RollupNodeNetworkArgs {
     /// A bool to represent if new blocks should be bridged from the eth wire protocol to the
     /// scroll wire protocol.
@@ -774,8 +1043,157 @@ impl RollupNodeNetworkArgs {
     }
 }
 
+// Hand-written `Debug` for every argument group that can carry a secret.
+//
+// `build()` logs the whole config at INFO with `{:#?}` on every launch, and
+// `url::Url`'s own `Debug` prints userinfo, path and query verbatim — so a
+// derived impl emits the L1 provider's API key (the book's own example is an
+// Alchemy URL with the key in the path), the remote source's credentials, the
+// blob provider's signed URL and the KMS key id. That defeats the redaction the
+// remote source applies to its error logs. Host and port only, and presence
+// rather than value for everything else.
+
+fn debug_url(url: Option<&reqwest::Url>) -> String {
+    match url {
+        Some(url) => format!(
+            "{}://{}:{}",
+            url.scheme(),
+            url.host_str().unwrap_or("<none>"),
+            url.port_or_known_default().unwrap_or(0)
+        ),
+        None => "<unset>".to_string(),
+    }
+}
+
+impl std::fmt::Debug for L1ProviderArgs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("L1ProviderArgs")
+            .field("url", &debug_url(self.url.as_ref()))
+            .field("compute_units_per_second", &self.compute_units_per_second)
+            .field("max_retries", &self.max_retries)
+            .field("initial_backoff", &self.initial_backoff)
+            .field("logs_query_block_range", &self.logs_query_block_range)
+            .field("cache_max_items", &self.cache_max_items)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for BlobProviderArgs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BlobProviderArgs")
+            .field("beacon_node_urls_set", &self.beacon_node_urls.is_some())
+            .field("s3_url", &debug_url(self.s3_url.as_ref()))
+            .field("anvil_url", &debug_url(self.anvil_url.as_ref()))
+            .field("compute_units_per_second", &self.compute_units_per_second)
+            .field("max_retries", &self.max_retries)
+            .field("initial_backoff", &self.initial_backoff)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for SignerArgs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SignerArgs")
+            .field("key_file_set", &self.key_file.is_some())
+            .field("aws_kms_key_id_set", &self.aws_kms_key_id.is_some())
+            .field("private_key_set", &self.private_key.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for RemoteBlockSourceArgs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RemoteBlockSourceArgs")
+            .field("enabled", &self.enabled)
+            .field("url", &debug_url(self.url.as_ref()))
+            .field("poll_interval_ms", &self.poll_interval_ms)
+            .field("build", &self.build)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for RollupNodeNetworkArgs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `sequencer_url` is a plain String and prints verbatim, so a follower
+        // configured with credentials in it would emit them to stdout through
+        // the config dump at startup. Same reason as the other four groups.
+        f.debug_struct("RollupNodeNetworkArgs")
+            .field("enable_eth_scroll_wire_bridge", &self.enable_eth_scroll_wire_bridge)
+            .field("enable_scroll_wire", &self.enable_scroll_wire)
+            .field(
+                "sequencer_url",
+                &self
+                    .sequencer_url
+                    .as_deref()
+                    .and_then(|url| url.parse::<reqwest::Url>().ok())
+                    .as_ref()
+                    .map_or_else(|| "<unset>".to_string(), |url| debug_url(Some(url))),
+            )
+            .field("signer_address", &self.signer_address)
+            .field("legacy_geth_header_transform", &self.legacy_geth_header_transform)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Why this node must refuse to start, or `None` when it may proceed.
+///
+/// Extracted and table-tested because the predicate is one token wide in several places and this
+/// branch has been corrected repeatedly — flipping the final `<` to `<=` refuses every node whose
+/// anchor sits exactly at finality, and nothing else in the suite would notice.
+///
+/// - `provider_fcs_missing`: no usable forkchoice state could be read at all.
+/// - `fcs_is_genesis`: the provider answered, but from genesis.
+/// - all three refusals apply only when the database already knows a head above genesis; a fresh
+///   database must still bootstrap.
+fn startup_refusal(
+    l2_head_block_number: u64,
+    provider_fcs_missing: bool,
+    fcs_is_genesis: bool,
+    finalized: u64,
+) -> Option<String> {
+    if l2_head_block_number == 0 {
+        return None;
+    }
+    // Both hypotheses in one message: a wiped or resynced execution-node datadir makes reth answer
+    // `null` for the safe and finalized tags, so it lands HERE rather than in the genesis arm, and
+    // naming only reachability sends the operator after the wrong thing.
+    if provider_fcs_missing {
+        return Some(format!(
+            "could not read a usable forkchoice state from the L2 provider while the database \
+             holds an L2 head at {l2_head_block_number}; refusing to start with head, safe and \
+             finalized all at genesis. Either the execution node is unreachable or not yet \
+             synced, or its datadir was wiped or resynced while the rollup database was kept \
+             (resync both, or point at the matching execution-node datadir)"
+        ));
+    }
+    if fcs_is_genesis {
+        return Some(format!(
+            "the L2 provider is at genesis while the database holds an L2 head at \
+             {l2_head_block_number}; the execution node's datadir looks wiped or resynced while \
+             the rollup database was kept (resync both, or point at the matching execution-node \
+             datadir)"
+        ));
+    }
+    // The database anchor BELOW the engine's finalized block is the state the run loop calls
+    // irreconcilable and fail-stops on, because `unwind()` commits the rewound head durably BEFORE
+    // those checks fire. Nothing used to refuse it here: the repair loop is gated
+    // `while l2_head > finalized`, false in exactly this shape, so the node came up with the engine
+    // head above the anchor and the mappings above it already purged — and the next build
+    // re-selected consumed messages into a queue gap every peer rejects.
+    //
+    // Strict `<`: an anchor exactly AT finality is the ordinary steady state and must launch.
+    if l2_head_block_number < finalized {
+        return Some(format!(
+            "the database L2 head {l2_head_block_number} is below the execution node's finalized \
+             block {finalized}; an unwind committed past finality and this cannot be reconciled \
+             automatically (restore the database from before the unwind, or resync this node)"
+        ));
+    }
+    None
+}
+
 /// The arguments for the L1 provider.
-#[derive(Debug, Clone, clap::Args)]
+#[derive(Clone, clap::Args)]
 pub struct L1ProviderArgs {
     /// The URL for the L1 RPC.
     #[arg(long = "l1.url", id = "l1_url", value_name = "L1_URL")]
@@ -820,7 +1238,7 @@ impl Default for L1ProviderArgs {
 }
 
 /// The arguments for the Beacon provider.
-#[derive(Debug, Default, Clone, clap::Args)]
+#[derive(Default, Clone, clap::Args)]
 pub struct BlobProviderArgs {
     /// The URLs for the beacon node blob provider.
     #[arg(
@@ -896,7 +1314,7 @@ pub struct SequencerArgs {
 }
 
 /// The arguments for the signer.
-#[derive(Debug, Default, Clone, clap::Args)]
+#[derive(Default, Clone, clap::Args)]
 pub struct SignerArgs {
     /// Path to the file containing the signer's private key
     #[arg(
@@ -915,6 +1333,10 @@ pub struct SignerArgs {
     pub aws_kms_key_id: Option<String>,
 
     /// The private key signer, if any.
+    /// `skip`, not a positional: without this clap derives one from the field,
+    /// and a raw hex signing key on argv lands in `ps`, `/proc/<pid>/cmdline`
+    /// and shell history. Both siblings are explicitly namespaced flags.
+    #[arg(skip)]
     pub private_key: Option<PrivateKeySigner>,
 }
 
@@ -998,7 +1420,6 @@ impl SignerArgs {
 #[derive(Debug, Default, Clone, clap::Args)]
 pub struct RollupNodeGasPriceOracleArgs {
     /// Minimum suggested priority fee (tip) in wei, default `100`
-    #[arg(long, default_value_t = 100)]
     #[arg(long = "gpo.default-suggest-priority-fee", id = "default_suggest_priority_fee", value_name = "DEFAULT_SUGGEST_PRIORITY_FEE", default_value_t = constants::DEFAULT_SUGGEST_PRIORITY_FEE)]
     pub default_suggested_priority_fee: u64,
 }
@@ -1038,7 +1459,7 @@ impl Default for PprofArgs {
 }
 
 /// The arguments for the remote block source.
-#[derive(Debug, Default, Clone, clap::Args)]
+#[derive(Default, Clone, clap::Args)]
 pub struct RemoteBlockSourceArgs {
     /// Enable the remote block source feature
     #[arg(long = "remote-source.enabled", default_value_t = false)]
@@ -1048,7 +1469,7 @@ pub struct RemoteBlockSourceArgs {
     #[arg(long = "remote-source.url", id = "remote_source_url", value_name = "URL")]
     pub url: Option<reqwest::Url>,
 
-    /// Polling interval in milliseconds (when already synced)
+    /// Polling interval in milliseconds (between polls; catch-up runs inside a single tick)
     #[arg(
         long = "remote-source.poll-interval-ms",
         default_value_t = 100,
@@ -1084,6 +1505,70 @@ mod tests {
     use super::*;
     use clap::Parser;
     use std::path::PathBuf;
+
+    /// The startup genesis reconciliation compares the chain spec's genesis
+    /// against the height-0 rows, so it depends on knowing which genesis the
+    /// static migration seeded — and that is NOT the same value. The dev
+    /// migration hardcodes upstream Scroll's dev genesis while every spec
+    /// shipped here computes its own, so a database written before this
+    /// reconciliation existed carries a height-0 row it must recognise as its
+    /// own rather than reject as another chain's data.
+    ///
+    /// This pins the mapping `build()` relies on: which migration each shipped
+    /// spec routes to, and that the seed really does differ from the spec's
+    /// genesis. `build()` runs `named.migrate()` for `Some(named)` and the dev
+    /// migration otherwise, so all three shipped specs seed through
+    /// `ScrollDevMigrationInfo` today. Naming mainnet or chikyu later would
+    /// route it onto a different seed, and this test is what should fail then.
+    #[test]
+    fn genesis_seed_pairing_holds_for_shipped_chain_specs() {
+        use dogeos_chainspec::{DOGEOS_CHIKYU, DOGEOS_DEV, DOGEOS_MAINNET};
+        use reth_chainspec::EthChainSpec;
+
+        for (name, chain_spec, expected_named) in [
+            ("mainnet", DOGEOS_MAINNET.clone(), None),
+            ("chikyu", DOGEOS_CHIKYU.clone(), None),
+            ("dev", DOGEOS_DEV.clone(), Some(NamedChain::Dev)),
+        ] {
+            assert_eq!(
+                chain_spec.chain().named(),
+                expected_named,
+                "{name} changed chain identity; re-check which migration build() routes it to \
+                 and which genesis that migration seeds"
+            );
+            // Every arm above falls through build()'s `_` case.
+            let seeded_genesis = match chain_spec.chain().named() {
+                Some(NamedChain::Scroll) => ScrollMainnetMigrationInfo::genesis_hash(),
+                Some(NamedChain::ScrollSepolia) => ScrollSepoliaMigrationInfo::genesis_hash(),
+                _ => ScrollDevMigrationInfo::genesis_hash(),
+            };
+            assert_eq!(
+                seeded_genesis,
+                ScrollDevMigrationInfo::genesis_hash(),
+                "{name} is expected to be seeded by the dev migration"
+            );
+            // THE load-bearing assertion, and the one the first version of this
+            // test missed. It compared against the migration seed only, which
+            // passed for chikyu for the wrong reason: the recomputed header
+            // hash was MAINNET's genesis, unequal to the seed but also unequal
+            // to chikyu's own sealed genesis. `genesis_hash()` returns the
+            // sealed value when a spec carries one, and that is what the EL
+            // stores at block 0, so the reconciliation must agree with it.
+            assert_eq!(
+                genesis_hash_from_chain_spec(chain_spec.clone()),
+                Some(chain_spec.genesis_hash()),
+                "{name}'s forkchoice genesis must be the chain spec's own genesis; a recomputed \
+                 header hash diverges from the sealed one and bricks the chain at startup"
+            );
+            assert_ne!(
+                genesis_hash_from_chain_spec(chain_spec.clone()),
+                Some(seeded_genesis),
+                "{name}'s genesis unexpectedly EQUALS the migration seed; if the two sources \
+                 have converged, reconcile_genesis_block no longer needs the seed threaded \
+                 through and this expectation should be revisited"
+            );
+        }
+    }
 
     #[derive(Debug, Parser)]
     struct ConsensusCli {
@@ -1239,7 +1724,12 @@ mod tests {
             database_args: RollupNodeDatabaseArgs::default(),
             engine_driver_args: EngineDriverArgs::default(),
             chain_orchestrator_args: ChainOrchestratorArgs::default(),
-            l1_provider_args: L1ProviderArgs::default(),
+            l1_provider_args: L1ProviderArgs {
+                // validate() requires an L1 provider: without one the L1 watcher
+                // is never built and startup aborts.
+                url: Some("http://localhost:8545".parse().unwrap()),
+                ..Default::default()
+            },
             blob_provider_args: BlobProviderArgs::default(),
             network_args: RollupNodeNetworkArgs::default(),
             gas_price_oracle_args: RollupNodeGasPriceOracleArgs::default(),
@@ -1271,7 +1761,12 @@ mod tests {
             database_args: RollupNodeDatabaseArgs::default(),
             engine_driver_args: EngineDriverArgs::default(),
             chain_orchestrator_args: ChainOrchestratorArgs::default(),
-            l1_provider_args: L1ProviderArgs::default(),
+            l1_provider_args: L1ProviderArgs {
+                // validate() requires an L1 provider: without one the L1 watcher
+                // is never built and startup aborts.
+                url: Some("http://localhost:8545".parse().unwrap()),
+                ..Default::default()
+            },
             blob_provider_args: BlobProviderArgs::default(),
             network_args: RollupNodeNetworkArgs::default(),
             gas_price_oracle_args: RollupNodeGasPriceOracleArgs::default(),
@@ -1296,6 +1791,265 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_remote_source_build_without_sequencer_fails() {
+        let config = ScrollRollupNodeConfig {
+            test_args: TestArgs::default(),
+            sequencer_args: SequencerArgs { sequencer_enabled: false, ..Default::default() },
+            signer_args: SignerArgs::default(),
+            database_args: RollupNodeDatabaseArgs::default(),
+            engine_driver_args: EngineDriverArgs::default(),
+            chain_orchestrator_args: ChainOrchestratorArgs::default(),
+            l1_provider_args: L1ProviderArgs {
+                // validate() requires an L1 provider: without one the L1 watcher
+                // is never built and startup aborts.
+                url: Some("http://localhost:8545".parse().unwrap()),
+                ..Default::default()
+            },
+            blob_provider_args: BlobProviderArgs::default(),
+            network_args: RollupNodeNetworkArgs::default(),
+            gas_price_oracle_args: RollupNodeGasPriceOracleArgs::default(),
+            consensus_args: ConsensusArgs::noop(),
+            database: None,
+            rpc_args: RpcArgs::default(),
+            pprof_args: PprofArgs::default(),
+            remote_block_source_args: RemoteBlockSourceArgs {
+                enabled: true,
+                url: Some("http://localhost:8545".parse().unwrap()),
+                poll_interval_ms: 100,
+                build: true,
+            },
+            require_l1_data_fee_buffer: false,
+        };
+
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("remote-source.build requires sequencer.enabled"));
+    }
+
+    /// `sequencer.auto-start` conflicts with the remote source whether or not
+    /// `remote-source.build` is set: with it the remote source is no longer the
+    /// sole build requester, and without it the sequencer's own block timer
+    /// still produces local blocks that every remote import then reorgs out.
+    #[test]
+    fn test_validate_remote_source_with_auto_start_fails() {
+        for build in [true, false] {
+            let config = ScrollRollupNodeConfig {
+                test_args: TestArgs::default(),
+                sequencer_args: SequencerArgs {
+                    sequencer_enabled: true,
+                    auto_start: true,
+                    ..Default::default()
+                },
+                signer_args: SignerArgs::default(),
+                database_args: RollupNodeDatabaseArgs::default(),
+                engine_driver_args: EngineDriverArgs::default(),
+                chain_orchestrator_args: ChainOrchestratorArgs::default(),
+                l1_provider_args: L1ProviderArgs {
+                    // validate() requires an L1 provider: without one the L1 watcher
+                    // is never built and startup aborts.
+                    url: Some("http://localhost:8545".parse().unwrap()),
+                    ..Default::default()
+                },
+                blob_provider_args: BlobProviderArgs::default(),
+                network_args: RollupNodeNetworkArgs::default(),
+                gas_price_oracle_args: RollupNodeGasPriceOracleArgs::default(),
+                consensus_args: ConsensusArgs::noop(),
+                database: None,
+                rpc_args: RpcArgs::default(),
+                pprof_args: PprofArgs::default(),
+                remote_block_source_args: RemoteBlockSourceArgs {
+                    enabled: true,
+                    url: Some("http://localhost:8545".parse().unwrap()),
+                    poll_interval_ms: 100,
+                    build,
+                },
+                require_l1_data_fee_buffer: false,
+            };
+
+            let result = config.validate();
+            assert!(result.is_err(), "build={build} must be rejected");
+            assert!(result
+                .unwrap_err()
+                .contains("sequencer.auto-start conflicts with remote-source.enabled"));
+        }
+    }
+
+    /// The startup refusals have been corrected repeatedly and had no coverage:
+    /// flipping the final `<` to `<=` refuses every node whose anchor sits
+    /// exactly at finality, and nothing else in the suite would notice.
+    #[test]
+    fn startup_refusal_table() {
+        // (l2_head, provider_missing, fcs_is_genesis, finalized) -> refuses?
+        let cases: &[(u64, bool, bool, u64, bool)] = &[
+            // A fresh database must bootstrap whatever the provider says.
+            (0, true, true, 0, false),
+            (0, false, true, 50, false),
+            // Populated, no usable forkchoice state.
+            (100, true, false, 0, true),
+            // Populated, provider answered from genesis.
+            (100, false, true, 0, true),
+            // Anchor below finality: an unwind committed past it.
+            (100, false, false, 140, true),
+            // BOUNDARY: an anchor exactly at finality is the steady state.
+            (100, false, false, 100, false),
+            // Anchor above finality is ordinary.
+            (100, false, false, 40, false),
+        ];
+        for (head, missing, genesis, finalized, want) in cases {
+            let got = startup_refusal(*head, *missing, *genesis, *finalized);
+            assert_eq!(
+                got.is_some(),
+                *want,
+                "startup_refusal({head}, {missing}, {genesis}, {finalized}) -> {got:?}"
+            );
+        }
+    }
+
+    /// The `l1.url` rule is otherwise untested: every other config in this
+    /// module sets a URL in order to SATISFY it, so deleting the rule would
+    /// leave the whole suite green. The second case pins the pass-52 gating —
+    /// note the unit lane builds `--all-features`, so `test-utils` is live here
+    /// and the exemption applies.
+    #[test]
+    fn test_validate_requires_l1_url() {
+        let mut config = rotation_watchdog_config();
+        config.consensus_args = ConsensusArgs::noop();
+        config.sequencer_args = SequencerArgs::default();
+        config.l1_provider_args = L1ProviderArgs::default();
+
+        // The exemption is keyed ONLY on the cfg, matching the mock-watcher
+        // fallback it guards — `scroll-debug` reaches that fallback with
+        // `test = false`. So on a build carrying test-utils (this one: the unit
+        // lane builds --all-features) the URL is optional either way, and on the
+        // shipped binary it is required either way.
+        for test in [false, true] {
+            config.test_args = TestArgs { test, skip_l1_synced: false };
+            let result = config.validate();
+            assert_eq!(result.is_ok(), cfg!(feature = "test-utils"), "test={test}: {result:?}");
+            if let Err(err) = result {
+                assert!(err.contains("l1.url is required"), "{err}");
+            }
+        }
+    }
+
+    /// The mirror image: without `sequencer.enabled` no Sequencer is built, so
+    /// `auto-start` starts nothing and the pair is inert. A templated fleet
+    /// layout that sets it for every role must stay valid on the read-only
+    /// followers — the same shape the adjacent warn arm blesses.
+    #[test]
+    fn test_validate_remote_source_with_inert_auto_start_is_accepted() {
+        let config = ScrollRollupNodeConfig {
+            test_args: TestArgs::default(),
+            sequencer_args: SequencerArgs {
+                sequencer_enabled: false,
+                auto_start: true,
+                ..Default::default()
+            },
+            signer_args: SignerArgs::default(),
+            database_args: RollupNodeDatabaseArgs::default(),
+            engine_driver_args: EngineDriverArgs::default(),
+            chain_orchestrator_args: ChainOrchestratorArgs::default(),
+            l1_provider_args: L1ProviderArgs {
+                // validate() now requires an L1 provider: without one the L1
+                // watcher is never built and startup aborts.
+                url: Some("http://localhost:8545".parse().unwrap()),
+                ..Default::default()
+            },
+            blob_provider_args: BlobProviderArgs::default(),
+            network_args: RollupNodeNetworkArgs::default(),
+            gas_price_oracle_args: RollupNodeGasPriceOracleArgs::default(),
+            consensus_args: ConsensusArgs::noop(),
+            database: None,
+            rpc_args: RpcArgs::default(),
+            pprof_args: PprofArgs::default(),
+            remote_block_source_args: RemoteBlockSourceArgs {
+                enabled: true,
+                url: Some("http://localhost:8545".parse().unwrap()),
+                poll_interval_ms: 100,
+                build: false,
+            },
+            require_l1_data_fee_buffer: false,
+        };
+
+        assert!(config.validate().is_ok(), "an inert auto-start must not block a read-only mirror");
+    }
+
+    #[test]
+    fn test_validate_remote_source_zero_poll_interval_fails() {
+        let config = ScrollRollupNodeConfig {
+            test_args: TestArgs::default(),
+            sequencer_args: SequencerArgs { sequencer_enabled: true, ..Default::default() },
+            signer_args: SignerArgs::default(),
+            database_args: RollupNodeDatabaseArgs::default(),
+            engine_driver_args: EngineDriverArgs::default(),
+            chain_orchestrator_args: ChainOrchestratorArgs::default(),
+            l1_provider_args: L1ProviderArgs {
+                // validate() requires an L1 provider: without one the L1 watcher
+                // is never built and startup aborts.
+                url: Some("http://localhost:8545".parse().unwrap()),
+                ..Default::default()
+            },
+            blob_provider_args: BlobProviderArgs::default(),
+            network_args: RollupNodeNetworkArgs::default(),
+            gas_price_oracle_args: RollupNodeGasPriceOracleArgs::default(),
+            consensus_args: ConsensusArgs::noop(),
+            database: None,
+            rpc_args: RpcArgs::default(),
+            pprof_args: PprofArgs::default(),
+            remote_block_source_args: RemoteBlockSourceArgs {
+                enabled: true,
+                url: Some("http://localhost:8545".parse().unwrap()),
+                poll_interval_ms: 0,
+                build: true,
+            },
+            require_l1_data_fee_buffer: false,
+        };
+
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("remote-source.poll-interval-ms must be greater than 0"), "{err}");
+    }
+
+    #[test]
+    fn test_validate_remote_source_non_http_scheme_fails() {
+        let mut config = ScrollRollupNodeConfig {
+            test_args: TestArgs::default(),
+            sequencer_args: SequencerArgs { sequencer_enabled: true, ..Default::default() },
+            signer_args: SignerArgs::default(),
+            database_args: RollupNodeDatabaseArgs::default(),
+            engine_driver_args: EngineDriverArgs::default(),
+            chain_orchestrator_args: ChainOrchestratorArgs::default(),
+            l1_provider_args: L1ProviderArgs {
+                // validate() requires an L1 provider: without one the L1 watcher
+                // is never built and startup aborts.
+                url: Some("http://localhost:8545".parse().unwrap()),
+                ..Default::default()
+            },
+            blob_provider_args: BlobProviderArgs::default(),
+            network_args: RollupNodeNetworkArgs::default(),
+            gas_price_oracle_args: RollupNodeGasPriceOracleArgs::default(),
+            consensus_args: ConsensusArgs::noop(),
+            database: None,
+            rpc_args: RpcArgs::default(),
+            pprof_args: PprofArgs::default(),
+            remote_block_source_args: RemoteBlockSourceArgs {
+                enabled: true,
+                url: Some("ws://localhost:8545".parse().unwrap()),
+                poll_interval_ms: 100,
+                build: true,
+            },
+            require_l1_data_fee_buffer: false,
+        };
+
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("must use http or https"), "{err}");
+
+        // The same URL is ignored (warn only) when the add-on is disabled.
+        config.remote_block_source_args.enabled = false;
+        config.remote_block_source_args.build = false;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
     fn test_validate_sequencer_enabled_with_both_signers_fails() {
         let config = ScrollRollupNodeConfig {
             test_args: TestArgs::default(),
@@ -1308,7 +2062,12 @@ mod tests {
             database_args: RollupNodeDatabaseArgs::default(),
             engine_driver_args: EngineDriverArgs::default(),
             chain_orchestrator_args: ChainOrchestratorArgs::default(),
-            l1_provider_args: L1ProviderArgs::default(),
+            l1_provider_args: L1ProviderArgs {
+                // validate() requires an L1 provider: without one the L1 watcher
+                // is never built and startup aborts.
+                url: Some("http://localhost:8545".parse().unwrap()),
+                ..Default::default()
+            },
             blob_provider_args: BlobProviderArgs::default(),
             network_args: RollupNodeNetworkArgs::default(),
             gas_price_oracle_args: RollupNodeGasPriceOracleArgs::default(),
@@ -1342,7 +2101,12 @@ mod tests {
             database_args: RollupNodeDatabaseArgs::default(),
             chain_orchestrator_args: ChainOrchestratorArgs::default(),
             engine_driver_args: EngineDriverArgs::default(),
-            l1_provider_args: L1ProviderArgs::default(),
+            l1_provider_args: L1ProviderArgs {
+                // validate() requires an L1 provider: without one the L1 watcher
+                // is never built and startup aborts.
+                url: Some("http://localhost:8545".parse().unwrap()),
+                ..Default::default()
+            },
             blob_provider_args: BlobProviderArgs::default(),
             network_args: RollupNodeNetworkArgs::default(),
             gas_price_oracle_args: RollupNodeGasPriceOracleArgs::default(),
@@ -1370,7 +2134,12 @@ mod tests {
             database_args: RollupNodeDatabaseArgs::default(),
             engine_driver_args: EngineDriverArgs::default(),
             chain_orchestrator_args: ChainOrchestratorArgs::default(),
-            l1_provider_args: L1ProviderArgs::default(),
+            l1_provider_args: L1ProviderArgs {
+                // validate() now requires an L1 provider: without one the L1
+                // watcher is never built and startup aborts.
+                url: Some("http://localhost:8545".parse().unwrap()),
+                ..Default::default()
+            },
             blob_provider_args: BlobProviderArgs::default(),
             network_args: RollupNodeNetworkArgs::default(),
             gas_price_oracle_args: RollupNodeGasPriceOracleArgs::default(),
@@ -1394,7 +2163,12 @@ mod tests {
             database_args: RollupNodeDatabaseArgs::default(),
             engine_driver_args: EngineDriverArgs::default(),
             chain_orchestrator_args: ChainOrchestratorArgs::default(),
-            l1_provider_args: L1ProviderArgs::default(),
+            l1_provider_args: L1ProviderArgs {
+                // validate() now requires an L1 provider: without one the L1
+                // watcher is never built and startup aborts.
+                url: Some("http://localhost:8545".parse().unwrap()),
+                ..Default::default()
+            },
             blob_provider_args: BlobProviderArgs::default(),
             network_args: RollupNodeNetworkArgs::default(),
             gas_price_oracle_args: RollupNodeGasPriceOracleArgs::default(),

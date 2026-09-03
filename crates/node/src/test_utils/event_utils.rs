@@ -18,12 +18,13 @@ pub struct EventWaiter<'a> {
     fixture: &'a mut TestFixture,
     node_indices: Vec<usize>,
     timeout_duration: Duration,
+    label: Option<&'static str>,
 }
 
 impl<'a> EventWaiter<'a> {
     /// Create a new multi-node event waiter.
     pub const fn new(fixture: &'a mut TestFixture, node_indices: Vec<usize>) -> Self {
-        Self { fixture, node_indices, timeout_duration: Duration::from_secs(30) }
+        Self { fixture, node_indices, timeout_duration: Duration::from_secs(30), label: None }
     }
 
     /// Set a custom timeout for waiting.
@@ -32,17 +33,48 @@ impl<'a> EventWaiter<'a> {
         self
     }
 
+    /// Name what is being waited for, so a timeout says more than the event
+    /// enum's type name (predicate-based waits are otherwise anonymous).
+    pub const fn label(mut self, label: &'static str) -> Self {
+        self.label = Some(label);
+        self
+    }
+
     /// Wait for block sequenced event on all specified nodes.
     pub async fn block_sequenced(self, target: u64) -> eyre::Result<DogeosBlock> {
-        self.wait_for_event_on_all(|e| {
-            if let ChainOrchestratorEvent::BlockSequenced(block) = e {
-                (block.header.number == target).then(|| block.clone())
+        // Block numbers are normally monotone per node (absent a reorg): once a higher number is
+        // seen, the target can never arrive. Record any overshoot so a doomed wait
+        // fails with a diagnosis instead of a silent timeout (issue #38).
+        let overshoot = std::sync::atomic::AtomicU64::new(0);
+        let result = self
+            .wait_for_event_on_all(|e| {
+                if let ChainOrchestratorEvent::BlockSequenced(block) = e {
+                    if block.header.number > target {
+                        overshoot
+                            .fetch_max(block.header.number, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    (block.header.number == target).then(|| block.clone())
+                } else {
+                    None
+                }
+            })
+            .await;
+        // Wrap (never replace) the underlying error: the wait can also fail
+        // for unrelated reasons (node shutdown, stream ended), and in a
+        // multi-node wait the overshoot may have been seen on a different
+        // node than the one that failed.
+        result.map(|v| v.first().expect("should have block sequenced").clone()).map_err(|e| {
+            let seen = overshoot.load(std::sync::atomic::Ordering::Relaxed);
+            if seen > target {
+                e.wrap_err(format!(
+                    "while waiting for BlockSequenced({target}), BlockSequenced({seen}) was \
+                     observed on one of the waited nodes; absent a reorg, numbers only grow, so \
+                     if that node is the incomplete one the target likely can no longer arrive"
+                ))
             } else {
-                None
+                e
             }
         })
-        .await
-        .map(|v| v.first().expect("should have block sequenced").clone())
     }
 
     /// Wait for chain consolidated event on all specified nodes.
@@ -217,15 +249,27 @@ impl<'a> EventWaiter<'a> {
     }
 
     /// Wait for N events matching a predicate.
+    ///
+    /// NOTE: the timeout applies PER NODE (each node in turn gets the full
+    /// budget), unlike `wait_for_event_on_all`, which shares one budget
+    /// across nodes.
     pub async fn where_n_events(
         self,
         count: usize,
         mut predicate: impl FnMut(&ChainOrchestratorEvent) -> bool,
     ) -> eyre::Result<Vec<ChainOrchestratorEvent>> {
+        eyre::ensure!(count > 0, "where_n_events requires count > 0");
+        eyre::ensure!(
+            !self.node_indices.is_empty(),
+            "where_n_events requires at least one node (a follower waiter on a single-node \
+             fixture selects none, and an empty wait would succeed with zero matches)"
+        );
         let mut matched_events = Vec::new();
         for node in self.node_indices {
             let Some(node_handle) = &mut self.fixture.nodes[node] else {
-                continue; // Skip shutdown nodes
+                // Match wait_for_event_on_all: silently skipping a shut-down
+                // node could return success with zero matches.
+                return Err(eyre::eyre!("Node at index {node} has been shutdown"));
             };
             let events = &mut node_handle.chain_orchestrator_rx;
             let mut node_matched_events = Vec::new();
@@ -235,7 +279,11 @@ impl<'a> EventWaiter<'a> {
                     if predicate(&event) {
                         node_matched_events.push(event.clone());
                         if node_matched_events.len() >= count {
-                            return Ok(matched_events.clone());
+                            // The events live in node_matched_events; the
+                            // match arm below extends the accumulator with
+                            // them. Returning a value here would hand back
+                            // the previous node's list.
+                            return Ok(());
                         }
                     }
                 }
@@ -244,12 +292,17 @@ impl<'a> EventWaiter<'a> {
             .await;
 
             match result {
-                Ok(_) => matched_events = node_matched_events,
+                // Extend, not overwrite: a multi-node call must return every
+                // node's matches, not just the final node's.
+                Ok(Ok(())) => matched_events.extend(node_matched_events),
+                // The stream ending before `count` matches must not pass as
+                // success with a partial (or empty) result.
+                Ok(Err(e)) => return Err(e),
                 Err(_) => {
                     return Err(eyre::eyre!(
                         "Timeout waiting for {} events (matched {} so far)",
                         count,
-                        matched_events.len()
+                        node_matched_events.len()
                     ))
                 }
             }
@@ -278,8 +331,14 @@ impl<'a> EventWaiter<'a> {
         T: Send + Clone + 'static,
     {
         let timeout_duration = self.timeout_duration;
+        let waited_for = self.label.unwrap_or_else(|| std::any::type_name::<T>());
         let node_indices = self.node_indices;
         let node_count = node_indices.len();
+        eyre::ensure!(
+            node_count > 0,
+            "wait_for_event_on_all requires at least one node (an empty wait burns the full \
+             timeout and reports 0/0)"
+        );
 
         // Track which nodes have found their event
         let mut results: Vec<Option<T>> = vec![None; node_count];
@@ -287,6 +346,8 @@ impl<'a> EventWaiter<'a> {
 
         let result = timeout(timeout_duration, async {
             loop {
+                let mut drained_any = false;
+
                 // Poll each node's event stream
                 for (idx, &node_index) in node_indices.iter().enumerate() {
                     // Skip nodes that already found their event
@@ -299,8 +360,22 @@ impl<'a> EventWaiter<'a> {
                     })?;
                     let events = &mut node_handle.chain_orchestrator_rx;
 
-                    // Try to get the next event (non-blocking with try_next)
-                    if let Some(event) = events.next().now_or_never() {
+                    // Drain the events already available on this node, in
+                    // BOUNDED batches: under sustained traffic (automatic
+                    // sequencing) an always-ready stream would otherwise
+                    // never reach the yield below, starving the other nodes
+                    // and the enclosing timeout. The old one-event-per-10ms
+                    // drain cost latency (a ~100 events/s ceiling), not event
+                    // loss — the broadcast channel holds 5000 events
+                    // (issue #38).
+                    let mut batch = 0usize;
+                    // Bound BEFORE popping: now_or_never() consumes the event,
+                    // so a post-pop bound check would silently discard the
+                    // 257th ready event of a burst.
+                    while batch < 256 {
+                        let Some(event) = events.next().now_or_never() else { break };
+                        drained_any = true;
+                        batch += 1;
                         match event {
                             Some(event) => {
                                 if let Some(value) = extractor(&event) {
@@ -314,6 +389,8 @@ impl<'a> EventWaiter<'a> {
                                             .map(|r| r.unwrap())
                                             .collect::<Vec<T>>());
                                     }
+                                    // This node is done; move to the next node.
+                                    break;
                                 }
                             }
                             None => {
@@ -326,8 +403,16 @@ impl<'a> EventWaiter<'a> {
                     }
                 }
 
-                // Small delay to avoid busy waiting
-                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                // Only sleep when nothing was immediately available; still
+                // yield after a busy pass so the enclosing timeout can fire
+                // even under a continuous event stream.
+                // NOTE: this drain requires a LIVE clock; a start_paused
+                // test would hang here rather than time out.
+                if drained_any {
+                    tokio::task::yield_now().await;
+                } else {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                }
             }
         })
         .await;
@@ -336,7 +421,7 @@ impl<'a> EventWaiter<'a> {
             Err(eyre::eyre!(
                 "Timeout ({:.1}s) waiting for event '{}' on {} nodes (completed {}/{})",
                 timeout_duration.as_secs_f64(),
-                std::any::type_name::<T>(),
+                waited_for,
                 node_count,
                 completed,
                 node_count

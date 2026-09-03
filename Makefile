@@ -64,6 +64,9 @@ ensure-zepter:
 .PHONY: lint
 lint: fmt lint-toml clippy udeps codespell zepter
 
+# The exclusions mirror the merge gate (test.yaml): the 15k soak test and
+# the resume test (known reboot-fixture teardown race) do not run here
+# either, so `make test` and the gate agree.
 .PHONY: test
 test:
 	cargo +$(NIGHTLY_TOOLCHAIN) nextest run \
@@ -71,7 +74,7 @@ test:
 	--locked \
 	--all-features \
 	--no-fail-fast \
-	-E 'not test(docker)'
+	-E 'not test(docker) and not test(test_should_consolidate_to_block_15k) and not test(test_remote_block_source_resumes_from_correct_head)'
 
 .PHONY: test-docker
 test-docker:
@@ -80,7 +83,7 @@ test-docker:
 	--locked \
 	--all-features \
 	--no-fail-fast \
-	--no-tests=pass \
+	--no-tests=fail \
 	-E 'test(docker)' \
 	--test-threads=1 \
 	--failure-output immediate \

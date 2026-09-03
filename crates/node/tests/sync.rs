@@ -1,6 +1,6 @@
 //! Contains tests related to RN and EN sync.
 
-use alloy_primitives::{b256, Address, B256, U256};
+use alloy_primitives::{b256, Address, Signature, B256, U256};
 use dogeos_chainspec::{DOGEOS_CHIKYU, DOGEOS_DEV};
 use dogeos_protocol_types::TxL1Message;
 use futures::StreamExt;
@@ -27,12 +27,17 @@ use std::{path::PathBuf, sync::Arc};
 async fn test_should_consolidate_to_block_15k() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    // Prepare the config for a L1 consolidation.
-    let alchemy_key = if let Ok(key) = std::env::var("ALCHEMY_KEY") {
-        key
-    } else {
-        eprintln!("ALCHEMY_KEY environment variable is not set. Skipping test.");
-        return Ok(());
+    // Prepare the config for a L1 consolidation. GitHub Actions passes a
+    // missing secret as an EMPTY string, so treat empty as unset. NOTE: with
+    // sync.yaml dispatch-gated and test.yaml skipping this test, no CI lane
+    // reaches this guard today — it protects local runs until issue #43
+    // re-points the test at chikyu infrastructure.
+    let alchemy_key = match std::env::var("ALCHEMY_KEY") {
+        Ok(key) if !key.trim().is_empty() => key,
+        _ => {
+            eprintln!("ALCHEMY_KEY environment variable is not set or empty. Skipping test.");
+            return Ok(());
+        }
     };
 
     let node_config = ScrollRollupNodeConfig {
@@ -174,16 +179,21 @@ async fn test_should_trigger_pipeline_sync_for_execution_node() -> eyre::Result<
 
     // Verify the unsynced node syncs.
     let mut num = follower.get_block(0).await?.header.number;
-    let mut retries = 0;
 
-    loop {
-        if retries > 10 || num > OPTIMISTIC_SYNC_TRIGGER {
-            break
-        }
-        num = follower.get_block(0).await?.header.number;
+    // Wall-clock deadline consistent with the other waiters: a ~2s retry
+    // budget for a 101-block pipeline sync would flake on contended runners,
+    // and this assertion gates merges.
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(30);
+    while num <= OPTIMISTIC_SYNC_TRIGGER && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-        retries += 1;
+        num = follower.get_block(0).await?.header.number;
     }
+    // Exhausting the deadline must FAIL, not fall through into the
+    // >=-matched extension wait below with num still at 0.
+    eyre::ensure!(
+        num > OPTIMISTIC_SYNC_TRIGGER,
+        "EN did not pipeline-sync past the optimistic-sync trigger: follower head {num}"
+    );
 
     // Assert that the unsynced node triggers a chain extension on the optimistic chain.
     follower.expect_event().chain_extended(num).await?;
@@ -196,12 +206,19 @@ async fn test_should_trigger_pipeline_sync_for_execution_node() -> eyre::Result<
 async fn test_should_consolidate_after_optimistic_sync() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
+    // The sequencer starts with automatic sequencing DISABLED (no
+    // auto_start(true)): the setup loop below drives manual build_block()
+    // calls with exact expected block numbers, and the 20ms build timer raced
+    // those on slow runners — a timer-built block claimed the expected number,
+    // its event was consumed by an interleaved waiter, and the exact-number
+    // wait hung for 30s (issue #38). Automatic sequencing is enabled after the
+    // loop, where the sync/consolidation phase relies on its continuous block
+    // stream and no assertion depends on exact numbers.
     let mut sequencer = TestFixture::builder()
         .sequencer()
         .with_memory_db()
         .with_eth_scroll_bridge(true)
         .with_scroll_wire(true)
-        .auto_start(true)
         .block_time(20)
         .with_l1_message_delay(0)
         .allow_empty_blocks(true)
@@ -250,6 +267,16 @@ async fn test_should_consolidate_after_optimistic_sync() -> eyre::Result<()> {
         sequencer.build_block().expect_block_number((i + 1) as u64).build_and_await_block().await?;
     }
 
+    // The exact-number assertions are done; from here the test needs a
+    // continuous stream of sequenced blocks (to trigger the follower's
+    // optimistic sync and later its consolidation), so enable the automatic
+    // build timer now. The command returns false when no sequencer is
+    // configured, which would surface much later as an unrelated timeout.
+    eyre::ensure!(
+        sequencer.sequencer().rollup_manager_handle.enable_automatic_sequencing().await?,
+        "automatic sequencing was not enabled"
+    );
+
     // Connect the nodes together.
     sequencer.sequencer().node.connect(&mut follower.follower(0).node).await;
 
@@ -282,8 +309,39 @@ async fn test_should_consolidate_after_optimistic_sync() -> eyre::Result<()> {
     // Send a notification to the unsynced node that the L1 watcher is synced.
     follower.l1().sync().await?;
 
-    // Wait for the unsynced node to sync to the L1 watcher.
-    follower.expect_event().l1_synced().await?;
+    // Consolidation is triggered by whichever completes last: the Synced
+    // notification (ChainConsolidated then L1Synced) or the L2 sync
+    // transition on a later import (L1Synced then ChainConsolidated). This
+    // waiter is safe under BOTH orderings — and deliberately NOT followed by
+    // an l1_synced() wait, which the drain here could strand:
+    // ChainConsolidated is only emitted when sync_state.is_synced(), which
+    // already proves the Synced notification was processed. This is the
+    // assertion the test is named for: the consolidated range must cover
+    // the optimistically-synced blocks.
+    //
+    // Explicit budget, NOT the 30s default: automatic sequencing is running, so
+    // the slower the runner, the further the sequencer's head has advanced by
+    // the time the follower starts consolidating — and consolidate_chain makes
+    // one full get_block_by_number round-trip per block over safe+1..=head. A
+    // fixed default budget against that growing workload is a capacity race,
+    // and this test runs in the merge gate at full parallelism and in the
+    // nightly soak under four CPU spinners, where a capacity timeout is
+    // auto-reported on issue #38 as a race regression. 120s makes the wait fail
+    // on behaviour instead.
+    let consolidations = follower
+        .expect_event()
+        .timeout(std::time::Duration::from_secs(120))
+        .chain_consolidated()
+        .await?;
+    // Assert the RANGE: `to` alone merely restates the head the earlier
+    // optimistic_sync wait guaranteed (ChainConsolidated is emitted even on
+    // the head == safe early-out); from == 0 proves validation actually
+    // covered the optimistically-synced blocks.
+    let (from, to) = *consolidations.first().expect("one consolidation per waited node");
+    eyre::ensure!(
+        from == 0 && to >= L1_MESSAGES_COUNT as u64,
+        "consolidation did not cover the optimistic range: from={from} to={to}"
+    );
 
     // Let the unsynced node process the L1 messages.
     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
@@ -496,7 +554,10 @@ async fn test_chain_orchestrator_fork_choice(
     let sequencer_handle = &sequencer.sequencer().rollup_manager_handle;
     sequencer_handle.set_gossip(false).await?;
     if let Some(block_info) = reorg_block_info {
-        sequencer_handle.update_fcs_head(block_info).await?;
+        sequencer_handle
+            .update_fcs_head(block_info)
+            .await?
+            .map_err(|refusal| eyre::eyre!("head update refused: {refusal}"))?;
     }
 
     // wait two seconds to ensure the timestamp of the new blocks is greater than the old ones
@@ -610,6 +671,7 @@ async fn test_chain_orchestrator_l1_reorg() -> eyre::Result<()> {
         sequencer_l1_watcher_tx.notification_tx.send(l1_message.clone()).await.unwrap();
         sequencer_l1_watcher_tx.notification_tx.send(new_block.clone()).await.unwrap();
         wait_n_events(
+            "sequencer NewL1Block",
             &mut sequencer_events,
             |e| matches!(e, ChainOrchestratorEvent::NewL1Block(_)),
             1,
@@ -618,6 +680,7 @@ async fn test_chain_orchestrator_l1_reorg() -> eyre::Result<()> {
         follower_l1_watcher_tx.notification_tx.send(l1_message).await.unwrap();
         follower_l1_watcher_tx.notification_tx.send(new_block).await.unwrap();
         wait_n_events(
+            "follower NewL1Block",
             &mut follower_events,
             |e| matches!(e, ChainOrchestratorEvent::NewL1Block(_)),
             1,
@@ -626,12 +689,14 @@ async fn test_chain_orchestrator_l1_reorg() -> eyre::Result<()> {
 
         sequencer_handle.build_block();
         wait_n_events(
+            "sequencer BlockSequenced",
             &mut sequencer_events,
             |e| matches!(e, ChainOrchestratorEvent::BlockSequenced(_)),
             1,
         )
         .await;
         wait_n_events(
+            "follower ChainExtended (gossiped block)",
             &mut follower_events,
             |e| matches!(e, ChainOrchestratorEvent::ChainExtended(_)),
             1,
@@ -646,6 +711,7 @@ async fn test_chain_orchestrator_l1_reorg() -> eyre::Result<()> {
         .await
         .unwrap();
     wait_n_events(
+        "sequencer L1Reorg(50)",
         &mut sequencer_events,
         |e| {
             matches!(
@@ -685,6 +751,7 @@ async fn test_chain_orchestrator_l1_reorg() -> eyre::Result<()> {
         sequencer_l1_watcher_tx.notification_tx.send(l1_message.clone()).await.unwrap();
         sequencer_l1_watcher_tx.notification_tx.send(new_block.clone()).await.unwrap();
         wait_n_events(
+            "sequencer NewL1Block",
             &mut sequencer_events,
             |e| matches!(e, ChainOrchestratorEvent::NewL1Block(_)),
             1,
@@ -693,6 +760,7 @@ async fn test_chain_orchestrator_l1_reorg() -> eyre::Result<()> {
 
         sequencer_handle.build_block();
         wait_n_events(
+            "sequencer BlockSequenced",
             &mut sequencer_events,
             |e| matches!(e, ChainOrchestratorEvent::BlockSequenced(_)),
             1,
@@ -709,6 +777,7 @@ async fn test_chain_orchestrator_l1_reorg() -> eyre::Result<()> {
 
     // The follower node should reject the new block as it has a different view of L1 data.
     wait_n_events(
+        "follower L1MessageMismatch",
         &mut follower_events,
         |e| matches!(e, ChainOrchestratorEvent::L1MessageMismatch { .. }),
         1,
@@ -720,14 +789,20 @@ async fn test_chain_orchestrator_l1_reorg() -> eyre::Result<()> {
     for notification in l1_notifications {
         follower_l1_watcher_tx.notification_tx.send(notification).await.unwrap();
     }
-    wait_n_events(&mut follower_events, |e| matches!(e, ChainOrchestratorEvent::NewL1Block(_)), 20)
-        .await;
+    wait_n_events(
+        "follower NewL1Block x20 (post-reorg L1 update)",
+        &mut follower_events,
+        |e| matches!(e, ChainOrchestratorEvent::NewL1Block(_)),
+        20,
+    )
+    .await;
 
     // Now build a new block on the sequencer to trigger the reorg on the follower
     sequencer_handle.build_block();
 
     // Wait for the follower node to accept the new chain
     wait_n_events(
+        "follower ChainExtended (post-reorg)",
         &mut follower_events,
         |e| matches!(e, ChainOrchestratorEvent::ChainExtended(_)),
         1,
@@ -737,18 +812,551 @@ async fn test_chain_orchestrator_l1_reorg() -> eyre::Result<()> {
     Ok(())
 }
 
+/// Contract: a manual build request while a payload building job is in flight
+/// coalesces with it — observable via the `BuildBlockCoalesced` event, which
+/// the pre-fix replace semantics never emit — and numbering stays contiguous
+/// (issue #38).
+#[allow(clippy::large_stack_frames)]
+#[tokio::test]
+async fn test_manual_build_block_coalesces_with_inflight_job() -> eyre::Result<()> {
+    reth_tracing::init_test_tracing();
+
+    let mut fixture = TestFixture::builder()
+        .sequencer()
+        .with_memory_db()
+        .payload_building_duration(2000) // long job so the second command lands mid-flight
+        .allow_empty_blocks(true)
+        .build()
+        .await?;
+
+    fixture.l1().sync().await?;
+
+    // Fire two build commands; the second arrives while the 2s job from the
+    // first is still in flight.
+    fixture.sequencer().rollup_manager_handle.build_block();
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    fixture.sequencer().rollup_manager_handle.build_block();
+
+    // The second command coalesced with the in-flight job. This event is
+    // emitted before the job completes, so it must arrive ahead of the
+    // BlockSequenced below and the waiter cannot discard that one.
+    fixture
+        .expect_event()
+        .label("BuildBlockCoalesced with the in-flight manual job")
+        .where_event(|e| matches!(e, ChainOrchestratorEvent::BuildBlockCoalesced))
+        .await?;
+
+    // Exactly one block results: number 1.
+    fixture.expect_event().block_sequenced(1).await?;
+
+    // Bite against a PARTIAL regression (emit the event but still spawn a
+    // second job): the sequencer is quiescent here — no auto-start, no
+    // outstanding command — so nothing may sequence within 2x the payload
+    // duration unless the coalesced command leaked a phantom job.
+    let phantom = fixture
+        .expect_event()
+        .timeout(std::time::Duration::from_secs(4))
+        .label("no phantom second BlockSequenced after coalescing")
+        .where_event(|e| matches!(e, ChainOrchestratorEvent::BlockSequenced(_)))
+        .await;
+    eyre::ensure!(
+        phantom.is_err(),
+        "a second job sequenced a block after the coalesced command: {phantom:?}"
+    );
+    // Behavioural anchor (the is_err above would also trip on a shut-down
+    // node or closed stream): the chain must still sit exactly at block 1.
+    eyre::ensure!(
+        fixture.get_block(0).await?.header.number == 1,
+        "unexpected head after the coalesced build"
+    );
+
+    // A follow-up build produces number 2. (`BuildBlockCoalesced` above is
+    // what distinguishes coalescing from the old replace-semantics; a phantom
+    // second job would also sequence 1 then 2, so contiguous numbering alone
+    // proves nothing.)
+    fixture.build_block().expect_block_number(2).build_and_await_block().await?;
+
+    Ok(())
+}
+
+/// The coalescing guard's original target: a manual build request arriving
+/// while a TIMER-triggered job is in flight must coalesce with it instead of
+/// replacing it (issue #38 — the replace made numbering timing-dependent).
+#[allow(clippy::large_stack_frames)]
+#[tokio::test]
+async fn test_manual_build_block_coalesces_with_timer_job() -> eyre::Result<()> {
+    reth_tracing::init_test_tracing();
+
+    let mut fixture = TestFixture::builder()
+        .sequencer()
+        .with_memory_db()
+        .auto_start(true)
+        .block_time(100)
+        .payload_building_duration(3000)
+        .allow_empty_blocks(true)
+        .build()
+        .await?;
+
+    fixture.l1().sync().await?;
+    // Observable precondition, not a guess: the sequencer arm's slot gate
+    // opens only once the Synced notification is processed, while a manual
+    // BuildBlock is ungated — sleeping blind here would race gate-open
+    // latency and let the manual command start the job itself.
+    fixture.expect_event().l1_synced().await?;
+
+    // From gate-open, slots fire every 100ms and each job runs 3s
+    // (comfortably inside the engine's ~12s payload-job deadline), so a job
+    // is in flight essentially continuously and a manual request at t=500ms
+    // lands mid-job with seconds of margin.
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+    // Bounded retry instead of a single blind request: this test also runs in
+    // the merge-gating lane at full parallelism, where a starved orchestrator
+    // could let one request start the job itself.
+    //
+    // The interval MUST exceed the payload duration, or this test stops
+    // testing what it is named for. At a shorter interval a ping that finds no
+    // job in flight starts a MANUAL one, and the next ping coalesces with
+    // that — `BuildBlockCoalesced` fires without a timer job ever being
+    // involved, which the sibling manual-manual test already covers. Waiting
+    // longer than the payload duration guarantees any job a ping started has
+    // finished before the next one, so the only job left to coalesce with is
+    // the timer's (slots fire every 100ms and each runs 3s, so one is in
+    // flight essentially continuously).
+    let pinger_handle = fixture.sequencer().rollup_manager_handle.clone();
+    let pinger = tokio::spawn(async move {
+        loop {
+            pinger_handle.build_block();
+            tokio::time::sleep(tokio::time::Duration::from_millis(3500)).await;
+        }
+    });
+    let coalesced = fixture
+        .expect_event()
+        .label("BuildBlockCoalesced with the in-flight timer job")
+        .where_event(|e| matches!(e, ChainOrchestratorEvent::BuildBlockCoalesced))
+        .await;
+    pinger.abort();
+    coalesced?;
+
+    // That slot still produces its block. The pinger's waiter above drained
+    // events on the way, possibly including the first BlockSequenced, so
+    // accept any height rather than pinning block 1 (which could hang 30s
+    // when the coalesce lands on a later ping).
+    fixture
+        .expect_event()
+        .where_event(|e| matches!(e, ChainOrchestratorEvent::BlockSequenced(_)))
+        .await?;
+
+    Ok(())
+}
+
+/// The head-move invariant: importing a chain must cancel an in-flight
+/// payload building job — its attributes were fixed against the pre-import
+/// head, and finalizing it later would reorg the imported block back out
+/// (issue #38 review). The cancellation is observable as
+/// `PayloadBuildingJobCancelled`.
+#[allow(clippy::large_stack_frames)]
+#[tokio::test]
+async fn test_chain_import_cancels_inflight_payload_job() -> eyre::Result<()> {
+    reth_tracing::init_test_tracing();
+
+    // Node under test: a long payload building job will be in flight. The
+    // duration must outlast the import below (the cancelled job never
+    // completes — FIFO command ordering means milliseconds) with generous
+    // margin for loaded runners, while staying well inside the engine's
+    // ~12s payload-job deadline, which the follow-up build at the end
+    // shares.
+    let mut node_a = TestFixture::builder()
+        .sequencer()
+        .with_memory_db()
+        .payload_building_duration(8000)
+        .allow_empty_blocks(true)
+        .build()
+        .await?;
+    // Same genesis; provides a valid block 1 to import.
+    let mut node_b = TestFixture::builder()
+        .sequencer()
+        .with_memory_db()
+        .allow_empty_blocks(true)
+        .build()
+        .await?;
+
+    node_a.l1().sync().await?;
+    node_b.l1().sync().await?;
+
+    // Build B's block BEFORE starting A's job: it plays no part in A's
+    // in-flight job, and building it after would burn seconds of the 8s job
+    // budget on a loaded runner before the import even lands.
+    let block = node_b.build_block().expect_block_number(1).build_and_await_block().await?;
+
+    // Start a long build on A, then import B's block 1 while it is in
+    // flight. No sleep is needed: the command channel is FIFO, so the import
+    // is processed after the build command.
+    node_a.sequencer().rollup_manager_handle.build_block();
+
+    // Prove the job slot is actually occupied — and drain any buffered
+    // start-failure event — before importing: a second request must
+    // coalesce with the in-flight job.
+    node_a.sequencer().rollup_manager_handle.build_block();
+    node_a
+        .expect_event()
+        .timeout(std::time::Duration::from_secs(2))
+        .label("BuildBlockCoalesced before the import")
+        .where_event(|e| matches!(e, ChainOrchestratorEvent::BuildBlockCoalesced))
+        .await?;
+
+    node_a
+        .sequencer()
+        .rollup_manager_handle
+        .import_block(scroll_network::NewBlockWithPeer {
+            peer_id: Default::default(),
+            block,
+            signature: Signature::new(Default::default(), Default::default(), false),
+        })
+        .await?
+        .map_err(|e| eyre::eyre!("import failed: {e}"))?;
+
+    // The import moved the head and must have cancelled the in-flight job.
+    // Tightly bounded: this test cannot pre-build a block (node_a must stay
+    // at genesis for the import to be a clean extension), so a loose wait
+    // could be satisfied by a finalization-time emission from the 8s job
+    // instead of the import's prompt cancellation.
+    node_a
+        .expect_event()
+        .timeout(std::time::Duration::from_secs(2))
+        .label("PayloadBuildingJobCancelled promptly after chain import")
+        .where_event(|e| matches!(e, ChainOrchestratorEvent::PayloadBuildingJobCancelled))
+        .await?;
+
+    // Vacuous-pass guard: the window must OUTLAST the remaining payload
+    // duration (an uncancelled 8s job sequences at ~t+8.0s; a shorter window
+    // would close before it and could never fail).
+    let phantom = node_a
+        .expect_event()
+        .timeout(std::time::Duration::from_secs(10))
+        .label("no BlockSequenced after the import-cancelled job")
+        .where_event(|e| matches!(e, ChainOrchestratorEvent::BlockSequenced(_)))
+        .await;
+    eyre::ensure!(
+        phantom.is_err(),
+        "the import-cancelled job still sequenced a block: {phantom:?}"
+    );
+
+    // A follow-up build proceeds cleanly on top of the imported block.
+    node_a.build_block().expect_block_number(2).build_and_await_block().await?;
+
+    Ok(())
+}
+
+/// An administrative FCS head update must cancel an in-flight payload
+/// building job (its parent may no longer be the head) and emit
+/// `PayloadBuildingJobCancelled` — otherwise finalizing the stale job would
+/// silently undo the update (issue #38 review).
+#[allow(clippy::large_stack_frames)]
+#[tokio::test]
+async fn test_update_fcs_head_cancels_inflight_payload_job() -> eyre::Result<()> {
+    reth_tracing::init_test_tracing();
+
+    let mut fixture = TestFixture::builder()
+        .sequencer()
+        .with_memory_db()
+        // Long enough to be mid-flight at the head update under load (FIFO
+        // ordering means milliseconds), short enough that the follow-up
+        // build's payload survives the engine's ~12s payload-job deadline.
+        .payload_building_duration(8000)
+        .allow_empty_blocks(true)
+        .build()
+        .await?;
+
+    fixture.l1().sync().await?;
+
+    // NOTE: get_block takes a NODE INDEX and returns that node's latest
+    // block — this is genesis only because nothing has been built yet.
+    let genesis = fixture.get_block(0).await?;
+    eyre::ensure!(genesis.header.number == 0, "expected genesis to still be the head");
+    let genesis_info = BlockInfo { number: genesis.header.number, hash: genesis.header.hash };
+
+    // Advance the head to block 1 so the administrative update below
+    // genuinely MOVES the head (updating a genesis head to genesis would
+    // exercise nothing).
+    fixture.build_block().expect_block_number(1).build_and_await_block().await?;
+
+    // Start a long build, then move the head back to genesis while it is in
+    // flight. No sleep is needed: the command channel is FIFO, so the head
+    // update is processed after the build command.
+    fixture.sequencer().rollup_manager_handle.build_block();
+
+    // Prove the job slot is actually occupied — and drain any buffered
+    // start-failure emission — before the operation under test: a second
+    // request must coalesce with the in-flight job.
+    fixture.sequencer().rollup_manager_handle.build_block();
+    fixture
+        .expect_event()
+        .timeout(std::time::Duration::from_secs(2))
+        .label("BuildBlockCoalesced occupancy probe")
+        .where_event(|e| matches!(e, ChainOrchestratorEvent::BuildBlockCoalesced))
+        .await?;
+    fixture
+        .sequencer()
+        .rollup_manager_handle
+        .update_fcs_head(genesis_info)
+        .await
+        .expect("update_fcs_head reply channel dropped")
+        .map_err(|refusal| eyre::eyre!("head update refused: {refusal}"))?;
+
+    // The head update must have cancelled the in-flight job.
+    // Bounded like the chain-import test: a post-finalization emission from
+    // the 8s job must not be able to satisfy this wait.
+    fixture
+        .expect_event()
+        .timeout(std::time::Duration::from_secs(2))
+        .label("PayloadBuildingJobCancelled after UpdateFcsHead")
+        .where_event(|e| matches!(e, ChainOrchestratorEvent::PayloadBuildingJobCancelled))
+        .await?;
+
+    // The event alone is not the cancellation (mirrors the sibling
+    // cancellation tests): a regression that emits it but leaves the 8s job
+    // in the slot would still sequence. Nothing may sequence within the
+    // job's remaining lifetime, and the head must sit at the updated target.
+    let phantom = fixture
+        .expect_event()
+        .timeout(std::time::Duration::from_secs(10))
+        .label("no BlockSequenced after the cancelled job")
+        .where_event(|e| matches!(e, ChainOrchestratorEvent::BlockSequenced(_)))
+        .await;
+    eyre::ensure!(phantom.is_err(), "the cancelled job still sequenced a block: {phantom:?}");
+    eyre::ensure!(
+        fixture.get_block(0).await?.header.number == 0,
+        "unexpected head after the administrative head update"
+    );
+
+    // A follow-up build proceeds cleanly from the updated head.
+    fixture.build_block().expect_block_number(1).build_and_await_block().await?;
+
+    Ok(())
+}
+
+/// Disabling automatic sequencing must cancel an in-flight payload building
+/// job through the observable path (`PayloadBuildingJobCancelled`), not clear
+/// it silently (issue #38 review).
+#[allow(clippy::large_stack_frames)]
+#[tokio::test]
+async fn test_disable_sequencing_cancels_inflight_payload_job() -> eyre::Result<()> {
+    reth_tracing::init_test_tracing();
+
+    let mut fixture = TestFixture::builder()
+        .sequencer()
+        .with_memory_db()
+        .payload_building_duration(8000)
+        .allow_empty_blocks(true)
+        .build()
+        .await?;
+
+    fixture.l1().sync().await?;
+
+    // Prove the sequencer actually builds before relying on a fire-and-forget
+    // command: without this the test could pass via the start-failure
+    // cancellation event with no job ever in flight.
+    fixture.build_block().expect_block_number(1).build_and_await_block().await?;
+
+    // Start a long build, then disable sequencing while it is in flight (the
+    // command channel is FIFO, so the disable is processed after the build
+    // command).
+    fixture.sequencer().rollup_manager_handle.build_block();
+
+    // Prove the job slot is actually occupied — and drain any buffered
+    // start-failure emission — before the operation under test: a second
+    // request must coalesce with the in-flight job.
+    fixture.sequencer().rollup_manager_handle.build_block();
+    fixture
+        .expect_event()
+        .timeout(std::time::Duration::from_secs(2))
+        .label("BuildBlockCoalesced occupancy probe")
+        .where_event(|e| matches!(e, ChainOrchestratorEvent::BuildBlockCoalesced))
+        .await?;
+    eyre::ensure!(
+        fixture.sequencer().rollup_manager_handle.disable_automatic_sequencing().await?,
+        "disable_automatic_sequencing should report success"
+    );
+
+    // Bounded like the sibling tests: only a prompt cancellation counts.
+    fixture
+        .expect_event()
+        .timeout(std::time::Duration::from_secs(2))
+        .label("PayloadBuildingJobCancelled after disabling sequencing")
+        .where_event(|e| matches!(e, ChainOrchestratorEvent::PayloadBuildingJobCancelled))
+        .await?;
+
+    // The event alone is not the cancellation: a regression that emits it
+    // but leaves the 8s job in the slot would still sequence. Nothing may
+    // sequence within the job's remaining lifetime, and the head must still
+    // sit at the pre-built block 1.
+    let phantom = fixture
+        .expect_event()
+        .timeout(std::time::Duration::from_secs(10))
+        .label("no BlockSequenced after the cancelled job")
+        .where_event(|e| matches!(e, ChainOrchestratorEvent::BlockSequenced(_)))
+        .await;
+    eyre::ensure!(phantom.is_err(), "the cancelled job still sequenced a block: {phantom:?}");
+    eyre::ensure!(
+        fixture.get_block(0).await?.header.number == 1,
+        "unexpected head after the cancelled job"
+    );
+
+    Ok(())
+}
+
+/// An administrative L1 unwind closes the sequencer gate for the whole
+/// re-scan, so it must cancel an in-flight payload building job observably
+/// (issue #38 review).
+#[allow(clippy::large_stack_frames)]
+#[tokio::test]
+async fn test_revert_to_l1_block_cancels_inflight_payload_job() -> eyre::Result<()> {
+    reth_tracing::init_test_tracing();
+
+    let mut fixture = TestFixture::builder()
+        .sequencer()
+        .with_memory_db()
+        .payload_building_duration(8000)
+        .allow_empty_blocks(true)
+        .build()
+        .await?;
+
+    fixture.l1().sync().await?;
+
+    // Prove the sequencer actually builds before relying on a fire-and-forget
+    // command: without this the test could pass via the start-failure
+    // cancellation event with no job ever in flight.
+    fixture.build_block().expect_block_number(1).build_and_await_block().await?;
+
+    // Start a long build, then revert the L1 view while it is in flight (the
+    // command channel is FIFO, so the revert is processed after the build
+    // command). The `?` proves the revert command was fully processed — a
+    // dropped reply channel would mean the handler bailed early; the
+    // cancellation itself happens before any fallible unwind work, so the
+    // event does not depend on the unwind's outcome.
+    fixture.sequencer().rollup_manager_handle.build_block();
+
+    // Prove the job slot is actually occupied — and drain any buffered
+    // start-failure emission — before the operation under test: a second
+    // request must coalesce with the in-flight job.
+    fixture.sequencer().rollup_manager_handle.build_block();
+    fixture
+        .expect_event()
+        .timeout(std::time::Duration::from_secs(2))
+        .label("BuildBlockCoalesced occupancy probe")
+        .where_event(|e| matches!(e, ChainOrchestratorEvent::BuildBlockCoalesced))
+        .await?;
+    eyre::ensure!(
+        fixture.sequencer().rollup_manager_handle.revert_to_l1_block(0).await?,
+        "administrative unwind was refused"
+    );
+
+    // Bounded like the sibling tests: only a prompt cancellation counts.
+    fixture
+        .expect_event()
+        .timeout(std::time::Duration::from_secs(2))
+        .label("PayloadBuildingJobCancelled after administrative L1 unwind")
+        .where_event(|e| matches!(e, ChainOrchestratorEvent::PayloadBuildingJobCancelled))
+        .await?;
+
+    // The event alone is not the cancellation: a regression that emits it
+    // but leaves the 8s job in the slot would still sequence. Nothing may
+    // sequence within the job's remaining lifetime, and the head must still
+    // sit at the pre-built block 1.
+    let phantom = fixture
+        .expect_event()
+        .timeout(std::time::Duration::from_secs(10))
+        .label("no BlockSequenced after the cancelled job")
+        .where_event(|e| matches!(e, ChainOrchestratorEvent::BlockSequenced(_)))
+        .await;
+    eyre::ensure!(phantom.is_err(), "the cancelled job still sequenced a block: {phantom:?}");
+    eyre::ensure!(
+        fixture.get_block(0).await?.header.number == 1,
+        "unexpected head after the cancelled job"
+    );
+
+    Ok(())
+}
+
+/// A build with an empty payload and empty blocks disabled is skipped, and
+/// the skip event carries the head it sat on — the identity the remote block
+/// source's outcome attribution rests on (issue #38 review).
+#[allow(clippy::large_stack_frames)]
+#[tokio::test]
+async fn test_block_building_skipped_carries_head_number() -> eyre::Result<()> {
+    reth_tracing::init_test_tracing();
+
+    let mut fixture = TestFixture::builder()
+        .sequencer()
+        .with_memory_db()
+        .allow_empty_blocks(false)
+        .build()
+        .await?;
+
+    fixture.l1().sync().await?;
+
+    // Give block 1 real content (an L1 message) so it is BUILT even with
+    // empty blocks disallowed: asserting the skip identity at head 0 could
+    // not distinguish a carried head from u64::default().
+    fixture
+        .l1()
+        .add_message()
+        .queue_index(0)
+        .sender(Address::random())
+        .value(1)
+        .at_block(1)
+        .send()
+        .await?;
+    fixture.expect_event().l1_message_committed().await?;
+    fixture.l1().new_block(1).await?;
+    fixture.expect_event().new_l1_block().await?;
+    fixture.build_block().expect_block_number(1).build_and_await_block().await?;
+
+    // No new messages: the next build is empty and skipped at head 1.
+    fixture.sequencer().rollup_manager_handle.build_block();
+    fixture
+        .expect_event()
+        .label("BlockBuildingSkipped at head 1")
+        .where_event(|e| {
+            matches!(
+                e,
+                ChainOrchestratorEvent::BlockBuildingSkipped { head_block_number } if *head_block_number == 1
+            )
+        })
+        .await?;
+
+    Ok(())
+}
+
 /// Waits for n events to be emitted.
+///
+/// Bounded: panics with a diagnosis after 60s instead of hanging the test
+/// binary forever (a hung test is indistinguishable from a slow one in CI and
+/// burns the whole job's timeout — issue #38).
 async fn wait_n_events(
+    label: &str,
     events: &mut EventStream<ChainOrchestratorEvent>,
     mut matches: impl FnMut(ChainOrchestratorEvent) -> bool,
     mut n: u64,
 ) {
-    while let Some(event) = events.next().await {
-        if matches(event.clone()) {
-            n -= 1;
+    assert!(n > 0, "wait_n_events requires n > 0");
+    let total = n;
+    tokio::time::timeout(tokio::time::Duration::from_secs(60), async {
+        while let Some(event) = events.next().await {
+            if matches(event.clone()) {
+                n -= 1;
+            }
+            if n == 0 {
+                break
+            }
         }
-        if n == 0 {
-            break
-        }
-    }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!("[{label}] Timeout (60s) waiting for {total} matching events ({n} still missing)")
+    });
+    // The stream ending early falls out of the while-let without the timeout
+    // firing; that must not pass silently either.
+    assert_eq!(n, 0, "[{label}] event stream ended with {n}/{total} matching events still missing");
 }

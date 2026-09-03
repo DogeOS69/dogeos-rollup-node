@@ -86,7 +86,9 @@ parking_lot.workspace = true
 rand.workspace = true
 reqwest.workspace = true
 serde_json.workspace = true
-tokio.workspace = true
+# `test-util` for the paused-clock tests: the L2-sync interval arm must be
+# provable without a real 10s wait in the unit lane.
+tokio = { workspace = true, features = ["test-util"] }
 
 [features]
 test-utils = [

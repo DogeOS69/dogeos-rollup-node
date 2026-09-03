@@ -27,6 +27,15 @@ impl MetricsHandler {
         self.block_building_meter.block_building_start = Some(Instant::now());
     }
 
+    /// Discards the current block building recording without recording a
+    /// duration sample — the attempt did not produce a valid build latency
+    /// (the job was cancelled in flight, or payload start/finalization
+    /// failed) — and counts it in `payload_building_jobs_cancelled`.
+    pub(crate) fn discard_block_building_recording(&mut self) {
+        self.block_building_meter.block_building_start = None;
+        self.block_building_meter.metric.payload_building_jobs_cancelled.increment(1);
+    }
+
     /// Finishes tracking the current block building task.
     pub(crate) fn finish_block_building_recording(&mut self, block: Option<&DogeosBlock>) {
         let now = Instant::now();
@@ -147,4 +156,10 @@ pub(crate) struct BlockBuildingMetric {
     all_block_building_duration: Histogram,
     /// The duration of the block interval include empty block
     consecutive_block_interval: Histogram,
+    /// The number of payload building attempts abandoned without a duration sample:
+    /// cancelled in flight, or failed at payload start or finalization. Three emission
+    /// sites do NOT count here: the two post-finalization failures (the build itself
+    /// completed and recorded its duration) and the no-sequencer `BuildBlock` refusal (no
+    /// recording ever starts)
+    payload_building_jobs_cancelled: Counter,
 }

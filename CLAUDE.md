@@ -56,7 +56,9 @@ The system follows this critical data flow pattern:
 cargo build --bin rollup-node
 
 # Run sequencer with test signer (bypasses signing requirements)
-cargo run --bin rollup-node -- node --chain dev -d --sequencer.enabled --test --http --http.api admin,debug,eth,net,trace,txpool,web3,rpc,reth,ots,flashbots,miner,mev
+# `--test` skips the L1 watcher, and the fallback that stands in for it only
+# exists under `test-utils` — without the feature this is rejected at startup.
+cargo run --features test-utils --bin rollup-node -- node --chain dev -d --sequencer.enabled --test --consensus.algorithm noop --http --http.api admin,debug,eth,net,trace,txpool,web3,rpc,reth,ots,flashbots,miner,mev
 
 # Production build
 cargo build --release --bin rollup-node
@@ -67,7 +69,8 @@ cargo run --bin rollup-node -- node --help
 
 ### Testing Strategy
 ```bash
-# Run all tests (excluding docker tests)
+# Run all tests, excluding the docker tests and two long/quarantined ones
+# (test_should_consolidate_to_block_15k, test_remote_block_source_resumes_from_correct_head)
 make test
 
 # Test specific crate
@@ -80,7 +83,7 @@ cargo test -p rollup-node --test e2e
 cargo test -p rollup-node --test e2e test_custom_genesis_block_production_and_propagation
 
 # Run docker-based integration tests (excluded by default)
-cargo test --package tests --test block_propagation_multi_clients
+make test-docker
 
 # Run with debug logs
 RUST_LOG=debug cargo test <test-name>

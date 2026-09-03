@@ -56,7 +56,11 @@ pub enum ChainOrchestratorEvent {
     BatchReverted {
         /// The latest batch info after the revert.
         batch_info: BatchInfo,
-        /// The new safe head after the revert.
+        /// The new safe head: when synced, the value actually ISSUED to the
+        /// engine — floored at the finalized block AND dragged down to the
+        /// engine's head mirror, so it may be BELOW the database's safe head;
+        /// when not synced, the database's post-revert safe head (no FCU is
+        /// issued then).
         safe_head: BlockInfo,
     },
     /// A new L1 block has been received returning the L1 block number.
@@ -67,8 +71,11 @@ pub enum ChainOrchestratorEvent {
     /// A `L1Message` event has been committed returning the message queue index.
     L1MessageCommitted(u64),
     /// A reorg has occurred on L1, returning the L1 block number of the new L1 head,
-    /// the L1 message queue index of the new L1 head, and optionally the L2 head and safe block
-    /// info if the reorg resulted in a new L2 head or safe block.
+    /// the L1 message queue index of the new L1 head, and optionally the L2 head and safe
+    /// block info as ISSUED to the engine — the safe value is floored at the finalized
+    /// block and dragged down to the engine's head mirror (which the reorg need not have rewound),
+    /// so `l2_safe_block_info` can be `Some` (the current safe dragged down to the rewound
+    /// head) even when the unwind itself produced no new safe block.
     L1Reorg {
         /// The L1 block number of the new L1 head.
         l1_block_number: u64,
@@ -91,8 +98,34 @@ pub enum ChainOrchestratorEvent {
     /// A new block has been sequenced by the sequencer.
     BlockSequenced(DogeosBlock),
     /// Block building was skipped because the built payload was empty and empty blocks are
-    /// disabled.
-    BlockBuildingSkipped,
+    /// disabled. Carries the head the skipped build sat on, so waiters can attribute the
+    /// skip to a specific request (a skip for a request expecting block N has
+    /// `head_block_number == N - 1`).
+    BlockBuildingSkipped {
+        /// The FCS head block number at the time the build was skipped.
+        head_block_number: u64,
+    },
+    /// A manual `BuildBlock` command arrived while a payload building job was already in
+    /// flight and was coalesced with it instead of replacing it.
+    BuildBlockCoalesced,
+    /// The in-flight payload building job was cancelled, failed, or could not be created;
+    /// no `BlockSequenced`/`BlockBuildingSkipped` will follow for it. Emission sites: the
+    /// head moved under the job (chain import, batch reconciliation, administrative FCS
+    /// head update, optimistic sync, or an L1 reorg that rewound the L2 head); an L1
+    /// unwind (reorg or administrative revert); the EL declining to adopt an imported
+    /// head (the import re-enters L2 sync); the L2-sync recheck adopting a head the EL
+    /// finally accepted (which may move the head BACKWARD); automatic sequencing was disabled; a
+    /// `BuildBlock` command or a timer slot failed to start a job (including when no
+    /// sequencer is configured — a permanent misconfiguration, not a transient
+    /// cancellation); payload
+    /// finalization failed; or post-finalization persistence/signing failed. CAUTION for
+    /// consumers: on the two post-finalization sites the block WAS built and the FCS head
+    /// has already advanced (a finalization-failure emission is always pre-commit — the
+    /// sequencer converts and validates the payload before its FCU). Re-check the head
+    /// before re-issuing a build, or a duplicate block one height up may be produced (the
+    /// remote block source's settlement does its head check first for exactly this
+    /// reason).
+    PayloadBuildingJobCancelled,
     /// A new block has been signed by the signer.
     SignedBlock {
         /// The signed block.

@@ -1,0 +1,521 @@
+name: nightly-soak
+
+# Recurrence guard for the CI races fixed in issue #38. Soaks the previously
+# flaky spots off the merge path (same tier idea as dogeos-core's tiered CI):
+#   - the in-process timing-sensitive suite — the optimistic-sync
+#     consolidation test, both build-coalescing tests, the four payload-job
+#     cancellation tests, the remote-source launch test, and the
+#     skip-identity test — plain and under deliberate CPU contention (the
+#     original race only fired on contended runners). The resume test is
+#     skipped in the merge lane and kept OUT of these race lanes (its own
+#     comment documents an unfixed first-tick race and its restart fixture
+#     retains a teardown race); it soaks in its
+#     own QUARANTINE job below whose failures are comment-only, so the known
+#     flake cannot be auto-filed as a regression of a fixed race. And
+#   - the docker remote-source pair (follow/import parity, and recovery
+#     across a sequencer restart), repeated serially.
+# Any failure here is a regression of a fixed race — treat it as a bug, not as
+# noise to re-run. (A job hitting its own timeout is a capacity problem, not a
+# race regression — the idle and contended soaks run as separate jobs so each
+# gets its own budget.)
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      iterations:
+        description: "Iterations per in-process soak job (default 12)"
+        required: false
+        default: "12"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Queue rather than cancel: a concurrency-cancelled soak would post a
+  # misleading mid-soak cancellation report and drown the signal of the run
+  # that superseded it.
+  cancel-in-progress: false
+
+permissions:
+  # Read-only for the soak jobs: a write-capable token must not be exposed
+  # to the third-party setup actions (mutable tags) they run. Reporting is
+  # isolated in its own needs-gated job below, which alone carries
+  # issues: write.
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  soak-integration-idle:
+    # Forks must not run these jobs at all (a dispatched fork run would
+    # still burn a long job and comment on the fork's own issue #38).
+    if: ${{ github.repository == 'DogeOS69/dogeos-rollup-node' }}
+    outputs:
+      soak_outcome: ${{ steps.soak.outcome }}
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    # Must exceed the SUM of the step budgets (45-minute build + 80-minute
+    # soak) plus checkout/toolchain/cache/Anvil setup, or the job-level cap
+    # fires first, cancels the job, and skips the reporter the step-level
+    # timeouts exist to protect.
+    timeout-minutes: 150
+    env:
+      RUST_BACKTRACE: 1
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # Only the reporter needs a token (and takes it explicitly); the
+          # build/soak steps run third-party build scripts for hours and
+          # must not find one in .git/config.
+          persist-credentials: false
+      - uses: rui314/setup-mold@v1
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: 'nightly-2026-01-05'
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          # One shared entry for all three soak jobs: three extra
+          # nightly writers against the repo's 10 GB cache LRU would evict
+          # the PR lanes' entries.
+          shared-key: soak-integration
+      - uses: taiki-e/install-action@nextest
+      - name: Install pinned Anvil
+        # None of the currently-soaked tests use the Anvil fixture, but the
+        # filters are substring matches — a future match that does must not
+        # fail on a missing binary and be auto-filed as a race regression.
+        run: |
+          set -euo pipefail
+          ANVIL_BIN="$(.github/assets/install_anvil.sh "$RUNNER_TEMP/anvil" | tail -n1)"
+          [ -x "$ANVIL_BIN" ] || { echo "::error::Anvil install produced no executable at '$ANVIL_BIN'"; exit 1; }
+          echo "ANVIL_BIN=$ANVIL_BIN" >> "$GITHUB_ENV"
+      - name: Build test binaries
+        # Step-level: a hung cold build (25-40 min normally) must fail this
+        # step, not ride into the job-level cancel that skips the reporter.
+        timeout-minutes: 45
+        run: |
+          set -euo pipefail
+          cargo nextest run --all-features --workspace --locked --no-run \
+            -E 'test(test_should_consolidate_after_optimistic_sync) or test(coalesces_with) or test(cancels_inflight_payload_job) or test(remote_source_node_launches_when_remote_unreachable) or test(block_building_skipped_carries_head_number)'
+          # --no-tests=fail on the soak step below only fires when the WHOLE
+          # filterset is empty, so renaming any single soaked test would leave
+          # the other four keeping the run green while that test is silently
+          # never soaked again. Require every pattern to match, and to match the
+          # EXPECTED NUMBER of tests: two of these are substring patterns
+          # covering several tests each, so a non-empty result alone would still
+          # let one of them drop out unnoticed.
+          # `nextest list` prints one indented line per test under each binary.
+          for spec in \
+            test_should_consolidate_after_optimistic_sync:1 \
+            coalesces_with:2 \
+            cancels_inflight_payload_job:4 \
+            remote_source_node_launches_when_remote_unreachable:1 \
+            block_building_skipped_carries_head_number:1
+          do
+            pat="${spec%:*}"
+            want="${spec##*:}"
+            # `|| true`: grep -c exits 1 on zero matches, and under `set -e` the
+            # assignment would then abort the step BEFORE the diagnostic below —
+            # in exactly the renamed-test case this guard exists to report.
+            got="$(cargo nextest list --all-features --workspace --locked -E "test($pat)" | grep -c '^ ' || true)"
+            if [ "$got" != "$want" ]; then
+              echo "::error::soak pattern '$pat' matches $got tests, expected $want; a soaked test was renamed, removed or added"
+              exit 1
+            fi
+          done
+      - name: Soak timing-sensitive integration tests (idle)
+        id: soak
+        # Step-level timeout, below the job's 150: a JOB-level timeout cancels
+        # the whole job and no later step (even with always()) runs, so a
+        # hang would post nothing. A step-level timeout terminates only this
+        # step and the reporter job still fires.
+        timeout-minutes: 80
+        env:
+          # Passed through env, never interpolated into the script body: a
+          # workflow_dispatch input is attacker-influencable text.
+          ITERATIONS: ${{ inputs.iterations || '12' }}
+        run: |
+          set -euo pipefail
+          [[ "$ITERATIONS" =~ ^[1-9][0-9]*$ ]] || { echo "::error::iterations must be a positive integer"; exit 1; }
+          for i in $(seq "$ITERATIONS"); do
+            echo "::group::idle iteration $i/$ITERATIONS"
+            # Same filter as the loaded job, so a loaded-only failure is
+            # distinguishable from a plain regression. Single-threaded so the
+            # tests' internal timing budgets are not compounded by peer load.
+            cargo nextest run --all-features --workspace --locked --test-threads=1 \
+              --no-tests=fail -E 'test(test_should_consolidate_after_optimistic_sync) or test(coalesces_with) or test(cancels_inflight_payload_job) or test(remote_source_node_launches_when_remote_unreachable) or test(block_building_skipped_carries_head_number)'
+            echo "::endgroup::"
+          done
+
+  soak-integration-loaded:
+    # Forks must not run these jobs at all (a dispatched fork run would
+    # still burn a long job and comment on the fork's own issue #38).
+    if: ${{ github.repository == 'DogeOS69/dogeos-rollup-node' }}
+    outputs:
+      soak_outcome: ${{ steps.soak.outcome }}
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    # Must exceed the SUM of the step budgets (45-minute build + 100-minute
+    # soak) plus checkout/toolchain/cache/Anvil setup, or the job-level cap
+    # fires first, cancels the job, and skips the reporter the step-level
+    # timeouts exist to protect.
+    timeout-minutes: 170
+    env:
+      RUST_BACKTRACE: 1
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # Only the reporter needs a token (and takes it explicitly); the
+          # build/soak steps run third-party build scripts for hours and
+          # must not find one in .git/config.
+          persist-credentials: false
+      - uses: rui314/setup-mold@v1
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: 'nightly-2026-01-05'
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          # One shared entry for all three soak jobs: three extra
+          # nightly writers against the repo's 10 GB cache LRU would evict
+          # the PR lanes' entries.
+          shared-key: soak-integration
+      - uses: taiki-e/install-action@nextest
+      - name: Install pinned Anvil
+        # None of the currently-soaked tests use the Anvil fixture, but the
+        # filters are substring matches — a future match that does must not
+        # fail on a missing binary and be auto-filed as a race regression.
+        run: |
+          set -euo pipefail
+          ANVIL_BIN="$(.github/assets/install_anvil.sh "$RUNNER_TEMP/anvil" | tail -n1)"
+          [ -x "$ANVIL_BIN" ] || { echo "::error::Anvil install produced no executable at '$ANVIL_BIN'"; exit 1; }
+          echo "ANVIL_BIN=$ANVIL_BIN" >> "$GITHUB_ENV"
+      - name: Build test binaries
+        # Step-level: a hung cold build (25-40 min normally) must fail this
+        # step, not ride into the job-level cancel that skips the reporter.
+        timeout-minutes: 45
+        run: |
+          set -euo pipefail
+          cargo nextest run --all-features --workspace --locked --no-run \
+            -E 'test(test_should_consolidate_after_optimistic_sync) or test(coalesces_with) or test(cancels_inflight_payload_job) or test(remote_source_node_launches_when_remote_unreachable) or test(block_building_skipped_carries_head_number)'
+          # --no-tests=fail on the soak step below only fires when the WHOLE
+          # filterset is empty, so renaming any single soaked test would leave
+          # the other four keeping the run green while that test is silently
+          # never soaked again. Require every pattern to match, and to match the
+          # EXPECTED NUMBER of tests: two of these are substring patterns
+          # covering several tests each, so a non-empty result alone would still
+          # let one of them drop out unnoticed.
+          # `nextest list` prints one indented line per test under each binary.
+          for spec in \
+            test_should_consolidate_after_optimistic_sync:1 \
+            coalesces_with:2 \
+            cancels_inflight_payload_job:4 \
+            remote_source_node_launches_when_remote_unreachable:1 \
+            block_building_skipped_carries_head_number:1
+          do
+            pat="${spec%:*}"
+            want="${spec##*:}"
+            # `|| true`: grep -c exits 1 on zero matches, and under `set -e` the
+            # assignment would then abort the step BEFORE the diagnostic below —
+            # in exactly the renamed-test case this guard exists to report.
+            got="$(cargo nextest list --all-features --workspace --locked -E "test($pat)" | grep -c '^ ' || true)"
+            if [ "$got" != "$want" ]; then
+              echo "::error::soak pattern '$pat' matches $got tests, expected $want; a soaked test was renamed, removed or added"
+              exit 1
+            fi
+          done
+      - name: Soak timing-sensitive integration tests (under CPU contention)
+        id: soak
+        # Step-level timeout: see the idle job's soak step. Larger than the
+        # idle lane's 80 because four of eight vCPUs are pinned by the
+        # spinners — this is the lane most likely to hit its cap (reported
+        # by the reporter job's widened failure message; a step timeout
+        # surfaces as outcome 'failure').
+        timeout-minutes: 100
+        env:
+          ITERATIONS: ${{ inputs.iterations || '12' }}
+        run: |
+          set -euo pipefail
+          [[ "$ITERATIONS" =~ ^[1-9][0-9]*$ ]] || { echo "::error::iterations must be a positive integer"; exit 1; }
+          # Add real contention — the condition under which the original race
+          # fired — but leave headroom: the tests run single-threaded below,
+          # and full saturation would blow their internal budgets and
+          # manufacture the false signal this lane exists to prevent.
+          cleanup() { jobs -p | xargs -r kill 2>/dev/null || true; }
+          trap cleanup EXIT
+          # INT/TERM must actually stop the job (a bare cleanup trap would
+          # resume the loop after handling the signal).
+          trap 'cleanup; exit 130' INT TERM
+          # timeout: the spinners must die on their own even if the step is
+          # killed hard and the cleanup trap never runs (6600s > the 100-min
+          # step cap).
+          for c in $(seq 4); do timeout 6600 yes > /dev/null & done
+          for i in $(seq "$ITERATIONS"); do
+            echo "::group::loaded iteration $i/$ITERATIONS"
+            # Also soak the wall-clock-sensitive tests this fix introduced,
+            # coalescing tests included: the timer test issues bounded
+            # retries until one provably lands mid-job, so contention cannot
+            # manufacture a false regression report.
+            cargo nextest run --all-features --workspace --locked --test-threads=1 \
+              --no-tests=fail -E 'test(test_should_consolidate_after_optimistic_sync) or test(coalesces_with) or test(cancels_inflight_payload_job) or test(remote_source_node_launches_when_remote_unreachable) or test(block_building_skipped_carries_head_number)'
+            echo "::endgroup::"
+          done
+
+  soak-docker-remote-source:
+    # Forks must not run these jobs at all (a dispatched fork run would
+    # still burn a long job and comment on the fork's own issue #38).
+    if: ${{ github.repository == 'DogeOS69/dogeos-rollup-node' }}
+    outputs:
+      soak_outcome: ${{ steps.soak.outcome }}
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    # Must exceed the SUM of the step budgets (45-minute build + 80-minute
+    # soak) plus checkout/toolchain/cache/Anvil setup, or the job-level cap
+    # fires first, cancels the job, and skips the reporter the step-level
+    # timeouts exist to protect.
+    timeout-minutes: 150
+    env:
+      RUST_BACKTRACE: 1
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # Only the reporter needs a token (and takes it explicitly); the
+          # build/soak steps run third-party build scripts for hours and
+          # must not find one in .git/config.
+          persist-credentials: false
+      - uses: rui314/setup-mold@v1
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - uses: taiki-e/install-action@nextest
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Verify Docker test disk capacity
+        run: |
+          set -euo pipefail
+          df -h /
+          available_kib=$(df --output=avail / | tail -n 1 | tr -d ' ')
+          minimum_kib=$((32 * 1024 * 1024))
+          if (( available_kib < minimum_kib )); then
+            echo "Docker Compose tests require at least 32 GiB free; available_kib=$available_kib" >&2
+            exit 1
+          fi
+      - name: Build test binaries
+        # Step-level: a hung cold build (25-40 min normally) must fail this
+        # step, not ride into the job-level cancel that skips the reporter.
+        # Without this step the full workspace compile would run inside the
+        # soak step's 80-minute cap and a cold-cache night would cap out and
+        # auto-file a FALSE regression report.
+        timeout-minutes: 45
+        run: |
+          set -euo pipefail
+          cargo nextest run --all-features --workspace --locked --no-run \
+            -E 'test(docker_test_remote_block_source)'
+          # Same hazard as the in-process lanes: this pattern covers TWO tests
+          # (_basic and _recovery), so --no-tests=fail stays satisfied by one of
+          # them if the other is renamed. That matters here — the in-process
+          # resume test is already out of the merge gate and confined to a
+          # comment-only quarantine lane, leaving the docker recovery test as
+          # the surviving signal for that path.
+          got="$(cargo nextest list --all-features --workspace --locked -E 'test(docker_test_remote_block_source)' | grep -c '^ ' || true)"
+          if [ "$got" != "2" ]; then
+            echo "::error::docker_test_remote_block_source matches $got tests, expected 2; a soaked test was renamed, removed or added"
+            exit 1
+          fi
+      - name: Soak docker remote-source tests
+        id: soak
+        # Step-level timeout: see the idle job's soak step.
+        timeout-minutes: 80
+        run: |
+          set -euo pipefail
+          # --no-tests=fail (nextest's default, pinned explicitly since the
+          # install action is unpinned): if a rename ever empties the filter,
+          # this guard must fail loudly instead of soaking nothing.
+          # Two iterations: the merge lane budgets 75 minutes for ONE pass
+          # of the docker tests, so three serial passes could hit the
+          # 80-minute cap and auto-file a false hang report.
+          for i in 1 2; do
+            echo "::group::docker iteration $i/2"
+            cargo nextest run --all-features --workspace --locked --no-tests=fail \
+              -E 'test(docker_test_remote_block_source)' \
+              --test-threads=1 --failure-output immediate --success-output never
+            echo "::endgroup::"
+          done
+        env:
+          # Match the merge gate (test.yaml): the lane most likely to catch a
+          # rare flake must not auto-file issue #38 with THINNER logs than the
+          # merge run that passed.
+          RUST_LOG: trace
+          RUST_BACKTRACE: full
+
+  soak-resume-quarantine:
+    # Quarantine lane for the ONLY test of the resume/rewind path
+    # (init_last_imported_block past genesis, the diverged classification,
+    # the update_fcs_head rewind): excluded from the merge gate and the race
+    # lanes above. Primary cause: the not-synced import path advances the
+    # resume pointer and drops that height's build (the test's own in-code
+    # note; ledger-tracked), compounded by a reboot-fixture teardown race.
+    # The highest-risk logic in the add-on must not ship with zero automated
+    # signal. The reporter posts its failures COMMENT-ONLY — never a reopen.
+    if: ${{ github.repository == 'DogeOS69/dogeos-rollup-node' }}
+    outputs:
+      soak_outcome: ${{ steps.soak.outcome }}
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    # Must exceed the sum of the step budgets (45-minute build + 45-minute
+    # soak) plus setup, or the job-level cap fires first and skips the
+    # reporter (see the idle job).
+    timeout-minutes: 110
+    env:
+      RUST_BACKTRACE: 1
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: rui314/setup-mold@v1
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: 'nightly-2026-01-05'
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          # Shares the in-process soak entry: same tree, same features.
+          shared-key: soak-integration
+      - uses: taiki-e/install-action@nextest
+      - name: Install pinned Anvil
+        # Defensive parity with the other in-process jobs: the filter is a
+        # substring match and a future match that needs Anvil must not fail
+        # on a missing binary.
+        run: |
+          set -euo pipefail
+          ANVIL_BIN="$(.github/assets/install_anvil.sh "$RUNNER_TEMP/anvil" | tail -n1)"
+          [ -x "$ANVIL_BIN" ] || { echo "::error::Anvil install produced no executable at '$ANVIL_BIN'"; exit 1; }
+          echo "ANVIL_BIN=$ANVIL_BIN" >> "$GITHUB_ENV"
+      - name: Build test binaries
+        timeout-minutes: 45
+        run: |
+          set -euo pipefail
+          cargo nextest run --all-features --workspace --locked --no-run \
+            -E 'test(test_remote_block_source_resumes_from_correct_head)'
+          # This lane is the ONLY automated signal for the resume/rewind path —
+          # the test is excluded from `make test` and the merge gate. The soak
+          # step carries continue-on-error, so a rename that empties the filter
+          # would end green with the ordinary quarantine comment, indistinguishable
+          # from a known-flake night. The build step is not continue-on-error, so
+          # the guard belongs here.
+          got="$(cargo nextest list --all-features --workspace --locked -E 'test(test_remote_block_source_resumes_from_correct_head)' | grep -c '^ ' || true)"
+          if [ "$got" != "1" ]; then
+            echo "::error::test_remote_block_source_resumes_from_correct_head matches $got tests, expected 1; the quarantined test was renamed or removed"
+            exit 1
+          fi
+      - name: Soak the quarantined resume test
+        id: soak
+        # Step-level (below the job's 110) so a hang fails THIS step and the
+        # reporter still fires; see the idle job.
+        #
+        # STEP-level continue-on-error (never job-level): the known flake
+        # must not redden the whole nightly run — but job-level would set
+        # needs.*.result to success and silently kill the reporter's
+        # setup-failure arm. Step-level keeps steps.soak.outcome accurate
+        # for the comment-only report while the job concludes green.
+        continue-on-error: true
+        timeout-minutes: 45
+        env:
+          ITERATIONS: ${{ inputs.iterations || '12' }}
+        run: |
+          set -euo pipefail
+          [[ "$ITERATIONS" =~ ^[1-9][0-9]*$ ]] || { echo "::error::iterations must be a positive integer"; exit 1; }
+          for i in $(seq "$ITERATIONS"); do
+            echo "::group::resume iteration $i/$ITERATIONS"
+            cargo nextest run --all-features --workspace --locked --test-threads=1 \
+              --no-tests=fail -E 'test(test_remote_block_source_resumes_from_correct_head)'
+            echo "::endgroup::"
+          done
+
+  report-soak-failures:
+    # Sole carrier of issues:write — the soak jobs stay read-only so a
+    # compromised third-party setup action cannot touch repository issues.
+    # !cancelled() (not the implicit success()) lets this run when a needed
+    # soak job failed; a manual run cancellation still skips it.
+    needs:
+      [
+        soak-integration-idle,
+        soak-integration-loaded,
+        soak-docker-remote-source,
+        soak-resume-quarantine,
+      ]
+    if: ${{ !cancelled() && github.repository == 'DogeOS69/dogeos-rollup-node' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      IDLE_OUTCOME: ${{ needs.soak-integration-idle.outputs.soak_outcome }}
+      IDLE_RESULT: ${{ needs.soak-integration-idle.result }}
+      LOADED_OUTCOME: ${{ needs.soak-integration-loaded.outputs.soak_outcome }}
+      LOADED_RESULT: ${{ needs.soak-integration-loaded.result }}
+      DOCKER_OUTCOME: ${{ needs.soak-docker-remote-source.outputs.soak_outcome }}
+      DOCKER_RESULT: ${{ needs.soak-docker-remote-source.result }}
+      RESUME_OUTCOME: ${{ needs.soak-resume-quarantine.outputs.soak_outcome }}
+      RESUME_RESULT: ${{ needs.soak-resume-quarantine.result }}
+    steps:
+      - name: Report failures on the tracking issue
+        run: |
+          set -euo pipefail
+          report() {
+            local job="$1" outcome="$2" result="$3" reopen_allowed="${4:-1}" body="" reopen=0
+            case "$outcome" in
+              failure)
+                # A soak step that exceeds its step-level timeout is ALSO
+                # recorded as outcome 'failure' (there is no 'cancelled'
+                # outcome for a step timeout), so these bodies name both
+                # readings. Only this arm can reopen the issue — and only
+                # for jobs whose failure is plausibly a regression; the
+                # quarantine lane (reopen_allowed=0) is comment-only, so its
+                # known flake cannot masquerade as one.
+                if [ "$reopen_allowed" = "1" ]; then
+                  body="nightly-soak job **$job** failed or hit its soak-step timeout: $RUN_URL — either a regression of a race fixed in #45, or a hang/capacity problem."
+                  reopen=1
+                else
+                  body="nightly-soak QUARANTINE job **$job** failed or hit its soak-step timeout: $RUN_URL — this lane soaks the resume/rewind test excluded from the merge gate (known: the not-synced import path drops builds after advancing the resume pointer, plus a reboot-fixture teardown race). Comment-only by design; NOT evidence of a race regression."
+                fi
+                ;;
+              cancelled)
+                # Reachable only via a manual RUN cancellation racing the
+                # grace period; comment-only, never reopen.
+                body="nightly-soak job **$job** soak step was cancelled: $RUN_URL"
+                ;;
+              *)
+                # The soak step never reported an outcome: a setup step
+                # failed or the JOB-level cap cancelled everything.
+                # Comment-only in both shapes — neither is a race regression.
+                if [ "$result" = "cancelled" ]; then
+                  body="nightly-soak job **$job** was cancelled before its soak step finished (job-level timeout — possible hang outside the soak step): $RUN_URL"
+                elif [ "$result" = "failure" ]; then
+                  body="nightly-soak job **$job** failed in a SETUP step, before its soak began (toolchain/cache/build problem, not a race regression): $RUN_URL"
+                fi
+                ;;
+            esac
+            if [ -n "$body" ]; then
+              if [ "$reopen" = "1" ]; then
+                # PR #45 closes issue 38; a comment on a closed issue
+                # notifies nobody, so reopen for genuine soak failures.
+                gh issue reopen 38 --repo "$GITHUB_REPOSITORY" 2>/dev/null || true
+              fi
+              # Surface EVERY report in the run's own UI (annotation + job
+              # summary), not just as an issue comment. The quarantine lane is
+              # continue-on-error (the run stays green) and its comment lands on
+              # a closed issue that notifies nobody, so without this its
+              # failures would be invisible everywhere.
+              echo "::warning title=nightly-soak::$body"
+              echo "- $body" >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+              # Guarded: one transient API failure must not abort the
+              # remaining jobs' reports under `set -e`.
+              gh issue comment 38 --repo "$GITHUB_REPOSITORY" --body "$body" \
+                || echo "::warning::failed to post the report for $job"
+            fi
+          }
+          report soak-integration-idle "${IDLE_OUTCOME:-}" "${IDLE_RESULT:-}"
+          report soak-integration-loaded "${LOADED_OUTCOME:-}" "${LOADED_RESULT:-}"
+          report soak-docker-remote-source "${DOCKER_OUTCOME:-}" "${DOCKER_RESULT:-}"
+          report soak-resume-quarantine "${RESUME_OUTCOME:-}" "${RESUME_RESULT:-}" 0

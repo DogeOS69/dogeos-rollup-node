@@ -455,6 +455,33 @@ impl DatabaseWriteOperations for Database {
         )
     }
 
+    async fn delete_mismatched_genesis_blocks(
+        &self,
+        genesis_hash: B256,
+    ) -> Result<u64, DatabaseError> {
+        metered!(
+            DatabaseOperation::DeleteMismatchedGenesisBlocks,
+            self,
+            tx_mut(
+                move |tx| async move { tx.delete_mismatched_genesis_blocks(genesis_hash).await }
+            )
+        )
+    }
+
+    async fn reconcile_genesis_block(
+        &self,
+        genesis_hash: B256,
+        seeded_genesis: B256,
+    ) -> Result<u64, DatabaseError> {
+        metered!(
+            DatabaseOperation::ReconcileGenesisBlock,
+            self,
+            tx_mut(move |tx| async move {
+                tx.reconcile_genesis_block(genesis_hash, seeded_genesis).await
+            })
+        )
+    }
+
     async fn update_l1_messages_from_l2_blocks(
         &self,
         blocks: Vec<L2BlockInfoWithL1Messages>,

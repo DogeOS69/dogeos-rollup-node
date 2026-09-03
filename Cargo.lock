@@ -11226,6 +11226,7 @@ dependencies = [
  "alloy-signer-local",
  "alloy-sol-types",
  "alloy-transport",
+ "alloy-transport-http",
  "async-trait",
  "auto_impl",
  "aws-config",

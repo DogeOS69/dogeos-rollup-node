@@ -679,7 +679,15 @@ impl ScrollRollupNodeConfig {
         // node never signed or announced — forking it from its peers. Drag the
         // engine head back down to the persisted head; the persisted head is at
         // or below finalized here, so it is guaranteed present in the EN.
-        if fcs.head_block_info().number > l2_head_block_number {
+        //
+        // Excluded when the persisted head is 0: a fresh rollup database against
+        // an already-synced execution datadir is a legitimate bootstrap that
+        // `startup_refusal` permits, and the zero anchor is NOT authoritative
+        // there — treating it as such would rewind the execution node to genesis
+        // (or fail with SafeBelowFinalized when its finalized marker is above 0).
+        // Bootstrap adopts the provider forkchoice unchanged, exactly as the
+        // loop above (whose `> finalized` bound is likewise never met at 0) does.
+        if l2_head_block_number > 0 && fcs.head_block_info().number > l2_head_block_number {
             if let Some(block) = l2_provider
                 .get_block(l2_head_block_number.into())
                 .full()
@@ -764,15 +772,21 @@ impl ScrollRollupNodeConfig {
                         result.payload_status.status
                     );
                 }
-                Ok(_result) => {
-                    // SYNCING/ACCEPTED: the execution node took the head but has
-                    // not finished adopting it. The mirror already holds it and
-                    // every later FCU reasserts it, so do not fail startup.
-                    tracing::warn!(
-                        target: "scroll::node::args",
-                        ?head,
-                        "Execution node has not yet adopted the recovered startup head; it will \
-                         be reasserted"
+                Ok(result) => {
+                    // Non-VALID (SYNCING/ACCEPTED): the execution node has NOT
+                    // adopted the rewind. The rewind target is an ANCESTOR the
+                    // execution node already holds, so VALID is the only correct
+                    // answer — anything else means it is in an unexpected state
+                    // (e.g. still snap-syncing). We cannot launch anyway: the
+                    // orchestrator starts L2-Synced with no recheck latch, and
+                    // its periodic recheck only fires while L2 is syncing WITH a
+                    // target, so nothing would reissue this FCU on a quiescent
+                    // node — it would keep serving the discarded head. Fail
+                    // startup so the supervisor restarts and retries.
+                    eyre::bail!(
+                        "execution node did not adopt the recovered startup head {head:?} \
+                         (status {:?}); refusing to launch on the discarded head",
+                        result.payload_status.status
                     );
                 }
                 Err(err) => {

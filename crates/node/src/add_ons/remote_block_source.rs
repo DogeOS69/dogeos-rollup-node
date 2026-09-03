@@ -193,12 +193,12 @@ const MAX_ANCESTOR_LOOKBACK: u64 = 8192;
 
 /// Geometric backoff for a wedged follower: after a failed poll tick the next
 /// poll is delayed by `poll_interval_ms << min(consecutive_failures, SHIFT)`,
-/// capped at [`FOLLOWER_BACKOFF_CAP`]. Without it a follower that cannot make
+/// capped at `FOLLOWER_BACKOFF_CAP_MS`. Without it a follower that cannot make
 /// progress (e.g. `FollowAction::RefuseBelowSafe`, which does not self-clear)
 /// re-runs the common-ancestor walk — up to `MAX_ANCESTOR_LOOKBACK` sequential
 /// RPCs — back-to-back at the poll cadence. Reset to no delay on the next
 /// successful tick.
-const FOLLOWER_BACKOFF_MAX_SHIFT: u32 = 8;
+const FOLLOWER_BACKOFF_MAX_SHIFT: u32 = u64::BITS - 1;
 const FOLLOWER_BACKOFF_CAP_MS: u64 = 30_000;
 
 /// The delay before the next poll after `consecutive_failures` failed ticks

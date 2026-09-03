@@ -703,7 +703,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${ALCHEMY_KEY:-}" ]; then
-            echo "::error::ALCHEMY_KEY secret is missing or empty. The sync workflow needs it to reach the L1 RPC; provision the repository secret (or keep this workflow disabled) instead of paying for a ~20 minute release build that cannot succeed." 
+            echo "::error::ALCHEMY_KEY secret is missing or empty. The sync workflow needs it to reach the L1 RPC; provision the repository secret (or keep this workflow disabled) instead of paying for a ~20 minute release build that cannot succeed."
             exit 1
           fi
 

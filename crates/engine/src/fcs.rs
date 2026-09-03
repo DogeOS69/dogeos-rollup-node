@@ -44,7 +44,7 @@ impl ForkchoiceState {
     }
 
     /// Reads the `latest`, `safe` and `finalized` tags from the provider and returns them with
-    /// `safe` clamped into `finalized <= safe <= head` (see [`clamp_startup_safe`]).
+    /// `safe` clamped into `finalized <= safe <= head` (see `clamp_startup_safe`).
     ///
     /// Returns `None` if ANY of the three reads fails or is absent, and also when the snapshot is
     /// internally inconsistent (`finalized` above `latest`). That `None` is load-bearing: the

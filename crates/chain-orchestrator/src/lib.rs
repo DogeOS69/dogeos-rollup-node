@@ -2391,32 +2391,87 @@ impl<
             // head is not a finalized-descendant — peer-triggerable and NOT
             // fatal, so it must fall through to the re-latch below instead of
             // crash-looping the node.
-            if validated && target == mirror {
-                tracing::error!(
-                    target: "scroll::chain_orchestrator",
-                    ?target,
-                    "Engine rejected as INVALID a validated head it currently holds; engine and \
-                     node disagree on committed state"
-                );
-                return Err(ChainOrchestratorError::FatalStateDivergence(
-                    "engine rejected a validated head it holds as its own mirror; restart \
-                     re-derives the head from the persisted state",
-                ));
+            if target == mirror {
+                let safe = *self.engine.fcs().safe_block_info();
+                if validated {
+                    // The engine rejects a head it VALIDATED via new_payload —
+                    // a genuine self-contradiction (not reachable via ordinary
+                    // peer/optimistic input, see the latch provenance).
+                    tracing::error!(
+                        target: "scroll::chain_orchestrator",
+                        ?target,
+                        "Engine rejected as INVALID a validated head it currently holds; engine \
+                         and node disagree on committed state"
+                    );
+                    return Err(ChainOrchestratorError::FatalStateDivergence(
+                        "engine rejected a validated head it holds as its own mirror; restart \
+                         re-derives the head from the persisted state",
+                    ));
+                }
+                if safe.number >= mirror.number {
+                    // No lower validated head to fall back to: the engine rejects
+                    // a head at or below its derivation-validated safe head —
+                    // unrecoverable in-place.
+                    tracing::error!(
+                        target: "scroll::chain_orchestrator",
+                        ?target,
+                        ?safe,
+                        "Engine rejected a head at or below the safe head it holds"
+                    );
+                    return Err(ChainOrchestratorError::FatalStateDivergence(
+                        "engine rejected a head at or below the safe head it holds; restart \
+                         re-derives the head from the persisted state",
+                    ));
+                }
+                // The rejected head IS the current mirror and is NOT validated
+                // (the optimistic-sync shape): re-latching onto it would re-probe
+                // the same permanently-rejected head forever, wedging L2 sync on
+                // a quiet chain. Move the engine head OFF it to the SAFE head
+                // (derivation-validated, a finalized-descendant) and latch onto
+                // safe, so the next probe adopts it through the normal
+                // exit-sync path (which consolidates and persists the head).
+                match self.engine.update_fcs_checked(Some(safe), None, None).await {
+                    Ok(r) if r.is_valid() => {
+                        tracing::warn!(
+                            target: "scroll::chain_orchestrator",
+                            ?target,
+                            ?safe,
+                            "Optimistic head rejected as INVALID; rewound the engine head to the \
+                             safe head and re-latched onto it"
+                        );
+                        self.l2_sync_recheck_target = Some(L2SyncRecheck {
+                            target: safe,
+                            latched_from: safe,
+                            validated: false,
+                        });
+                    }
+                    other => {
+                        // SYNCING/transport: the head did not move, keep the
+                        // current latch and retry next tick.
+                        tracing::warn!(
+                            target: "scroll::chain_orchestrator",
+                            ?target,
+                            ?safe,
+                            ?other,
+                            "Could not rewind to the safe head after an INVALID optimistic head; \
+                             keeping the latch to retry"
+                        );
+                    }
+                }
+                return Ok(());
             }
 
-            // Otherwise stop re-issuing THIS target but keep a recovery path, for the same reason
-            // the stale arm above does: a cleared latch leaves L2 marked syncing with no target at
-            // all, and on the quiescent chain this mechanism exists for, nothing reopens that gate.
+            // target != mirror: the mirror moved to a DIFFERENT head since the
+            // latch. Re-latch onto it (provenance reset — it is not the block
+            // just probed, and we did not validate it) and re-probe next tick;
+            // a cleared latch would leave L2 marked syncing with no target, and
+            // on a quiescent chain nothing reopens that gate.
             tracing::warn!(
                 target: "scroll::chain_orchestrator",
                 ?target,
                 ?mirror,
                 "Latched L2 sync target rejected as INVALID; re-latching onto the current head"
             );
-            // Reset provenance: this re-latches onto `mirror`, which is NOT the
-            // block just probed (`target`), so the target's `validated` bit does
-            // not describe it. Carrying it would be the only way the fail-stop
-            // arm becomes reachable, and onto a head we did not validate.
             self.l2_sync_recheck_target =
                 Some(L2SyncRecheck { target: mirror, latched_from: mirror, validated: false });
             return Ok(());
@@ -3687,7 +3742,7 @@ mod run_loop_policy_tests {
     /// fail-stop — the peer-import path ran `new_payload`, so rejecting the head
     /// it committed is a genuine engine self-contradiction. (The optimistic
     /// counterpart is covered by
-    /// `invalid_recheck_of_optimistic_mirror_relatches_not_fail_stops`.)
+    /// `invalid_recheck_of_optimistic_mirror_rewinds_to_safe`.)
     #[tokio::test]
     async fn invalid_recheck_of_the_mirror_itself_fail_stops() {
         let database = Arc::new(setup_test_db().await);
@@ -3732,25 +3787,36 @@ mod run_loop_policy_tests {
         );
     }
 
-    /// A1: the OPTIMISTIC counterpart must NOT fail-stop. Optimistic sync
-    /// commits its head on SYNCING (zeroed safe/finalized, no `new_payload`), so
-    /// a later INVALID for `target == mirror` means the head is merely not a
-    /// finalized-descendant — peer-triggerable. The node must re-latch and stay
-    /// up, never crash-loop. Reverting the `validated` flag makes this fail-stop.
+    /// A1/P66: the OPTIMISTIC counterpart must NOT fail-stop, and must not
+    /// re-latch onto the rejected head either. Optimistic sync commits its head
+    /// on SYNCING (no `new_payload`), so a later INVALID for `target == mirror`
+    /// means that head is merely not a finalized-descendant — peer-triggerable.
+    /// Re-latching onto it would re-probe the same permanently-rejected head
+    /// forever, wedging L2 sync on a quiet chain. Recovery: rewind the engine
+    /// head OFF it to the SAFE head (derivation-validated) and re-latch onto
+    /// safe, so the next probe adopts it through the normal exit-sync path.
     #[tokio::test]
-    async fn invalid_recheck_of_optimistic_mirror_relatches_not_fail_stops() {
+    async fn invalid_recheck_of_optimistic_mirror_rewinds_to_safe() {
         let database = Arc::new(setup_test_db().await);
         database.insert_genesis_block(B256::ZERO).await.unwrap();
         database.delete_mismatched_genesis_blocks(B256::ZERO).await.unwrap();
 
         let engine_client = Arc::new(ScriptedEngineClient::new());
+        // 1) The probe of the optimistic head M is rejected as INVALID.
         engine_client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(
             PayloadStatusEnum::Invalid { validation_error: "scripted".to_string() },
             None,
         )));
+        // 2) The rewind FCU that moves the head back to the safe block succeeds.
+        engine_client
+            .push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Valid, None)));
         let asserter = Asserter::new();
         asserter.push_success(&Option::<()>::None);
         asserter.push_success(&Option::<()>::None);
+        // Optimistic head M (height SAFE) sits ABOVE the derivation-validated
+        // safe head S (height SAFE - 5) — the realistic optimistic-sync shape.
+        let optimistic_head = info(SAFE, 0x11);
+        let safe_head = info(SAFE - 5, 0x0a);
         let (mut orchestrator, _handle, _notification_tx) = test_orchestrator_with_fcs(
             database.clone(),
             engine_client.clone(),
@@ -3761,7 +3827,7 @@ mod run_loop_policy_tests {
                 skipped_l1_messages: vec![],
                 target_status: BatchStatus::Consolidated,
             },
-            ForkchoiceState::new(info(SAFE, 0x11), info(SAFE, 0x11), info(0, 0x00)),
+            ForkchoiceState::new(optimistic_head, safe_head, info(0, 0x00)),
         )
         .await;
 
@@ -3769,20 +3835,30 @@ mod run_loop_policy_tests {
         orchestrator.sync_state.l2_mut().set_syncing();
         // The optimistic-sync shape: target == latched_from == mirror, NOT validated.
         orchestrator.l2_sync_recheck_target = Some(super::L2SyncRecheck {
-            target: info(SAFE, 0x11),
-            latched_from: info(SAFE, 0x11),
+            target: optimistic_head,
+            latched_from: optimistic_head,
             validated: false,
         });
 
         let result = orchestrator.recheck_l2_sync_target().await;
         assert!(result.is_ok(), "an optimistic INVALID must not fail-stop; got {result:?}");
-        assert!(
-            orchestrator.l2_sync_recheck_target.is_some(),
-            "it must re-latch, keeping a recovery target"
+        assert_eq!(
+            *orchestrator.engine.fcs().head_block_info(),
+            safe_head,
+            "the engine head must be rewound OFF the rejected optimistic head to the safe head"
+        );
+        assert_eq!(
+            orchestrator.l2_sync_recheck_target,
+            Some(super::L2SyncRecheck {
+                target: safe_head,
+                latched_from: safe_head,
+                validated: false,
+            }),
+            "it must re-latch onto the safe head, never back onto the rejected head"
         );
         assert!(
             orchestrator.sync_state.l2().is_syncing(),
-            "and stay L2-syncing rather than exit or die"
+            "and stay L2-syncing until the next probe adopts safe via the exit path"
         );
     }
 

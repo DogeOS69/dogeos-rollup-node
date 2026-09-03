@@ -171,7 +171,9 @@ impl ScrollRollupNodeConfig {
             self.consensus_args.authorized_signer.is_none() &&
             self.l1_provider_args.url.is_none()
         {
-            return Err("System contract consensus requires --l1.url (the authorized signer is                  read from L1); a static --consensus.authorized-signer only overrides it and does                  not remove the --l1.url requirement"
+            return Err("System contract consensus requires --l1.url (the authorized signer is \
+                 read from L1); a static --consensus.authorized-signer only overrides it and \
+                 does not remove the --l1.url requirement"
                 .to_string());
         }
 
@@ -658,6 +660,47 @@ impl ScrollRollupNodeConfig {
             // Decrement the L2 head block number and try again
             tracing::info!(target: "scroll::node::args", ?l2_head_block_number, "L2 head block not found in EN, decrementing");
             l2_head_block_number -= 1;
+        }
+
+        // The loop above only runs while the persisted head sits ABOVE finalized,
+        // so it never fires when the persisted head is at or below finalized. But
+        // the execution node's head can sit ABOVE the persisted head there too: a
+        // sequenced block is committed to the engine BEFORE it is signed and its
+        // head persisted, so a crash between those steps (e.g. a signing failure
+        // that fail-stops the node) leaves the engine one block ahead of the
+        // database. Resuming on that block would sequence on top of a block this
+        // node never signed or announced — forking it from its peers. Drag the
+        // engine head back down to the persisted head; the persisted head is at
+        // or below finalized here, so it is guaranteed present in the EN.
+        if fcs.head_block_info().number > l2_head_block_number {
+            if let Some(block) = l2_provider
+                .get_block(l2_head_block_number.into())
+                .full()
+                .await?
+                .map(|b| b.into_consensus().map_transactions(|tx| tx.inner.into_inner()))
+            {
+                let block_info: BlockInfo = (&block).into();
+                tracing::warn!(
+                    target: "scroll::node::args",
+                    engine_head = ?fcs.head_block_info(),
+                    persisted_head = ?block_info,
+                    "Execution node head sits above the persisted L2 head at startup; clamping \
+                     it down (a built block was likely committed to the engine without \
+                     completing signing and persistence)"
+                );
+                // Clamp safe too if it sits above the head we are resuming from,
+                // the same rule the loop above and the runtime rewind paths apply.
+                if fcs.safe_block_info().number > block_info.number {
+                    fcs = ForkchoiceState::new(block_info, block_info, *fcs.finalized_block_info());
+                } else {
+                    fcs.update(Some(block_info), None, None)?;
+                }
+                db.tx_mut(move |tx| async move {
+                    tx.set_l2_head_block_number(l2_head_block_number).await?;
+                    tx.purge_l1_message_to_l2_block_mappings(Some(l2_head_block_number + 1)).await
+                })
+                .await?;
+            }
         }
 
         let chain_spec = Arc::new(chain_spec.clone());

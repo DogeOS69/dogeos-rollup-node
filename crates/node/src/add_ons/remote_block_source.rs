@@ -191,6 +191,16 @@ const ERROR_LOG_MIN_INTERVAL: Duration = Duration::from_secs(1);
 /// never finishes and restarts from the top on every failure.
 const MAX_ANCESTOR_LOOKBACK: u64 = 8192;
 
+/// Geometric backoff for a wedged follower: after a failed poll tick the next
+/// poll is delayed by `poll_interval_ms << min(consecutive_failures, SHIFT)`,
+/// capped at [`FOLLOWER_BACKOFF_CAP`]. Without it a follower that cannot make
+/// progress (e.g. `FollowAction::RefuseBelowSafe`, which does not self-clear)
+/// re-runs the common-ancestor walk — up to `MAX_ANCESTOR_LOOKBACK` sequential
+/// RPCs — back-to-back at the poll cadence. Reset to no delay on the next
+/// successful tick.
+const FOLLOWER_BACKOFF_MAX_SHIFT: u32 = 8;
+const FOLLOWER_BACKOFF_CAP: Duration = Duration::from_secs(30);
+
 /// The outcome of waiting for a requested build.
 enum BuildOutcome {
     /// The build landed at EXACTLY the expected height — the block was
@@ -705,9 +715,9 @@ where
                             // Rate-limit identical errors by elapsed time (at
                             // the default 100ms poll interval an unreachable
                             // remote would otherwise emit ~10 identical
-                            // lines/second), but log a changed error ahead of the
-                            // interval, but no sooner than ERROR_LOG_MIN_INTERVAL after
-                            // the last emitted line.
+                            // lines/second), but log a CHANGED error ahead of the
+                            // interval — though no sooner than ERROR_LOG_MIN_INTERVAL
+                            // after the last emitted line.
                             // Scrubbed BEFORE it is stored or compared: this
                             // string is both the log payload and the
                             // rate-limiter's memory.
@@ -749,6 +759,23 @@ where
                             } else {
                                 self.suppressed_errors += 1;
                             }
+                        }
+                    }
+                    // Back off while wedged. `consecutive_failures` was reset to
+                    // 0 on the Ok arm above, so this is a no-op on a healthy
+                    // tick; on a persistent fault it caps the ancestor-walk
+                    // storm at one attempt per `FOLLOWER_BACKOFF_CAP`.
+                    // Interruptible by shutdown.
+                    if self.consecutive_failures > 0 {
+                        let shift =
+                            (self.consecutive_failures as u32).min(FOLLOWER_BACKOFF_MAX_SHIFT);
+                        let backoff = Duration::from_millis(self.config.poll_interval_ms)
+                            .saturating_mul(1u32 << shift)
+                            .min(FOLLOWER_BACKOFF_CAP);
+                        tokio::select! {
+                            biased;
+                            _guard = &mut shutdown => break,
+                            _ = tokio::time::sleep(backoff) => {}
                         }
                     }
                 }
@@ -828,6 +855,22 @@ where
                     }
                     Some(ChainOrchestratorEvent::Shutdown) => {
                         break Err(orchestrator_gone("Chain orchestrator is shutting down"));
+                    }
+                    Some(ChainOrchestratorEvent::BuildBlockCoalesced) => {
+                        // The remote source is meant to be the SOLE build
+                        // requester, so a coalesced build means a second
+                        // requester exists (e.g. auto-sequencing enabled at
+                        // runtime) — the invariant that makes build-outcome
+                        // attribution sound is violated. Surface it as a
+                        // one-line diagnosis rather than waiting the full
+                        // budget in silence; keep waiting for this request's
+                        // own outcome.
+                        tracing::warn!(
+                            target: "scroll::remote_source",
+                            expected_number,
+                            "Observed BuildBlockCoalesced while awaiting a build outcome; the \
+                             single-build-requester invariant may be violated"
+                        );
                     }
                     Some(_) => {
                         // Ignore other events, keep waiting

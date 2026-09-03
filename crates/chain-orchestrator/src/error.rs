@@ -47,8 +47,9 @@ pub enum ChainOrchestratorError {
     /// SYNCING raise it (nothing has been mutated and the refusal is
     /// replied to the caller); at the `RevertToL1Block` combined head+safe
     /// site only INVALID raises it (the unwind has already run and the run
-    /// loop escalates to a fail-stop — SYNCING there is a retryable refusal
-    /// that replies `false` instead); at the peer-chain-import site only
+    /// loop escalates to a fail-stop); SYNCING there no longer replies a
+    /// retryable `false` — every post-latch failure, SYNCING included, now
+    /// fail-stops via `FatalStateDivergence`; at the peer-chain-import site only
     /// SYNCING raises it (INVALID is an `InvalidBlock`), the L2 sync state
     /// has been set back to syncing, and the error is only logged on the
     /// gossip path — while via the `ImportBlock` command it is stringified

@@ -502,6 +502,13 @@ jobs:
                 # notifies nobody, so reopen for genuine soak failures.
                 gh issue reopen 38 --repo "$GITHUB_REPOSITORY" 2>/dev/null || true
               fi
+              # Surface EVERY report in the run's own UI (annotation + job
+              # summary), not just as an issue comment. The quarantine lane is
+              # continue-on-error (the run stays green) and its comment lands on
+              # a closed issue that notifies nobody, so without this its
+              # failures would be invisible everywhere.
+              echo "::warning title=nightly-soak::$body"
+              echo "- $body" >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
               # Guarded: one transient API failure must not abort the
               # remaining jobs' reports under `set -e`.
               gh issue comment 38 --repo "$GITHUB_REPOSITORY" --body "$body" \

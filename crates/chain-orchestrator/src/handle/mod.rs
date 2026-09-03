@@ -179,10 +179,11 @@ impl<N: FullNetwork<Primitives = DogeosNetworkPrimitives>> ChainOrchestratorHand
 
     /// Revert the rollup node state to the specified L1 block number.
     ///
-    /// `Ok(false)` means the unwind was REFUSED or could not be fully
-    /// applied (nothing to act on / retry later); the state may be
-    /// partially advanced only in the retryable-refusal cases documented on
-    /// the handler.
+    /// `Ok(false)` means the unwind was REFUSED before any durable change —
+    /// both `false` sites are PRE-latch (bad finalized-L1 read, or a target
+    /// below the finalized L1 block), so nothing was touched. Every failure
+    /// AFTER the latch now fail-stops the run loop, which surfaces here as an
+    /// outer `Err(RecvError)` (the reply channel is dropped), never `Ok(false)`.
     pub async fn revert_to_l1_block(
         &self,
         block_number: u64,

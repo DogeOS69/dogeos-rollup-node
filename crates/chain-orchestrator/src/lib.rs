@@ -339,6 +339,17 @@ impl<
                         .flatten();
                     if let Err(err) = self.handle_command(command).await {
                         if matches!(err, ChainOrchestratorError::FatalStateDivergence(_)) {
+                            // A fatal divergence raised mid-unwind must not lose
+                            // the held-batch context (batch_index/attempt/held_ms):
+                            // pass 60 made several admin-unwind branches fatal, so
+                            // this arm is now reachable while a batch is held.
+                            if let Some(context) = held_unwind_context {
+                                self.log_fatal_held_operation(
+                                    context,
+                                    "administrative L1 unwind",
+                                    &err,
+                                );
+                            }
                             tracing::error!(
                                 target: "scroll::chain_orchestrator",
                                 ?err,
@@ -1048,11 +1059,11 @@ impl<
                 // The FCU targets are derived from ABSOLUTE persisted state
                 // compared against the engine mirror — never from what this
                 // particular unwind deleted. The unwind is idempotent in its
-                // effects but not in its deltas: after a retryable refusal
-                // below, the re-issued revert deletes nothing, and a
-                // delta-derived FCU would be skipped entirely while the
-                // engine still disagrees — the very retry the refusal asked
-                // for would silently no-op and reply true.
+                // effects but not in its deltas: after a crash between the
+                // durable unwind and this FCU, the restart re-runs the revert
+                // and it deletes nothing, so a delta-derived FCU would be
+                // skipped while the engine still disagrees. Absolute targets
+                // re-issue correctly on that replay.
                 let finalized = *self.engine.fcs().finalized_block_info();
                 let mirror_head = *self.engine.fcs().head_block_info();
                 let mirror_safe = *self.engine.fcs().safe_block_info();
@@ -2329,6 +2340,37 @@ impl<
             "Execution node adopted the latched head; L2 is now synced"
         );
         self.l2_sync_recheck_target = None;
+        // The probe FCU may have moved the head BACKWARD (the latch is taken on
+        // a ChainReorged import whose target sits below the mirror). A backward
+        // move must be paired with the same L1-message-mapping purge and pool
+        // refill every other head-rewind seam performs (`UpdateFcsHead`,
+        // `handle_l1_reorg`): `mirror` is the pre-probe head, so the reverted
+        // range is `target.number + 1 ..= mirror.number`. Collect the reverted
+        // transactions now (the blocks still exist on the EL after the rewind);
+        // the purge is folded into the persist tx_mut below and the refill runs
+        // after it commits. Without the purge, L1 messages stamped on the
+        // abandoned blocks stay stamped and `get_n_l1_messages(NotIncluded(..))`
+        // skips their queue indices — an out-of-order queue peers reject.
+        let rewound_backward = target.number < mirror.number;
+        let reverted_transactions = if rewound_backward {
+            match self
+                .collect_reverted_txs_in_range(target.number.saturating_add(1), mirror.number)
+                .await
+            {
+                Ok(txs) => txs,
+                Err(err) => {
+                    tracing::warn!(
+                        target: "scroll::chain_orchestrator",
+                        %err,
+                        "Failed to collect reverted transactions for the pool refill after \
+                         an L2-sync-recheck rewind; continuing without them"
+                    );
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
         // Every other head-moving seam cancels, and `event.rs` documents that
         // list as exhaustive. `BuildBlock` is deliberately NOT gated on sync
         // state, so a job can be parked on the pre-recheck parent: left alive it
@@ -2363,7 +2405,16 @@ impl<
         // that height, startup refuses outright.
         if let Err(err) = self
             .database
-            .tx_mut(move |tx| async move { tx.set_l2_head_block_number(target.number).await })
+            .tx_mut(move |tx| async move {
+                tx.set_l2_head_block_number(target.number).await?;
+                // Fold the mapping purge into the head persist so a crash
+                // between them cannot leave messages stamped on the abandoned
+                // blocks. No-op when the head did not move backward.
+                if rewound_backward {
+                    tx.purge_l1_message_to_l2_block_mappings(Some(target.number + 1)).await?;
+                }
+                Ok::<_, DatabaseError>(())
+            })
             .await
         {
             tracing::error!(
@@ -2376,6 +2427,9 @@ impl<
                 "engine adopted the latched head but it could not be persisted; \
                  restart re-converges from the persisted state",
             ));
+        }
+        if rewound_backward {
+            self.reinsert_txs_into_pool(reverted_transactions).await;
         }
         Ok(())
     }
@@ -4509,13 +4563,14 @@ mod run_loop_policy_tests {
         // The dev migration seeded the Scroll dev genesis row beside the
         // test genesis; drop it so height-0 queries are deterministic.
         database.delete_mismatched_genesis_blocks(B256::ZERO).await.unwrap();
-        // The genesis batch is marker-eligible, so the marker floor is the
-        // genesis block even before any real batch finalizes (harmless in
-        // production: it can never exceed the engine's finalized mirror).
+        // The seeded genesis batch (index 0) is excluded from the marker, so
+        // there is no marker until a real (index > 0) batch finalizes — this
+        // is what stops a genesis-hash mismatch from being misreported as a
+        // finality divergence on the first finalized notification.
         assert_eq!(
             database.finalize_consolidated_batches(10).await.unwrap(),
-            Some(info(0, 0x00)),
-            "the genesis batch is the initial marker floor"
+            None,
+            "the seeded genesis batch does not produce a marker"
         );
 
         let batch_info = BatchInfo::new(1, B256::repeat_byte(1));
@@ -4550,8 +4605,8 @@ mod run_loop_policy_tests {
         );
         assert_eq!(
             database.finalize_consolidated_batches(5).await.unwrap(),
-            Some(info(0, 0x00)),
-            "batches above the finalized L1 bound are not eligible; the floor remains"
+            None,
+            "batches above the finalized L1 bound are not eligible, and genesis is excluded"
         );
     }
 

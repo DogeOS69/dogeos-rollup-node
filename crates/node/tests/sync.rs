@@ -1019,7 +1019,7 @@ async fn test_chain_import_cancels_inflight_payload_job() -> eyre::Result<()> {
     // The import moved the head and must have cancelled the in-flight job.
     // Tightly bounded: this test cannot pre-build a block (node_a must stay
     // at genesis for the import to be a clean extension), so a loose wait
-    // could be satisfied by a finalization-time emission from the 3s job
+    // could be satisfied by a finalization-time emission from the 8s job
     // instead of the import's prompt cancellation.
     node_a
         .expect_event()
@@ -1029,11 +1029,11 @@ async fn test_chain_import_cancels_inflight_payload_job() -> eyre::Result<()> {
         .await?;
 
     // Vacuous-pass guard: the window must OUTLAST the remaining payload
-    // duration (an uncancelled 3s job sequences at ~t+3.0s; a 2s window
+    // duration (an uncancelled 8s job sequences at ~t+8.0s; a shorter window
     // would close before it and could never fail).
     let phantom = node_a
         .expect_event()
-        .timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(10))
         .label("no BlockSequenced after the import-cancelled job")
         .where_event(|e| matches!(e, ChainOrchestratorEvent::BlockSequenced(_)))
         .await;
@@ -1106,7 +1106,7 @@ async fn test_update_fcs_head_cancels_inflight_payload_job() -> eyre::Result<()>
 
     // The head update must have cancelled the in-flight job.
     // Bounded like the chain-import test: a post-finalization emission from
-    // the 3s job must not be able to satisfy this wait.
+    // the 8s job must not be able to satisfy this wait.
     fixture
         .expect_event()
         .timeout(std::time::Duration::from_secs(2))
@@ -1115,12 +1115,12 @@ async fn test_update_fcs_head_cancels_inflight_payload_job() -> eyre::Result<()>
         .await?;
 
     // The event alone is not the cancellation (mirrors the sibling
-    // cancellation tests): a regression that emits it but leaves the 3s job
+    // cancellation tests): a regression that emits it but leaves the 8s job
     // in the slot would still sequence. Nothing may sequence within the
     // job's remaining lifetime, and the head must sit at the updated target.
     let phantom = fixture
         .expect_event()
-        .timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(10))
         .label("no BlockSequenced after the cancelled job")
         .where_event(|e| matches!(e, ChainOrchestratorEvent::BlockSequenced(_)))
         .await;
@@ -1188,12 +1188,12 @@ async fn test_disable_sequencing_cancels_inflight_payload_job() -> eyre::Result<
         .await?;
 
     // The event alone is not the cancellation: a regression that emits it
-    // but leaves the 3s job in the slot would still sequence. Nothing may
+    // but leaves the 8s job in the slot would still sequence. Nothing may
     // sequence within the job's remaining lifetime, and the head must still
     // sit at the pre-built block 1.
     let phantom = fixture
         .expect_event()
-        .timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(10))
         .label("no BlockSequenced after the cancelled job")
         .where_event(|e| matches!(e, ChainOrchestratorEvent::BlockSequenced(_)))
         .await;
@@ -1261,12 +1261,12 @@ async fn test_revert_to_l1_block_cancels_inflight_payload_job() -> eyre::Result<
         .await?;
 
     // The event alone is not the cancellation: a regression that emits it
-    // but leaves the 3s job in the slot would still sequence. Nothing may
+    // but leaves the 8s job in the slot would still sequence. Nothing may
     // sequence within the job's remaining lifetime, and the head must still
     // sit at the pre-built block 1.
     let phantom = fixture
         .expect_event()
-        .timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(10))
         .label("no BlockSequenced after the cancelled job")
         .where_event(|e| matches!(e, ChainOrchestratorEvent::BlockSequenced(_)))
         .await;

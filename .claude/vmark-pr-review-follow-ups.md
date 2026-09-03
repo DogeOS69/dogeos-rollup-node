@@ -524,9 +524,16 @@ from every pass is either fixed in the PR or recorded here.
     audit is better done once, outside this PR.
   - Suggested Linear title: "ci: pin third-party actions by commit SHA across workflows"
 
-- **Blocked-resume ancestor walk re-runs every tick with no backoff**
+- **[RESOLVED pass 61] Blocked-resume ancestor walk re-runs every tick with no backoff**
   (`crates/node/src/add_ons/remote_block_source.rs`, `follow_and_build` /
   `init_last_imported_block`)
+  - RESOLUTION: pass 61 (Claude finding 7) added a geometric backoff
+    (`FOLLOWER_BACKOFF_MAX_SHIFT`/`FOLLOWER_BACKOFF_CAP`) in `run_until_shutdown`:
+    after a failed tick the next poll is delayed by
+    `poll_interval_ms << min(consecutive_failures, 8)`, capped at 30s, reset on
+    the next success. This caps the ancestor-walk storm without blunting the
+    transient-fault retry. (Caching the walk result was the alternative; the
+    backoff is simpler and does not add state to the walk itself.)
   - Impact/evidence: Claude pass 43 m3 (2026-09-02). When the resume point
     cannot be established (`resume < local_safe`, or the `!diverged`
     "remote trails" bail), the walk returns Err after completing and caches
@@ -595,6 +602,67 @@ from every pass is either fixed in the PR or recorded here.
     transient, and choosing a retry bound and its failure behaviour, is a
     policy decision for the database layer well beyond this PR's diff.
   - Suggested Linear title: "rollup-node: bound database retries and stop classifying deterministic SQL faults as retryable"
+
+- **[pass 61 F3] `--private-key` flag silently removed with no migration hint**
+  (`crates/node/src/args.rs` `SignerArgs::private_key` `#[arg(skip)]`)
+  - Impact/evidence: Claude pass 61 finding 3 (2026-09-02). The PR adds
+    `#[arg(skip)]`, removing the previously-working `--private-key` flag. An
+    operator still passing it dies at clap parse time ("unexpected argument")
+    with no pointer to `--signer.key-file` / `--signer.aws-kms-key-id`. The
+    security motive (raw key in `ps` / `/proc/<pid>/cmdline`) is sound.
+  - Why unaddressed: product judgment. A hidden `--signer.private-key` rejected
+    in `validate()` with a migration message gives the best UX (the key is on
+    argv the moment it is typed regardless, so it is no worse security-wise) but
+    contradicts the field's security comment and touches signer wiring; doc-only
+    is the safe minimum. Also update the PR breaking-change callout (lists 3 of
+    the 5 hard rules).
+  - Suggested Linear title: "rollup-node: migration hint for the removed --private-key flag"
+
+- **[pass 61 F8] Remote-source rewind depth is floored only by the local safe head**
+  (`crates/node/src/add_ons/remote_block_source.rs` `decide_follow_action`)
+  - Impact/evidence: Claude pass 61 finding 8 (2026-09-02). `Rewind` is returned
+    whenever `local_head` exceeds `resume + 1` with divergence, floored only by
+    `resume` at-or-above `local_safe`. On a fresh follower whose safe is still 0,
+    a remote forking near genesis drives an administrative rewind of nearly the
+    whole local chain (bounded at `MAX_ANCESTOR_LOOKBACK` = 8192: deep, not
+    unbounded).
+  - Why unaddressed: the fix is a new operator flag `--remote-source.max-rewind-depth`
+    with a default — a config/product decision, not a local fix.
+  - Suggested Linear title: "rollup-node: bound remote-source rewind depth with a configurable max"
+
+- **[pass 61 F9] `delete_mismatched_genesis_blocks` public write op can leave the DB genesis-less**
+  (`crates/database/db/src/operations.rs`, `db.rs` wrapper, `metrics.rs`)
+  - Impact/evidence: Claude pass 61 finding 9 (2026-09-02). The standalone
+    `Database` wrapper does the DELETE with no compensating insert; against a DB
+    whose only height-0 row is the migration seed it commits a genesis-less
+    `l2_block` and the next `get_latest_safe_l2_info()` panics. Only tests call
+    it; production uses the safe `reconcile_genesis_block`.
+  - Why unaddressed: the tx-level method is on the shared `DatabaseOperations`
+    trait and used INTERNALLY by `reconcile_genesis_block`, so gating only the
+    test-facing wrapper cleanly needs splitting it off the trait — structural
+    churn for a footgun with no production caller.
+  - Suggested Linear title: "scroll-db: gate delete_mismatched_genesis_blocks behind test/test-utils"
+
+- **[pass 61] Coverage gaps flagged as merge-time decisions (not defects)**
+  - Impact/evidence: Claude pass 61. (a) Consolidation fetch-retry
+    (`ConsolidationFetchFailed` + `consolidate_chain_with_retry`) has no test;
+    the scripted `l2_provider` makes it cheap to pin. (b) Remote-source rewind
+    EXECUTION is untested (the decision tables are). (c) `ForkchoiceState::from_provider`
+    refusal arms are untested and load-bearing (the caller hard-bails the node).
+    (d) `handle_l1_finalized`'s marker-exceeds-head deferral arm is untested
+    (deliberate, documented).
+  - Why unaddressed: batched as a coverage decision, scoped out of an
+    already-large round; a and c are worth adding.
+  - Suggested Linear title: "rollup-node: close fetch-retry / rewind-execution / from_provider-refusal coverage gaps"
+
+- **[pass 61] Minor comment/error-string accuracy nits (batched)**
+  - Impact/evidence: Claude pass 61 minor batch, remaining after pass-61 fixes:
+    `error.rs` GenesisMismatch summary vs raise-on-any-foreign-row;
+    `finalize_consolidated_batches` trait doc omits the blockless-Consolidated
+    handling; a purge-bound comment overstates the exclusive bound. All cosmetic
+    (no behavior), reviewer-verified.
+  - Why unaddressed: pure comment precision, batched to keep the pass bounded.
+  - Suggested Linear title: "rollup-node: minor comment/error-string accuracy cleanup"
 
 ## Pass 35 findings — resolution (loop resumed 2026-09-01)
 

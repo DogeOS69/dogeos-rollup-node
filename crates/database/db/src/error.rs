@@ -36,8 +36,8 @@ pub enum DatabaseError {
     },
     /// A populated database carries no genesis (height-0) row.
     #[error(
-        "database has an L2 head above genesis but no block 0 row; the database is truncated or \
-         corrupt and cannot be reconciled against configured genesis {configured}"
+        "database has an L2 head or L2 block rows above genesis but no block 0 row; the database is \
+         truncated or corrupt and cannot be reconciled against configured genesis {configured}"
     )]
     GenesisMissing {
         /// The genesis hash the node was configured with.

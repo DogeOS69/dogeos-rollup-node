@@ -587,10 +587,21 @@ impl<T: WriteConnectionProvider + ?Sized + Sync> DatabaseWriteOperations for T {
         // finalized-head FCU lost to a crash or transport error must be
         // recomputable when the finalized notification replays. Only
         // `Consolidated` rows have their status transitioned below.
-        let marker_filter = eligible.clone().add(
-            models::batch_commit::Column::Status
-                .is_in([BatchStatus::Consolidated.as_str(), BatchStatus::Finalized.as_str()]),
-        );
+        let marker_filter = eligible
+            .clone()
+            .add(
+                models::batch_commit::Column::Status
+                    .is_in([BatchStatus::Consolidated.as_str(), BatchStatus::Finalized.as_str()]),
+            )
+            // Exclude the migration-seeded genesis batch (index 0). It carries a
+            // height-0 `l2_block`, so before this guard it made the marker
+            // `Some(BlockInfo{number: 0, ..})` from the very first call — which
+            // `handle_l1_finalized` then compares against the EL-sourced
+            // finalized mirror, turning a genesis/chainspec mismatch into a
+            // misleading "finality divergence" fail-stop on every restart. A
+            // real finalized batch (index > 0) still yields the marker; the
+            // same `Index > 0` guard is used for this seeded row elsewhere.
+            .add(models::batch_commit::Column::Index.gt(0_i64));
         let transition_filter = eligible
             .add(models::batch_commit::Column::Status.eq(BatchStatus::Consolidated.as_str()));
         // The marker is the HIGHEST finalized L2 block across ALL eligible

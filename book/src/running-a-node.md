@@ -436,4 +436,8 @@ likely a misrouted or lagging remote backend than a wrong URL, so the node
 stays up and re-walks at the poll interval instead of fail-stopping a healthy
 node. A follower stuck in that loop imports nothing while still looking
 healthy, so watch the add-on's repeated sync-error logs rather than expecting
-the process to exit.
+the process to exit. While it is stuck the retry cadence is not the configured
+poll interval: after each failed tick the next poll is delayed by an
+exponential backoff (doubling from the poll interval, capped at 30 seconds and
+reset on the next success), so the sync-error logs grow sparser over time —
+that widening gap is the backoff working, not a second fault.

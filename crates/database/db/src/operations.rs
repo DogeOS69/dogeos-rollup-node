@@ -634,15 +634,13 @@ impl<T: WriteConnectionProvider + ?Sized + Sync> DatabaseWriteOperations for T {
             .await?
             .map(|block| block.block_info());
 
-        // Defensive: never transition rows when no marker resolved. In practice
-        // the migration seeds a genesis `batch_commit` row (index 0, hash
-        // `0x00…`, `finalized_block_number = 0`, status `finalized`) with a
-        // matching height-0 `l2_block`, so `marker_filter` always matches and
-        // the marker is `Some` from the first call — the genesis block is the
-        // marker FLOOR on a node that has finalized nothing. That floor can
-        // never exceed the engine's finalized mirror, and the named-chain
-        // genesis constants are shared with the forkchoice state, so the
-        // same-height hash check in `handle_l1_finalized` agrees on it.
+        // Defensive: never transition rows when no marker resolved. The
+        // migration-seeded genesis `batch_commit` (index 0) is now EXCLUDED
+        // from `marker_filter` above, so on a node that has finalized no real
+        // (index > 0) batch this resolves to `None` — deliberately, so the
+        // first finalized notification does not compare a height-0 marker
+        // against the EL-sourced finalized mirror and misreport a
+        // genesis/chainspec mismatch as a finality divergence.
         if finalized_block_info.is_some() {
             // Only batches that actually contributed block rows may finalize.
             //

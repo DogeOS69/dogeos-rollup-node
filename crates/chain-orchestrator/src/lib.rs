@@ -2258,6 +2258,35 @@ impl<
             return Ok(());
         }
 
+        // If the probe adopts a target BELOW the current mirror it is a
+        // backward head move, which must be paired with an L1-message-mapping
+        // purge and a pool refill (like every other head-rewind seam). Collect
+        // the reverted transactions BEFORE the probe FCU: on VALID it commits
+        // the mirror to `target`, after which `collect_reverted_txs_in_range`'s
+        // canonical lookups would find nothing above the new head. The purge
+        // and refill run in the adopted branch below; on a non-VALID probe
+        // these collected txs are simply dropped.
+        let rewound_backward = target.number < mirror.number;
+        let reverted_transactions = if rewound_backward {
+            match self
+                .collect_reverted_txs_in_range(target.number.saturating_add(1), mirror.number)
+                .await
+            {
+                Ok(txs) => txs,
+                Err(err) => {
+                    tracing::warn!(
+                        target: "scroll::chain_orchestrator",
+                        %err,
+                        "Failed to collect reverted transactions for the pool refill before \
+                         an L2-sync-recheck rewind; continuing without them"
+                    );
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
+
         // Checked, like the site that latched: the mirror must not advance to a head the engine
         // has not adopted. A transport error is not fatal here — this is an opportunistic probe,
         // and the next announcement retries it.
@@ -2340,37 +2369,12 @@ impl<
             "Execution node adopted the latched head; L2 is now synced"
         );
         self.l2_sync_recheck_target = None;
-        // The probe FCU may have moved the head BACKWARD (the latch is taken on
-        // a ChainReorged import whose target sits below the mirror). A backward
-        // move must be paired with the same L1-message-mapping purge and pool
-        // refill every other head-rewind seam performs (`UpdateFcsHead`,
-        // `handle_l1_reorg`): `mirror` is the pre-probe head, so the reverted
-        // range is `target.number + 1 ..= mirror.number`. Collect the reverted
-        // transactions now (the blocks still exist on the EL after the rewind);
-        // the purge is folded into the persist tx_mut below and the refill runs
-        // after it commits. Without the purge, L1 messages stamped on the
-        // abandoned blocks stay stamped and `get_n_l1_messages(NotIncluded(..))`
-        // skips their queue indices — an out-of-order queue peers reject.
-        let rewound_backward = target.number < mirror.number;
-        let reverted_transactions = if rewound_backward {
-            match self
-                .collect_reverted_txs_in_range(target.number.saturating_add(1), mirror.number)
-                .await
-            {
-                Ok(txs) => txs,
-                Err(err) => {
-                    tracing::warn!(
-                        target: "scroll::chain_orchestrator",
-                        %err,
-                        "Failed to collect reverted transactions for the pool refill after \
-                         an L2-sync-recheck rewind; continuing without them"
-                    );
-                    Vec::new()
-                }
-            }
-        } else {
-            Vec::new()
-        };
+        // A backward rewind (`rewound_backward`, computed before the probe FCU
+        // above) is paired with an L1-message-mapping purge (folded into the
+        // persist tx_mut below) and a pool refill from `reverted_transactions`.
+        // Without the purge, L1 messages stamped on the abandoned blocks stay
+        // stamped and `get_n_l1_messages(NotIncluded(..))` skips their queue
+        // indices — an out-of-order queue peers reject.
         // Every other head-moving seam cancels, and `event.rs` documents that
         // list as exhaustive. `BuildBlock` is deliberately NOT gated on sync
         // state, so a job can be parked on the pre-recheck parent: left alive it

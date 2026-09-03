@@ -664,6 +664,72 @@ from every pass is either fixed in the PR or recorded here.
   - Why unaddressed: pure comment precision, batched to keep the pass bounded.
   - Suggested Linear title: "rollup-node: minor comment/error-string accuracy cleanup"
 
+- **[pass 63 A2] L2-sync recheck re-collects the reverted-tx range on every gossip announcement**
+  (`crates/chain-orchestrator/src/lib.rs` `recheck_l2_sync_target`, called from `handle_block_from_peer`)
+  - Impact/evidence: Claude pass 63 A2 (2026-09-03). During a backward latch the
+    recheck (run at the top of every announcement, before the already-known
+    short-circuit) re-collects the reverted-tx range — up to
+    MAX_REVERTED_TX_COLLECTION_BLOCKS (1024) serial full-block RPCs — on the
+    single-task run loop, per announcement, even for already-known blocks.
+  - Why unaddressed: the fix caches the collection on `L2SyncRecheck`, adding a
+    second field + invalidation to a struct just churned by A1; performance, not
+    correctness. Deferred to avoid stacking two struct changes in one pass.
+  - Suggested Linear title: "chain-orchestrator: cache the recheck reverted-tx collection per latch"
+
+- **[pass 63 A3/A5/A6] Test-precision cluster around the recheck rewind and finalized-marker replay**
+  (`crates/chain-orchestrator/src/lib.rs` tests; `crates/node/tests/e2e.rs`)
+  - Impact/evidence: Claude pass 63. A3: the BACKWARD-rewind recheck seam (fixed
+    in b4273c4/ba75dd1) has no test — reverting that commit leaves the suite
+    green; needs an integration scenario driving a ChainReorged import to a lower
+    height that gets SYNCING then VALID. A5: `l1_finalization_replay_reissues_
+    marker_fcu_once` is vacuous — the held batch also becomes eligible and its
+    block dominates the marker, and both blocks share hash 0x22, so the hash
+    assertion can't tell (the DB-layer `finalize_consolidated_batches_recomputes_
+    over_finalized_rows` DOES pin the Finalized-inclusion non-vacuously). A6:
+    three fail-stop tests assert only the `FatalStateDivergence` variant while an
+    adjacent branch returns the same variant — assert the `&'static str` message
+    to pin the intended branch.
+  - Why unaddressed: A3 needs integration scaffolding; A5 is hard to make
+    non-vacuous under the head>=safe constraint (the held batch's consolidation
+    block must exceed the safe head) without risking the safe-reconciliation the
+    test already guards; A6 needs each intended branch's exact message. Deferred
+    as a focused test-hardening batch.
+  - Suggested Linear title: "chain-orchestrator: pin the recheck backward-rewind, de-vacuum the replay test, and message-match the fail-stop tests"
+
+- **[pass 63 A7/B8] Finalized-marker eligible set is unbounded and evaluated in the write lock**
+  (`crates/database/db/src/operations.rs` `finalize_consolidated_batches`)
+  - Impact/evidence: Claude pass 63 A7 (2026-09-03). `marker_filter` includes
+    `Finalized`, so the eligible set is every batch ever finalized; it is
+    materialized (`IN (subquery)`) and run on every finalized notification inside
+    the caller's `tx_mut`, holding the single write mutex. B8: legacy blockless
+    `Consolidated` batches are silently skipped, contradicting the neighbouring
+    comment.
+  - Why unaddressed: the fix is a correlated `Expr::exists` rewrite (the shape
+    used ~10 lines below) — semantically identical, query-plan improvement;
+    inferred not measured, and worth doing carefully with a scale check.
+  - Suggested Linear title: "scroll-db: bound the finalized-marker query with a correlated EXISTS"
+
+- **[pass 63 A8] Both cfg(test-utils)-gated startup refusals are unexercised**
+  (`crates/node/src/args.rs` l1.url-required and --test/--blob.anvil_url rules)
+  - Impact/evidence: Claude pass 63 A8 (2026-09-03). Every CI lane builds
+    `--all-features`, so `test_validate_requires_l1_url` reduces to
+    `assert!(is_ok())` with a dead message check, and the --test-without-anvil
+    refusal has no test at all.
+  - Why unaddressed: the fix extracts `const fn`s taking the flag as a parameter
+    and table-tests both polarities (mirroring `startup_refusal`); a separate,
+    self-contained test-coverage task.
+  - Suggested Linear title: "rollup-node: table-test the cfg-gated startup refusals independent of --all-features"
+
+- **[pass 63 minor batch] B5/B7/B10/B11 residual test/doc precision**
+  - Impact/evidence: Claude pass 63. B5: `collect_reverted_txs_in_range` can
+    never return `Err`, so four callers carry dead `Err` arms with misleading
+    comments. B7: `GenesisMismatch` doc/`stored` labelling could be tightened.
+    B10: a 2s wait races a 2s hold backoff in one test and can drain the scripted
+    FCU queue into a panic rather than an assertion. B11: a `reconcile_genesis_block`
+    test assertion holds unconditionally (it never writes l2_head_block).
+  - Why unaddressed: cosmetic / test-precision, batched to keep the pass bounded.
+  - Suggested Linear title: "rollup-node: residual test/doc precision (dead Err arms, race-y wait, unconditional assert)"
+
 ## Pass 35 findings — resolution (loop resumed 2026-09-01)
 
 All five majors and eight minors from Claude pass 35 were FIXED in the

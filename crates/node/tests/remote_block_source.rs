@@ -105,7 +105,14 @@ async fn test_remote_source_node_launches_when_remote_unreachable() -> eyre::Res
 
     // Remote source recovers: imports blocks 1-2 and ends up building block 3
     // on top (same event pattern as test_remote_block_source).
-    fixture.expect_event_on(1).block_sequenced(3).await?;
+    // 120s (not the 30s default): the pass-61 follower backoff can delay a
+    // retry up to 30s while the remote is gated closed during setup, which
+    // could otherwise blow a 30s budget and auto-file a false race regression.
+    fixture
+        .expect_event_on(1)
+        .timeout(std::time::Duration::from_secs(120))
+        .block_sequenced(3)
+        .await?;
 
     Ok(())
 }

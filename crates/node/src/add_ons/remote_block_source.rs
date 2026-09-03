@@ -199,7 +199,26 @@ const MAX_ANCESTOR_LOOKBACK: u64 = 8192;
 /// RPCs — back-to-back at the poll cadence. Reset to no delay on the next
 /// successful tick.
 const FOLLOWER_BACKOFF_MAX_SHIFT: u32 = 8;
-const FOLLOWER_BACKOFF_CAP: Duration = Duration::from_secs(30);
+const FOLLOWER_BACKOFF_CAP_MS: u64 = 30_000;
+
+/// The delay before the next poll after `consecutive_failures` failed ticks
+/// (0 = no delay). Extracted and table-tested like every other risky decision
+/// in this file. `poll_interval_ms.max(1)` guards a programmatic/default config
+/// of 0 (which would otherwise disable the backoff and hot-loop the walk), and
+/// the shift is clamped BEFORE it is applied (no `as u32` truncation).
+const fn follower_backoff(poll_interval_ms: u64, consecutive_failures: u64) -> Duration {
+    if consecutive_failures == 0 {
+        return Duration::ZERO;
+    }
+    let base = if poll_interval_ms == 0 { 1 } else { poll_interval_ms };
+    let shift = if consecutive_failures > FOLLOWER_BACKOFF_MAX_SHIFT as u64 {
+        FOLLOWER_BACKOFF_MAX_SHIFT
+    } else {
+        consecutive_failures as u32
+    };
+    let ms = base.saturating_mul(1u64 << shift);
+    Duration::from_millis(if ms > FOLLOWER_BACKOFF_CAP_MS { FOLLOWER_BACKOFF_CAP_MS } else { ms })
+}
 
 /// The outcome of waiting for a requested build.
 enum BuildOutcome {
@@ -761,17 +780,12 @@ where
                             }
                         }
                     }
-                    // Back off while wedged. `consecutive_failures` was reset to
-                    // 0 on the Ok arm above, so this is a no-op on a healthy
-                    // tick; on a persistent fault it caps the ancestor-walk
-                    // storm at one attempt per `FOLLOWER_BACKOFF_CAP`.
-                    // Interruptible by shutdown.
-                    if self.consecutive_failures > 0 {
-                        let shift =
-                            (self.consecutive_failures as u32).min(FOLLOWER_BACKOFF_MAX_SHIFT);
-                        let backoff = Duration::from_millis(self.config.poll_interval_ms)
-                            .saturating_mul(1u32 << shift)
-                            .min(FOLLOWER_BACKOFF_CAP);
+                    // Back off while wedged (no-op on a healthy tick:
+                    // `consecutive_failures` was reset to 0 on the Ok arm
+                    // above). Interruptible by shutdown.
+                    let backoff =
+                        follower_backoff(self.config.poll_interval_ms, self.consecutive_failures);
+                    if !backoff.is_zero() {
                         tokio::select! {
                             biased;
                             _guard = &mut shutdown => break,
@@ -1258,7 +1272,7 @@ where
                     // mappings above it.
                     if self.provider.block_hash(resume)? != Some(resume_hash) {
                         return Err(eyre::eyre!(
-                            "block {resume} changed locally while the ancestor walk ran;                              re-deriving next tick"
+                            "block {resume} changed locally while the ancestor walk ran; re-deriving next tick"
                         ));
                     }
                     tracing::warn!(
@@ -1651,6 +1665,26 @@ mod tests {
             let got = decide_follow_action(*head, *safe, *resume, *diverged);
             assert_eq!(&got, want, "decide_follow_action({head}, {safe}, {resume}, {diverged})");
         }
+    }
+
+    #[test]
+    fn follower_backoff_table() {
+        use std::time::Duration;
+        // (poll_interval_ms, consecutive_failures) -> backoff
+        // No failures: no delay.
+        assert_eq!(follower_backoff(100, 0), Duration::ZERO);
+        // Geometric doubling from the poll interval.
+        assert_eq!(follower_backoff(100, 1), Duration::from_millis(200));
+        assert_eq!(follower_backoff(100, 2), Duration::from_millis(400));
+        assert_eq!(follower_backoff(100, 8), Duration::from_millis(25_600));
+        // Capped at 30s, and the shift is clamped (no truncation/overflow) far
+        // past the shift ceiling.
+        assert_eq!(follower_backoff(100, 9), Duration::from_millis(30_000));
+        assert_eq!(follower_backoff(100, u64::MAX), Duration::from_millis(30_000));
+        // B1: a 0 poll interval must NOT disable the backoff (it is clamped to
+        // 1ms) — otherwise a wedged follower hot-loops the ancestor walk.
+        assert_eq!(follower_backoff(0, 1), Duration::from_millis(2));
+        assert_eq!(follower_backoff(0, 0), Duration::ZERO);
     }
 
     #[test]

@@ -102,7 +102,8 @@ Replace:
 
 - `--l1.url <URL>`: L1 Ethereum RPC endpoint URL (required for every node, except in a build
   compiled with the `test-utils` feature, which substitutes a mock watcher). Separately, a
-  `--test` run requires `--blob.anvil_url` and aborts at launch without it.
+  `--test` run in a build WITHOUT the `test-utils` feature requires
+  `--blob.anvil_url` and aborts at launch without it.
 - `--l1.cups <NUMBER>`: Compute units per second for rate limiting (default: 10000)
 - `--l1.max-retries <NUMBER>`: Maximum retry attempts for L1 requests (default: 10)
 - `--l1.initial-backoff <MS>`: Initial backoff duration for retries in milliseconds (default: 100)

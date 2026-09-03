@@ -238,6 +238,24 @@ impl ScrollRollupNodeConfig {
                     url.scheme()
                 ));
             }
+            // Warn (do not reject) on PLAINTEXT http to a non-loopback host:
+            // remote-source imports bypass consensus/signer validation
+            // (import_chain never calls consensus.validate_new_block) and can
+            // now drive an administrative head rewind, so a MITM on the wire
+            // could steer this node's head. https, or a loopback dev remote, is
+            // fine.
+            if url.scheme() == "http" {
+                let host = url.host_str().unwrap_or_default();
+                let loopback = matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]") ||
+                    host.starts_with("127.");
+                if !loopback {
+                    tracing::warn!(
+                        target: "scroll::node::args",
+                        host,
+                        "remote-source.url is plaintext http to a non-loopback host;                          remote-source imports bypass consensus/signer validation and can                          rewind the local head — prefer https"
+                    );
+                }
+            }
         }
 
         if self.remote_block_source_args.enabled &&
@@ -301,7 +319,7 @@ impl ScrollRollupNodeConfig {
             self.blob_provider_args.anvil_url.is_none()
         {
             return Err(
-                "--test disables the L1 watcher and this build has no test-utils fallback:                  drop --test, set --blob.anvil_url, or rebuild with --features test-utils"
+                "--test disables the L1 watcher and this build has no test-utils fallback: drop --test, set --blob.anvil_url, or rebuild with --features test-utils"
                     .to_string(),
             );
         }

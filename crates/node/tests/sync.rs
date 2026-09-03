@@ -985,8 +985,8 @@ async fn test_chain_import_cancels_inflight_payload_job() -> eyre::Result<()> {
     node_b.l1().sync().await?;
 
     // Build B's block BEFORE starting A's job: it plays no part in A's
-    // in-flight job, and building it after would burn up to ~2.5s of the 3s
-    // job budget on a loaded runner before the import even lands.
+    // in-flight job, and building it after would burn seconds of the 8s job
+    // budget on a loaded runner before the import even lands.
     let block = node_b.build_block().expect_block_number(1).build_and_await_block().await?;
 
     // Start a long build on A, then import B's block 1 while it is in

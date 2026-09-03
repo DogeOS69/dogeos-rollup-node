@@ -948,7 +948,7 @@ impl<T: WriteConnectionProvider + ?Sized + Sync> DatabaseWriteOperations for T {
         {
             return Err(DatabaseError::GenesisMismatch {
                 configured: genesis_hash,
-                stored: B256::from_slice(foreign),
+                stored: B256::try_from(foreign.as_slice()).unwrap_or_default(),
             });
         }
 

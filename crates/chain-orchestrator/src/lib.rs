@@ -111,8 +111,10 @@ const L2_SYNC_RECHECK_INTERVAL: std::time::Duration = std::time::Duration::from_
 
 /// How many consecutive re-check transport failures before the node says so at `warn!`.
 ///
-/// Roughly a minute at [`L2_SYNC_RECHECK_INTERVAL`]: long enough to ride out a restarting
-/// execution node, short enough that a node gated on L1 and sequencing does not stay silent.
+/// Six CONSECUTIVE failures, not a wall-clock minute: the counter increments per re-check
+/// invocation, and two of the three trigger sites are gossip-driven, so on a busy chain the
+/// six can land in well under a second. Long enough to ride out a brief blip, short enough that
+/// a node gated on L1 and sequencing does not stay silent.
 const L2_SYNC_RECHECK_WARN_AFTER: u32 = 6;
 
 /// A latched L2-sync target and the engine mirror head it was latched against.
@@ -123,6 +125,14 @@ struct L2SyncRecheck {
     /// The engine's mirror head at that moment. When the mirror no longer
     /// matches this, some other site moved it and the target is stale.
     latched_from: BlockInfo,
+    /// Whether `target` was committed to the engine through a full
+    /// `new_payload` validation (the peer-import path). Only then is an
+    /// INVALID re-probe of `target == mirror` a genuine engine
+    /// self-contradiction worth fail-stopping on. The optimistic-sync entry
+    /// commits its head on SYNCING with a ZEROED safe/finalized and never runs
+    /// `new_payload`, so a later INVALID (the head is simply not a
+    /// finalized-descendant) is peer-triggerable and must NOT kill the node.
+    validated: bool,
 }
 
 /// Upper bound on how many blocks one reverted-transaction collection walks.
@@ -530,8 +540,18 @@ impl<
                         // a possibly-canonical block's anchor and
                         // announcement on a blip. Proceed on the full path —
                         // the anchor write below is made monotone explicitly,
-                        // and a stale announcement is harmless gossip.
-                        _ => true,
+                        // and a stale announcement is harmless gossip. Logged so an
+                        // unreachable L2 client does not classify every signed block
+                        // canonical without a trace.
+                        outcome => {
+                            tracing::debug!(
+                                target: "scroll::chain_orchestrator",
+                                block_number = block.header.number,
+                                ?outcome,
+                                "Could not confirm signed-block canonicality; proceeding on the                                  full path (anchor write is monotone)"
+                            );
+                            true
+                        }
                     }
                 } else {
                     // number >= head.number with a differing hash: either the
@@ -1529,7 +1549,7 @@ impl<
                 requested_from = from,
                 from = capped,
                 to,
-                "Reverted-transaction collection truncated to the blocks nearest the head;                  transactions below it are not refilled into the pool"
+                "Reverted-transaction collection truncated to the blocks nearest the head; transactions below it are not refilled into the pool"
             );
             capped
         } else {
@@ -2228,7 +2248,8 @@ impl<
         if !self.sync_state.l2().is_syncing() {
             return Ok(());
         }
-        let Some(L2SyncRecheck { target, latched_from }) = self.l2_sync_recheck_target else {
+        let Some(L2SyncRecheck { target, latched_from, validated }) = self.l2_sync_recheck_target
+        else {
             return Ok(())
         };
 
@@ -2254,7 +2275,7 @@ impl<
                 "Engine head moved since the L2 sync latch; re-latching onto the current head"
             );
             self.l2_sync_recheck_target =
-                Some(L2SyncRecheck { target: mirror, latched_from: mirror });
+                Some(L2SyncRecheck { target: mirror, latched_from: mirror, validated });
             return Ok(());
         }
 
@@ -2328,21 +2349,25 @@ impl<
             }
         };
         if result.is_invalid() {
-            // Rejecting the head the engine ITSELF holds is not recoverable here. The optimistic
-            // sync latches with `target == latched_from == mirror` (it commits its target even on
-            // SYNCING, so the target already is the mirror), and re-latching onto the mirror there
-            // would re-latch the very block just rejected — every later probe answers INVALID and
-            // the node stays L2-syncing forever, polling no L1 and sequencing nothing. There is no
-            // better target to fall back to: the engine and this node disagree about a head the
-            // engine committed.
-            if target == mirror {
+            // Fail-stop ONLY for a VALIDATED head the engine now rejects: the
+            // peer-import path ran `new_payload`, so an INVALID re-probe of the
+            // head it committed is a genuine engine self-contradiction. The
+            // optimistic-sync entry also produces `target == mirror` (it commits
+            // on SYNCING with a zeroed safe/finalized and never runs
+            // `new_payload`), but an INVALID there just means the optimistic
+            // head is not a finalized-descendant — peer-triggerable and NOT
+            // fatal, so it must fall through to the re-latch below instead of
+            // crash-looping the node.
+            if validated && target == mirror {
                 tracing::error!(
                     target: "scroll::chain_orchestrator",
                     ?target,
-                    "Engine rejected as INVALID the head it currently holds;                      engine and node disagree on committed state"
+                    "Engine rejected as INVALID a validated head it currently holds; engine and \
+                     node disagree on committed state"
                 );
                 return Err(ChainOrchestratorError::FatalStateDivergence(
-                    "engine rejected the head it holds as its own mirror;                      restart re-derives the head from the persisted state",
+                    "engine rejected a validated head it holds as its own mirror; restart \
+                     re-derives the head from the persisted state",
                 ));
             }
 
@@ -2356,7 +2381,7 @@ impl<
                 "Latched L2 sync target rejected as INVALID; re-latching onto the current head"
             );
             self.l2_sync_recheck_target =
-                Some(L2SyncRecheck { target: mirror, latched_from: mirror });
+                Some(L2SyncRecheck { target: mirror, latched_from: mirror, validated });
             return Ok(());
         }
         if !result.is_valid() {
@@ -2396,7 +2421,7 @@ impl<
                     "Chain consolidation failed after the latched L2 sync target was adopted"
                 );
                 return Err(ChainOrchestratorError::FatalStateDivergence(
-                    "chain consolidation failed after the node was marked synced;                      restart re-consolidates from the persisted state",
+                    "chain consolidation failed after the node was marked synced; restart re-consolidates from the persisted state",
                 ));
             }
         }
@@ -2528,8 +2553,12 @@ impl<
             // quiescent chain leaves the gate closed forever. The optimistic
             // sync commits its mirror even on SYNCING, so the head it just
             // committed is what the execution node has to catch up to.
-            self.l2_sync_recheck_target =
-                Some(L2SyncRecheck { target: block_info, latched_from: block_info });
+            self.l2_sync_recheck_target = Some(L2SyncRecheck {
+                target: block_info,
+                latched_from: block_info,
+                // Optimistic: committed on SYNCING, no new_payload validation.
+                validated: false,
+            });
 
             // Purge all L1 message to L2 block mappings as they may be invalid after an
             // optimistic sync. The head is already committed hundreds of
@@ -2776,6 +2805,8 @@ impl<
             self.l2_sync_recheck_target = Some(L2SyncRecheck {
                 target: head,
                 latched_from: *self.engine.fcs().head_block_info(),
+                // Peer-import: new_payload validated this head before the FCU.
+                validated: true,
             });
             return Err(ChainOrchestratorError::FcuRejected(
                 "peer chain import forkchoice update was not applied by the engine",
@@ -3511,8 +3542,11 @@ mod run_loop_policy_tests {
         // Latched against a mirror the engine has since moved off: the recorded
         // `latched_from` (99) is not the current mirror (SAFE).
         orchestrator.sync_state.l2_mut().set_syncing();
-        orchestrator.l2_sync_recheck_target =
-            Some(super::L2SyncRecheck { target: info(50, 0x50), latched_from: info(99, 0x99) });
+        orchestrator.l2_sync_recheck_target = Some(super::L2SyncRecheck {
+            target: info(50, 0x50),
+            latched_from: info(99, 0x99),
+            validated: true,
+        });
 
         orchestrator.recheck_l2_sync_target().await.unwrap();
 
@@ -3523,9 +3557,13 @@ mod run_loop_policy_tests {
         );
         assert_eq!(
             orchestrator.l2_sync_recheck_target,
-            Some(super::L2SyncRecheck { target: info(SAFE, 0x11), latched_from: info(SAFE, 0x11) }),
+            Some(super::L2SyncRecheck {
+                target: info(SAFE, 0x11),
+                latched_from: info(SAFE, 0x11),
+                validated: true,
+            }),
             "the stale latch must be REPLACED by one onto the current mirror: clearing it would \
-                         leave L2 syncing with no recovery target, and on a quiescent chain nothing reopens              that gate"
+                         leave L2 syncing with no recovery target, and on a quiescent chain nothing reopens that gate"
         );
         assert_eq!(
             *orchestrator.engine.fcs().head_block_info(),
@@ -3574,14 +3612,19 @@ mod run_loop_policy_tests {
         orchestrator.l2_sync_recheck_target = Some(super::L2SyncRecheck {
             target: info(SAFE + 1, 0x22),
             latched_from: info(SAFE, 0x11),
+            validated: true,
         });
 
         orchestrator.recheck_l2_sync_target().await.unwrap();
 
         assert_eq!(
             orchestrator.l2_sync_recheck_target,
-            Some(super::L2SyncRecheck { target: info(SAFE, 0x11), latched_from: info(SAFE, 0x11) }),
-            "a rejected target must be replaced by one onto the current head, never cleared:              clearing leaves L2 syncing with no way back"
+            Some(super::L2SyncRecheck {
+                target: info(SAFE, 0x11),
+                latched_from: info(SAFE, 0x11),
+                validated: true,
+            }),
+            "a rejected target must be replaced by one onto the current head, never cleared: clearing leaves L2 syncing with no way back"
         );
         assert!(
             orchestrator.sync_state.l2().is_syncing(),
@@ -3589,12 +3632,11 @@ mod run_loop_policy_tests {
         );
     }
 
-    /// P58: an INVALID answer for a target that IS the mirror must fail-stop,
-    /// not re-latch. The optimistic-sync entry latches with
-    /// `target == latched_from == mirror` (it commits its target even on
-    /// SYNCING), so re-latching onto the mirror there re-latches the very block
-    /// just rejected — every later probe answers INVALID and the node stays
-    /// L2-syncing forever, polling no L1 and sequencing nothing.
+    /// P58/A1: an INVALID answer for a VALIDATED target that IS the mirror must
+    /// fail-stop — the peer-import path ran `new_payload`, so rejecting the head
+    /// it committed is a genuine engine self-contradiction. (The optimistic
+    /// counterpart is covered by
+    /// `invalid_recheck_of_optimistic_mirror_relatches_not_fail_stops`.)
     #[tokio::test]
     async fn invalid_recheck_of_the_mirror_itself_fail_stops() {
         let database = Arc::new(setup_test_db().await);
@@ -3625,15 +3667,71 @@ mod run_loop_policy_tests {
 
         orchestrator.sync_state.l1_mut().set_syncing();
         orchestrator.sync_state.l2_mut().set_syncing();
-        // Exactly the shape the optimistic-sync entry produces.
-        orchestrator.l2_sync_recheck_target =
-            Some(super::L2SyncRecheck { target: info(SAFE, 0x11), latched_from: info(SAFE, 0x11) });
+        // A VALIDATED latch on the mirror (the peer-import shape).
+        orchestrator.l2_sync_recheck_target = Some(super::L2SyncRecheck {
+            target: info(SAFE, 0x11),
+            latched_from: info(SAFE, 0x11),
+            validated: true,
+        });
 
         let result = orchestrator.recheck_l2_sync_target().await;
         assert!(
             matches!(result, Err(ChainOrchestratorError::FatalStateDivergence(_))),
-            "an engine that rejects its own mirror head must fail-stop, not re-latch \
-                         the rejected block forever; got {result:?}"
+            "an engine that rejects its own VALIDATED mirror head must fail-stop; got {result:?}"
+        );
+    }
+
+    /// A1: the OPTIMISTIC counterpart must NOT fail-stop. Optimistic sync
+    /// commits its head on SYNCING (zeroed safe/finalized, no `new_payload`), so
+    /// a later INVALID for `target == mirror` means the head is merely not a
+    /// finalized-descendant — peer-triggerable. The node must re-latch and stay
+    /// up, never crash-loop. Reverting the `validated` flag makes this fail-stop.
+    #[tokio::test]
+    async fn invalid_recheck_of_optimistic_mirror_relatches_not_fail_stops() {
+        let database = Arc::new(setup_test_db().await);
+        database.insert_genesis_block(B256::ZERO).await.unwrap();
+        database.delete_mismatched_genesis_blocks(B256::ZERO).await.unwrap();
+
+        let engine_client = Arc::new(ScriptedEngineClient::new());
+        engine_client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(
+            PayloadStatusEnum::Invalid { validation_error: "scripted".to_string() },
+            None,
+        )));
+        let asserter = Asserter::new();
+        asserter.push_success(&Option::<()>::None);
+        asserter.push_success(&Option::<()>::None);
+        let (mut orchestrator, _handle, _notification_tx) = test_orchestrator_with_fcs(
+            database.clone(),
+            engine_client.clone(),
+            asserter,
+            BatchDerivationResult {
+                attributes: vec![],
+                batch_info: BatchInfo::new(1, B256::repeat_byte(1)),
+                skipped_l1_messages: vec![],
+                target_status: BatchStatus::Consolidated,
+            },
+            ForkchoiceState::new(info(SAFE, 0x11), info(SAFE, 0x11), info(0, 0x00)),
+        )
+        .await;
+
+        orchestrator.sync_state.l1_mut().set_syncing();
+        orchestrator.sync_state.l2_mut().set_syncing();
+        // The optimistic-sync shape: target == latched_from == mirror, NOT validated.
+        orchestrator.l2_sync_recheck_target = Some(super::L2SyncRecheck {
+            target: info(SAFE, 0x11),
+            latched_from: info(SAFE, 0x11),
+            validated: false,
+        });
+
+        let result = orchestrator.recheck_l2_sync_target().await;
+        assert!(result.is_ok(), "an optimistic INVALID must not fail-stop; got {result:?}");
+        assert!(
+            orchestrator.l2_sync_recheck_target.is_some(),
+            "it must re-latch, keeping a recovery target"
+        );
+        assert!(
+            orchestrator.sync_state.l2().is_syncing(),
+            "and stay L2-syncing rather than exit or die"
         );
     }
 
@@ -3666,8 +3764,11 @@ mod run_loop_policy_tests {
 
         orchestrator.sync_state.l1_mut().set_syncing();
         orchestrator.sync_state.l2_mut().set_syncing();
-        let latch =
-            super::L2SyncRecheck { target: info(SAFE + 1, 0x22), latched_from: info(SAFE, 0x11) };
+        let latch = super::L2SyncRecheck {
+            target: info(SAFE + 1, 0x22),
+            latched_from: info(SAFE, 0x11),
+            validated: true,
+        };
         orchestrator.l2_sync_recheck_target = Some(latch);
 
         orchestrator.recheck_l2_sync_target().await.unwrap();
@@ -3720,6 +3821,7 @@ mod run_loop_policy_tests {
         orchestrator.l2_sync_recheck_target = Some(super::L2SyncRecheck {
             target: info(SAFE + 1, 0x22),
             latched_from: info(SAFE, 0x11),
+            validated: true,
         });
 
         // Paused only now: a paused clock during setup breaks the temp database.
@@ -3803,6 +3905,7 @@ mod run_loop_policy_tests {
         orchestrator.l2_sync_recheck_target = Some(super::L2SyncRecheck {
             target: info(SAFE + 1, 0x22),
             latched_from: info(SAFE, 0x11),
+            validated: true,
         });
 
         orchestrator.recheck_l2_sync_target().await.unwrap();

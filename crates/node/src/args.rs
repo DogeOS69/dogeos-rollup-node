@@ -249,8 +249,18 @@ impl ScrollRollupNodeConfig {
             // fine.
             if url.scheme() == "http" {
                 let host = url.host_str().unwrap_or_default();
-                let loopback = matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]") ||
-                    host.starts_with("127.");
+                // Classify by the PARSED address, not a string prefix: a prefix
+                // check treats DNS names like `127.rpc.example` as loopback even
+                // though they resolve to arbitrary addresses, silencing the very
+                // warning that matters. `host_str()` brackets IPv6 literals, so
+                // strip those before parsing; only the exact `localhost` name is
+                // exempt among domains.
+                let host_ip =
+                    host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host);
+                let loopback = match host_ip.parse::<std::net::IpAddr>() {
+                    Ok(ip) => ip.is_loopback(),
+                    Err(_) => host.eq_ignore_ascii_case("localhost"),
+                };
                 if !loopback {
                     tracing::warn!(
                         target: "scroll::node::args",
@@ -582,13 +592,6 @@ impl ScrollRollupNodeConfig {
             }
         };
 
-        // The execution node's live head, before any startup head-repair below
-        // moves the in-memory mirror. If a repair rewinds the mirror BELOW this,
-        // the rewind must be pushed to the execution node (see the FCU after the
-        // engine is built); otherwise only the mirror and database move and the
-        // execution node keeps serving the discarded head.
-        let provider_head_number = fcs.head_block_info().number;
-
         let (l1_block_startup_info, mut l2_head_block_number) = db
             .tx_mut(move |tx| async move {
                 // On startup we replay the latest batch of blocks from the database as such we set
@@ -669,55 +672,6 @@ impl ScrollRollupNodeConfig {
             l2_head_block_number -= 1;
         }
 
-        // The loop above only runs while the persisted head sits ABOVE finalized,
-        // so it never fires when the persisted head is at or below finalized. But
-        // the execution node's head can sit ABOVE the persisted head there too: a
-        // sequenced block is committed to the engine BEFORE it is signed and its
-        // head persisted, so a crash between those steps (e.g. a signing failure
-        // that fail-stops the node) leaves the engine one block ahead of the
-        // database. Resuming on that block would sequence on top of a block this
-        // node never signed or announced — forking it from its peers. Drag the
-        // engine head back down to the persisted head; the persisted head is at
-        // or below finalized here, so it is guaranteed present in the EN.
-        //
-        // Excluded when the persisted head is 0: a fresh rollup database against
-        // an already-synced execution datadir is a legitimate bootstrap that
-        // `startup_refusal` permits, and the zero anchor is NOT authoritative
-        // there — treating it as such would rewind the execution node to genesis
-        // (or fail with SafeBelowFinalized when its finalized marker is above 0).
-        // Bootstrap adopts the provider forkchoice unchanged, exactly as the
-        // loop above (whose `> finalized` bound is likewise never met at 0) does.
-        if l2_head_block_number > 0 && fcs.head_block_info().number > l2_head_block_number {
-            if let Some(block) = l2_provider
-                .get_block(l2_head_block_number.into())
-                .full()
-                .await?
-                .map(|b| b.into_consensus().map_transactions(|tx| tx.inner.into_inner()))
-            {
-                let block_info: BlockInfo = (&block).into();
-                tracing::warn!(
-                    target: "scroll::node::args",
-                    engine_head = ?fcs.head_block_info(),
-                    persisted_head = ?block_info,
-                    "Execution node head sits above the persisted L2 head at startup; clamping \
-                     it down (a built block was likely committed to the engine without \
-                     completing signing and persistence)"
-                );
-                // Clamp safe too if it sits above the head we are resuming from,
-                // the same rule the loop above and the runtime rewind paths apply.
-                if fcs.safe_block_info().number > block_info.number {
-                    fcs = ForkchoiceState::new(block_info, block_info, *fcs.finalized_block_info());
-                } else {
-                    fcs.update(Some(block_info), None, None)?;
-                }
-                db.tx_mut(move |tx| async move {
-                    tx.set_l2_head_block_number(l2_head_block_number).await?;
-                    tx.purge_l1_message_to_l2_block_mappings(Some(l2_head_block_number + 1)).await
-                })
-                .await?;
-            }
-        }
-
         let chain_spec = Arc::new(chain_spec.clone());
 
         // Instantiate the network manager
@@ -738,65 +692,7 @@ impl ScrollRollupNodeConfig {
         ctx.task_executor.spawn_task(scroll_network_manager.run());
 
         tracing::info!(target: "scroll::node::args", fcs = ?fcs, payload_building_duration = ?self.sequencer_args.payload_building_duration, "Starting engine driver");
-        let mut engine = Engine::new(Arc::new(engine_api), fcs);
-
-        // If the startup head-repair above rewound the mirror BELOW the
-        // execution node's live head, the repair so far has only moved the
-        // in-memory mirror and the database — the execution node still holds the
-        // discarded head (e.g. an unsigned block committed to the engine by a
-        // crash between commit and sign, or an EL that simply ran ahead). Push
-        // and validate the rewind against the execution node now, before
-        // launching: otherwise a quiescent node keeps serving — and followers
-        // keep importing — the block this repair discarded, because nothing in
-        // the run loop reissues a head FCU on an idle chain. Skipped when the
-        // provider forkchoice could not be read (engine unreachable / genesis
-        // fallback), since there is no live head to rewind.
-        if !provider_fcs_missing && engine.fcs().head_block_info().number < provider_head_number {
-            let head = *engine.fcs().head_block_info();
-            match engine.update_fcs_checked(Some(head), None, None).await {
-                Ok(result) if result.is_valid() => {
-                    tracing::info!(
-                        target: "scroll::node::args",
-                        ?head,
-                        provider_head_number,
-                        "Rewound the execution node head to the recovered startup head"
-                    );
-                }
-                Ok(result) if result.is_invalid() => {
-                    // The execution node actively rejected a head the node
-                    // recovered from its own persisted state — a genuine
-                    // divergence that must not launch.
-                    eyre::bail!(
-                        "execution node rejected the recovered startup head {head:?} as INVALID: \
-                         {:?}",
-                        result.payload_status.status
-                    );
-                }
-                Ok(result) => {
-                    // Non-VALID (SYNCING/ACCEPTED): the execution node has NOT
-                    // adopted the rewind. The rewind target is an ANCESTOR the
-                    // execution node already holds, so VALID is the only correct
-                    // answer — anything else means it is in an unexpected state
-                    // (e.g. still snap-syncing). We cannot launch anyway: the
-                    // orchestrator starts L2-Synced with no recheck latch, and
-                    // its periodic recheck only fires while L2 is syncing WITH a
-                    // target, so nothing would reissue this FCU on a quiescent
-                    // node — it would keep serving the discarded head. Fail
-                    // startup so the supervisor restarts and retries.
-                    eyre::bail!(
-                        "execution node did not adopt the recovered startup head {head:?} \
-                         (status {:?}); refusing to launch on the discarded head",
-                        result.payload_status.status
-                    );
-                }
-                Err(err) => {
-                    eyre::bail!(
-                        "failed to push the recovered startup head {head:?} to the execution \
-                         node: {err}"
-                    );
-                }
-            }
-        }
+        let engine = Engine::new(Arc::new(engine_api), fcs);
 
         // Create the consensus.
         let authorized_signer = if let Some(provider) = l1_provider.as_ref() {

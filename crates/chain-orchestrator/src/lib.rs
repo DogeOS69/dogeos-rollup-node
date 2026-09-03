@@ -2430,6 +2430,30 @@ impl<
                 // (derivation-validated, a finalized-descendant) and latch onto
                 // safe, so the next probe adopts it through the normal
                 // exit-sync path (which consolidates and persists the head).
+                //
+                // This is a backward head move (safe < mirror), so — like every
+                // other rewind seam — the transactions in the discarded blocks
+                // (safe+1 ..= mirror) must be refilled into the pool. Collect
+                // them BEFORE the FCU: on VALID it commits the mirror to `safe`,
+                // after which the canonical lookups find nothing above it. (The
+                // L1-message mappings for those blocks were already cleared when
+                // optimistic_sync purged all mappings on entry, so no purge is
+                // paired here.)
+                let reverted_transactions = match self
+                    .collect_reverted_txs_in_range(safe.number.saturating_add(1), mirror.number)
+                    .await
+                {
+                    Ok(txs) => txs,
+                    Err(err) => {
+                        tracing::warn!(
+                            target: "scroll::chain_orchestrator",
+                            %err,
+                            "Failed to collect reverted transactions for the pool refill before \
+                             an optimistic-head rewind to safe; continuing without them"
+                        );
+                        Vec::new()
+                    }
+                };
                 match self.engine.update_fcs_checked(Some(safe), None, None).await {
                     Ok(r) if r.is_valid() => {
                         tracing::warn!(
@@ -2439,6 +2463,7 @@ impl<
                             "Optimistic head rejected as INVALID; rewound the engine head to the \
                              safe head and re-latched onto it"
                         );
+                        self.reinsert_txs_into_pool(reverted_transactions).await;
                         self.l2_sync_recheck_target = Some(L2SyncRecheck {
                             target: safe,
                             latched_from: safe,
@@ -3811,8 +3836,14 @@ mod run_loop_policy_tests {
         engine_client
             .push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Valid, None)));
         let asserter = Asserter::new();
-        asserter.push_success(&Option::<()>::None);
-        asserter.push_success(&Option::<()>::None);
+        // The rewind to safe collects reverted txs from the discarded blocks
+        // (safe+1 ..= mirror = 5 blocks) BEFORE the rewind FCU; answer each
+        // getBlockByNumber with a null block so the collection returns empty
+        // (the refill mechanics themselves are covered by the backward-adopt
+        // tests — here we only assert the rewind and re-latch).
+        for _ in 0..5 {
+            asserter.push_success(&Option::<()>::None);
+        }
         // Optimistic head M (height SAFE) sits ABOVE the derivation-validated
         // safe head S (height SAFE - 5) — the realistic optimistic-sync shape.
         let optimistic_head = info(SAFE, 0x11);

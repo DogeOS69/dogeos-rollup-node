@@ -582,6 +582,13 @@ impl ScrollRollupNodeConfig {
             }
         };
 
+        // The execution node's live head, before any startup head-repair below
+        // moves the in-memory mirror. If a repair rewinds the mirror BELOW this,
+        // the rewind must be pushed to the execution node (see the FCU after the
+        // engine is built); otherwise only the mirror and database move and the
+        // execution node keeps serving the discarded head.
+        let provider_head_number = fcs.head_block_info().number;
+
         let (l1_block_startup_info, mut l2_head_block_number) = db
             .tx_mut(move |tx| async move {
                 // On startup we replay the latest batch of blocks from the database as such we set
@@ -723,7 +730,59 @@ impl ScrollRollupNodeConfig {
         ctx.task_executor.spawn_task(scroll_network_manager.run());
 
         tracing::info!(target: "scroll::node::args", fcs = ?fcs, payload_building_duration = ?self.sequencer_args.payload_building_duration, "Starting engine driver");
-        let engine = Engine::new(Arc::new(engine_api), fcs);
+        let mut engine = Engine::new(Arc::new(engine_api), fcs);
+
+        // If the startup head-repair above rewound the mirror BELOW the
+        // execution node's live head, the repair so far has only moved the
+        // in-memory mirror and the database — the execution node still holds the
+        // discarded head (e.g. an unsigned block committed to the engine by a
+        // crash between commit and sign, or an EL that simply ran ahead). Push
+        // and validate the rewind against the execution node now, before
+        // launching: otherwise a quiescent node keeps serving — and followers
+        // keep importing — the block this repair discarded, because nothing in
+        // the run loop reissues a head FCU on an idle chain. Skipped when the
+        // provider forkchoice could not be read (engine unreachable / genesis
+        // fallback), since there is no live head to rewind.
+        if !provider_fcs_missing && engine.fcs().head_block_info().number < provider_head_number {
+            let head = *engine.fcs().head_block_info();
+            match engine.update_fcs_checked(Some(head), None, None).await {
+                Ok(result) if result.is_valid() => {
+                    tracing::info!(
+                        target: "scroll::node::args",
+                        ?head,
+                        provider_head_number,
+                        "Rewound the execution node head to the recovered startup head"
+                    );
+                }
+                Ok(result) if result.is_invalid() => {
+                    // The execution node actively rejected a head the node
+                    // recovered from its own persisted state — a genuine
+                    // divergence that must not launch.
+                    eyre::bail!(
+                        "execution node rejected the recovered startup head {head:?} as INVALID: \
+                         {:?}",
+                        result.payload_status.status
+                    );
+                }
+                Ok(_result) => {
+                    // SYNCING/ACCEPTED: the execution node took the head but has
+                    // not finished adopting it. The mirror already holds it and
+                    // every later FCU reasserts it, so do not fail startup.
+                    tracing::warn!(
+                        target: "scroll::node::args",
+                        ?head,
+                        "Execution node has not yet adopted the recovered startup head; it will \
+                         be reasserted"
+                    );
+                }
+                Err(err) => {
+                    eyre::bail!(
+                        "failed to push the recovered startup head {head:?} to the execution \
+                         node: {err}"
+                    );
+                }
+            }
+        }
 
         // Create the consensus.
         let authorized_signer = if let Some(provider) = l1_provider.as_ref() {

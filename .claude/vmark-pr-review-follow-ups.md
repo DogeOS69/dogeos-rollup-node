@@ -5,6 +5,27 @@ from every pass is either fixed in the PR or recorded here.
 
 ## Unresolved
 
+- **No e2e coverage for the startup rewind of an execution node that ran ahead
+  of the persisted head** (`crates/node/src/args.rs` startup head-repair + the
+  new post-`Engine::new` forkchoice push)
+  - Impact/evidence: Codex pass 67 P1 (2026-09-03) found that the pass-66
+    startup reconciliation only moved the in-memory mirror and the database, and
+    never pushed `engine_forkchoiceUpdated` to Reth, so a quiescent node would
+    keep serving — and followers keep importing — the discarded head. FIXED this
+    pass by issuing a checked FCU to the execution node after the engine is
+    built whenever startup repair lowered the mirror below the execution node's
+    live head (also closes the same latent gap in the pre-existing repair loop).
+    The new path has no automated test: it needs an e2e restart where the
+    execution node holds a block above the persisted L2 head (an unsigned
+    sequenced block left by a crash between commit and sign), asserting the
+    execution node's RPC head is rewound on restart.
+  - First/most-recent pass: Codex pass 67 (2026-09-03).
+  - Why unaddressed: exercising it requires a full node restart against a real
+    execution client with a head deliberately ahead of the database — an e2e
+    harness addition beyond this review loop's local-fix scope; the production
+    fix itself is landed and verified by build/clippy.
+  - Suggested Linear title: "rollup-node: e2e test for startup rewind when the execution node runs ahead of the persisted head"
+
 - **Remote block source has no metrics** (`crates/node/src/add_ons/remote_block_source.rs`)
   - Impact/evidence: Claude pass 1 m6 and pass 5 m2 — the add-on exports no
     metrics and `ChainOrchestratorStatus` does not model it, so a node can

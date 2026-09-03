@@ -548,7 +548,7 @@ impl<
                                 target: "scroll::chain_orchestrator",
                                 block_number = block.header.number,
                                 ?outcome,
-                                "Could not confirm signed-block canonicality; proceeding on the                                  full path (anchor write is monotone)"
+                                "Could not confirm signed-block canonicality; proceeding on the full path (anchor write is monotone)"
                             );
                             true
                         }
@@ -2274,8 +2274,13 @@ impl<
                 ?mirror,
                 "Engine head moved since the L2 sync latch; re-latching onto the current head"
             );
+            // Reset `validated`: the mirror moved via ANOTHER path (possibly
+            // optimistic_sync, which commits on SYNCING without a new_payload),
+            // so the old target's validation provenance does not transfer to
+            // this new head. Carrying it would let a later INVALID fail-stop the
+            // node on an optimistically-committed head — the crash loop A1 fixed.
             self.l2_sync_recheck_target =
-                Some(L2SyncRecheck { target: mirror, latched_from: mirror, validated });
+                Some(L2SyncRecheck { target: mirror, latched_from: mirror, validated: false });
             return Ok(());
         }
 
@@ -3560,7 +3565,9 @@ mod run_loop_policy_tests {
             Some(super::L2SyncRecheck {
                 target: info(SAFE, 0x11),
                 latched_from: info(SAFE, 0x11),
-                validated: true,
+                // Provenance is RESET on a stale re-latch: the mirror moved via
+                // another path, so the old validated bit must not transfer.
+                validated: false,
             }),
             "the stale latch must be REPLACED by one onto the current mirror: clearing it would \
                          leave L2 syncing with no recovery target, and on a quiescent chain nothing reopens that gate"

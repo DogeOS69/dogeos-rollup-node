@@ -252,7 +252,7 @@ impl ScrollRollupNodeConfig {
                     tracing::warn!(
                         target: "scroll::node::args",
                         host,
-                        "remote-source.url is plaintext http to a non-loopback host;                          remote-source imports bypass consensus/signer validation and can                          rewind the local head — prefer https"
+                        "remote-source.url is plaintext http to a non-loopback host; remote-source imports bypass consensus/signer validation and can rewind the local head — prefer https"
                     );
                 }
             }

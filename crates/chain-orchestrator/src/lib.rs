@@ -1056,29 +1056,32 @@ impl<
                 let finalized = *self.engine.fcs().finalized_block_info();
                 let mirror_head = *self.engine.fcs().head_block_info();
                 let mirror_safe = *self.engine.fcs().safe_block_info();
-                // A failed read is RETRYABLE, not divergence — the same
-                // rationale as the head lookup below: the unwind is durably
-                // committed and nothing has been issued to the engine yet,
-                // so momentary database contention must refuse, not
-                // fail-stop.
+                // The unwind is durably committed but the engine head has NOT
+                // moved yet. Every failure from here on is a FATAL divergence,
+                // never a retryable refusal: resetting the watcher to retry
+                // would let it re-emit `Synced` and reopen sequencing while the
+                // engine mirror still sits on the pre-unwind head, so un-marked
+                // L1 messages would be re-selected against the old EL chain
+                // (duplicate/out-of-order messages peers reject). Fail-stopping
+                // keeps the gate latched; a restart re-derives the head from the
+                // unwound database and rewinds the EL to match.
                 let (persisted_head_number, persisted_safe) = match (
                     self.database.get_l2_head_block_number().await,
                     self.database.get_latest_safe_l2_info().await,
                 ) {
                     (Ok(head_number), Ok((safe, _))) => (head_number, safe),
                     outcome => {
-                        tracing::warn!(
+                        tracing::error!(
                             target: "scroll::chain_orchestrator",
                             ?outcome,
-                            "Administrative unwind could not read the persisted head/safe; \
-                             refusing (retryable)"
+                            "Administrative unwind could not read the persisted head/safe \
+                             after a durable unwind; fail-stopping"
                         );
-                        self.l1_watcher.revert_to_l1_block(block_number);
-                        if matches!(held_outcome, HeldReorgOutcome::Survived { .. }) {
-                            self.derivation_driver.schedule_fresh_reconciliation();
-                        }
-                        let _ = tx.send(false);
-                        return Ok(());
+                        return Err(ChainOrchestratorError::FatalStateDivergence(
+                            "administrative unwind could not read the persisted head/safe \
+                             after a durable unwind; restart re-converges from the \
+                             persisted state",
+                        ));
                     }
                 };
                 // Symmetric with handle_l1_reorg: a persisted head below the
@@ -1118,11 +1121,9 @@ impl<
                     }
                     None
                 } else {
-                    // A failed lookup is RETRYABLE, not divergence: reset the
-                    // watcher (the database is consistently unwound to the
-                    // target, so re-scanning from it is correct), reply false
-                    // so the operator re-issues, and do not ride the
-                    // admin-unwind fail-stop.
+                    // A failed lookup after a durable unwind is FATAL, not
+                    // retryable (see the head/safe read above): reopening on a
+                    // retry would diverge the engine from the unwound database.
                     let head_block = match self
                         .l2_client
                         .get_block_by_number(persisted_head_number.into())
@@ -1130,19 +1131,18 @@ impl<
                     {
                         Ok(Some(block)) => block,
                         outcome => {
-                            tracing::warn!(
+                            tracing::error!(
                                 target: "scroll::chain_orchestrator",
                                 persisted_head_number,
                                 ?outcome,
-                                "Administrative unwind could not resolve the new L2 head; \
-                                 refusing (retryable)"
+                                "Administrative unwind could not resolve the new L2 head \
+                                 after a durable unwind; fail-stopping"
                             );
-                            self.l1_watcher.revert_to_l1_block(block_number);
-                            if matches!(held_outcome, HeldReorgOutcome::Survived { .. }) {
-                                self.derivation_driver.schedule_fresh_reconciliation();
-                            }
-                            let _ = tx.send(false);
-                            return Ok(());
+                            return Err(ChainOrchestratorError::FatalStateDivergence(
+                                "administrative unwind could not resolve the new L2 head \
+                                 after a durable unwind; restart re-converges from the \
+                                 persisted state",
+                            ));
                         }
                     };
                     Some(BlockInfo {
@@ -1207,12 +1207,11 @@ impl<
                     // later: an out-of-order L1 message queue that
                     // `validate_l1_messages` rejects on every peer.
                     if let Some(head) = new_head {
-                        // Refuse, do not fail-stop: the two database reads above
-                        // this arm deliberately reply `false` and return Ok on
-                        // error, because momentary contention must not kill the
-                        // node. Propagating here would make this one write the
-                        // exception. Nothing durable has changed yet — the FCU
-                        // has not been issued — so the operator re-issues.
+                        // Fail-stop on failure (see the head/safe read above):
+                        // the unwind is durable and the FCU is about to move the
+                        // engine head, so a half-applied purge that then reopened
+                        // on a retry would leave messages mis-stamped against a
+                        // stale EL chain.
                         if let Err(err) = self
                             .database
                             .tx_mut(move |tx| async move {
@@ -1221,19 +1220,18 @@ impl<
                             })
                             .await
                         {
-                            tracing::warn!(
+                            tracing::error!(
                                 target: "scroll::chain_orchestrator",
                                 ?head,
                                 %err,
                                 "Could not purge L1 message mappings for the administrative \
-                                 unwind; refusing (retryable)"
+                                 unwind after a durable unwind; fail-stopping"
                             );
-                            self.l1_watcher.revert_to_l1_block(block_number);
-                            if matches!(held_outcome, HeldReorgOutcome::Survived { .. }) {
-                                self.derivation_driver.schedule_fresh_reconciliation();
-                            }
-                            let _ = tx.send(false);
-                            return Ok(());
+                            return Err(ChainOrchestratorError::FatalStateDivergence(
+                                "administrative unwind could not purge L1 message mappings \
+                                 after a durable unwind; restart re-converges from the \
+                                 persisted state",
+                            ));
                         }
                     }
                     let result = self.engine.update_fcs_checked(new_head, new_safe, None).await?;
@@ -1253,22 +1251,24 @@ impl<
                         ));
                     }
                     if !result.is_valid() {
-                        // SYNCING commits nothing — RETRYABLE, not divergence:
-                        // an operator RPC must not panic the node on a
-                        // routine engine response. Reset the watcher so the
-                        // sync gate is not left latched and reply false.
-                        tracing::warn!(
+                        // SYNCING commits nothing — with the unwind already
+                        // durable, the engine head stays on the pre-unwind chain
+                        // while the database is rewound. Resetting the watcher to
+                        // retry would reopen sequencing over that divergence, so
+                        // fail-stop instead (a rewind targets an ancestor the EL
+                        // already has, so SYNCING here is itself anomalous). A
+                        // restart rewinds the EL to the persisted head.
+                        tracing::error!(
                             target: "scroll::chain_orchestrator",
                             ?new_head,
                             ?new_safe,
-                            "Administrative unwind FCU returned SYNCING; refusing (retryable)"
+                            "Administrative unwind FCU returned SYNCING after a durable \
+                             unwind; fail-stopping"
                         );
-                        self.l1_watcher.revert_to_l1_block(block_number);
-                        if matches!(held_outcome, HeldReorgOutcome::Survived { .. }) {
-                            self.derivation_driver.schedule_fresh_reconciliation();
-                        }
-                        let _ = tx.send(false);
-                        return Ok(());
+                        return Err(ChainOrchestratorError::FatalStateDivergence(
+                            "administrative unwind forkchoice update returned SYNCING after \
+                             a durable unwind; restart re-converges from the persisted state",
+                        ));
                     }
                     self.reinsert_txs_into_pool(reverted_transactions).await;
                 }
@@ -4304,17 +4304,14 @@ mod run_loop_policy_tests {
         );
     }
 
-    /// Pins pass-39 C1: the administrative unwind derives its FCU targets
-    /// from ABSOLUTE persisted state, so a retryable refusal stays a refusal
-    /// on every retry until the divergence is actually gone — the delta-
-    /// derived version replied `true` on the retry while issuing no FCU at
-    /// all.
+    /// Pass-60 P1: a head lookup that fails AFTER the durable unwind is a
+    /// FATAL divergence, not a retryable refusal. The database is rewound but
+    /// the engine head is not, so resetting the watcher to retry would let it
+    /// re-emit `Synced` and reopen sequencing over that gap.
     #[tokio::test]
-    async fn admin_unwind_refusal_is_sticky_until_state_converges() {
+    async fn admin_unwind_head_lookup_failure_fail_stops() {
         let database = Arc::new(setup_test_db().await);
         database.insert_genesis_block(B256::ZERO).await.unwrap();
-        // The dev migration seeded the Scroll dev genesis row beside the
-        // test genesis; drop it so height-0 queries are deterministic.
         database.delete_mismatched_genesis_blocks(B256::ZERO).await.unwrap();
         let batch_info = BatchInfo::new(1, B256::repeat_byte(1));
         database
@@ -4336,10 +4333,111 @@ mod run_loop_policy_tests {
         let engine_client = Arc::new(ScriptedEngineClient::new());
         script_syncing_hold_then_success(&engine_client);
         let asserter = Asserter::new();
+        // Consolidation consumes some provider calls; the revert's head lookup
+        // then reads a `None`, which is now the fatal path.
         asserter.push_success(&Option::<()>::None);
         asserter.push_success(&Option::<()>::None);
-        // Two head-lookup refusals: the persisted head diverges from the
-        // mirror and the L2 client cannot resolve the block.
+        asserter.push_success(&Option::<()>::None);
+        asserter.push_success(&Option::<()>::None);
+        let (mut orchestrator, handle, notification_tx) = test_orchestrator(
+            database.clone(),
+            engine_client.clone(),
+            asserter,
+            BatchDerivationResult {
+                attributes: vec![DerivedAttributes {
+                    block_number: SAFE + 1,
+                    attributes: ScrollPayloadAttributes::default(),
+                }],
+                batch_info,
+                skipped_l1_messages: vec![],
+                target_status: BatchStatus::Consolidated,
+            },
+        )
+        .await;
+        let mut events = orchestrator.event_listener();
+
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let run_task = tokio::spawn(orchestrator.run_until_shutdown(Box::pin(async move {
+            let _ = shutdown_rx.await;
+        })));
+
+        time::timeout(Duration::from_secs(2), async {
+            while engine_client.fork_choice_updated_calls() < 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first Engine SYNCING response must hold the batch");
+
+        // Drive the held batch to full consolidation.
+        notification_tx.send(Arc::new(L1Notification::Finalized(1))).await.unwrap();
+        let seen = time::timeout(Duration::from_secs(5), async {
+            while let Some(event) = events.next().await {
+                if matches!(event, ChainOrchestratorEvent::L1BlockFinalized(1, _)) {
+                    return true;
+                }
+            }
+            false
+        })
+        .await
+        .expect("consolidation must complete");
+        assert!(
+            seen,
+            "consolidation must complete — the event stream closed (run loop terminated)"
+        );
+        assert_eq!(engine_client.fork_choice_updated_calls(), 3);
+
+        // Diverge the persisted head below the mirror (the crash-window state):
+        // the revert then takes the head-lookup branch, whose mocked `None`
+        // used to be a retryable refusal and is now a fail-stop.
+        database.set_l2_head_block_number(SAFE).await.unwrap();
+
+        // The reply channel is dropped by the fail-stop; ignore the RecvError.
+        tokio::spawn(async move {
+            let _ = handle.revert_to_l1_block(10).await;
+        });
+
+        let result = time::timeout(Duration::from_secs(5), run_task)
+            .await
+            .expect("a failed post-unwind head lookup must terminate the run loop")
+            .unwrap();
+        assert!(
+            matches!(result, Err(ChainOrchestratorError::FatalStateDivergence(_))),
+            "expected FatalStateDivergence, got {result:?}"
+        );
+    }
+
+    /// The converged path stays a clean no-op success: when the persisted head
+    /// and safe already match the engine mirror, an administrative revert
+    /// issues NO FCU and replies `true` (the absolute-target derivation from
+    /// pass-39 C1 — a delta-derived version would also reply true here, but
+    /// this pins that the converged shape is not disturbed by the pass-60
+    /// fail-stop tightening).
+    #[tokio::test]
+    async fn admin_unwind_converged_state_is_noop_success() {
+        let database = Arc::new(setup_test_db().await);
+        database.insert_genesis_block(B256::ZERO).await.unwrap();
+        database.delete_mismatched_genesis_blocks(B256::ZERO).await.unwrap();
+        let batch_info = BatchInfo::new(1, B256::repeat_byte(1));
+        database
+            .insert_batch(BatchCommitData {
+                hash: batch_info.hash,
+                index: batch_info.index,
+                block_number: 10,
+                block_timestamp: 0,
+                calldata: Arc::new(Bytes::new()),
+                blob_versioned_hash: None,
+                finalized_block_number: None,
+                reverted_block_number: None,
+            })
+            .await
+            .unwrap();
+        database.update_batch_status(batch_info.hash, BatchStatus::Processing).await.unwrap();
+        database.set_finalized_l1_block_number(5).await.unwrap();
+
+        let engine_client = Arc::new(ScriptedEngineClient::new());
+        script_syncing_hold_then_success(&engine_client);
+        let asserter = Asserter::new();
         asserter.push_success(&Option::<()>::None);
         asserter.push_success(&Option::<()>::None);
         let (mut orchestrator, handle, notification_tx) = test_orchestrator(
@@ -4372,8 +4470,7 @@ mod run_loop_policy_tests {
         .await
         .expect("first Engine SYNCING response must hold the batch");
 
-        // Drive the held batch to full consolidation so no scripted
-        // responses remain queued for it.
+        // Drive the held batch to full consolidation.
         notification_tx.send(Arc::new(L1Notification::Finalized(1))).await.unwrap();
         let seen = time::timeout(Duration::from_secs(5), async {
             while let Some(event) = events.next().await {
@@ -4381,41 +4478,21 @@ mod run_loop_policy_tests {
                     return true;
                 }
             }
-            // A closed stream is a terminated run loop. `poll_next` then returns
-            // Ready(None) forever, so a `loop` here spins on a ready future, never
-            // yields Pending, and the timeout above is never re-polled — the test
-            // hangs at 100% CPU instead of failing, in exactly the regression it pins.
             false
         })
         .await
         .expect("consolidation must complete");
         assert!(
             seen,
-            "consolidation must complete — the event stream closed, so the run loop terminated"
+            "consolidation must complete — the event stream closed (run loop terminated)"
         );
         assert_eq!(engine_client.fork_choice_updated_calls(), 3);
 
-        // Diverge the persisted head below the mirror (the crash-window /
-        // half-completed-unwind state C1 describes).
-        database.set_l2_head_block_number(SAFE).await.unwrap();
-
-        // First revert: the head lookup fails (mocked None) — retryable
-        // refusal, no FCU issued.
+        // No divergence: persisted head/safe already match the mirror, so the
+        // revert issues no FCU and cleanly succeeds. (Revert target 10 == the
+        // held batch's L1 block, so the unwind removes nothing.)
         let replied = handle.revert_to_l1_block(10).await.unwrap();
-        assert!(!replied, "an unresolvable head must be a refusal");
-        assert_eq!(engine_client.fork_choice_updated_calls(), 3, "no FCU on a refusal");
-
-        // The re-issued revert deletes nothing, but the divergence is still
-        // there: the retry must REFUSE again, not silently reply true.
-        let replied = handle.revert_to_l1_block(10).await.unwrap();
-        assert!(!replied, "the retry must stay a refusal while the mirror disagrees");
-        assert_eq!(engine_client.fork_choice_updated_calls(), 3);
-
-        // Converge the persisted state; the next revert is a clean no-op
-        // success without any FCU.
-        database.set_l2_head_block_number(SAFE + 1).await.unwrap();
-        let replied = handle.revert_to_l1_block(10).await.unwrap();
-        assert!(replied, "a converged revert must succeed");
+        assert!(replied, "a converged revert is a clean no-op success");
         assert_eq!(engine_client.fork_choice_updated_calls(), 3, "converged state needs no FCU");
 
         let _ = shutdown_tx.send(());
@@ -4866,17 +4943,16 @@ mod run_loop_policy_tests {
         );
     }
 
-    /// Pins the admin revert's safe-FCU branches: a SYNCING answer is a
-    /// retryable refusal (reply false, mirror uncommitted), the retry
-    /// reissues the SAME absolute target and converges on VALID, and a
-    /// converged third call needs no FCU. Also asserts WHAT was issued: the
-    /// genesis safe target the persisted state dictates.
+    /// Pass-60 P1: a SYNCING answer to the admin-unwind FCU, AFTER the
+    /// durable unwind, is a FATAL divergence. SYNCING commits nothing, so the
+    /// engine head stays on the pre-unwind chain while the database is
+    /// rewound; reopening on a retry would sequence over that gap. Also
+    /// asserts WHAT was issued before the fail-stop: the genesis safe target
+    /// the persisted state dictates, head unmoved.
     #[tokio::test]
-    async fn admin_unwind_syncing_safe_fcu_refuses_then_converges() {
+    async fn admin_unwind_syncing_safe_fcu_fail_stops() {
         let database = Arc::new(setup_test_db().await);
         database.insert_genesis_block(B256::ZERO).await.unwrap();
-        // The dev migration seeded the Scroll dev genesis row beside the
-        // test genesis; drop it so height-0 queries are deterministic.
         database.delete_mismatched_genesis_blocks(B256::ZERO).await.unwrap();
         let batch_info = BatchInfo::new(1, B256::repeat_byte(1));
         database
@@ -4894,8 +4970,7 @@ mod run_loop_policy_tests {
             .unwrap();
         database.update_batch_status(batch_info.hash, BatchStatus::Processing).await.unwrap();
         // Revert target 0 sits below batch 1's commit block, so the unwind
-        // discards the held batch (no reconciliation retry can race the
-        // scripted FCU queue) and the absolute safe falls to genesis.
+        // discards the held batch and the absolute safe falls to genesis.
         database.set_l2_head_block_number(SAFE).await.unwrap();
 
         let engine_client = Arc::new(ScriptedEngineClient::new());
@@ -4922,7 +4997,7 @@ mod run_loop_policy_tests {
         )
         .await;
 
-        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let run_task = tokio::spawn(orchestrator.run_until_shutdown(Box::pin(async move {
             let _ = shutdown_rx.await;
         })));
@@ -4935,11 +5010,23 @@ mod run_loop_policy_tests {
         .await
         .expect("first Engine SYNCING response must hold the batch");
 
-        // SYNCING on the safe FCU: retryable refusal, mirror uncommitted.
-        let replied = handle.revert_to_l1_block(0).await.unwrap();
-        assert!(!replied, "SYNCING must be a retryable refusal");
-        assert_eq!(engine_client.fork_choice_updated_calls(), 2);
+        // The reply channel is dropped by the fail-stop; ignore the RecvError.
+        tokio::spawn(async move {
+            let _ = handle.revert_to_l1_block(0).await;
+        });
+
+        let result = time::timeout(Duration::from_secs(5), run_task)
+            .await
+            .expect("a SYNCING post-unwind FCU must terminate the run loop")
+            .unwrap();
+        assert!(
+            matches!(result, Err(ChainOrchestratorError::FatalStateDivergence(_))),
+            "expected FatalStateDivergence, got {result:?}"
+        );
+        // The FCU that was issued before the fail-stop carried the persisted
+        // (genesis) safe target with the head left untouched.
         let issued = engine_client.fork_choice_updated_states();
+        assert_eq!(issued.len(), 2, "the hold FCU and the one refused safe FCU");
         assert_eq!(
             issued[1].safe_block_hash,
             B256::ZERO,
@@ -4950,22 +5037,6 @@ mod run_loop_policy_tests {
             B256::repeat_byte(0x11),
             "the head must not move on a safe-only divergence"
         );
-
-        // The retry reissues the SAME absolute target and converges.
-        engine_client
-            .push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Valid, None)));
-        let replied = handle.revert_to_l1_block(0).await.unwrap();
-        assert!(replied, "a VALID retry must succeed");
-        assert_eq!(engine_client.fork_choice_updated_calls(), 3);
-        assert_eq!(engine_client.fork_choice_updated_states()[2].safe_block_hash, B256::ZERO);
-
-        // Converged: no further FCU.
-        let replied = handle.revert_to_l1_block(0).await.unwrap();
-        assert!(replied, "a converged revert is a clean no-op success");
-        assert_eq!(engine_client.fork_choice_updated_calls(), 3);
-
-        let _ = shutdown_tx.send(());
-        assert!(run_task.await.unwrap().is_ok());
     }
 
     /// The INVALID counterpart: the engine actively rejects the safe target

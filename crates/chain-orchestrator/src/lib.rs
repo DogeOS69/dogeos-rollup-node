@@ -2326,6 +2326,34 @@ impl<
                 result
             }
             Err(err) => {
+                // A LOCAL pre-flight refusal is NOT a transport blip:
+                // update_fcs_checked validates the candidate before any RPC
+                // (engine.rs), so an FcsError (HeadBelowSafe/SafeBelowFinalized)
+                // means the latched target is no longer a valid forkchoice —
+                // derivation raised `safe` above it. Retrying it forever wedges
+                // the node (no L1 polling, no sequencing) behind a misleading
+                // "could not reach the engine", and re-collects the reverted-tx
+                // range every tick. Re-latch onto the current mirror (>= safe,
+                // so the next probe is a valid no-op re-issue), provenance reset,
+                // and do not count it as a transport failure.
+                if let EngineError::FcsError(_) = &err {
+                    let mirror = *self.engine.fcs().head_block_info();
+                    tracing::warn!(
+                        target: "scroll::chain_orchestrator",
+                        ?target,
+                        ?mirror,
+                        %err,
+                        "L2 sync re-check target is no longer a valid forkchoice (safe moved \
+                         past it); re-latching onto the current mirror"
+                    );
+                    self.l2_sync_recheck_target = Some(L2SyncRecheck {
+                        target: mirror,
+                        latched_from: mirror,
+                        validated: false,
+                    });
+                    self.l2_sync_recheck_failures = 0;
+                    return Ok(());
+                }
                 // While this probe keeps failing the node polls no L1 and
                 // sequences nothing — `l1_notification_receiver_may_poll` and
                 // the sequencer arm both require a synced L2 — while reporting
@@ -2385,8 +2413,12 @@ impl<
                 ?mirror,
                 "Latched L2 sync target rejected as INVALID; re-latching onto the current head"
             );
+            // Reset provenance: this re-latches onto `mirror`, which is NOT the
+            // block just probed (`target`), so the target's `validated` bit does
+            // not describe it. Carrying it would be the only way the fail-stop
+            // arm becomes reachable, and onto a head we did not validate.
             self.l2_sync_recheck_target =
-                Some(L2SyncRecheck { target: mirror, latched_from: mirror, validated });
+                Some(L2SyncRecheck { target: mirror, latched_from: mirror, validated: false });
             return Ok(());
         }
         if !result.is_valid() {
@@ -2752,7 +2784,13 @@ impl<
             self.validate_l1_messages(&chain).await?;
         }
 
-        // Validate the new blocks by sending them to the engine.
+        // Validate the new blocks by sending them to the engine. Only INVALID
+        // is rejected here; SYNCING/ACCEPTED proceed (the EL may still be
+        // catching up). Track whether EVERY block returned VALID so the L2-sync
+        // latch below records honest validation provenance — a SYNCING new_payload
+        // is NOT a validated head, and latching it as such is what let a later
+        // forkchoice INVALID fail-stop the node.
+        let mut all_validated = true;
         for block in &chain {
             let payload = ExecutionPayloadV1::from_block_slow(block);
             let status = self.engine.new_payload(payload).await?;
@@ -2765,6 +2803,7 @@ impl<
                 ));
                 return Err(ChainOrchestratorError::InvalidBlock);
             }
+            all_validated &= status.is_valid();
         }
 
         // Update the FCS to the new head.
@@ -2810,8 +2849,11 @@ impl<
             self.l2_sync_recheck_target = Some(L2SyncRecheck {
                 target: head,
                 latched_from: *self.engine.fcs().head_block_info(),
-                // Peer-import: new_payload validated this head before the FCU.
-                validated: true,
+                // Only VALIDATED (every block's new_payload returned VALID) — a
+                // SYNCING new_payload means the EL has not validated the head, so
+                // recording it as validated would let a later forkchoice INVALID
+                // (a valid-but-non-canonical head, peer-triggerable) fail-stop.
+                validated: all_validated,
             });
             return Err(ChainOrchestratorError::FcuRejected(
                 "peer chain import forkchoice update was not applied by the engine",
@@ -3629,7 +3671,9 @@ mod run_loop_policy_tests {
             Some(super::L2SyncRecheck {
                 target: info(SAFE, 0x11),
                 latched_from: info(SAFE, 0x11),
-                validated: true,
+                // The INVALID re-latch resets provenance (it re-latches onto the
+                // mirror, not the just-probed target).
+                validated: false,
             }),
             "a rejected target must be replaced by one onto the current head, never cleared: clearing leaves L2 syncing with no way back"
         );

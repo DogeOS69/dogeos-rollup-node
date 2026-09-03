@@ -132,10 +132,10 @@ These can be used as reliable blob sources without requiring your own beacon nod
     - `system-contract` (default): Validates blocks against authorized signer from L1
     - `noop`: No consensus validation (testing only)
 - `--consensus.authorized-signer <ADDRESS>`: Static authorized signer address (when using
-  system-contract; `--l1.url` is required either way). When set, this **overrides** the
-  signer read from L1 for the lifetime of the process — the node will NOT honor an on-chain
-  signer rotation while this flag is present (the L1 signer is read once at startup, not
-  tracked live), which is why `--consensus.exit-on-signer-rotation` is rejected alongside it.
+  system-contract; `--l1.url` is required either way). The L1 signer IS re-read on every L1
+  block, but when this flag is set it **overrides** that value every time — so the node will
+  NOT honor an on-chain signer rotation while the flag is present, which is why
+  `--consensus.exit-on-signer-rotation` is rejected alongside it.
 
 #### Database Configuration
 

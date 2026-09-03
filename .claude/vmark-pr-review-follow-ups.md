@@ -671,9 +671,13 @@ from every pass is either fixed in the PR or recorded here.
     short-circuit) re-collects the reverted-tx range — up to
     MAX_REVERTED_TX_COLLECTION_BLOCKS (1024) serial full-block RPCs — on the
     single-task run loop, per announcement, even for already-known blocks.
+  - Update (pass 65 M1): the WORST sub-case — a local FcsError (safe climbed
+    past the latched target) retried forever, re-collecting every tick — was
+    FIXED by re-latching onto the current mirror on an FcsError instead of
+    treating it as a transport blip. What remains is the transient re-collection
+    per gossip announcement during a genuine backward latch.
   - Why unaddressed: the fix caches the collection on `L2SyncRecheck`, adding a
-    second field + invalidation to a struct just churned by A1; performance, not
-    correctness. Deferred to avoid stacking two struct changes in one pass.
+    field + invalidation; performance, not correctness.
   - Suggested Linear title: "chain-orchestrator: cache the recheck reverted-tx collection per latch"
 
 - **[pass 63 A3/A5/A6] Test-precision cluster around the recheck rewind and finalized-marker replay**
@@ -729,6 +733,23 @@ from every pass is either fixed in the PR or recorded here.
     test assertion holds unconditionally (it never writes l2_head_block).
   - Why unaddressed: cosmetic / test-precision, batched to keep the pass bounded.
   - Suggested Linear title: "rollup-node: residual test/doc precision (dead Err arms, race-y wait, unconditional assert)"
+
+- **[pass 65 M3/M4] Two consensus-relevant guards are correct but unpinned by tests**
+  (`crates/chain-orchestrator/src/lib.rs` finalized-marker `safe_arg` guard;
+  the admin-unwind `persisted_head >= mirror_head` direction guard)
+  - Impact/evidence: Claude pass 65 (2026-09-03). M3: the joint safe+finalized
+    raise uses unchecked `update_fcs` (which enforces monotonicity on finalized
+    only), so mutating `safe_arg` to an unconditional `Some(finalized_block_info)`
+    ships green and would drag the EL safe marker backward on every routine
+    finalization; the one test on that branch never asserts `safe_block_hash`
+    and can't (the phantom marker shares `B256::repeat_byte(0x22)` with the
+    `payload()` helper). M4: the `>=` direction guard's `>` mutant survives all
+    three existing cases — the equal-height hash-swap case it exists for is
+    missing (public-API defence today, so blast radius is capped).
+  - Why unaddressed: test-precision only (both production guards are correct);
+    batched with the pass-63 A5/A6 test-hardening cluster to keep the review
+    round bounded.
+  - Suggested Linear title: "chain-orchestrator: pin the joint-safe-raise and admin-unwind direction guards with distinct-hash assertions"
 
 ## Pass 35 findings — resolution (loop resumed 2026-09-01)
 

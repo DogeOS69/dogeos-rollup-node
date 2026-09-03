@@ -171,7 +171,8 @@ impl ScrollRollupNodeConfig {
             self.consensus_args.authorized_signer.is_none() &&
             self.l1_provider_args.url.is_none()
         {
-            return Err("System contract consensus requires either an authorized signer or a L1 provider URL".to_string());
+            return Err("System contract consensus requires --l1.url (the authorized signer is                  read from L1); a static --consensus.authorized-signer only overrides it and does                  not remove the --l1.url requirement"
+                .to_string());
         }
 
         if self.remote_block_source_args.enabled && self.remote_block_source_args.url.is_none() {

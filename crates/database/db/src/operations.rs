@@ -627,9 +627,18 @@ impl<T: WriteConnectionProvider + ?Sized + Sync> DatabaseWriteOperations for T {
             .select_only()
             .column(models::batch_commit::Column::Hash)
             .into_query();
+        // Deterministic: exclude reverted rows and tie-break by batch index,
+        // mirroring get_latest_safe_l2_info. `idx_l2_block_block_number` is
+        // non-unique, so after a revert-then-reorg-restore two batches can hold
+        // the same height with different hashes; a bare `ORDER BY block_number
+        // DESC LIMIT 1` would pick nondeterministically, and a wrong pick raises
+        // FatalStateDivergence in handle_l1_finalized (and a restart re-rolls it,
+        // presenting as a transient).
         let finalized_block_info = models::l2_block::Entity::find()
             .filter(models::l2_block::Column::BatchHash.in_subquery(eligible_hashes))
+            .filter(models::l2_block::Column::Reverted.eq(false))
             .order_by_desc(models::l2_block::Column::BlockNumber)
+            .order_by_desc(models::l2_block::Column::BatchIndex)
             .one(self.get_connection())
             .await?
             .map(|block| block.block_info());

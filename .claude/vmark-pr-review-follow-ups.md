@@ -5,6 +5,30 @@ from every pass is either fixed in the PR or recorded here.
 
 ## Unresolved
 
+- **nightly-soak `report-soak-failures` may skip on a job-level-timeout
+  cancellation** (`.github/workflows/nightly-soak.yml` reporter job `if:` guard)
+  - Impact/evidence: Codex pass 70 P2 (2026-09-03). The reporter is guarded by
+    `if: !cancelled() && ...`; Codex argues that when a needed soak job is
+    cancelled — including by its own job-level `timeout-minutes` (the likeliest
+    shape of a reintroduced hang/livelock) — the reporter is skipped, so the
+    `needs.*.result == "cancelled"` branch never fires and a hung setup/build
+    produces neither an issue comment nor a step summary. Suggested remedy: an
+    `always()`-style dependency guard that still excludes a genuine user
+    cancellation of the whole run.
+  - First/most-recent pass: Codex pass 70 (2026-09-03).
+  - Why unaddressed: the exact GitHub Actions semantics here are subtle and
+    NOT verifiable from this repo — whether `cancelled()` is true in a dependent
+    job when only an upstream job hits its own `timeout-minutes` (vs. a
+    workflow-level cancellation) determines whether the current guard is already
+    correct, and the fix must distinguish a job-timeout from a user run
+    cancellation (the current `!cancelled()` was chosen deliberately, per its
+    own comment, to keep a manual run cancellation from posting a bogus hang
+    report). Getting it wrong reintroduces false regression reports or keeps the
+    missed-signal gap. It needs validation with a throwaway workflow run, which
+    is out of scope for a blind edit in this review loop. (Same reporter area as
+    the pass-? F6 hardening already in the PR.)
+  - Suggested Linear title: "nightly-soak: ensure report-soak-failures fires on a soak job's job-level timeout without reporting user cancellations"
+
 - **Startup reconciliation of an execution node whose head diverges from the
   persisted L2 head is unsolved and was REVERTED** (`crates/node/src/args.rs`
   startup head-repair loop; the sign-failure fail-stop in

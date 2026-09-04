@@ -29,7 +29,7 @@ jobs:
           ALCHEMY_KEY: ${{ secrets.ALCHEMY_KEY }}
         run: |
           set -euo pipefail
-          if [ -z "${ALCHEMY_KEY:-}" ]; then
+          if [ -z "${ALCHEMY_KEY//[[:space:]]/}" ]; then
             echo "::error::ALCHEMY_KEY secret is missing or empty. The sync workflow needs it to reach the L1 RPC; provision the repository secret before dispatching this workflow."
             exit 1
           fi

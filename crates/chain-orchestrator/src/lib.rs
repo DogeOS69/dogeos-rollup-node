@@ -442,9 +442,10 @@ impl<
                     // Coalesce with an in-flight job instead of silently
                     // replacing it: a replaced job discards engine work and
                     // makes block numbering timing-dependent when the build
-                    // timer and manual triggers race (issue #38). Callers wait
-                    // on BlockSequenced/BlockBuildingSkipped, which the
-                    // in-flight job will emit.
+                    // timer and manual triggers race (issue #38). The only
+                    // production sender serializes on BlockSequenced or
+                    // BlockBuildingSkipped, which the in-flight job emits when
+                    // it completes. Cancellation emits no outcome, as before.
                     if sequencer.payload_building_job().is_some() {
                         tracing::debug!(target: "scroll::chain_orchestrator", "BuildBlock requested while a payload building job is in flight; coalescing with the in-flight job");
                     } else {

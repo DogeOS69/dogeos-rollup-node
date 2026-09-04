@@ -263,7 +263,10 @@ async fn test_should_consolidate_after_optimistic_sync() -> eyre::Result<()> {
     // continuous stream of sequenced blocks (to trigger the follower's
     // optimistic sync and later its consolidation), so enable the automatic
     // build timer now.
-    sequencer.sequencer().rollup_manager_handle.enable_automatic_sequencing().await?;
+    eyre::ensure!(
+        sequencer.sequencer().rollup_manager_handle.enable_automatic_sequencing().await?,
+        "automatic sequencing was not enabled"
+    );
 
     // Connect the nodes together.
     sequencer.sequencer().node.connect(&mut follower.follower(0).node).await;
@@ -752,9 +755,11 @@ async fn test_chain_orchestrator_l1_reorg() -> eyre::Result<()> {
     Ok(())
 }
 
-/// Contract: a manual build request while a payload building job is in flight
-/// coalesces with it — two rapid `build_block()` commands yield exactly one new
-/// block and numbering stays contiguous (issue #38).
+/// Contract pin: a manual build request while a payload building job is in
+/// flight coalesces with it — two rapid `build_block()` commands yield exactly
+/// one new block and numbering stays contiguous (issue #38). The timing race
+/// itself is exercised by `test_should_consolidate_after_optimistic_sync`;
+/// replacing a job on the same parent can produce this sequence too.
 #[allow(clippy::large_stack_frames)]
 #[tokio::test]
 async fn test_manual_build_block_coalesces_with_inflight_job() -> eyre::Result<()> {
@@ -810,4 +815,7 @@ async fn wait_n_events(
     .unwrap_or_else(|_| {
         panic!("Timeout (60s) waiting for {total} matching events ({n} still missing)")
     });
+    // The stream ending early falls out of the while-let without the timeout
+    // firing; that must not pass silently either.
+    assert_eq!(n, 0, "event stream ended with {n}/{total} matching events still missing");
 }

@@ -88,8 +88,8 @@ where
     /// Determines the last imported block by finding the highest common block
     /// between the local chain and the remote node.
     ///
-    /// Called on the first successful contact with the remote; a failure here
-    /// (e.g. the remote is not up yet) is retried on the next poll tick.
+    /// Called on every poll tick until it succeeds; a failure here (e.g. the
+    /// remote is not up yet) is retried on the next poll tick.
     async fn init_last_imported_block(&self) -> eyre::Result<u64> {
         let local_head = self.orchestrator_handle.status().await?.l2.fcs.head_block_info().number;
         let remote_head = self.remote.get_block_number().await?;

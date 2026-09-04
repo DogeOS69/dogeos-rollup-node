@@ -27,12 +27,14 @@ use std::{path::PathBuf, sync::Arc};
 async fn test_should_consolidate_to_block_15k() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    // Prepare the config for a L1 consolidation.
-    let alchemy_key = if let Ok(key) = std::env::var("ALCHEMY_KEY") {
-        key
-    } else {
-        eprintln!("ALCHEMY_KEY environment variable is not set. Skipping test.");
-        return Ok(());
+    // Prepare the config for a L1 consolidation. GitHub Actions passes a
+    // missing secret as an EMPTY string, so treat empty as unset.
+    let alchemy_key = match std::env::var("ALCHEMY_KEY") {
+        Ok(key) if !key.trim().is_empty() => key,
+        _ => {
+            eprintln!("ALCHEMY_KEY environment variable is not set or empty. Skipping test.");
+            return Ok(());
+        }
     };
 
     let node_config = ScrollRollupNodeConfig {
@@ -196,12 +198,19 @@ async fn test_should_trigger_pipeline_sync_for_execution_node() -> eyre::Result<
 async fn test_should_consolidate_after_optimistic_sync() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
+    // The sequencer starts with automatic sequencing DISABLED (no
+    // auto_start(true)): the setup loop below drives manual build_block()
+    // calls with exact expected block numbers, and the 20ms build timer raced
+    // those on slow runners — a timer-built block claimed the expected number,
+    // its event was consumed by an interleaved waiter, and the exact-number
+    // wait hung for 30s (issue #38). Automatic sequencing is enabled after the
+    // loop, where the sync/consolidation phase relies on its continuous block
+    // stream and no assertion depends on exact numbers.
     let mut sequencer = TestFixture::builder()
         .sequencer()
         .with_memory_db()
         .with_eth_scroll_bridge(true)
         .with_scroll_wire(true)
-        .auto_start(true)
         .block_time(20)
         .with_l1_message_delay(0)
         .allow_empty_blocks(true)
@@ -249,6 +258,15 @@ async fn test_should_consolidate_after_optimistic_sync() -> eyre::Result<()> {
 
         sequencer.build_block().expect_block_number((i + 1) as u64).build_and_await_block().await?;
     }
+
+    // The exact-number assertions are done; from here the test needs a
+    // continuous stream of sequenced blocks (to trigger the follower's
+    // optimistic sync and later its consolidation), so enable the automatic
+    // build timer now.
+    eyre::ensure!(
+        sequencer.sequencer().rollup_manager_handle.enable_automatic_sequencing().await?,
+        "automatic sequencing was not enabled"
+    );
 
     // Connect the nodes together.
     sequencer.sequencer().node.connect(&mut follower.follower(0).node).await;
@@ -737,18 +755,67 @@ async fn test_chain_orchestrator_l1_reorg() -> eyre::Result<()> {
     Ok(())
 }
 
+/// Contract pin: a manual build request while a payload building job is in
+/// flight coalesces with it — two rapid `build_block()` commands yield exactly
+/// one new block and numbering stays contiguous (issue #38). The timing race
+/// itself is exercised by `test_should_consolidate_after_optimistic_sync`;
+/// replacing a job on the same parent can produce this sequence too.
+#[allow(clippy::large_stack_frames)]
+#[tokio::test]
+async fn test_manual_build_block_coalesces_with_inflight_job() -> eyre::Result<()> {
+    reth_tracing::init_test_tracing();
+
+    let mut fixture = TestFixture::builder()
+        .sequencer()
+        .with_memory_db()
+        .payload_building_duration(500) // long job so the second command lands mid-flight
+        .allow_empty_blocks(true)
+        .build()
+        .await?;
+
+    fixture.l1().sync().await?;
+
+    // Fire two build commands back-to-back; the second arrives while the
+    // 500ms job from the first is still in flight.
+    fixture.sequencer().rollup_manager_handle.build_block();
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    fixture.sequencer().rollup_manager_handle.build_block();
+
+    // Exactly one block results: number 1.
+    fixture.expect_event().block_sequenced(1).await?;
+
+    // A follow-up build produces number 2 — numbering is contiguous.
+    fixture.build_block().expect_block_number(2).build_and_await_block().await?;
+
+    Ok(())
+}
+
 /// Waits for n events to be emitted.
+///
+/// Bounded: panics with a diagnosis after 60s instead of hanging the test
+/// binary forever (a hung test is indistinguishable from a slow one in CI and
+/// burns the whole job's timeout — issue #38).
 async fn wait_n_events(
     events: &mut EventStream<ChainOrchestratorEvent>,
     mut matches: impl FnMut(ChainOrchestratorEvent) -> bool,
     mut n: u64,
 ) {
-    while let Some(event) = events.next().await {
-        if matches(event.clone()) {
-            n -= 1;
+    let total = n;
+    tokio::time::timeout(tokio::time::Duration::from_secs(60), async {
+        while let Some(event) = events.next().await {
+            if matches(event.clone()) {
+                n -= 1;
+            }
+            if n == 0 {
+                break
+            }
         }
-        if n == 0 {
-            break
-        }
-    }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!("Timeout (60s) waiting for {total} matching events ({n} still missing)")
+    });
+    // The stream ending early falls out of the while-let without the timeout
+    // firing; that must not pass silently either.
+    assert_eq!(n, 0, "event stream ended with {n}/{total} matching events still missing");
 }

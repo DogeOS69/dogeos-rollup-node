@@ -150,8 +150,8 @@ async fn serve_tsuki_retained_range() -> eyre::Result<()> {
     )?;
     std::fs::write(output.join("manifest.json"), serde_json::to_vec_pretty(&manifest)?)?;
     println!("RETAINED_RANGE_READY {}", output.display());
-    let deadline = tokio::time::Instant::now()
-        + Duration::from_secs(option("RANGE_SERVE_SECONDS", 3600)?.min(7200));
+    let deadline = tokio::time::Instant::now() +
+        Duration::from_secs(option("RANGE_SERVE_SECONDS", 3600)?.min(7200));
     while tokio::time::Instant::now() < deadline && !output.join("stop").exists() {
         if deferred && manifest["phase"] == "near" && output.join("advance").exists() {
             for index in length..length + depth {
@@ -203,8 +203,8 @@ async fn verify_retained_range_db() -> eyre::Result<()> {
     let number = checkpoint.ok_or_else(|| eyre::eyre!("execution checkpoint absent"))?.block_number;
     let manifest: Value = serde_json::from_slice(&std::fs::read(output.join("manifest.json"))?)?;
     let last = manifest["blocks"].as_array().unwrap().last().unwrap()["number"].as_str().unwrap();
-    let expected = u64::from_str_radix(last.trim_start_matches("0x"), 16)?
-        + manifest["advanceDepth"].as_u64().unwrap();
+    let expected = u64::from_str_radix(last.trim_start_matches("0x"), 16)? +
+        manifest["advanceDepth"].as_u64().unwrap();
     eyre::ensure!(number >= expected, "DB checkpoint {number} below workload head {expected}");
     std::fs::write(
         output.join("retained-db-verified.json"),

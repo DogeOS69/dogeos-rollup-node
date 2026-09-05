@@ -468,3 +468,6 @@ async fn serve_fixture(tsuki: bool) -> eyre::Result<()> {
     }
     Ok(())
 }
+
+#[path = "support/multiproof_range.rs"]
+mod retained_range;

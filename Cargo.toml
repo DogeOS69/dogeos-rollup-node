@@ -125,17 +125,17 @@ strip = "none"
 [workspace.dependencies]
 # DogeOS Reth 2 component family. Keep this immutable so the in-process execution graph is
 # reproducible across rollup-node builds.
-dogeos-chainspec = { git = "https://github.com/DogeOS69/dogeos-reth.git", rev = "8f0b98b056111e8f497a4c6dd78ef1f776b626a5", default-features = false }
-dogeos-hardforks = { git = "https://github.com/DogeOS69/dogeos-reth.git", rev = "8f0b98b056111e8f497a4c6dd78ef1f776b626a5", default-features = false }
-dogeos-protocol-types = { git = "https://github.com/DogeOS69/dogeos-reth.git", rev = "8f0b98b056111e8f497a4c6dd78ef1f776b626a5", default-features = false }
-dogeos-reth-engine = { git = "https://github.com/DogeOS69/dogeos-reth.git", rev = "8f0b98b056111e8f497a4c6dd78ef1f776b626a5", default-features = false }
-dogeos-reth-evm = { git = "https://github.com/DogeOS69/dogeos-reth.git", rev = "8f0b98b056111e8f497a4c6dd78ef1f776b626a5", default-features = false }
-dogeos-reth-consensus = { git = "https://github.com/DogeOS69/dogeos-reth.git", rev = "8f0b98b056111e8f497a4c6dd78ef1f776b626a5", default-features = false }
-dogeos-reth-node = { git = "https://github.com/DogeOS69/dogeos-reth.git", rev = "8f0b98b056111e8f497a4c6dd78ef1f776b626a5", default-features = false }
-dogeos-reth-primitives = { git = "https://github.com/DogeOS69/dogeos-reth.git", rev = "8f0b98b056111e8f497a4c6dd78ef1f776b626a5", default-features = false }
-dogeos-reth-rpc = { git = "https://github.com/DogeOS69/dogeos-reth.git", rev = "8f0b98b056111e8f497a4c6dd78ef1f776b626a5", default-features = false }
-dogeos-reth-txpool = { git = "https://github.com/DogeOS69/dogeos-reth.git", rev = "8f0b98b056111e8f497a4c6dd78ef1f776b626a5", default-features = false }
-dogeos-rpc-types = { git = "https://github.com/DogeOS69/dogeos-reth.git", rev = "8f0b98b056111e8f497a4c6dd78ef1f776b626a5", default-features = false }
+dogeos-chainspec = { git = "https://github.com/DogeOS69/dogeos-reth.git", rev = "7105d8d468622d32ef507dd7a547e492d2359451", default-features = false }
+dogeos-hardforks = { git = "https://github.com/DogeOS69/dogeos-reth.git", rev = "7105d8d468622d32ef507dd7a547e492d2359451", default-features = false }
+dogeos-protocol-types = { git = "https://github.com/DogeOS69/dogeos-reth.git", rev = "7105d8d468622d32ef507dd7a547e492d2359451", default-features = false }
+dogeos-reth-engine = { git = "https://github.com/DogeOS69/dogeos-reth.git", rev = "7105d8d468622d32ef507dd7a547e492d2359451", default-features = false }
+dogeos-reth-evm = { git = "https://github.com/DogeOS69/dogeos-reth.git", rev = "7105d8d468622d32ef507dd7a547e492d2359451", default-features = false }
+dogeos-reth-consensus = { git = "https://github.com/DogeOS69/dogeos-reth.git", rev = "7105d8d468622d32ef507dd7a547e492d2359451", default-features = false }
+dogeos-reth-node = { git = "https://github.com/DogeOS69/dogeos-reth.git", rev = "7105d8d468622d32ef507dd7a547e492d2359451", default-features = false }
+dogeos-reth-primitives = { git = "https://github.com/DogeOS69/dogeos-reth.git", rev = "7105d8d468622d32ef507dd7a547e492d2359451", default-features = false }
+dogeos-reth-rpc = { git = "https://github.com/DogeOS69/dogeos-reth.git", rev = "7105d8d468622d32ef507dd7a547e492d2359451", default-features = false }
+dogeos-reth-txpool = { git = "https://github.com/DogeOS69/dogeos-reth.git", rev = "7105d8d468622d32ef507dd7a547e492d2359451", default-features = false }
+dogeos-rpc-types = { git = "https://github.com/DogeOS69/dogeos-reth.git", rev = "7105d8d468622d32ef507dd7a547e492d2359451", default-features = false }
 
 # alloy
 alloy-chains = { version = "0.2.34", default-features = false }

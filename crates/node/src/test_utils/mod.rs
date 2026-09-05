@@ -112,6 +112,35 @@ use tracing::{span, Level};
 /// This is the legacy setup function that's used by existing tests.
 /// For new tests, consider using the `TestFixture` API instead.
 pub async fn setup_engine(
+    scroll_node_config: ScrollRollupNodeConfig,
+    num_nodes: usize,
+    chain_spec: Arc<<ScrollRollupNode as NodeTypes>::ChainSpec>,
+    is_dev: bool,
+    no_local_transactions_propagation: bool,
+    trusted_peers: Option<Vec<TrustedPeer>>,
+    reboot_info: Option<(usize, Arc<reth_db::test_utils::TempDatabase<reth_db::DatabaseEnv>>)>,
+) -> eyre::Result<(
+    Vec<ScrollNodeTestComponents>,
+    Vec<Arc<reth_db::test_utils::TempDatabase<reth_db::DatabaseEnv>>>,
+    Wallet,
+)> {
+    setup_engine_with_rpc(
+        scroll_node_config,
+        num_nodes,
+        chain_spec,
+        is_dev,
+        no_local_transactions_propagation,
+        trusted_peers,
+        reboot_info,
+        RpcServerArgs::default().with_http().with_http_api(RpcModuleSelection::All),
+    )
+    .await
+}
+
+/// Creates test nodes with explicit RPC transport and module selection.
+///
+/// Other node and persistence settings match [`setup_engine`].
+pub async fn setup_engine_with_rpc(
     mut scroll_node_config: ScrollRollupNodeConfig,
     num_nodes: usize,
     chain_spec: Arc<<ScrollRollupNode as NodeTypes>::ChainSpec>,
@@ -119,6 +148,7 @@ pub async fn setup_engine(
     no_local_transactions_propagation: bool,
     trusted_peers: Option<Vec<TrustedPeer>>,
     reboot_info: Option<(usize, Arc<reth_db::test_utils::TempDatabase<reth_db::DatabaseEnv>>)>,
+    rpc_args: RpcServerArgs,
 ) -> eyre::Result<(
     Vec<ScrollNodeTestComponents>,
     Vec<Arc<reth_db::test_utils::TempDatabase<reth_db::DatabaseEnv>>>,
@@ -153,7 +183,7 @@ pub async fn setup_engine(
                 gas_limit: Some(chain_spec.genesis_header().gas_limit()),
                 ..Default::default()
             })
-            .with_rpc(RpcServerArgs::default().with_http().with_http_api(RpcModuleSelection::All))
+            .with_rpc(rpc_args.clone())
             .with_unused_ports()
             .set_dev(is_dev)
             .with_txpool(TxPoolArgs {
@@ -307,7 +337,7 @@ pub fn default_test_scroll_rollup_node_config() -> ScrollRollupNodeConfig {
         database: None,
         pprof_args: PprofArgs::default(),
         remote_block_source_args: Default::default(),
-        rpc_args: RpcArgs { basic_enabled: true, admin_enabled: true },
+        rpc_args: RpcArgs { basic_enabled: true, admin_enabled: true, ..Default::default() },
         require_l1_data_fee_buffer: false,
     }
 }
@@ -348,7 +378,7 @@ pub fn default_sequencer_test_scroll_rollup_node_config() -> ScrollRollupNodeCon
         database: None,
         remote_block_source_args: Default::default(),
         pprof_args: PprofArgs::default(),
-        rpc_args: RpcArgs { basic_enabled: true, admin_enabled: true },
+        rpc_args: RpcArgs { basic_enabled: true, admin_enabled: true, ..Default::default() },
         require_l1_data_fee_buffer: false,
     }
 }

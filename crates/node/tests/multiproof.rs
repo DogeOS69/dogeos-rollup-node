@@ -48,7 +48,8 @@ fn targets(parent_number: u64) -> Value {
 fn chain_spec(tsuki: bool) -> Arc<DogeosChainSpec> {
     let mut genesis = DOGEOS_DEV.genesis().clone();
     genesis.config.chain_id = DOGEOS_DEV.chain().id();
-    for fork in ["feynmanTime", "galileoTime", "galileoV2Time"] {
+    // Core retains EuclidV2 as the predecessor implied by compact Reth's Feynman baseline.
+    for fork in ["euclidV2Time", "feynmanTime", "galileoTime", "galileoV2Time"] {
         genesis.config.extra_fields.insert(fork.into(), json!(0));
     }
     if tsuki {
@@ -293,6 +294,12 @@ async fn multiproof_tsuki_fixture_mines_real_blocks() -> eyre::Result<()> {
     let client = fixture.sequencer().node.rpc_client().unwrap();
     // The emitted genesis must recreate both the schedule and genesis hash in another process.
     let serialized = serde_json::to_vec(fixture.chain_spec.genesis())?;
+    let exported: Value = serde_json::from_slice(&serialized)?;
+    // This is core's complete ordered genesis schedule, including the predecessor
+    // which compact Reth no longer exposes as a separate fork enum variant.
+    for fork in ["euclidV2Time", "feynmanTime", "galileoTime", "galileoV2Time", "tsukiTime"] {
+        assert_eq!(exported["config"][fork], 0, "missing active predecessor {fork}");
+    }
     let reparsed = DogeosChainSpec::from_custom_genesis(serde_json::from_slice(&serialized)?);
     assert_eq!(reparsed.genesis_hash(), fixture.chain_spec.genesis_hash());
     assert!(reparsed.is_tsuki_active_at_timestamp(0));

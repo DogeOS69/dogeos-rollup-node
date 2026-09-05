@@ -121,6 +121,7 @@ where
         Evm = ScrollEvmConfig,
         Network = NetworkHandle<DogeosNetworkPrimitives>,
     >,
+    N::Provider: dogeos_reth_rpc::MultiProofProvider,
     EthApiError: FromEvmError<N::Evm>,
     EvmFactoryFor<N::Evm>: EvmFactory<Tx = ScrollTransactionIntoTxEnv<TxEnv>, BlockEnv = BlockEnv>,
     RpcMiddleware: RethRpcMiddleware,
@@ -145,6 +146,15 @@ where
         let rollup_node_rpc_ext = Arc::new(RollupNodeRpcExt::<N::Network>::new(rx));
 
         rpc_add_ons = rpc_add_ons.extend_rpc_modules(move |ctx| {
+            if rpc_config.experimental_multiproof {
+                // Build once: all configured transports share the adapter's admission state.
+                let multiproof_api = dogeos_reth_rpc::DogeosMultiProofApi::new(
+                    ctx.registry.eth_api().clone(),
+                    dogeos_reth_rpc::MultiProofLimits::default(),
+                );
+                register_multiproof_module(ctx.modules, multiproof_api.into_rpc()?)?;
+            }
+
             let priority_fee_api = dogeos_reth_rpc::DogeosPriorityFeeApi::new(
                 ctx.registry.eth_api().clone(),
                 ctx.registry.eth_api().gas_oracle().config().max_price,
@@ -243,6 +253,7 @@ where
         Evm = ScrollEvmConfig,
         Network = NetworkHandle<DogeosNetworkPrimitives>,
     >,
+    N::Provider: dogeos_reth_rpc::MultiProofProvider,
     EthApiError: FromEvmError<N::Evm>,
     EvmFactoryFor<N::Evm>: EvmFactory<Tx = ScrollTransactionIntoTxEnv<TxEnv>, BlockEnv = BlockEnv>,
     RpcMiddleware: RethRpcMiddleware,
@@ -271,5 +282,64 @@ where
 
     fn engine_validator_builder(&self) -> Self::ValidatorBuilder {
         EngineValidatorAddOn::engine_validator_builder(&self.rpc_add_ons)
+    }
+}
+
+/// Keep the experimental transport boundary separate from the proof handler.
+fn register_multiproof_module<Context>(
+    modules: &mut reth_rpc_builder::TransportRpcModules,
+    module: jsonrpsee::RpcModule<Context>,
+) -> Result<(), jsonrpsee::core::RegisterMethodError> {
+    modules.merge_if_module_configured(RethRpcModule::Eth, module)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use jsonrpsee::RpcModule;
+    use reth_rpc_builder::{TransportRpcModuleConfig, TransportRpcModules};
+
+    fn proof_module() -> RpcModule<()> {
+        let mut module = RpcModule::new(());
+        module.register_method("dogeos_getProofs", |_, _, _| true).unwrap();
+        module
+    }
+
+    #[test]
+    fn multiproof_registration_respects_each_transport_and_rejects_collision() {
+        for eth_transport in 0..3 {
+            let selected = |transport| {
+                if eth_transport == transport {
+                    RethRpcModule::Eth
+                } else {
+                    RethRpcModule::Net
+                }
+            };
+            let mut modules = TransportRpcModules::default()
+                .with_config(
+                    TransportRpcModuleConfig::default()
+                        .with_http([selected(0)])
+                        .with_ws([selected(1)])
+                        .with_ipc([selected(2)]),
+                )
+                .with_http(RpcModule::new(()))
+                .with_ws(RpcModule::new(()))
+                .with_ipc(RpcModule::new(()));
+            register_multiproof_module(&mut modules, proof_module()).unwrap();
+            for (transport, methods) in [
+                modules.http_methods(|_| true),
+                modules.ws_methods(|_| true),
+                modules.ipc_methods(|_| true),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                assert_eq!(
+                    methods.unwrap().method_names().any(|name| name == "dogeos_getProofs"),
+                    eth_transport == transport,
+                );
+            }
+            assert!(register_multiproof_module(&mut modules, proof_module()).is_err());
+        }
     }
 }

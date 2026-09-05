@@ -228,9 +228,10 @@ early, otherwise it stops after 15 minutes. The Tsuki fixture enables `debug`
 for real execution witnesses. Core artifact equality and performance require
 separate comparisons against this running node.
 
-During the unpublished experiment, use the orchestrator's external Cargo patch
-configuration for the entire compact dependency family and its shared build-lock
-wrapper. Keep local path patches and their lockfile changes uncommitted. The
+The manifest and lockfile pin the published compact dependency family containing
+the multiproof adapter. Build and test with `--locked`; no local path overrides
+are needed. When using shared build resources, use the orchestrator's build-lock
+wrapper. The
 fixed image in the existing compose example does not contain these source edits;
 use the experiment binary with a fresh temporary data directory.
 

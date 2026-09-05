@@ -140,6 +140,7 @@ pub async fn setup_engine(
 /// Creates test nodes with explicit RPC transport and module selection.
 ///
 /// Other node and persistence settings match [`setup_engine`].
+#[allow(clippy::too_many_arguments)] // Preserve the legacy setup shape with one RPC override.
 pub async fn setup_engine_with_rpc(
     mut scroll_node_config: ScrollRollupNodeConfig,
     num_nodes: usize,

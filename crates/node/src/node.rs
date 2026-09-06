@@ -66,6 +66,7 @@ impl ScrollRollupNode {
 impl<N> Node<N> for ScrollRollupNode
 where
     N: FullNodeTypes<Types = Self>,
+    N::Provider: dogeos_reth_rpc::MultiProofProvider,
 {
     type ComponentsBuilder = ComponentsBuilder<
         N,

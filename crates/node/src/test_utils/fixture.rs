@@ -479,7 +479,7 @@ impl TestFixtureBuilder {
             gas_price_oracle_args: RollupNodeGasPriceOracleArgs::default(),
             consensus_args: ConsensusArgs::noop(),
             database: None,
-            rpc_args: RpcArgs { basic_enabled: true, admin_enabled: true },
+            rpc_args: RpcArgs { basic_enabled: true, admin_enabled: true, ..Default::default() },
             remote_block_source_args: Default::default(),
             pprof_args: PprofArgs::default(),
             require_l1_data_fee_buffer: false,

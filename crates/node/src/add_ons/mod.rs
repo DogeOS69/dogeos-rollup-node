@@ -64,6 +64,10 @@ where
     /// Rollup manager addon responsible for managing the components of the rollup node.
     pub rollup_manager_addon: RollupManagerAddOn,
 
+    /// Optional range fixture observer; absent from normal production builds.
+    #[cfg(feature = "test-utils")]
+    pub(crate) range_multiproof_observer: Option<Arc<dogeos_reth_rpc::MultiProofObserver>>,
+
     /// Shared handle populated after the rollup manager launches.
     rollup_manager_handle: Arc<OnceLock<RollupManagerHandle>>,
 }
@@ -89,7 +93,13 @@ where
         );
         let rollup_manager_addon =
             RollupManagerAddOn::new(config, scroll_wire_event, eth_wire_event);
-        Self { rpc_add_ons, rollup_manager_addon, rollup_manager_handle }
+        Self {
+            rpc_add_ons,
+            rollup_manager_addon,
+            rollup_manager_handle,
+            #[cfg(feature = "test-utils")]
+            range_multiproof_observer: None,
+        }
     }
 }
 
@@ -105,6 +115,8 @@ where
             rpc_add_ons,
             rollup_manager_addon: self.rollup_manager_addon,
             rollup_manager_handle: self.rollup_manager_handle,
+            #[cfg(feature = "test-utils")]
+            range_multiproof_observer: self.range_multiproof_observer,
         }
     }
 }
@@ -133,6 +145,8 @@ where
             mut rpc_add_ons,
             rollup_manager_addon: rollup_node_manager_addon,
             rollup_manager_handle: shared_rollup_manager_handle,
+            #[cfg(feature = "test-utils")]
+            range_multiproof_observer,
         } = self;
         let (tx, rx) = tokio::sync::oneshot::channel();
         let rpc_config = rollup_node_manager_addon.config().rpc_args.clone();
@@ -146,12 +160,21 @@ where
         let rollup_node_rpc_ext = Arc::new(RollupNodeRpcExt::<N::Network>::new(rx));
 
         rpc_add_ons = rpc_add_ons.extend_rpc_modules(move |ctx| {
-            if rpc_config.experimental_multiproof {
+            let enabled = rpc_config.experimental_multiproof;
+            #[cfg(feature = "test-utils")]
+            let enabled = enabled || range_multiproof_observer.is_some();
+            if enabled {
                 // Build once: all configured transports share the adapter's admission state.
                 let multiproof_api = dogeos_reth_rpc::DogeosMultiProofApi::new(
                     ctx.registry.eth_api().clone(),
                     dogeos_reth_rpc::MultiProofLimits::default(),
                 );
+                #[cfg(feature = "test-utils")]
+                let multiproof_api = if let Some(observer) = range_multiproof_observer {
+                    multiproof_api.with_observer(observer)
+                } else {
+                    multiproof_api
+                };
                 register_multiproof_module(ctx.modules, multiproof_api.into_rpc()?)?;
             }
 

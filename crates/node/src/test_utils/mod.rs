@@ -137,6 +137,11 @@ pub async fn setup_engine(
     .await
 }
 
+tokio::task_local! {
+    /// Range experiment only: capture before spawning; never inherited implicitly.
+    pub static RANGE_MULTIPROOF_OBSERVER: Arc<dogeos_reth_rpc::MultiProofObserver>;
+}
+
 /// Creates test nodes with explicit RPC transport and module selection.
 ///
 /// Other node and persistence settings match [`setup_engine`].
@@ -250,10 +255,18 @@ pub async fn setup_engine_with_rpc(
             .with_launch_context(task_executor.clone());
         let testing_config = testing_node.config().clone();
         let rollup_node = ScrollRollupNode::new(scroll_node_config.clone(), testing_config).await;
+        let range_observer = RANGE_MULTIPROOF_OBSERVER.try_with(Arc::clone).ok();
+        eyre::ensure!(range_observer.is_none() || !scroll_node_config.rpc_args.experimental_multiproof,
+            "range observer uses one fixture registration; production registration must be disabled");
         let RethNodeHandle { node, node_exit_future } = testing_node
             .with_types_and_provider::<ScrollRollupNode, BlockchainProvider<_>>()
             .with_components(rollup_node.components_builder())
-            .with_add_ons(rollup_node.add_ons())
+            .with_add_ons({
+                // components_builder initializes the wire receivers consumed here.
+                let mut add_ons = rollup_node.add_ons();
+                add_ons.range_multiproof_observer = range_observer;
+                add_ons
+            })
             .launch_with_fn(|builder| {
                 let tree_config = TreeConfig::default()
                     .with_always_process_payload_attributes_on_canonical_head(true)

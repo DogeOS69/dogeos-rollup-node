@@ -5,6 +5,10 @@ use alloy_primitives::{Bytes, TxKind};
 use alloy_rpc_types_eth::{TransactionInput, TransactionRequest};
 use dogeos_rpc_types::ScrollTransactionRequest;
 use reth_rpc_eth_api::SignableTxRequest;
+#[path = "multiproof_range_baseline.rs"]
+mod baseline;
+#[path = "multiproof_range_control.rs"]
+mod control;
 
 async fn inject(f: &mut TestFixture, to: TxKind, data: Bytes, value: u64) -> eyre::Result<B256> {
     let mut wallet = f.wallet.lock().await;
@@ -99,7 +103,17 @@ async fn serve_tsuki_retained_range() -> eyre::Result<()> {
     let ordinary_proof_permits = rpc.rpc_proof_permits;
     let blocking_io_requests = rpc.rpc_max_blocking_io_requests;
     rpc.rpc_eth_proof_window = length + depth + 32;
-    let mut f = fixture_with_tsuki(true, rpc, true).await?;
+    let instrumented = std::env::var("RANGE_REQUIRE_NODE_DRAIN").as_deref() == Ok("1");
+    let observer =
+        Arc::new(dogeos_reth_rpc::MultiProofObserver::with_thread_cpu_clock(control::thread_cpu));
+    let mut f = if instrumented {
+        rollup_node::test_utils::RANGE_MULTIPROOF_OBSERVER
+            .scope(observer.clone(), fixture_with_tsuki(false, rpc, true))
+            .await?
+    } else {
+        fixture_with_tsuki(true, rpc, true).await?
+    };
+    let mut poisoned = false;
     let client = f.sequencer().node.rpc_client().unwrap();
     f.l1().sync().await?;
     f.expect_event().l1_synced().await?;
@@ -141,6 +155,12 @@ async fn serve_tsuki_retained_range() -> eyre::Result<()> {
         "limits": {"maxBlocks": 8, "maxGas": 6000000, "maxBytes": 122880},
         "chunks": (0..length).step_by(chunk_blocks as usize).map(|i| json!({"start": i + 2, "end": (i + chunk_blocks + 1).min(length + 1)})).collect::<Vec<_>>(),
         "bridgeCoverage": false, "cache": "warm/uncontrolled OS page cache", "contract": contract});
+    manifest["observerFixtureExtension"] = json!(instrumented);
+    manifest["productionMultiproofFlag"] = json!(!instrumented);
+    if instrumented {
+        manifest["controlDirectory"] = json!(output);
+        manifest["observerNote"] = json!("one fixture API with production limits and shared eth guard; production flag suppressed only to avoid duplicate registration");
+    }
     if let Ok(path) = std::env::var("RANGE_NODE_IDENTITY") {
         manifest["identity"] = serde_json::from_slice(&std::fs::read(path)?)?;
     }
@@ -153,7 +173,18 @@ async fn serve_tsuki_retained_range() -> eyre::Result<()> {
     let deadline = tokio::time::Instant::now() +
         Duration::from_secs(option("RANGE_SERVE_SECONDS", 3600)?.min(7200));
     while tokio::time::Instant::now() < deadline && !output.join("stop").exists() {
+        if instrumented {
+            control::service(
+                &output,
+                &mut f,
+                &observer,
+                ordinary_proof_permits as u32,
+                &mut poisoned,
+            )
+            .await?;
+        }
         if deferred && manifest["phase"] == "near" && output.join("advance").exists() {
+            eyre::ensure!(!poisoned, "cannot advance after undrained sample");
             for index in length..length + depth {
                 blocks.push(
                     workload_block(&mut f, &client, index, count, "state-churn", seed, contract)
@@ -171,7 +202,8 @@ async fn serve_tsuki_retained_range() -> eyre::Result<()> {
             )?;
             std::fs::rename(output.join("manifest.next.json"), output.join("manifest.json"))?;
         }
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        // Poll only file-control arrival; worker quiescence uses notification/permits.
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
     f.shutdown_node(0).await?;
     // Retain only DB handles after graceful node shutdown. TempDatabase otherwise

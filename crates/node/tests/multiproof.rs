@@ -85,7 +85,7 @@ fn chain_spec(tsuki: bool) -> Arc<DogeosChainSpec> {
             let storage = account.storage.get_or_insert_with(BTreeMap::new);
             for slot in slots {
                 // Preserve the initialized dev system-contract values when present.
-                storage.entry(key(slot)).or_insert(key(slot + 1));
+                storage.entry(key(slot)).or_insert_with(|| key(slot + 1));
             }
         }
         genesis
@@ -400,8 +400,8 @@ async fn multiproof_invalid_requests_do_not_fall_back() -> eyre::Result<()> {
 }
 
 /// A bounded local endpoint for the root's external comparison harness. Run explicitly
-/// with --ignored --exact serve_multiproof_fixture --nocapture. The manifest and genesis
-/// are written only when MULTIPROOF_FIXTURE_DIR is supplied; the node lives for at most
+/// with --ignored --exact `serve_multiproof_fixture` --nocapture. The manifest and genesis
+/// are written only when `MULTIPROOF_FIXTURE_DIR` is supplied; the node lives for at most
 /// 15 minutes, or until a `stop` file appears in that directory.
 #[tokio::test]
 #[ignore = "starts a temporary RPC endpoint for the external experiment harness"]

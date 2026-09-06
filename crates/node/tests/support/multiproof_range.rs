@@ -90,14 +90,14 @@ async fn serve_tsuki_retained_range() -> eyre::Result<()> {
     let chunk_blocks = option("RANGE_CHUNK_BLOCKS", 2)?;
     eyre::ensure!((1..=8).contains(&chunk_blocks), "chunk block limit is 8");
     let seed = option("RANGE_SEED", 1066)?;
-    let profile = std::env::var("RANGE_PROFILE").unwrap_or("quiet".into());
+    let profile = std::env::var("RANGE_PROFILE").unwrap_or_else(|_| "quiet".into());
     let count = match profile.as_str() {
         "quiet" => 1,
         "transaction-heavy" => 16,
         "state-churn" => 8,
         _ => eyre::bail!("unknown profile"),
     };
-    eyre::ensure!(length >= 4 && length <= 512 && depth <= 2048, "bounded local range/depth");
+    eyre::ensure!((4..=512).contains(&length) && depth <= 2048, "bounded local range/depth");
     let deferred = std::env::var("RANGE_DEFER_ADVANCE").as_deref() == Ok("1") && depth > 0;
     let mut rpc = rpc_args(true, false);
     let ordinary_proof_permits = rpc.rpc_proof_permits;

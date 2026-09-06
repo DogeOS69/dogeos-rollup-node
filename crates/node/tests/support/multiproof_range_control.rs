@@ -18,7 +18,7 @@ pub(super) fn thread_cpu() -> Option<Duration> {
     }
     let mut value = Timespec { seconds: 0, nanos: 0 };
     // SAFETY: valid writable timespec for Linux's C ABI; constant is a thread clock.
-    if unsafe { clock_gettime(3, &mut value) } != 0 ||
+    if unsafe { clock_gettime(3, &raw mut value) } != 0 ||
         value.seconds < 0 ||
         !(0..1_000_000_000).contains(&value.nanos)
     {

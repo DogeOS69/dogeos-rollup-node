@@ -1851,7 +1851,7 @@ mod test {
         assert_eq!(stored.to_string(), foreign.to_string(), "a well-formed hash renders as one");
     }
 
-    /// `l2_block.block_hash` is declared 32 bytes wide, but SQLite does not
+    /// `l2_block.block_hash` is declared 32 bytes wide, but `SQLite` does not
     /// enforce blob lengths, so a corrupt row can hold any number of bytes.
     /// The diagnostic must show those bytes verbatim: a zero hash standing in
     /// for them reads as a legitimate genesis and hides the operator's one clue.

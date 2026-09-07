@@ -898,7 +898,7 @@ impl fmt::Debug for RollupNodeNetworkArgs {
             None => "<unset>".to_string(),
             Some(raw) => match raw.parse::<reqwest::Url>() {
                 Ok(url) => debug_url(Some(&url)),
-                Err(e) => format!("<unparseable: {e}>"),
+                Err(e) => format!("<unparsable: {e}>"),
             },
         };
         f.debug_struct("RollupNodeNetworkArgs")
@@ -1337,10 +1337,10 @@ mod tests {
         let no_beacons = format!("{:?}", BlobProviderArgs::default());
         assert!(no_beacons.contains("beacon_node_urls: None"), "{no_beacons}");
 
-        // A set-but-unparseable sequencer URL is reported as such, not as unset,
+        // A set-but-unparsable sequencer URL is reported as such, not as unset,
         // and the parse error is kept: it is fieldless, so it carries none of
         // the input, and it is what tells the operator what to fix.
-        let unparseable = format!(
+        let unparsable = format!(
             "{:?}",
             RollupNodeNetworkArgs {
                 sequencer_url: Some("not a url".to_string()),
@@ -1349,10 +1349,10 @@ mod tests {
         );
         let expected_error = "not a url".parse::<reqwest::Url>().unwrap_err().to_string();
         assert!(
-            unparseable.contains(&format!("sequencer_url: \"<unparseable: {expected_error}>\"")),
-            "{unparseable}"
+            unparsable.contains(&format!("sequencer_url: \"<unparsable: {expected_error}>\"")),
+            "{unparsable}"
         );
-        assert!(!unparseable.contains("not a url"), "input echoed: {unparseable}");
+        assert!(!unparsable.contains("not a url"), "input echoed: {unparsable}");
         let unset = format!("{:?}", RollupNodeNetworkArgs::default());
         assert!(unset.contains("sequencer_url: \"<unset>\""), "{unset}");
     }

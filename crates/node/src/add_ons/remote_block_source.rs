@@ -123,6 +123,16 @@ fn redact_remote(url: Option<&reqwest::Url>, message: &str) -> String {
             push(segment, "<path>");
         }
     }
+    // Gateways commonly return JSON bodies, where credentials can contain escaped characters.
+    let escaped: Vec<_> = components
+        .iter()
+        .filter_map(|(needle, marker)| {
+            let json = serde_json::to_string(needle).ok()?;
+            let encoded = percent_decode(&json[1..json.len() - 1]);
+            (encoded != *needle).then_some((encoded, *marker))
+        })
+        .collect();
+    components.extend(escaped);
     // Longest first, so the whole query wins over one of its values.
     components.sort_by_key(|(needle, _)| std::cmp::Reverse(needle.len()));
     components.iter().fold(redacted, |text, (needle, marker)| replace_token(&text, needle, marker))
@@ -153,7 +163,7 @@ fn replace_token(text: &str, needle: &str, marker: &str) -> String {
         let before = text[..start].trim_end_matches('.');
         let after = text[end..].trim_start_matches('.');
         let bounded =
-            !(open && before.ends_with(is_url_char)) && !(close && after.starts_with(is_url_char));
+            !(open && before.ends_with(is_url_char) || close && after.starts_with(is_url_char));
         if bounded {
             out.push_str(&text[cursor..start]);
             out.push_str(marker);
@@ -696,6 +706,20 @@ mod tests {
             assert_eq!(
                 super::redact_remote(Some(&url), &body),
                 "Invalid password: <password>. Invalid key: <path>."
+            );
+        }
+    }
+
+    #[test]
+    fn redact_remote_scrubs_json_escaped_credentials() {
+        for password in ["pa%22ss", "pa%5Css", "pa%0Ass"] {
+            let url = format!("https://ops:{password}@rpc.internal/").parse().unwrap();
+            let decoded = super::percent_decode(password);
+            let body = serde_json::json!({"error": format!("Invalid password: {decoded}")});
+            let message = format!("HTTP error 401 with body: {body}");
+            assert_eq!(
+                super::redact_remote(Some(&url), &message),
+                r#"HTTP error 401 with body: {"error":"Invalid password: <password>"}"#
             );
         }
     }

@@ -52,7 +52,11 @@ where
 fn redact_remote(url: Option<&reqwest::Url>, message: &str) -> String {
     let Some(url) = url else { return message.to_string() };
     let host = safe_remote_host(url);
-    let mut redacted = replace_url(message, url.as_str(), &host);
+    // Normalize both sides before matching: gateways can echo equivalent escapes with different
+    // hex case or decode only part of a credential. Raw and fully decoded needles alone miss
+    // those spellings. This is display-only; the actual request URL is never changed.
+    let message = percent_decode(message);
+    let mut redacted = replace_url(&message, &percent_decode(url.as_str()), &host);
     // reqwest moves userinfo into an Authorization header before it builds the
     // request, so its error text carries the STRIPPED url — which does not match
     // the configured string. Without this second pass, configuring credentials
@@ -62,7 +66,7 @@ fn redact_remote(url: Option<&reqwest::Url>, message: &str) -> String {
     if stripped.set_username("").is_ok() && stripped.set_password(None).is_ok() {
         let stripped = stripped.as_str();
         if stripped != url.as_str() {
-            redacted = replace_url(&redacted, stripped, &host);
+            redacted = replace_url(&redacted, &percent_decode(stripped), &host);
         }
     }
     // Third pass, for text the remote controls: a non-2xx response is rendered
@@ -101,8 +105,17 @@ fn redact_remote(url: Option<&reqwest::Url>, message: &str) -> String {
     for (_, value) in query.split('&').filter_map(|pair| pair.split_once('=')) {
         push(value, "<query>");
     }
+    // Form-encoded query values may also be echoed with '+' decoded to a space.
+    for (_, value) in url.query_pairs() {
+        push(&value, "<query>");
+    }
     if url.path() != "/" {
         push(url.path(), "<path>");
+        // API keys commonly occupy one path segment (e.g. /v2/KEY), and an error body can
+        // quote that segment without its prefix. The same token bounds preserve source paths.
+        for segment in url.path().split('/').filter(|segment| !segment.is_empty()) {
+            push(segment, "<path>");
+        }
     }
     // Longest first, so the whole query wins over one of its values.
     components.sort_by_key(|(needle, _)| std::cmp::Reverse(needle.len()));
@@ -130,8 +143,11 @@ fn replace_token(text: &str, needle: &str, marker: &str) -> String {
     while let Some(offset) = text[cursor..].find(needle) {
         let start = cursor + offset;
         let end = start + needle.len();
-        let bounded = !(open && text[..start].ends_with(is_url_char)) &&
-            !(close && text[end..].starts_with(is_url_char));
+        // Dots inside hosts or paths extend a token; trailing sentence punctuation does not.
+        let before = text[..start].trim_end_matches('.');
+        let after = text[end..].trim_start_matches('.');
+        let bounded =
+            !(open && before.ends_with(is_url_char)) && !(close && after.starts_with(is_url_char));
         if bounded {
             out.push_str(&text[cursor..start]);
             out.push_str(marker);
@@ -625,6 +641,45 @@ mod tests {
         assert_eq!(super::percent_decode("50%"), "50%");
         assert_eq!(super::percent_decode("a%zzb%4"), "a%zzb%4");
         assert_eq!(super::percent_decode("plain"), "plain");
+    }
+
+    #[test]
+    fn redact_remote_scrubs_credentials_next_to_sentence_punctuation() {
+        let url = "https://ops:ops123@rpc.internal/?apikey=SUPERSECRET".parse().unwrap();
+        for body in [
+            "HTTP error 401: Invalid password ops123. Invalid API key SUPERSECRET.",
+            "HTTP error 401: (ops123...) [...SUPERSECRET]",
+        ] {
+            let result = super::redact_remote(Some(&url), body);
+            assert!(!result.contains("ops123"), "{result}");
+            assert!(!result.contains("SUPERSECRET"), "{result}");
+            assert!(result.contains("HTTP error 401"), "{result}");
+        }
+    }
+
+    #[test]
+    fn redact_remote_scrubs_individually_echoed_path_keys() {
+        let url = "https://rpc.internal/v2/API_KEY_123".parse().unwrap();
+        let body = format!("Invalid API key: API_KEY_123. Location: {}", file!());
+        let result = super::redact_remote(Some(&url), &body);
+        assert!(!result.contains("API_KEY_123"), "{result}");
+        assert!(result.contains(file!()), "{result}");
+    }
+
+    #[test]
+    fn redact_remote_normalizes_equivalent_percent_encodings() {
+        let url =
+            "https://ops:p%40ss%2Fword@rpc.internal/v2/PATH%2FKEY?key=QUERY%2FKEY".parse().unwrap();
+        for password in ["p%40ss%2fword", "p@ss%2Fword", "p@ss/word"] {
+            let body = format!("Invalid password={password}. key=QUERY%2fKEY path=PATH%2fKEY");
+            let result = super::redact_remote(Some(&url), &body);
+            assert_eq!(result, "Invalid password=<password>. key=<query> path=<path>");
+        }
+        let query_url = "https://rpc.internal/?key=QUERY+SECRET".parse().unwrap();
+        assert_eq!(
+            super::redact_remote(Some(&query_url), "Invalid key: QUERY SECRET."),
+            "Invalid key: <query>."
+        );
     }
 
     /// A path-less URL renders as `scheme://host:port/`. When that string is a

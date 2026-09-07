@@ -182,14 +182,14 @@ pub trait DatabaseWriteOperations {
     ///
     /// On a FRESH database (nothing above genesis) the stale rows are dropped and the real genesis
     /// is (re-)inserted in the same call, so a crash between the two cannot leave `l2_block` empty.
-    /// On a POPULATED database a height-0 row is reconcilable when it is either this chain's
-    /// genesis or `seeded_genesis`: both are rows THIS node wrote, so the stale ones are dropped
-    /// and the real genesis restored. Only a height-0 row that is neither belongs to another
-    /// chain, and that is [`DatabaseError::GenesisMismatch`] rather than something to graft this
-    /// chain's genesis onto. A populated database with NO height-0 row at all is
+    /// On a POPULATED database the configured genesis must already be present before a duplicate
+    /// migration seed can be removed. A seed alone is shared across chains and cannot identify
+    /// the retained history; [`DatabaseError::GenesisAmbiguous`] refuses to replace it. An
+    /// unexpected height-0 hash is [`DatabaseError::GenesisMismatch`]. A populated database with
+    /// NO height-0 row at all is
     /// [`DatabaseError::GenesisMissing`]: there is nothing to reconcile against, and inserting a
     /// genesis under history that never carried it would hide a truncated or corrupt database.
-    /// Both are fatal at startup.
+    /// All three errors are fatal at startup and leave the genesis rows unchanged.
     async fn reconcile_genesis_block(
         &self,
         genesis_hash: B256,
@@ -853,13 +853,15 @@ impl<T: WriteConnectionProvider + ?Sized + Sync> DatabaseWriteOperations for T {
             if stored_genesis_hashes.is_empty() {
                 return Err(DatabaseError::GenesisMissing { configured: genesis_hash });
             }
-            let removed = self.delete_mismatched_genesis_blocks(genesis_hash).await?;
-            // Only the seeded row was on record: restore this chain's genesis in its place, in
-            // the same transaction, so the delete cannot leave `l2_block` without a height-0 row.
             if !stored_genesis_hashes.iter().any(|hash| is(hash, genesis_hash)) {
-                self.insert_genesis_block(genesis_hash).await?;
+                // A shared migration seed is not proof that this history belongs to the
+                // configured chain. Refuse before deleting the only legacy marker.
+                return Err(DatabaseError::GenesisAmbiguous {
+                    configured: genesis_hash,
+                    seeded: seeded_genesis,
+                });
             }
-            return Ok(removed);
+            return self.delete_mismatched_genesis_blocks(genesis_hash).await;
         }
 
         let removed = self.delete_mismatched_genesis_blocks(genesis_hash).await?;

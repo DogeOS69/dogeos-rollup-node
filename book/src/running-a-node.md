@@ -147,8 +147,12 @@ seed means the database belongs to another chain, and a populated database with 
 at all is treated as truncated or corrupt; both refuse to start with an actionable message
 instead of running on a wrong safe baseline. To recover from a mismatch, point
 `--rollup-node-db.path` at the database that belongs to the configured chain. A missing block-0
-row cannot be repaired in place, so the rollup database has to be discarded and re-derived; the
-execution-layer database is not affected.
+row requires restoring a valid backup or re-deriving into a new rollup database; keep the old
+database for investigation. A populated legacy database containing only the shared migration seed
+also refuses startup: that seed cannot identify which chain owns the history, and replacing it
+could relabel another chain's data. This includes legitimate older dev databases. Verify the chain
+and database path, then restore a backup with the correct genesis marker or re-derive into a new
+rollup database. No genesis rows are changed on refusal; the execution-layer database is not affected.
 
 #### Network Configuration
 

@@ -1722,40 +1722,34 @@ mod test {
         ));
     }
 
-    /// The migration's seeded genesis is NOT the chain spec's genesis — the dev
-    /// migration hardcodes upstream Scroll's dev genesis while the dev chain
-    /// spec computes its own. A database written before the genesis
-    /// reconciliation existed therefore carries ONLY that seed at height 0, so
-    /// treating an unrecognised height-0 row as another chain's data would fail
-    /// every such node at startup on upgrade. The seed must be reconciled in
-    /// place instead.
+    /// A shared migration seed cannot identify retained history. Trying another chain must not
+    /// replace that marker, even when unwind has lowered the metadata anchor to zero.
     #[tokio::test]
-    async fn populated_database_reconciles_a_migration_seeded_genesis() {
+    async fn populated_database_preserves_an_ambiguous_migration_seed() {
         let db = setup_test_db().await;
-        // Exactly what the older binary left: the migration's seed alone,
-        // under history that has already advanced past genesis.
-        db.set_l2_head_block_number(7).await.unwrap();
-        assert_eq!(
-            db.get_l2_block_info_by_number(0).await.unwrap().map(|b| b.hash),
-            Some(seeded_test_genesis()),
-            "the fixture must start from the seeded row alone"
-        );
-
-        assert_eq!(
-            db.reconcile_genesis_block(B256::ZERO, seeded_test_genesis()).await.unwrap(),
-            1,
-            "the seeded row must be replaced, not rejected as another chain's genesis"
-        );
-        assert_eq!(
-            db.get_l2_block_info_by_number(0).await.unwrap(),
-            Some(BlockInfo::new(0, B256::ZERO)),
-            "this chain's genesis must be restored in the seed's place"
-        );
-        assert_eq!(
-            db.reconcile_genesis_block(B256::ZERO, seeded_test_genesis()).await.unwrap(),
-            0,
-            "reconciliation is idempotent"
-        );
+        let batch = BatchInfo::new(1, B256::repeat_byte(1));
+        let retained = BlockInfo::new(7, B256::repeat_byte(0x77));
+        db.insert_batch(genesis_batch_commit(batch, 6)).await.unwrap();
+        db.insert_blocks(vec![retained], batch).await.unwrap();
+        for anchor in [7, 0] {
+            db.set_l2_head_block_number(anchor).await.unwrap();
+            // Neither a wrong-chain attempt nor a later corrected configuration may silently
+            // claim this history without independent evidence of its original chain.
+            for configured in [B256::repeat_byte(0xAB), B256::ZERO] {
+                let error = db
+                    .reconcile_genesis_block(configured, seeded_test_genesis())
+                    .await
+                    .expect_err("shared seed must not authorize a populated replacement");
+                assert!(matches!(error, DatabaseError::GenesisAmbiguous { .. }));
+                assert!(error.to_string().contains("No genesis rows were changed"));
+                assert_eq!(
+                    db.get_l2_block_info_by_number(0).await.unwrap(),
+                    Some(BlockInfo::new(0, seeded_test_genesis()))
+                );
+                assert_eq!(db.get_l2_block_info_by_number(7).await.unwrap(), Some(retained));
+                assert_eq!(db.get_l2_head_block_number().await.unwrap(), anchor);
+            }
+        }
     }
 
     /// A populated database with no height-0 row at all: returning success

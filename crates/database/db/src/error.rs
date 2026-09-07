@@ -46,6 +46,19 @@ pub enum DatabaseError {
         /// The genesis hash the node was configured with.
         configured: B256,
     },
+    /// A populated legacy database has only the shared migration seed as its genesis marker.
+    #[error(
+        "populated legacy database contains only migration genesis {seeded}; this shared seed \
+         cannot establish ownership for configured genesis {configured}. No genesis rows were \
+         changed. Verify the chain and database path; restore a chain-identified backup or \
+         re-derive into a new rollup database"
+    )]
+    GenesisAmbiguous {
+        /// The genesis hash the node was configured with.
+        configured: B256,
+        /// The migration seed recorded under the existing history.
+        seeded: B256,
+    },
     /// Failed to commit the transaction to database.
     #[error("TXMut commit failed")]
     CommitFailed,

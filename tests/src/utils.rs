@@ -528,13 +528,15 @@ pub async fn send_l1_scroll_messenger_message(
     let call = sendMessageCall { to, value, message, gasLimit: U256::from(gas_limit) };
     let calldata = call.abi_encode();
 
-    // Build the transaction request
+    // Build the transaction request. Fees are left unset so the provider
+    // estimates them against the current base fee: a hardcoded 0.1 gwei cap
+    // was rejected ("max fee per gas less than block base fee") whenever the
+    // continuous senders pushed the anvil base fee above it.
     let tx = TransactionRequest::default()
         .with_to(L1_SCROLL_MESSENGER_PROXY_ADDR)
         .with_input(calldata)
         .with_value(U256::from(10_000_000_000_000_000u64)) // 0.01 ether
-        .with_gas_limit(200000)
-        .with_gas_price(100_000_000); // 0.1 gwei
+        .with_gas_limit(200000);
 
     let pending_tx = provider.send_transaction(tx).await?;
     tracing::debug!(
@@ -581,13 +583,14 @@ pub async fn send_l1_enforced_tx_gateway_transaction(
     let call = sendTransactionCall { target, value, gasLimit: U256::from(gas_limit), data };
     let calldata = call.abi_encode();
 
-    // Build the transaction request
+    // Build the transaction request. Fees are left unset so the provider
+    // estimates them against the current base fee (see
+    // send_l1_scroll_messenger_message above).
     let tx = TransactionRequest::default()
         .with_to(L1_ENFORCED_TX_GATEWAY_PROXY_ADDR)
         .with_input(calldata)
         .with_value(U256::from(10_000_000_000_000_000u64)) // 0.01 ether
-        .with_gas_limit(200000)
-        .with_gas_price(100_000_000); // 0.1 gwei
+        .with_gas_limit(200000);
 
     let pending_tx = provider.send_transaction(tx).await?;
     tracing::debug!(

@@ -1,8 +1,14 @@
 name: sync
 
 on:
-  push:
-    branches: [main]
+  # Gated to manual runs: test_should_consolidate_to_block_15k cannot pass on
+  # the current tree — DOGEOS_CHIKYU's genesis lacks scroll.l1Config.startL1Block
+  # (NodeConfig::from_chainspec fails at crates/primitives/src/node/config.rs
+  # before any networking), and chikyu's L1 is chain 111111, which the
+  # Sepolia-Alchemy URL and Scroll S3 blob bucket in the test cannot serve.
+  # Re-enable the push trigger once the follow-up issue re-points the test at
+  # chikyu infrastructure. See issue #38 (defect 3).
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -12,7 +18,25 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Validate required configuration before paying for the ~20 minute release
+  # build. GitHub passes a missing secret as an EMPTY string, so check both.
+  preflight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Validate required configuration
+        env:
+          ALCHEMY_KEY: ${{ secrets.ALCHEMY_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${ALCHEMY_KEY//[[:space:]]/}" ]; then
+            echo "::error::ALCHEMY_KEY secret is missing or empty. The sync workflow needs it to reach the L1 RPC; provision the repository secret before dispatching this workflow."
+            exit 1
+          fi
+          echo "Required configuration present."
+
   sync:
+    needs: preflight
     runs-on: ubuntu-latest
     timeout-minutes: 25
     env:

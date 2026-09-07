@@ -18,7 +18,7 @@ use tokio::time::{interval, Duration};
 /// Remote block source add-on that imports blocks from a trusted remote L2 node
 /// and triggers block building on top of each imported block.
 #[derive(Debug)]
-pub struct RemoteBlockSourceAddOn<N>
+pub struct RemoteBlockSourceAddOn<N, P>
 where
     N: FullNetwork<Primitives = DogeosNetworkPrimitives>,
 {
@@ -31,20 +31,31 @@ where
     events: EventStream<ChainOrchestratorEvent>,
     /// A provider for the remote node, used to fetch blocks and block information.
     remote: RootProvider<Scroll>,
+    /// Local block reader, used to find the highest common block with the remote.
+    provider: P,
     /// Tracks the last block number we imported from remote.
     /// This is different from local head because we build blocks on top of imports.
-    last_imported_block: u64,
+    ///
+    /// `None` until the remote has been reached once and the highest common
+    /// block determined — construction must not depend on the remote being up
+    /// (issue #38): a connection error at startup used to abort the whole node.
+    last_imported_block: Option<u64>,
 }
 
-impl<N> RemoteBlockSourceAddOn<N>
+impl<N, P> RemoteBlockSourceAddOn<N, P>
 where
     N: FullNetwork<Primitives = DogeosNetworkPrimitives> + Send + Sync + 'static,
+    P: BlockReader,
 {
     /// Creates a new remote block source add-on.
+    ///
+    /// Performs no remote I/O: the resume point is determined lazily on the
+    /// first successful poll, where errors are logged and retried at poll
+    /// cadence instead of failing node launch.
     pub async fn new(
         config: RemoteBlockSourceArgs,
         handle: ChainOrchestratorHandle<N>,
-        provider: impl BlockReader,
+        provider: P,
     ) -> eyre::Result<Self> {
         // Build remote provider with retry layer.
         let Some(url) = config.url.clone() else {
@@ -64,10 +75,24 @@ where
             }
         };
 
-        // Determine the last imported block by finding the highest common block
-        // between the local chain and the remote node.
-        let local_head = handle.status().await?.l2.fcs.head_block_info().number;
-        let remote_head = remote.get_block_number().await?;
+        Ok(Self {
+            config,
+            orchestrator_handle: handle,
+            events,
+            remote,
+            provider,
+            last_imported_block: None,
+        })
+    }
+
+    /// Determines the last imported block by finding the highest common block
+    /// between the local chain and the remote node.
+    ///
+    /// Called on every poll tick until it succeeds; a failure here (e.g. the
+    /// remote is not up yet) is retried on the next poll tick.
+    async fn init_last_imported_block(&self) -> eyre::Result<u64> {
+        let local_head = self.orchestrator_handle.status().await?.l2.fcs.head_block_info().number;
+        let remote_head = self.remote.get_block_number().await?;
 
         let last_imported_block;
         let mut search = local_head.min(remote_head);
@@ -77,8 +102,8 @@ where
                 last_imported_block = 0;
                 break;
             }
-            let local_hash = provider.block_hash(search)?;
-            let remote_block = remote.get_block_by_number(search.into()).await?;
+            let local_hash = self.provider.block_hash(search)?;
+            let remote_block = self.remote.get_block_by_number(search.into()).await?;
             match (local_hash, remote_block) {
                 (Some(lh), Some(rb)) if lh == rb.header.hash => {
                     last_imported_block = search;
@@ -96,8 +121,7 @@ where
             remote_head,
             "Determined highest common block with remote"
         );
-
-        Ok(Self { config, orchestrator_handle: handle, events, remote, last_imported_block })
+        Ok(last_imported_block)
     }
 
     /// Runs the remote block source until shutdown.
@@ -124,7 +148,15 @@ where
 
     /// Follows the remote node and builds blocks on top of imported blocks.
     async fn follow_and_build(&mut self) -> eyre::Result<()> {
+        // First successful contact with the remote determines the resume point.
+        if self.last_imported_block.is_none() {
+            let resume = self.init_last_imported_block().await?;
+            self.last_imported_block = Some(resume);
+        }
+
         loop {
+            let last_imported = self.last_imported_block.expect("initialized above");
+
             // Get remote head
             let remote_block = self
                 .remote
@@ -136,23 +168,23 @@ where
             let remote_head = remote_block.header.number;
 
             // Compare against last imported block
-            if remote_head <= self.last_imported_block {
+            if remote_head <= last_imported {
                 tracing::trace!(target: "scroll::remote_source",
-                    last_imported = self.last_imported_block,
+                    last_imported,
                     remote_head,
                     "Already synced with remote");
                 return Ok(());
             }
 
-            let blocks_behind = remote_head - self.last_imported_block;
+            let blocks_behind = remote_head - last_imported;
             tracing::info!(target: "scroll::remote_source",
-                last_imported = self.last_imported_block,
+                last_imported,
                 remote_head,
                 blocks_behind,
                 "Catching up");
 
             // Fetch and import the next block from remote
-            let next_block_num = self.last_imported_block + 1;
+            let next_block_num = last_imported + 1;
             let block = self
                 .remote
                 .get_block_by_number(next_block_num.into())
@@ -173,7 +205,7 @@ where
             // height)
             let chain_import = match self.orchestrator_handle.import_block(block_with_peer).await {
                 Ok(Ok(chain_import)) => {
-                    self.last_imported_block = next_block_num;
+                    self.last_imported_block = Some(next_block_num);
                     chain_import
                 }
                 Ok(Err(e)) => {

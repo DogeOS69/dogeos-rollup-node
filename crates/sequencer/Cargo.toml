@@ -64,9 +64,10 @@ rollup-node-providers = { workspace = true, features = ["test-utils"] }
 rollup-node-sequencer.workspace = true
 rollup-node-watcher.workspace = true
 scroll-db = { workspace = true, features = ["test-utils"] }
-scroll-engine.workspace = true
+scroll-engine = { workspace = true, features = ["test-utils"] }
 
 # misc
 futures.workspace = true
 tempfile = "3.20.0"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 alloy-signer-local.workspace = true

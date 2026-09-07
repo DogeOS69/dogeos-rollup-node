@@ -157,6 +157,7 @@ where
         self.metrics.payload_attributes_building_duration.record(now.elapsed().as_secs_f64());
 
         // Request the engine to build a new payload.
+        let parent = *engine.fcs().head_block_info();
         let fcu = engine.build_payload(None, payload_attributes).await?;
         let payload_id = fcu.payload_id.ok_or(SequencerError::MissingPayloadId)?;
 
@@ -164,6 +165,7 @@ where
         // ready.
         let payload_building_duration = self.config.payload_building_duration;
         self.payload_building_job = Some(PayloadBuildingJob {
+            parent,
             l1_origin,
             future: Box::pin(async move {
                 // wait the configured duration for the execution node to build the payload.
@@ -210,6 +212,8 @@ where
 
 /// A job that builds a new payload.
 pub struct PayloadBuildingJob {
+    /// The L2 head on which the payload was requested.
+    parent: BlockInfo,
     /// The L1 origin block number of the first included L1 message, if any.
     l1_origin: Option<u64>,
     /// The future that resolves to the payload ID once the job is complete.
@@ -219,6 +223,7 @@ pub struct PayloadBuildingJob {
 impl fmt::Debug for PayloadBuildingJob {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PayloadBuildingJob")
+            .field("parent", &self.parent)
             .field("l1_origin", &self.l1_origin)
             .field("future", &"PayloadBuildingJobFuture")
             .finish()
@@ -226,6 +231,11 @@ impl fmt::Debug for PayloadBuildingJob {
 }
 
 impl PayloadBuildingJob {
+    /// Returns the L2 parent of this payload job.
+    pub const fn parent(&self) -> BlockInfo {
+        self.parent
+    }
+
     /// Returns the L1 origin block number of the first included L1 message, if any.
     pub const fn l1_origin(&self) -> Option<u64> {
         self.l1_origin

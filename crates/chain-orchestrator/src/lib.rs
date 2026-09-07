@@ -446,9 +446,15 @@ impl<
                     // production sender serializes on BlockSequenced or
                     // BlockBuildingSkipped, which the in-flight job emits when
                     // it completes. Cancellation emits no outcome, as before.
-                    if sequencer.payload_building_job().is_some() {
+                    if sequencer
+                        .payload_building_job()
+                        .is_some_and(|job| job.parent() == *self.engine.fcs().head_block_info())
+                    {
                         tracing::debug!(target: "scroll::chain_orchestrator", "BuildBlock requested while a payload building job is in flight; coalescing with the in-flight job");
                     } else {
+                        // An import or reorg may have moved the head since this job started.
+                        // Discard it before restarting, including if the new request fails.
+                        sequencer.cancel_payload_building_job();
                         sequencer.start_payload_building(&mut self.engine).await?;
                     }
                 } else {
@@ -1662,6 +1668,130 @@ mod run_loop_policy_tests {
                 "l2_synced={l2_synced}, pipeline_empty={pipeline_empty}, \
                  can_accept_batch={can_accept_batch}"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn manual_build_restarts_job_after_import_changes_parent() {
+        use rollup_node_sequencer::{
+            L1MessageInclusionMode, PayloadBuildingConfig, SequencerConfig,
+        };
+
+        // A higher head and a same-height reorg must both invalidate the old parent.
+        // Also check that a failed replacement cannot leave the obsolete job runnable.
+        for (imported_number, replacement_succeeds) in
+            [(SAFE + 2, true), (SAFE + 1, true), (SAFE + 2, false)]
+        {
+            let database = Arc::new(setup_test_db().await);
+            let client = Arc::new(ScriptedEngineClient::new());
+            let (mut orchestrator, _handle, _notifications) = test_orchestrator(
+                database.clone(),
+                client.clone(),
+                Asserter::new(),
+                BatchDerivationResult {
+                    attributes: vec![],
+                    batch_info: BatchInfo::new(1, B256::repeat_byte(1)),
+                    skipped_l1_messages: vec![],
+                    target_status: BatchStatus::Consolidated,
+                },
+            )
+            .await;
+            let old_parent = info(SAFE + 1, 0x11);
+            orchestrator.engine = Engine::new(
+                client.clone(),
+                ForkchoiceState::new(old_parent, info(SAFE, 0x10), info(0, 0)),
+            );
+            orchestrator.sync_state.l2_mut().set_synced();
+            orchestrator.sequencer = Some(Sequencer::new(
+                Arc::new(MockL1Provider { db: database, blobs: Default::default() }),
+                SequencerConfig {
+                    chain_spec: DOGEOS_DEV.clone(),
+                    fee_recipient: Address::ZERO,
+                    auto_start: true,
+                    block_time: 100,
+                    payload_building_duration: 0,
+                    allow_empty_blocks: true,
+                    payload_building_config: PayloadBuildingConfig {
+                        block_gas_limit: 30_000_000,
+                        max_l1_messages_per_block: 10,
+                        l1_message_inclusion_mode: L1MessageInclusionMode::BlockDepth(0),
+                    },
+                },
+            ));
+
+            client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(
+                PayloadStatusEnum::Valid,
+                Some(PayloadId::new([1; 8])),
+            )));
+            // Install the job using the same operation as an automatic NewSlot, without sleeps.
+            orchestrator
+                .sequencer
+                .as_mut()
+                .unwrap()
+                .start_payload_building(&mut orchestrator.engine)
+                .await
+                .unwrap();
+            assert_eq!(
+                orchestrator.sequencer.as_ref().unwrap().payload_building_job().unwrap().parent(),
+                old_parent
+            );
+            orchestrator.handle_command(ChainOrchestratorCommand::BuildBlock).await.unwrap();
+            assert_eq!(client.fork_choice_updated_calls(), 1, "same-parent request must coalesce");
+
+            let mut imported = DogeosBlock::default();
+            imported.header.number = imported_number;
+            imported.header.parent_hash = if imported_number == old_parent.number {
+                orchestrator.engine.fcs().safe_block_info().hash
+            } else {
+                old_parent.hash
+            };
+            let new_parent = BlockInfo { number: imported_number, hash: imported.hash_slow() };
+            client.push_new_payload(ScriptedResponse::Ok(PayloadStatus {
+                status: PayloadStatusEnum::Valid,
+                latest_valid_hash: None,
+            }));
+            client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(
+                PayloadStatusEnum::Valid,
+                None,
+            )));
+            orchestrator
+                .import_chain(
+                    vec![imported.clone()],
+                    NewBlockWithPeer {
+                        block: imported,
+                        peer_id: Default::default(),
+                        signature: alloy_primitives::Signature::new(U256::ZERO, U256::ZERO, false),
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(*orchestrator.engine.fcs().head_block_info(), new_parent);
+            assert_eq!(client.fork_choice_updated_calls(), 2);
+
+            let replacement_id = PayloadId::new([2; 8]);
+            client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(
+                PayloadStatusEnum::Valid,
+                replacement_succeeds.then_some(replacement_id),
+            )));
+            let result = orchestrator.handle_command(ChainOrchestratorCommand::BuildBlock).await;
+            assert_eq!(
+                client.fork_choice_updated_calls(),
+                3,
+                "changed parent must restart the job"
+            );
+            let sequencer = orchestrator.sequencer.as_mut().unwrap();
+            if replacement_succeeds {
+                result.unwrap();
+                assert_eq!(sequencer.payload_building_job().unwrap().parent(), new_parent);
+                assert!(matches!(sequencer.next().await,
+                    Some(SequencerEvent::PayloadReady(id)) if id == replacement_id));
+            } else {
+                assert!(result.is_err());
+                assert!(
+                    sequencer.payload_building_job().is_none(),
+                    "obsolete job must stay cancelled"
+                );
+            }
         }
     }
 

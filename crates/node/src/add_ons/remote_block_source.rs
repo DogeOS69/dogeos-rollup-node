@@ -89,6 +89,12 @@ fn redact_remote(url: Option<&reqwest::Url>, message: &str) -> String {
             return;
         }
         let decoded = percent_decode(raw);
+        // An already-decoded echo is normalized once more with the message above. Match
+        // that representation too when the credential itself contains a literal %HH.
+        let normalized_decoded = percent_decode(&decoded);
+        if normalized_decoded != decoded {
+            components.push((normalized_decoded, marker));
+        }
         if decoded != raw {
             components.push((decoded, marker));
         }
@@ -673,13 +679,25 @@ mod tests {
         for password in ["p%40ss%2fword", "p@ss%2Fword", "p@ss/word"] {
             let body = format!("Invalid password={password}. key=QUERY%2fKEY path=PATH%2fKEY");
             let result = super::redact_remote(Some(&url), &body);
-            assert_eq!(result, "Invalid password=<password>. key=<query> path=<path>");
+            assert_eq!(result, "Invalid password=<password>. <query> path=<path>");
         }
         let query_url = "https://rpc.internal/?key=QUERY+SECRET".parse().unwrap();
         assert_eq!(
             super::redact_remote(Some(&query_url), "Invalid key: QUERY SECRET."),
             "Invalid key: <query>."
         );
+    }
+
+    #[test]
+    fn redact_remote_scrubs_literal_percent_sequences() {
+        let url = "https://ops:pa%2540ss@rpc.internal/v2/PATH%252FKEY".parse().unwrap();
+        for (password, key) in [("pa%2540ss", "PATH%252FKEY"), ("pa%40ss", "PATH%2FKEY")] {
+            let body = format!("Invalid password: {password}. Invalid key: {key}.");
+            assert_eq!(
+                super::redact_remote(Some(&url), &body),
+                "Invalid password: <password>. Invalid key: <path>."
+            );
+        }
     }
 
     /// A path-less URL renders as `scheme://host:port/`. When that string is a

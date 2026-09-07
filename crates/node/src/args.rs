@@ -133,7 +133,9 @@ impl ScrollRollupNodeConfig {
                 self.signer_args.aws_kms_key_id.is_none() &&
                 self.signer_args.private_key.is_none()
             {
-                return Err("Either signer key file, AWS KMS key ID or private key is required when sequencer is enabled".to_string());
+                // `private_key` is `#[arg(skip)]` and only settable programmatically,
+                // so the message names the two sources a CLI user can pick.
+                return Err("A signer is required when the sequencer is enabled: pass --signer.key-file or --signer.aws-kms-key-id".to_string());
             }
 
             if (self.signer_args.key_file.is_some() as u8 +
@@ -715,7 +717,7 @@ impl Default for ChainOrchestratorArgs {
 }
 
 /// The network arguments.
-#[derive(Debug, Clone, clap::Args)]
+#[derive(Clone, clap::Args)]
 pub struct RollupNodeNetworkArgs {
     /// A bool to represent if new blocks should be bridged from the eth wire protocol to the
     /// scroll wire protocol.
@@ -774,8 +776,143 @@ impl RollupNodeNetworkArgs {
     }
 }
 
+// Hand-written `Debug` for every argument group that can carry a secret.
+//
+// `build()` logs the whole config at INFO with `{:#?}` on every launch, and
+// `url::Url`'s own `Debug` prints userinfo, path and query verbatim — so a
+// derived impl emits the L1 provider's API key (the book's own example is an
+// Alchemy URL with the key in the path), the remote source's credentials, the
+// blob provider's signed URL and the KMS key id. Host and port only, and
+// presence rather than value for everything else.
+//
+// Each impl destructures `Self` without `..`, so adding a field to one of these
+// structs is a compile error here rather than a field that silently never
+// reaches the config dump (or, worse, one that a later `derive` would print
+// verbatim).
+
+fn debug_url(url: Option<&reqwest::Url>) -> String {
+    match url {
+        Some(url) => format!(
+            "{}://{}:{}",
+            url.scheme(),
+            url.host_str().unwrap_or("<none>"),
+            url.port_or_known_default().unwrap_or(0)
+        ),
+        None => "<unset>".to_string(),
+    }
+}
+
+impl fmt::Debug for L1ProviderArgs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            url,
+            compute_units_per_second,
+            max_retries,
+            initial_backoff,
+            logs_query_block_range,
+            cache_max_items,
+            liveness_threshold,
+            liveness_check_interval,
+        } = self;
+        f.debug_struct("L1ProviderArgs")
+            .field("url", &debug_url(url.as_ref()))
+            .field("compute_units_per_second", compute_units_per_second)
+            .field("max_retries", max_retries)
+            .field("initial_backoff", initial_backoff)
+            .field("logs_query_block_range", logs_query_block_range)
+            .field("cache_max_items", cache_max_items)
+            .field("liveness_threshold", liveness_threshold)
+            .field("liveness_check_interval", liveness_check_interval)
+            .finish()
+    }
+}
+
+impl fmt::Debug for BlobProviderArgs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            beacon_node_urls,
+            s3_url,
+            anvil_url,
+            mock,
+            compute_units_per_second,
+            max_retries,
+            initial_backoff,
+        } = self;
+        // One sanitized endpoint per configured beacon node, so the dump shows
+        // how many there are and which hosts, not just that the list is set.
+        let beacon_node_urls = beacon_node_urls
+            .as_ref()
+            .map(|urls| urls.iter().map(|url| debug_url(Some(url))).collect::<Vec<_>>());
+        f.debug_struct("BlobProviderArgs")
+            .field("beacon_node_urls", &beacon_node_urls)
+            .field("s3_url", &debug_url(s3_url.as_ref()))
+            .field("anvil_url", &debug_url(anvil_url.as_ref()))
+            .field("mock", mock)
+            .field("compute_units_per_second", compute_units_per_second)
+            .field("max_retries", max_retries)
+            .field("initial_backoff", initial_backoff)
+            .finish()
+    }
+}
+
+impl fmt::Debug for SignerArgs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Presence only, deliberately: the key file is a local path and the KMS
+        // id names the production signing key.
+        let Self { key_file, aws_kms_key_id, private_key } = self;
+        f.debug_struct("SignerArgs")
+            .field("key_file_set", &key_file.is_some())
+            .field("aws_kms_key_id_set", &aws_kms_key_id.is_some())
+            .field("private_key_set", &private_key.is_some())
+            .finish()
+    }
+}
+
+impl fmt::Debug for RemoteBlockSourceArgs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self { enabled, url, poll_interval_ms, build } = self;
+        f.debug_struct("RemoteBlockSourceArgs")
+            .field("enabled", enabled)
+            .field("url", &debug_url(url.as_ref()))
+            .field("poll_interval_ms", poll_interval_ms)
+            .field("build", build)
+            .finish()
+    }
+}
+
+impl fmt::Debug for RollupNodeNetworkArgs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            enable_eth_scroll_wire_bridge,
+            enable_scroll_wire,
+            sequencer_url,
+            signer_address,
+            legacy_geth_header_transform,
+        } = self;
+        // `sequencer_url` is a plain String and prints verbatim, so a follower
+        // configured with credentials in it would emit them to stdout through
+        // the config dump at startup. Same reason as the other four groups.
+        // `url::ParseError` is a fieldless enum, so the reason carries none of
+        // the input and is the actionable part of an otherwise bare failure.
+        let sequencer_url = match sequencer_url.as_deref() {
+            None => "<unset>".to_string(),
+            Some(raw) => match raw.parse::<reqwest::Url>() {
+                Ok(url) => debug_url(Some(&url)),
+                Err(e) => format!("<unparseable: {e}>"),
+            },
+        };
+        f.debug_struct("RollupNodeNetworkArgs")
+            .field("enable_eth_scroll_wire_bridge", enable_eth_scroll_wire_bridge)
+            .field("enable_scroll_wire", enable_scroll_wire)
+            .field("sequencer_url", &sequencer_url)
+            .field("signer_address", signer_address)
+            .field("legacy_geth_header_transform", legacy_geth_header_transform)
+            .finish()
+    }
+}
+
 /// The arguments for the L1 provider.
-#[derive(Debug, Clone, clap::Args)]
+#[derive(Clone, clap::Args)]
 pub struct L1ProviderArgs {
     /// The URL for the L1 RPC.
     #[arg(long = "l1.url", id = "l1_url", value_name = "L1_URL")]
@@ -820,7 +957,7 @@ impl Default for L1ProviderArgs {
 }
 
 /// The arguments for the Beacon provider.
-#[derive(Debug, Default, Clone, clap::Args)]
+#[derive(Default, Clone, clap::Args)]
 pub struct BlobProviderArgs {
     /// The URLs for the beacon node blob provider.
     #[arg(
@@ -896,7 +1033,7 @@ pub struct SequencerArgs {
 }
 
 /// The arguments for the signer.
-#[derive(Debug, Default, Clone, clap::Args)]
+#[derive(Default, Clone, clap::Args)]
 pub struct SignerArgs {
     /// Path to the file containing the signer's private key
     #[arg(
@@ -915,6 +1052,10 @@ pub struct SignerArgs {
     pub aws_kms_key_id: Option<String>,
 
     /// The private key signer, if any.
+    /// `skip`, not a positional: without this clap derives one from the field,
+    /// and a raw hex signing key on argv lands in `ps`, `/proc/<pid>/cmdline`
+    /// and shell history. Both siblings are explicitly namespaced flags.
+    #[arg(skip)]
     pub private_key: Option<PrivateKeySigner>,
 }
 
@@ -1038,7 +1179,7 @@ impl Default for PprofArgs {
 }
 
 /// The arguments for the remote block source.
-#[derive(Debug, Default, Clone, clap::Args)]
+#[derive(Default, Clone, clap::Args)]
 pub struct RemoteBlockSourceArgs {
     /// Enable the remote block source feature
     #[arg(long = "remote-source.enabled", default_value_t = false)]
@@ -1082,7 +1223,7 @@ const fn l1_v2_message_queue_start_index(chain: Option<NamedChain>) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::Parser;
+    use clap::{CommandFactory, Parser};
     use std::path::PathBuf;
 
     #[derive(Debug, Parser)]
@@ -1124,6 +1265,239 @@ mod tests {
         let cli = ConsensusCli::parse_from(["rollup-node"]);
 
         assert!(!cli.consensus.exit_on_signer_rotation);
+    }
+
+    /// `build()` dumps the whole config with `{:#?}` at startup; the hand-written
+    /// `Debug` impls are the only thing keeping credentials out of that line.
+    #[test]
+    fn debug_output_redacts_urls_and_secrets() {
+        let secret_url: reqwest::Url =
+            "https://ops:s3cr3t@rpc.internal:8545/v2/API_KEY_123?token=QUERY_KEY".parse().unwrap();
+
+        let l1_args = L1ProviderArgs { url: Some(secret_url.clone()), ..Default::default() };
+        let l1 = format!("{l1_args:?}");
+        let blob = format!(
+            "{:?}",
+            BlobProviderArgs {
+                beacon_node_urls: Some(vec![secret_url.clone()]),
+                s3_url: Some(secret_url.clone()),
+                anvil_url: Some(secret_url.clone()),
+                ..Default::default()
+            }
+        );
+        let remote = format!(
+            "{:?}",
+            RemoteBlockSourceArgs {
+                enabled: true,
+                url: Some(secret_url.clone()),
+                ..Default::default()
+            }
+        );
+        let network = format!(
+            "{:?}",
+            RollupNodeNetworkArgs {
+                sequencer_url: Some(secret_url.to_string()),
+                ..Default::default()
+            }
+        );
+
+        for (name, rendered) in
+            [("l1", &l1), ("blob", &blob), ("remote", &remote), ("network", &network)]
+        {
+            for leak in ["s3cr3t", "ops:", "API_KEY_123", "QUERY_KEY", "/v2"] {
+                assert!(!rendered.contains(leak), "{name} Debug leaked `{leak}`: {rendered}");
+            }
+            assert!(
+                rendered.contains("https://rpc.internal:8545"),
+                "{name} lost the host: {rendered}"
+            );
+        }
+        assert!(l1.contains("url: \"https://rpc.internal:8545\""), "{l1}");
+        // Every beacon endpoint is listed, sanitized, rather than collapsed to a
+        // presence flag: the dump is the only record of the effective config.
+        assert!(blob.contains("beacon_node_urls: Some([\"https://rpc.internal:8545\"])"), "{blob}");
+        let two_beacons = format!(
+            "{:?}",
+            BlobProviderArgs {
+                beacon_node_urls: Some(vec![
+                    secret_url,
+                    "http://beacon-b.internal/".parse().unwrap()
+                ]),
+                ..Default::default()
+            }
+        );
+        assert!(
+            two_beacons.contains(
+                "beacon_node_urls: Some([\"https://rpc.internal:8545\", \
+                 \"http://beacon-b.internal:80\"])"
+            ),
+            "{two_beacons}"
+        );
+        assert!(!two_beacons.contains("s3cr3t"), "{two_beacons}");
+        let no_beacons = format!("{:?}", BlobProviderArgs::default());
+        assert!(no_beacons.contains("beacon_node_urls: None"), "{no_beacons}");
+
+        // A set-but-unparseable sequencer URL is reported as such, not as unset,
+        // and the parse error is kept: it is fieldless, so it carries none of
+        // the input, and it is what tells the operator what to fix.
+        let unparseable = format!(
+            "{:?}",
+            RollupNodeNetworkArgs {
+                sequencer_url: Some("not a url".to_string()),
+                ..Default::default()
+            }
+        );
+        let expected_error = "not a url".parse::<reqwest::Url>().unwrap_err().to_string();
+        assert!(
+            unparseable.contains(&format!("sequencer_url: \"<unparseable: {expected_error}>\"")),
+            "{unparseable}"
+        );
+        assert!(!unparseable.contains("not a url"), "input echoed: {unparseable}");
+        let unset = format!("{:?}", RollupNodeNetworkArgs::default());
+        assert!(unset.contains("sequencer_url: \"<unset>\""), "{unset}");
+    }
+
+    /// `build()` logs `self` — the whole `ScrollRollupNodeConfig` — with
+    /// `{:#?}`, which is the derived impl walking every argument group. The
+    /// per-group tests cannot catch a credential-bearing field added to a
+    /// group that still derives `Debug`; this renders the exact form that
+    /// reaches the log, with a secret in every place the config can hold one.
+    #[test]
+    fn whole_config_debug_dump_redacts_secrets() {
+        let secret_url: reqwest::Url =
+            "https://ops:s3cr3t@rpc.internal:8545/v2/API_KEY_123?token=QUERY_KEY".parse().unwrap();
+        let config = ScrollRollupNodeConfig {
+            blob_provider_args: BlobProviderArgs {
+                beacon_node_urls: Some(vec![secret_url.clone()]),
+                s3_url: Some(secret_url.clone()),
+                anvil_url: Some(secret_url.clone()),
+                ..Default::default()
+            },
+            l1_provider_args: L1ProviderArgs {
+                url: Some(secret_url.clone()),
+                ..Default::default()
+            },
+            network_args: RollupNodeNetworkArgs {
+                sequencer_url: Some(secret_url.to_string()),
+                ..Default::default()
+            },
+            signer_args: SignerArgs {
+                key_file: Some(PathBuf::from("/run/secrets/signer.key")),
+                aws_kms_key_id: Some("arn:aws:kms:region:acct:key/KMS_KEY_LEAK".to_string()),
+                private_key: Some(PrivateKeySigner::from_slice(&[0x11; 32]).unwrap()),
+            },
+            remote_block_source_args: RemoteBlockSourceArgs {
+                enabled: true,
+                url: Some(secret_url),
+                ..Default::default()
+            },
+            ..rotation_watchdog_config()
+        };
+
+        let dump = format!("{config:#?}");
+        for leak in [
+            "s3cr3t",
+            "ops:",
+            "API_KEY_123",
+            "QUERY_KEY",
+            "/v2",
+            "signer.key",
+            "KMS_KEY_LEAK",
+            "LocalSigner",
+        ] {
+            assert!(!dump.contains(leak), "config dump leaked `{leak}`: {dump}");
+        }
+        // Sanitized values are still there, so the dump remains a usable
+        // record of the effective config.
+        assert!(dump.contains("url: \"https://rpc.internal:8545\""), "{dump}");
+        assert!(dump.contains("sequencer_url: \"https://rpc.internal:8545\""), "{dump}");
+        assert!(dump.contains("private_key_set: true"), "{dump}");
+    }
+
+    /// The signer group renders presence flags only. A real private key is
+    /// needed here: with `private_key: None`, an impl that fell back to
+    /// `.field("private_key", &self.private_key)` — the shape the sibling
+    /// impls use — would still pass.
+    ///
+    /// `PrivateKeySigner`'s own `Debug` is hand-written to print the address
+    /// and chain id, never the key bytes, so the address (and the
+    /// `LocalSigner` type name) is what a derive revert would actually leak.
+    /// The exact-output comparisons close the rest: any extra field fails.
+    #[test]
+    fn signer_debug_reports_presence_only() {
+        let key = PrivateKeySigner::from_slice(&[0x11; 32]).unwrap();
+        let address = key.address().to_string().to_lowercase();
+        let kms_key_id = "arn:aws:kms:region:acct:key/KMS_KEY_LEAK";
+        let signer = format!(
+            "{:?}",
+            SignerArgs {
+                key_file: Some(PathBuf::from("/run/secrets/signer.key")),
+                aws_kms_key_id: Some(kms_key_id.to_string()),
+                private_key: Some(key),
+            }
+        );
+
+        assert!(!signer.to_lowercase().contains(&address), "signer address leaked: {signer}");
+        assert!(!signer.contains("LocalSigner"), "signer value leaked: {signer}");
+        assert!(!signer.contains("signer.key"), "key file path leaked: {signer}");
+        assert!(!signer.contains("KMS_KEY_LEAK"), "KMS key id leaked: {signer}");
+        assert_eq!(
+            signer,
+            "SignerArgs { key_file_set: true, aws_kms_key_id_set: true, private_key_set: true }"
+        );
+
+        let unset = format!("{:?}", SignerArgs::default());
+        assert_eq!(
+            unset,
+            "SignerArgs { key_file_set: false, aws_kms_key_id_set: false, private_key_set: false }"
+        );
+    }
+
+    #[derive(Debug, Parser)]
+    struct SignerCli {
+        #[command(flatten)]
+        signer: SignerArgs,
+    }
+
+    /// `private_key` is `#[arg(skip)]`. Without it clap derives a positional
+    /// from the field, and a raw hex signing key on argv lands in `ps`,
+    /// `/proc/<pid>/cmdline` and shell history. The flag-only siblings are
+    /// the two CLI-reachable key sources.
+    #[test]
+    fn private_key_is_not_a_cli_argument() {
+        // The clap metadata is the direct check: a positional-parse failure
+        // below would still pass if `skip` were swapped for a named flag such
+        // as `--signer.private-key`, which puts the raw key on argv all the same.
+        let command = SignerCli::command();
+        let ids: Vec<_> = command.get_arguments().map(|arg| arg.get_id().to_string()).collect();
+        assert!(!ids.iter().any(|id| id == "private_key"), "private_key is a clap arg: {ids:?}");
+        for arg in command.get_arguments() {
+            let long = arg.get_long().unwrap_or_default();
+            assert!(
+                !long.contains("private") && !arg.get_id().as_str().contains("private"),
+                "a private-key flag is CLI-reachable: --{long} ({})",
+                arg.get_id()
+            );
+        }
+        // Exactly the two flag-only sources, ignoring clap's own help/version.
+        let mut sorted: Vec<_> =
+            ids.iter().filter(|id| *id != "help" && *id != "version").cloned().collect();
+        sorted.sort_unstable();
+        assert_eq!(sorted, ["aws_kms_key_id", "key_file"], "unexpected signer args: {ids:?}");
+
+        let key_hex = format!("0x{}", "11".repeat(32));
+        let err = SignerCli::try_parse_from(["rollup-node", key_hex.as_str()]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument, "{err}");
+
+        let cli = SignerCli::try_parse_from(["rollup-node"]).unwrap();
+        assert!(cli.signer.private_key.is_none());
+        assert!(cli.signer.key_file.is_none());
+        assert!(cli.signer.aws_kms_key_id.is_none());
+
+        let flag_only = ["rollup-node", "--signer.aws-kms-key-id", "kms-id"];
+        let cli = SignerCli::try_parse_from(flag_only).unwrap();
+        assert_eq!(cli.signer.aws_kms_key_id.as_deref(), Some("kms-id"));
+        assert!(cli.signer.private_key.is_none());
     }
 
     #[test]
@@ -1255,11 +1629,12 @@ mod tests {
             require_l1_data_fee_buffer: false,
         };
 
-        let result = config.validate();
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains(
-            "Either signer key file, AWS KMS key ID or private key is required when sequencer is enabled"
-        ));
+        // The message names only the two sources a CLI user can select;
+        // `private_key` is `#[arg(skip)]` and set programmatically.
+        assert_eq!(
+            config.validate().unwrap_err(),
+            "A signer is required when the sequencer is enabled: pass --signer.key-file or --signer.aws-kms-key-id"
+        );
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use super::{models, DatabaseError};
 use crate::{ReadConnectionProvider, WriteConnectionProvider};
 
-use alloy_primitives::{Signature, B256};
+use alloy_primitives::{Bytes, Signature, B256};
 use dogeos_reth_engine::BlockDataHint;
 use rollup_node_primitives::{
     BatchCommitData, BatchConsolidationOutcome, BatchInfo, BatchStatus, BlockInfo,
@@ -153,6 +153,48 @@ pub trait DatabaseWriteOperations {
 
     /// Insert the genesis block into the database.
     async fn insert_genesis_block(&self, genesis_hash: B256) -> Result<(), DatabaseError>;
+
+    /// Delete any genesis-height (block 0) rows whose hash does not match the chain's genesis
+    /// hash, returning how many were removed. The static dev migration seeds the Scroll dev
+    /// genesis row; the real genesis is inserted by `reconcile_genesis_block` (the insert cannot
+    /// overwrite — its conflict key includes the hash), and the seeded row would otherwise shadow
+    /// the real one nondeterministically in highest-block queries such as
+    /// `get_latest_safe_l2_info`, presenting as a same-height different-hash safe divergence.
+    ///
+    /// This primitive has no floor: it removes the LAST height-0 row too, leaving `l2_block`
+    /// without a genesis — the state [`DatabaseError::GenesisMissing`] reports and
+    /// `get_latest_safe_l2_info` panics on. Production callers must pair it with
+    /// `insert_genesis_block` in the same transaction, as [`Self::reconcile_genesis_block`] does.
+    async fn delete_mismatched_genesis_blocks(
+        &self,
+        genesis_hash: B256,
+    ) -> Result<u64, DatabaseError>;
+
+    /// Reconcile the height-0 rows with this chain's genesis hash on startup, returning how many
+    /// stale rows were removed. `seeded_genesis` is the genesis the static migration for this
+    /// chain writes, which is NOT always `genesis_hash` — the dev migration hardcodes upstream
+    /// Scroll's dev genesis while the chain spec computes its own.
+    ///
+    /// A height-0 row that is neither this chain's genesis nor `seeded_genesis` is another chain's
+    /// data and fail-stops on BOTH paths — the check runs before the fresh/populated split, because
+    /// that split reads the `l2_head_block` metadata counter, which an unwind can drive to 0 while
+    /// foreign rows remain.
+    ///
+    /// On a FRESH database (nothing above genesis) the stale rows are dropped and the real genesis
+    /// is (re-)inserted in the same call, so a crash between the two cannot leave `l2_block` empty.
+    /// On a POPULATED database the configured genesis must already be present before a duplicate
+    /// migration seed can be removed. A seed alone is shared across chains and cannot identify
+    /// the retained history; [`DatabaseError::GenesisAmbiguous`] refuses to replace it. An
+    /// unexpected height-0 hash is [`DatabaseError::GenesisMismatch`]. A populated database with
+    /// NO height-0 row at all is
+    /// [`DatabaseError::GenesisMissing`]: there is nothing to reconcile against, and inserting a
+    /// genesis under history that never carried it would hide a truncated or corrupt database.
+    /// All three errors are fatal at startup and leave the genesis rows unchanged.
+    async fn reconcile_genesis_block(
+        &self,
+        genesis_hash: B256,
+        seeded_genesis: B256,
+    ) -> Result<u64, DatabaseError>;
 
     /// Update the executed L1 messages from the provided L2 blocks in the database.
     async fn update_l1_messages_from_l2_blocks(
@@ -755,6 +797,76 @@ impl<T: WriteConnectionProvider + ?Sized + Sync> DatabaseWriteOperations for T {
         let genesis_block = BlockInfo::new(0, genesis_hash);
         let genesis_batch = BatchInfo::new(0, B256::ZERO);
         self.insert_blocks(vec![genesis_block], genesis_batch).await
+    }
+
+    async fn delete_mismatched_genesis_blocks(
+        &self,
+        genesis_hash: B256,
+    ) -> Result<u64, DatabaseError> {
+        let result = models::l2_block::Entity::delete_many()
+            .filter(
+                Condition::all()
+                    .add(models::l2_block::Column::BlockNumber.eq(0i64))
+                    .add(models::l2_block::Column::BlockHash.ne(genesis_hash.to_vec())),
+            )
+            .exec(self.get_connection())
+            .await?;
+        Ok(result.rows_affected)
+    }
+
+    async fn reconcile_genesis_block(
+        &self,
+        genesis_hash: B256,
+        seeded_genesis: B256,
+    ) -> Result<u64, DatabaseError> {
+        // The WHOLE height-0 set: `get_l2_block_info_by_number(0)` is unordered and returns either
+        // row when an older startup left the migration seed beside the real genesis.
+        let stored_genesis_hashes = models::l2_block::Entity::find()
+            .select_only()
+            .column(models::l2_block::Column::BlockHash)
+            .filter(models::l2_block::Column::BlockNumber.eq(0i64))
+            .into_tuple::<Vec<u8>>()
+            .all(self.get_connection())
+            .await?;
+        let is = |hash: &Vec<u8>, want: B256| hash.as_slice() == want.as_slice();
+
+        if let Some(foreign) = stored_genesis_hashes
+            .iter()
+            .find(|hash| !is(hash, genesis_hash) && !is(hash, seeded_genesis))
+        {
+            return Err(DatabaseError::GenesisMismatch {
+                configured: genesis_hash,
+                stored: Bytes::copy_from_slice(foreign),
+            });
+        }
+
+        // Populated by the metadata anchor OR by stored rows: an unwind can leave the anchor at 0.
+        let rows_above_genesis = models::l2_block::Entity::find()
+            .filter(models::l2_block::Column::BlockNumber.gt(0i64))
+            .select_only()
+            .column(models::l2_block::Column::BlockHash)
+            .into_tuple::<Vec<u8>>()
+            .one(self.get_connection())
+            .await?
+            .is_some();
+        if DatabaseReadOperations::get_l2_head_block_number(self).await? > 0 || rows_above_genesis {
+            if stored_genesis_hashes.is_empty() {
+                return Err(DatabaseError::GenesisMissing { configured: genesis_hash });
+            }
+            if !stored_genesis_hashes.iter().any(|hash| is(hash, genesis_hash)) {
+                // A shared migration seed is not proof that this history belongs to the
+                // configured chain. Refuse before deleting the only legacy marker.
+                return Err(DatabaseError::GenesisAmbiguous {
+                    configured: genesis_hash,
+                    seeded: seeded_genesis,
+                });
+            }
+            return self.delete_mismatched_genesis_blocks(genesis_hash).await;
+        }
+
+        let removed = self.delete_mismatched_genesis_blocks(genesis_hash).await?;
+        self.insert_genesis_block(genesis_hash).await?;
+        Ok(removed)
     }
 
     async fn update_l1_messages_from_l2_blocks(

@@ -1,7 +1,7 @@
 use crate::FcsError;
 use alloy_chains::NamedChain;
 use alloy_eips::{BlockId, BlockNumberOrTag};
-use alloy_primitives::{Sealable, B256};
+use alloy_primitives::B256;
 use alloy_provider::Provider;
 use alloy_rpc_types_engine::ForkchoiceState as AlloyForkchoiceState;
 use dogeos_chainspec::{DOGEOS_CHIKYU_GENESIS_HASH, DOGEOS_MAINNET_GENESIS_HASH};
@@ -178,7 +178,15 @@ pub fn genesis_hash_from_chain_spec<CS: EthChainSpec<Header: BlockHeader>>(
     match chain_spec.chain().named() {
         Some(NamedChain::Scroll) => Some(DOGEOS_MAINNET_GENESIS_HASH),
         Some(NamedChain::ScrollSepolia) => Some(DOGEOS_CHIKYU_GENESIS_HASH),
-        Some(NamedChain::Dev) | None => Some(chain_spec.genesis_header().hash_slow()),
+        // `genesis_hash()` returns the SEALED hash when the spec carries one and
+        // recomputes only otherwise. `genesis_header().hash_slow()` always
+        // recomputes, and the two differ: chikyu's genesis document is
+        // byte-identical to mainnet's in every field the header is built from,
+        // so recomputing yields MAINNET's genesis hash for chikyu. Using it
+        // made the database, the forkchoice fallback and the EL disagree on
+        // chikyu's block 0 — a fresh node diverged at the first finalized
+        // notification and an existing one failed startup outright.
+        Some(NamedChain::Dev) | None => Some(chain_spec.genesis_hash()),
         _ => None,
     }
 }

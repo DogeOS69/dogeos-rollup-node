@@ -11,7 +11,6 @@ use std::{
 };
 
 use alloy_eips::eip2718::Encodable2718;
-use alloy_primitives::U256;
 use alloy_rpc_types_engine::{ExecutionData, PayloadAttributes, PayloadId};
 use dogeos_hardforks::DogeosHardforks;
 use dogeos_reth_engine::{BlockDataHint, ScrollPayloadAttributes};
@@ -180,7 +179,16 @@ where
         Ok(())
     }
 
-    /// Handles a new payload by fetching it from the engine and updating the FCS head.
+    /// Handles a new payload by fetching it from the engine, validating it and committing it as
+    /// the FCS head.
+    ///
+    /// Returns `Ok(Some(block))` once the engine confirmed the block as its head with `VALID`,
+    /// and `Ok(None)` when the payload is empty and empty blocks are disabled. Fails with
+    /// [`SequencerError::PayloadError`] when the payload does not convert into a block or its hash
+    /// does not match the reconstructed header after applying [`DEFAULT_BLOCK_DIFFICULTY`], with
+    /// [`SequencerError::FcuNotValid`] when the engine answered anything but `VALID`, and with the
+    /// engine error when a call itself failed. On every `Ok(None)` and error path the local FCS
+    /// mirror is left unchanged.
     pub async fn finalize_payload_building<EC: ScrollEngineApi + Sync + Send + 'static>(
         &mut self,
         payload_id: PayloadId,
@@ -194,16 +202,36 @@ where
         } else {
             tracing::info!(target: "rollup_node::sequencer", "Built payload with id {payload_id:?}, hash: {:#x}, number: {} containing {} transactions.", payload.block_hash, payload.block_number, payload.transactions.len());
             let block_info = BlockInfo { hash: payload.block_hash, number: payload.block_number };
-            engine.update_fcs(Some(block_info), None, None).await?;
             let expected_hash = payload.block_hash;
+            // Convert and validate, including the difficulty used by `block_data_hint`, before
+            // committing the head so a deterministic local failure cannot leave it advanced.
             let ExecutionData { payload, sidecar } =
                 ExecutionData { payload: payload.into(), sidecar: Default::default() };
             let mut block: DogeosBlock = payload
                 .try_into_block_with_sidecar::<ScrollTransactionSigned>(&sidecar)
                 .map_err(|_| SequencerError::PayloadError)?;
-            block.header.difficulty = U256::ONE;
+            block.header.difficulty = DEFAULT_BLOCK_DIFFICULTY;
             if block.hash_slow() != expected_hash {
                 return Err(SequencerError::PayloadError)
+            }
+            let result = engine.update_fcs_checked(Some(block_info), None, None).await?;
+            if !result.is_valid() {
+                // Any non-VALID verdict (INVALID, SYNCING, or the spec-illegal
+                // ACCEPTED) leaves the mirror uncommitted and the head
+                // unchanged. Proceeding would sign and gossip a block the EL
+                // has not adopted and mark its L1 messages consumed. Log the
+                // verdict and the EL's latest valid hash so INVALID (genuine
+                // divergence, with the last ancestor the EL still accepts) is
+                // distinguishable from SYNCING (a transient, e.g. after an EL
+                // restart) instead of a contentless error type.
+                tracing::error!(
+                    target: "rollup_node::sequencer",
+                    ?block_info,
+                    status = ?result.payload_status.status,
+                    latest_valid_hash = ?result.payload_status.latest_valid_hash,
+                    "Engine did not confirm the freshly built block's forkchoice update"
+                );
+                return Err(SequencerError::FcuNotValid);
             }
             Ok(Some(block))
         }
@@ -295,4 +323,200 @@ fn delayed_interval(interval: u64) -> Interval {
     let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(interval));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     interval
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_primitives::{Address, Bloom, Bytes, B256, U256};
+    use alloy_rpc_types_engine::{
+        ExecutionPayloadV1, ForkchoiceUpdated, PayloadStatus, PayloadStatusEnum,
+    };
+    use dogeos_chainspec::{DogeosChainSpec, DOGEOS_DEV};
+    use rollup_node_providers::test_utils::MockL1Provider;
+    use scroll_db::{test_utils::setup_test_db, Database};
+    use scroll_engine::{
+        test_utils::{ScriptedEngineClient, ScriptedResponse},
+        ForkchoiceState,
+    };
+
+    type TestSequencer = Sequencer<MockL1Provider<Arc<Database>>, DogeosChainSpec>;
+
+    async fn test_sequencer() -> TestSequencer {
+        let db = Arc::new(setup_test_db().await);
+        let provider = Arc::new(MockL1Provider { db, blobs: Default::default() });
+        Sequencer::new(
+            provider,
+            SequencerConfig {
+                chain_spec: DOGEOS_DEV.clone(),
+                fee_recipient: Address::ZERO,
+                auto_start: false,
+                payload_building_config: PayloadBuildingConfig {
+                    block_gas_limit: 30_000_000,
+                    max_l1_messages_per_block: 4,
+                    l1_message_inclusion_mode: L1MessageInclusionMode::default(),
+                },
+                block_time: 1_000,
+                payload_building_duration: 0,
+                allow_empty_blocks: true,
+            },
+        )
+    }
+
+    fn fcu(status: PayloadStatusEnum) -> ForkchoiceUpdated {
+        ForkchoiceUpdated {
+            payload_status: PayloadStatus { status, latest_valid_hash: None },
+            payload_id: None,
+        }
+    }
+
+    /// A payload whose `block_hash` matches the block the sequencer derives
+    /// from it (with the difficulty pinned to `DEFAULT_BLOCK_DIFFICULTY`),
+    /// computed through the same conversion `finalize_payload_building`
+    /// performs so the hash check passes for the right reason.
+    fn consistent_payload(number: u64) -> ExecutionPayloadV1 {
+        let mut payload = ExecutionPayloadV1 {
+            parent_hash: B256::repeat_byte(0x11),
+            fee_recipient: Address::ZERO,
+            state_root: B256::ZERO,
+            receipts_root: B256::ZERO,
+            logs_bloom: Bloom::default(),
+            prev_randao: B256::ZERO,
+            block_number: number,
+            gas_limit: 30_000_000,
+            gas_used: 0,
+            timestamp: 1,
+            extra_data: Bytes::new(),
+            base_fee_per_gas: U256::from(7),
+            block_hash: B256::ZERO,
+            transactions: vec![],
+        };
+        let ExecutionData { payload: generic, sidecar } =
+            ExecutionData { payload: payload.clone().into(), sidecar: Default::default() };
+        let mut block: DogeosBlock = generic
+            .try_into_block_with_sidecar::<ScrollTransactionSigned>(&sidecar)
+            .expect("payload converts into a block");
+        block.header.difficulty = DEFAULT_BLOCK_DIFFICULTY;
+        payload.block_hash = block.hash_slow();
+        payload
+    }
+
+    /// The engine must not adopt a head it did not confirm: a SYNCING, INVALID
+    /// or (spec-illegal) ACCEPTED verdict for the freshly built payload leaves
+    /// the FCS mirror untouched and surfaces as `FcuNotValid`, instead of
+    /// signing and gossiping a block the EL never applied.
+    #[tokio::test]
+    async fn finalize_payload_building_requires_a_valid_forkchoice_update() {
+        for status in [
+            PayloadStatusEnum::Syncing,
+            PayloadStatusEnum::Invalid { validation_error: "scripted".to_string() },
+            PayloadStatusEnum::Accepted,
+        ] {
+            let mut sequencer = test_sequencer().await;
+            let client = Arc::new(ScriptedEngineClient::new());
+            let genesis = BlockInfo { number: 0, hash: B256::repeat_byte(0x11) };
+            let mut engine =
+                Engine::new(client.clone(), ForkchoiceState::new(genesis, genesis, genesis));
+
+            client.push_get_payload(ScriptedResponse::Ok(consistent_payload(1)));
+            client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(status.clone())));
+
+            let result =
+                sequencer.finalize_payload_building(PayloadId::new([7; 8]), &mut engine).await;
+            assert!(
+                matches!(result, Err(SequencerError::FcuNotValid)),
+                "{status:?}: expected FcuNotValid, got {result:?}"
+            );
+            assert_eq!(client.fork_choice_updated_calls(), 1, "{status:?}");
+            assert_eq!(
+                *engine.fcs().head_block_info(),
+                genesis,
+                "{status:?}: the mirror must not advance to an unadopted head"
+            );
+        }
+    }
+
+    /// The happy path is unchanged: VALID commits the head and returns the
+    /// converted block.
+    #[tokio::test]
+    async fn finalize_payload_building_commits_head_on_valid() {
+        let mut sequencer = test_sequencer().await;
+        let client = Arc::new(ScriptedEngineClient::new());
+        let genesis = BlockInfo { number: 0, hash: B256::repeat_byte(0x11) };
+        let mut engine =
+            Engine::new(client.clone(), ForkchoiceState::new(genesis, genesis, genesis));
+
+        let payload = consistent_payload(1);
+        client.push_get_payload(ScriptedResponse::Ok(payload.clone()));
+        client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Valid)));
+
+        let block = sequencer
+            .finalize_payload_building(PayloadId::new([7; 8]), &mut engine)
+            .await
+            .expect("finalization succeeds")
+            .expect("a non-empty payload yields a block");
+        assert_eq!(block.header.number, 1);
+        assert_eq!(block.header.difficulty, DEFAULT_BLOCK_DIFFICULTY);
+        assert_eq!(
+            *engine.fcs().head_block_info(),
+            BlockInfo { number: 1, hash: payload.block_hash },
+            "VALID commits the built block as the new head"
+        );
+        assert_eq!(*engine.fcs().safe_block_info(), genesis);
+        assert_eq!(*engine.fcs().finalized_block_info(), genesis);
+    }
+
+    /// Conversion and the hash check run before any forkchoice update: a
+    /// payload whose `block_hash` does not match its contents is rejected with
+    /// `PayloadError` without the engine ever being asked to adopt it. No
+    /// forkchoice response is scripted, so a regression that commits the head
+    /// first panics in the scripted client before the assertions run.
+    #[tokio::test]
+    async fn finalize_payload_building_rejects_a_payload_whose_hash_does_not_match() {
+        let mut sequencer = test_sequencer().await;
+        let client = Arc::new(ScriptedEngineClient::new());
+        let genesis = BlockInfo { number: 0, hash: B256::repeat_byte(0x11) };
+        let mut engine =
+            Engine::new(client.clone(), ForkchoiceState::new(genesis, genesis, genesis));
+
+        let mut payload = consistent_payload(1);
+        payload.block_hash = B256::repeat_byte(0xbb);
+        client.push_get_payload(ScriptedResponse::Ok(payload));
+
+        let result = sequencer.finalize_payload_building(PayloadId::new([7; 8]), &mut engine).await;
+        assert!(
+            matches!(result, Err(SequencerError::PayloadError)),
+            "expected PayloadError, got {result:?}"
+        );
+        assert_eq!(
+            client.fork_choice_updated_calls(),
+            0,
+            "the hash check must run before the forkchoice update"
+        );
+        assert_eq!(*engine.fcs().head_block_info(), genesis);
+    }
+
+    /// A forkchoice update that fails in transport is the ambiguous case (the
+    /// EL may or may not have applied it): the error propagates as
+    /// `EngineError`, no block is returned and the mirror stays on the parent,
+    /// so the next build re-points the engine from there.
+    #[tokio::test]
+    async fn finalize_payload_building_keeps_the_head_on_forkchoice_transport_failure() {
+        let mut sequencer = test_sequencer().await;
+        let client = Arc::new(ScriptedEngineClient::new());
+        let genesis = BlockInfo { number: 0, hash: B256::repeat_byte(0x11) };
+        let mut engine =
+            Engine::new(client.clone(), ForkchoiceState::new(genesis, genesis, genesis));
+
+        client.push_get_payload(ScriptedResponse::Ok(consistent_payload(1)));
+        client.push_fork_choice_updated(ScriptedResponse::TransportFailure);
+
+        let result = sequencer.finalize_payload_building(PayloadId::new([7; 8]), &mut engine).await;
+        assert!(
+            matches!(result, Err(SequencerError::EngineError(_))),
+            "expected EngineError, got {result:?}"
+        );
+        assert_eq!(client.fork_choice_updated_calls(), 1);
+        assert_eq!(*engine.fcs().head_block_info(), genesis);
+    }
 }

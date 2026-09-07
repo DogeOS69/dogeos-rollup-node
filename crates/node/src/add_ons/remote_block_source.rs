@@ -248,7 +248,7 @@ where
                         break;
                     }
                     Some(ChainOrchestratorEvent::BlockBuildingSkipped) => {
-                        tracing::debug!(target: "scroll::remote_source", "Block building skipped (empty block)");
+                        tracing::debug!(target: "scroll::remote_source", "Block building skipped (empty payload or finalization failure; see orchestrator log)");
                         break;
                     }
                     Some(_) => {

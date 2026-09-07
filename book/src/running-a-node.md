@@ -135,6 +135,21 @@ These can be used as reliable blob sources without requiring your own beacon nod
 
 - `--rollup-node-db.path <PATH>`: Custom database path (default: `<datadir>/scroll.db`)
 
+**Genesis reconciliation at startup.** On every launch the node reconciles the block-0 rows of
+the rollup database with the configured chain's genesis hash. The static migrations seed a fixed
+genesis row (upstream Scroll's dev genesis for dev and custom chains) that is not the chain's
+own genesis, and older versions inserted the real genesis beside it without removing the seed.
+On a fresh database the seed is replaced by the chain's genesis on the first launch; on a
+database written by an older version the duplicate seed is removed the first time the new
+version starts. Both are expected one-time mutations, logged at INFO with the number of removed
+rows, not a sign of damage. A block-0 row that is neither the chain's genesis nor the migration
+seed means the database belongs to another chain, and a populated database with no block-0 row
+at all is treated as truncated or corrupt; both refuse to start with an actionable message
+instead of running on a wrong safe baseline. To recover from a mismatch, point
+`--rollup-node-db.path` at the database that belongs to the configured chain. A missing block-0
+row cannot be repaired in place, so the rollup database has to be discarded and re-derived; the
+execution-layer database is not affected.
+
 #### Network Configuration
 
 - `--network.bridge`: Enable bridging blocks from eth wire to scroll wire protocol (default: true)

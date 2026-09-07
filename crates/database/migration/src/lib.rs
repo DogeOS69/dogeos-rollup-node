@@ -11,7 +11,8 @@ mod m20251028_110719_add_l1_block_table;
 
 mod migration_info;
 pub use migration_info::{
-    MigrationInfo, ScrollDevMigrationInfo, ScrollMainnetMigrationInfo, ScrollSepoliaMigrationInfo,
+    MigrationInfo, ScrollDevMigrationInfo, ScrollMainnetMigrationInfo,
+    ScrollMainnetTestMigrationInfo, ScrollSepoliaMigrationInfo,
 };
 
 pub struct Migrator<MI>(pub std::marker::PhantomData<MI>);

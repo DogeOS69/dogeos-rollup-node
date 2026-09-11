@@ -7,10 +7,21 @@ use tracing::debug;
 /// Returns true if the [`Block`] matches the [`ScrollPayloadAttributes`]:
 ///    - all transactions match.
 ///    - timestamps are equal.
+///    - gas limits are equal when the attributes specify a gas limit.
 ///    - `prev_randaos` are equal.
 ///    - `block_data_hint` matches the block data if present.
 pub fn block_matches_attributes<B: Block>(attributes: &ScrollPayloadAttributes, block: &B) -> bool {
     let header = block.header();
+
+    if attributes.gas_limit.is_some_and(|gas_limit| gas_limit != header.gas_limit()) {
+        debug!(
+            target: "scroll::engine::driver",
+            expected = ?attributes.gas_limit,
+            got = header.gas_limit(),
+            "reorg: mismatch in gas_limit"
+        );
+        return false;
+    }
 
     let payload_transactions = &block.body().encoded_2718_transactions();
     let matching_transactions =
@@ -145,6 +156,42 @@ mod tests {
         assert!(block_matches_attributes(&attributes, &block));
 
         Ok(())
+    }
+
+    #[test]
+    fn test_payload_gas_limit_equivalence() {
+        let gas_limit = 30_000_000;
+        let block = DogeosBlock {
+            header: Header { gas_limit, timestamp: 1_700_000_001, ..Default::default() },
+            body: Default::default(),
+        };
+        let mut attributes = ScrollPayloadAttributes {
+            payload_attributes: PayloadAttributes {
+                timestamp: block.header.timestamp,
+                ..Default::default()
+            },
+            transactions: Some(vec![]),
+            no_tx_pool: true,
+            ..Default::default()
+        };
+
+        // Equal state roots cannot identify a header-only gas-limit difference.
+        for state_root in [None, Some(block.header.state_root)] {
+            attributes.block_data_hint.state_root = state_root;
+            for (gas_limit, expected_match) in [
+                (None, true),
+                (Some(gas_limit), true),
+                (Some(gas_limit - 1), false),
+                (Some(gas_limit + 1), false),
+            ] {
+                attributes.gas_limit = gas_limit;
+                assert_eq!(
+                    block_matches_attributes(&attributes, &block),
+                    expected_match,
+                    "gas_limit={gas_limit:?}, state_root={state_root:?}"
+                );
+            }
+        }
     }
 
     #[test]

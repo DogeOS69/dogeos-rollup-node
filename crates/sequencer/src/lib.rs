@@ -11,7 +11,7 @@ use std::{
 };
 
 use alloy_eips::eip2718::Encodable2718;
-use alloy_rpc_types_engine::{ExecutionData, PayloadAttributes, PayloadId};
+use alloy_rpc_types_engine::{ExecutionData, PayloadAttributes, PayloadId, PayloadStatusEnum};
 use dogeos_hardforks::DogeosHardforks;
 use dogeos_reth_engine::{BlockDataHint, ScrollPayloadAttributes};
 use dogeos_reth_primitives::{DogeosBlock, ScrollTransactionSigned};
@@ -236,15 +236,20 @@ where
                 return Err(SequencerError::PayloadError)
             }
             let result = engine.update_fcs_checked(Some(block_info), None, None).await?;
+            if let PayloadStatusEnum::Invalid { ref validation_error } =
+                result.payload_status.status
+            {
+                // A rejection of the Engine's own payload is fatal. Propagate it before
+                // L1 accounting, signing, or publication can observe the candidate.
+                return Err(SequencerError::InvalidPayload {
+                    block_info,
+                    latest_valid_hash: result.payload_status.latest_valid_hash,
+                    validation_error: validation_error.clone(),
+                });
+            }
             if !result.is_valid() {
-                // Any non-VALID verdict (INVALID, SYNCING, or the spec-illegal
-                // ACCEPTED) leaves the mirror uncommitted and the head
-                // unchanged. Proceeding would sign and gossip a block the EL
-                // has not adopted and mark its L1 messages consumed. Log the
-                // verdict and the EL's latest valid hash so INVALID (genuine
-                // divergence, with the last ancestor the EL still accepts) is
-                // distinguishable from SYNCING (a transient, e.g. after an EL
-                // restart) instead of a contentless error type.
+                // SYNCING or the spec-illegal ACCEPTED leaves the mirror uncommitted.
+                // Skip this slot without signing or consuming its L1 messages.
                 tracing::error!(
                     target: "rollup_node::sequencer",
                     ?block_info,
@@ -673,7 +678,7 @@ mod tests {
 
     /// The engine must not adopt a head it did not confirm: a SYNCING, INVALID
     /// or (spec-illegal) ACCEPTED verdict for the freshly built payload leaves
-    /// the FCS mirror untouched and surfaces as `FcuNotValid`, instead of
+    /// the FCS mirror untouched and surfaces as a typed error, instead of
     /// signing and gossiping a block the EL never applied.
     #[tokio::test]
     async fn finalize_payload_building_requires_a_valid_forkchoice_update() {
@@ -693,10 +698,12 @@ mod tests {
 
             let result =
                 sequencer.finalize_payload_building(PayloadId::new([7; 8]), &mut engine).await;
-            assert!(
-                matches!(result, Err(SequencerError::FcuNotValid)),
-                "{status:?}: expected FcuNotValid, got {result:?}"
-            );
+            match status {
+                PayloadStatusEnum::Invalid { .. } => {
+                    assert!(matches!(result, Err(SequencerError::InvalidPayload { .. })))
+                }
+                _ => assert!(matches!(result, Err(SequencerError::FcuNotValid))),
+            }
             assert_eq!(client.fork_choice_updated_calls(), 1, "{status:?}");
             assert_eq!(
                 *engine.fcs().head_block_info(),

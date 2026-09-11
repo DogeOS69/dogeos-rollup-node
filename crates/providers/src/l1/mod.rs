@@ -5,7 +5,7 @@ pub(crate) mod system_contract;
 use crate::{l1::message::L1MessageProvider, BlobProvider};
 use std::sync::Arc;
 
-use alloy_eips::eip4844::Blob;
+use alloy_eips::eip4844::{Blob, BlobTransactionValidationError};
 use alloy_primitives::B256;
 use alloy_transport::{RpcError, TransportErrorKind};
 use rollup_node_primitives::L1MessageEnvelope;
@@ -24,6 +24,9 @@ pub enum L1ProviderError {
     /// Error at the s3 provider.
     #[error("S3 provider error: {0}")]
     S3Provider(reqwest::Error),
+    /// Blob contents do not match their commitment or requested versioned hash.
+    #[error(transparent)]
+    BlobValidation(#[from] BlobTransactionValidationError),
     /// Invalid timestamp for slot.
     #[error("invalid block timestamp: genesis {0}, provided {1}")]
     InvalidBlockTimestamp(u64, u64),

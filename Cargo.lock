@@ -11410,6 +11410,7 @@ dependencies = [
  "rollup-node-primitives",
  "scroll-db",
  "serde",
+ "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tracing",

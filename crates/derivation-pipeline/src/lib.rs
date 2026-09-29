@@ -975,3 +975,6 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod reorg_finding_tests;

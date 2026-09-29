@@ -21,3 +21,6 @@ pub use engine::Engine;
 
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_utils;
+
+#[cfg(test)]
+mod fcs_finality_tests;

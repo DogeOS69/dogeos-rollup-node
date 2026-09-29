@@ -2083,3 +2083,6 @@ mod run_loop_policy_tests {
         assert!(database.get_batch_by_index(2).await.unwrap().is_none());
     }
 }
+
+#[cfg(test)]
+mod reorg_finding_tests;

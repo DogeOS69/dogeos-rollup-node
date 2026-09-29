@@ -20,19 +20,18 @@ use futures::FutureExt;
 use reth_network_api::noop::NoopNetwork;
 use reth_network_p2p::NoopFullBlockClient;
 use rollup_node_providers::{test_utils::MockL1Provider, ScrollRootProvider};
+use rollup_node_watcher::L1WatcherCommand;
 use scroll_db::test_utils::setup_test_db;
-use scroll_engine::{test_utils::PanicEngineClient, EngineError, FcsError, ForkchoiceState};
+use scroll_engine::{
+    test_utils::{PanicEngineClient, ScriptedEngineClient, ScriptedResponse},
+    EngineError, FcsError, ForkchoiceState,
+};
 use scroll_network::{NetworkHandleMessage, ScrollNetworkHandle};
 
 type TestNetwork = NoopNetwork<DogeosNetworkPrimitives>;
 type TestL1Provider = MockL1Provider<Arc<Database>>;
-type TestOrchestrator = ChainOrchestrator<
-    TestNetwork,
-    DogeosChainSpec,
-    TestL1Provider,
-    ScrollRootProvider,
-    PanicEngineClient,
->;
+type TestOrchestrator<EC = PanicEngineClient> =
+    ChainOrchestrator<TestNetwork, DogeosChainSpec, TestL1Provider, ScrollRootProvider, EC>;
 
 fn info(number: u64, tag: u8) -> BlockInfo {
     BlockInfo { number, hash: B256::repeat_byte(tag) }
@@ -65,6 +64,15 @@ async fn test_scroll_network(
     handle.into_scroll_network().await
 }
 
+/// Observation points on the orchestrator's outputs. Each one is optional.
+#[derive(Default)]
+struct Probes {
+    /// Receives every block the orchestrator announces to the network.
+    announced: Option<mpsc::UnboundedSender<(DogeosBlock, alloy_primitives::Signature)>>,
+    /// Receives every command the orchestrator sends to the L1 watcher.
+    watcher_commands: Option<mpsc::UnboundedSender<L1WatcherCommand>>,
+}
+
 /// An orchestrator with no held batch, an Engine that panics if called and the given forkchoice
 /// state and V2 message-queue start index.
 async fn orchestrator(
@@ -72,23 +80,35 @@ async fn orchestrator(
     fcs: ForkchoiceState,
     v2_start: u64,
 ) -> TestOrchestrator {
-    orchestrator_capturing(database, fcs, v2_start, None).await
+    orchestrator_probed(database, fcs, v2_start, Probes::default()).await
 }
 
-/// Like [`orchestrator`], and forwards every block the orchestrator announces to `announced`.
-async fn orchestrator_capturing(
+/// Like [`orchestrator`], and reports the outputs named in `probes`.
+async fn orchestrator_probed(
     database: Arc<Database>,
     fcs: ForkchoiceState,
     v2_start: u64,
-    announced: Option<mpsc::UnboundedSender<(DogeosBlock, alloy_primitives::Signature)>>,
+    probes: Probes,
 ) -> TestOrchestrator {
-    let engine = Engine::new(Arc::new(PanicEngineClient), fcs);
+    orchestrator_with_engine(database, fcs, v2_start, probes, Arc::new(PanicEngineClient)).await
+}
+
+/// Like [`orchestrator_probed`], with the given Engine client.
+async fn orchestrator_with_engine<EC: ScrollEngineApi + Unpin + Send + Sync + 'static>(
+    database: Arc<Database>,
+    fcs: ForkchoiceState,
+    v2_start: u64,
+    probes: Probes,
+    engine_client: Arc<EC>,
+) -> TestOrchestrator<EC> {
+    let engine = Engine::new(engine_client, fcs);
     let l2_provider =
         ProviderBuilder::<_, _, Scroll>::default().connect_mocked_client(Asserter::new());
     let l1_provider = MockL1Provider { db: database.clone(), blobs: Default::default() };
     let derivation_pipeline =
         DerivationPipeline::new(l1_provider.clone(), database.clone(), v2_start).await;
     let (watcher_command_tx, _watcher_command_rx) = mpsc::unbounded_channel();
+    let watcher_command_tx = probes.watcher_commands.unwrap_or(watcher_command_tx);
     let (_notification_tx, notification_rx) = mpsc::channel(16);
     let l1_watcher = L1WatcherHandle::new(watcher_command_tx, notification_rx);
     let block_client = Arc::new(FullBlockClient::new(
@@ -102,7 +122,7 @@ async fn orchestrator_capturing(
         block_client,
         l2_provider,
         l1_watcher,
-        test_scroll_network(announced).await,
+        test_scroll_network(probes.announced).await,
         Box::new(NoopConsensus),
         engine,
         None::<Sequencer<TestL1Provider, DogeosChainSpec>>,
@@ -177,14 +197,10 @@ async fn rg43_queue_gap_stops_l1_message_storage() {
     }
 }
 
-/// F9: L2 blocks 6..=10 of batch 2 were finalized at zero L1 depth. A synthetic L1 reorg below
-/// batch 2's commit block deletes the batch row and (by cascade) its L2 block rows, then the
-/// forkchoice update with the lowered safe block and no finalized value fails with
-/// `SafeBelowFinalized`. `handle_l1_reorg` returns that error after the database unwind, without
-/// the `L1Reorg` event, and the Engine keeps the old head, safe and finalized blocks.
-#[tokio::test]
-async fn rg46_l1_reorg_below_zero_depth_finalized_batch_leaves_db_and_engine_disagreeing() {
-    let database = Arc::new(setup_test_db().await);
+/// Batch 1 (L2 blocks 1..=5, committed and finalized at L1 block 10) and batch 2 (L2 blocks
+/// 6..=10, committed and finalized at L1 block 20). Both were finalized at zero L1 depth, so a
+/// reorg below batch 2's commit block deletes batch 2 and its L2 blocks.
+async fn seed_zero_depth_finalized_batches(database: &Database) {
     let batch = |index: u64, tag: u8, l1_block: u64| BatchCommitData {
         hash: B256::repeat_byte(tag),
         index,
@@ -207,6 +223,17 @@ async fn rg46_l1_reorg_below_zero_depth_finalized_batch_leaves_db_and_engine_dis
         .insert_blocks((6..=10).map(|n| info(n, n as u8)).collect(), (&batch_2).into())
         .await
         .unwrap();
+}
+
+/// F9: L2 blocks 6..=10 of batch 2 were finalized at zero L1 depth. A synthetic L1 reorg below
+/// batch 2's commit block deletes the batch row and (by cascade) its L2 block rows, then the
+/// forkchoice update with the lowered safe block and no finalized value fails with
+/// `SafeBelowFinalized`. `handle_l1_reorg` returns that error after the database unwind, without
+/// the `L1Reorg` event, and the Engine keeps the old head, safe and finalized blocks.
+#[tokio::test]
+async fn rg46_l1_reorg_below_zero_depth_finalized_batch_leaves_db_and_engine_disagreeing() {
+    let database = Arc::new(setup_test_db().await);
+    seed_zero_depth_finalized_batches(&database).await;
 
     let finalized = info(10, 10);
     let mut orchestrator =
@@ -258,11 +285,11 @@ async fn rg46_l1_reorg_below_zero_depth_finalized_batch_leaves_db_and_engine_dis
 async fn rg49_signed_block_requested_before_an_unwind_is_still_persisted_and_announced() {
     let database = Arc::new(setup_test_db().await);
     let (announced_tx, mut announced_rx) = mpsc::unbounded_channel();
-    let orchestrator = orchestrator_capturing(
+    let orchestrator = orchestrator_probed(
         database.clone(),
         ForkchoiceState::from_genesis(B256::ZERO),
         0,
-        Some(announced_tx),
+        Probes { announced: Some(announced_tx), ..Default::default() },
     )
     .await;
 
@@ -309,4 +336,59 @@ async fn rg49_signed_block_requested_before_an_unwind_is_still_persisted_and_ann
     let (announced, announced_signature) =
         announced_rx.try_recv().expect("the stale block was announced to the network");
     assert_eq!((announced.header.number, announced_signature), (5, signature));
+}
+
+/// RG-49: the administrative `RevertToL1Block` command is not atomic. It unwinds the database
+/// first, then updates the forkchoice state, and only then tells the L1 watcher to go back. If the
+/// forkchoice step fails, the command returns early, the database is already unwound and the
+/// watcher is never reset, so it keeps delivering from its old position and the L1 data between
+/// the revert point and that position is never fetched again.
+///
+/// The trigger is an Engine API failure on the safe-head update that follows the unwind (a
+/// transport error here; an Engine that is restarting or slow produces the same result). The
+/// unwind deletes batch 2, so the safe block moves and the Engine call is made.
+///
+/// The test asserts the invariant that holds under every fix: the database is unwound if and only
+/// if the watcher was told to revert. Today the database is unwound and the watcher is not, so the
+/// test is ignored. A fix may order the steps differently (forkchoice first, or a compensating
+/// reset), which is why the assertion compares the two effects and does not pin either one.
+#[tokio::test]
+#[ignore = "RG-49: RevertToL1Block unwinds the database, then fails at the forkchoice step and never resets the L1 watcher"]
+async fn rg49_admin_revert_unwinds_the_database_only_together_with_the_watcher_reset() {
+    let database = Arc::new(setup_test_db().await);
+    seed_zero_depth_finalized_batches(&database).await;
+
+    let engine_client = Arc::new(ScriptedEngineClient::new());
+    engine_client.push_fork_choice_updated(ScriptedResponse::TransportFailure);
+    let (watcher_commands_tx, mut watcher_commands_rx) = mpsc::unbounded_channel();
+    let finalized = info(10, 10);
+    let mut orchestrator = orchestrator_with_engine(
+        database.clone(),
+        ForkchoiceState::new(finalized, finalized, finalized),
+        0,
+        Probes { watcher_commands: Some(watcher_commands_tx), ..Default::default() },
+        engine_client.clone(),
+    )
+    .await;
+
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    let result = orchestrator
+        .handle_command(ChainOrchestratorCommand::RevertToL1Block((15, reply_tx)))
+        .await;
+
+    // The trigger: the forkchoice step fails after the database unwind.
+    assert!(matches!(result, Err(ChainOrchestratorError::EngineError(_))), "got {result:?}");
+    assert_eq!(engine_client.fork_choice_updated_calls(), 1);
+    // The caller is told nothing: the reply channel is dropped without a value.
+    assert!(reply_rx.await.is_err(), "the admin caller gets no reply");
+
+    let database_unwound = database.get_batch_by_index(2).await.unwrap().is_none();
+    let watcher_reset = matches!(
+        watcher_commands_rx.try_recv(),
+        Ok(L1WatcherCommand::ResetToBlock { block: 15, .. })
+    );
+    assert_eq!(
+        database_unwound, watcher_reset,
+        "database unwound: {database_unwound}, watcher reset: {watcher_reset}"
+    );
 }

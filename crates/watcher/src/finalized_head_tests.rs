@@ -215,7 +215,15 @@ fn deposit(block: &Header, queue_index: u64, variant: u64) -> Log {
 }
 
 fn watcher(l1: SyntheticL1) -> (L1Watcher<SyntheticL1>, L1WatcherHandle) {
-    let (notification_tx, notification_rx) = mpsc::channel(1024);
+    watcher_with_capacity(l1, 1024)
+}
+
+/// As [`watcher`], with a notification channel of `capacity`.
+fn watcher_with_capacity(
+    l1: SyntheticL1,
+    capacity: usize,
+) -> (L1Watcher<SyntheticL1>, L1WatcherHandle) {
+    let (notification_tx, notification_rx) = mpsc::channel(capacity);
     let (command_tx, command_rx) = mpsc::unbounded_channel();
     let handle = L1WatcherHandle::new(command_tx, notification_rx);
     (
@@ -634,4 +642,48 @@ async fn rg52_runtime_signer_refresh_never_reads_the_system_contract() {
         Some(L1Notification::Consensus(ConsensusUpdate::AuthorizedSigner(new_signer)))
     );
     assert_eq!(l1.state().storage_reads, 1);
+}
+
+/// RG-49 (rollup-node issue #29): a reset queued while the watcher is blocked sending on the old
+/// channel is never processed.
+///
+/// `revert_to_l1_block` queues `ResetToBlock` and then drops the old notification receiver. If the
+/// watcher is in the middle of a send on the old channel at that moment, the send fails with
+/// `SendError`. `run()` treats that as terminal and breaks out of its loop without draining the
+/// command queue, so the reset is never applied and the fresh channel is closed: no further L1
+/// notification (batches, messages, finalizations) is ever delivered.
+///
+/// The race is made deterministic with a notification channel of capacity 1 that nobody reads. The
+/// first notification fills it and the watcher then blocks on the second send.
+///
+/// The test asserts the intended behaviour, so it fails on main. Remove the `#[ignore]` when the
+/// watcher recovers onto the fresh channel.
+#[tokio::test]
+#[ignore = "RG-49 (rollup-node #29): the watcher stops on a send error after a channel swap and never processes the queued reset"]
+async fn rg49_reset_queued_while_the_watcher_is_blocked_sending_is_processed_on_the_fresh_channel()
+{
+    let f = Fixture::new();
+    let l1 = SyntheticL1::new(f.chain(), f.logs());
+    let (watcher, mut handle) = watcher_with_capacity(l1, 1);
+    let task = tokio::spawn(watcher.run());
+
+    // Let the watcher fill the channel and block on its next send.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(!task.is_finished(), "the watcher is blocked sending, not stopped");
+
+    // Reset to block 0 on a fresh channel. This drops the old receiver under the blocked send.
+    handle.revert_to_l1_block(0);
+
+    // Intended behaviour: the watcher applies the reset and delivers on the new channel.
+    let first = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        handle.l1_notification_receiver().recv(),
+    )
+    .await;
+    let finished = task.is_finished();
+    task.abort();
+    assert!(
+        matches!(first, Ok(Some(_))),
+        "the watcher must recover onto the fresh channel, got {first:?} (watcher task finished: {finished})"
+    );
 }

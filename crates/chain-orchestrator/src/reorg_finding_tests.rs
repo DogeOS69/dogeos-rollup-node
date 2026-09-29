@@ -1,12 +1,14 @@
-//! Verification tests for REORG_FINDINGS F1 (queue-gap stop) and F9 (finality at zero depth)
+//! Verification tests for `REORG_FINDINGS` F1 (queue-gap stop) and F9 (finality at zero depth)
 //! at the orchestrator level. They call the orchestrator's handlers directly with an in-memory
 //! database, a no-op network and an Engine client that panics if called. Assertions document
 //! current behaviour.
 //!
-//! Tracker rows (Reorg Issue Tracker, Private Mainnet): RG-43 (message sync stops on a queue gap)
-//! and RG-46 (L2 finalized at zero synthetic depth cannot be undone). Each test name starts with
-//! the RG key of the row it pins. Every test passes today and documents behaviour that is not
-//! fixed; when a row is fixed, change the matching assertion instead of deleting the test.
+//! Tracker rows (Reorg Issue Tracker, Private Mainnet): RG-43 (message sync stops on a queue gap),
+//! RG-46 (L2 finalized at zero synthetic depth cannot be undone) and RG-49 (a signed block that was
+//! requested before an unwind is still persisted and announced after it, rollup-node issue #30).
+//! Each test name starts with the RG key of the row it pins. Every test passes today and documents
+//! behaviour that is not fixed; when a row is fixed, change the matching assertion instead of
+//! deleting the test.
 
 use super::*;
 use alloy_primitives::{Address, U256};
@@ -36,15 +38,27 @@ fn info(number: u64, tag: u8) -> BlockInfo {
     BlockInfo { number, hash: B256::repeat_byte(tag) }
 }
 
-async fn test_scroll_network() -> ScrollNetwork<TestNetwork> {
+/// A network handle backed by a no-op network. Every block announcement is forwarded to
+/// `announced` when given.
+async fn test_scroll_network(
+    announced: Option<mpsc::UnboundedSender<(DogeosBlock, alloy_primitives::Signature)>>,
+) -> ScrollNetwork<TestNetwork> {
     let (to_manager_tx, mut from_handle_rx) = mpsc::unbounded_channel();
     let handle =
         ScrollNetworkHandle::new(to_manager_tx, NoopNetwork::<DogeosNetworkPrimitives>::new());
     tokio::spawn(async move {
         let events = EventSender::new(16);
         while let Some(message) = from_handle_rx.recv().await {
-            if let NetworkHandleMessage::EventListener(response) = message {
-                let _ = response.send(events.new_listener());
+            match message {
+                NetworkHandleMessage::EventListener(response) => {
+                    let _ = response.send(events.new_listener());
+                }
+                NetworkHandleMessage::AnnounceBlock { block, signature } => {
+                    if let Some(announced) = &announced {
+                        let _ = announced.send((block, signature));
+                    }
+                }
+                _ => {}
             }
         }
     });
@@ -57,6 +71,16 @@ async fn orchestrator(
     database: Arc<Database>,
     fcs: ForkchoiceState,
     v2_start: u64,
+) -> TestOrchestrator {
+    orchestrator_capturing(database, fcs, v2_start, None).await
+}
+
+/// Like [`orchestrator`], and forwards every block the orchestrator announces to `announced`.
+async fn orchestrator_capturing(
+    database: Arc<Database>,
+    fcs: ForkchoiceState,
+    v2_start: u64,
+    announced: Option<mpsc::UnboundedSender<(DogeosBlock, alloy_primitives::Signature)>>,
 ) -> TestOrchestrator {
     let engine = Engine::new(Arc::new(PanicEngineClient), fcs);
     let l2_provider =
@@ -78,7 +102,7 @@ async fn orchestrator(
         block_client,
         l2_provider,
         l1_watcher,
-        test_scroll_network().await,
+        test_scroll_network(announced).await,
         Box::new(NoopConsensus),
         engine,
         None::<Sequencer<TestL1Provider, DogeosChainSpec>>,
@@ -212,4 +236,77 @@ async fn rg46_l1_reorg_below_zero_depth_finalized_batch_leaves_db_and_engine_dis
     // The run loop only logs the error; no event is emitted.
     orchestrator.handle_outcome(result);
     assert!(events.next().now_or_never().is_none(), "no L1Reorg event");
+}
+
+/// RG-49 (rollup-node issue #30): block signing is asynchronous, and the orchestrator has no way to
+/// tell that an unwind happened between the sign request and the signed result.
+///
+/// The chain has L2 blocks 1..=5. Block 4 executed the L1 message from L1 block 5, and block 5 is
+/// waiting for its signature. An L1 reorg to block 3 deletes the message, so the database head
+/// moves back to L2 block 3 and block 5 belongs to a chain that no longer exists. The signed result
+/// for block 5 then arrives. `handle_signer_event` persists it as the new head, stores its
+/// signature and announces the block to the network.
+///
+/// The unwind is applied through `Database::unwind`, the operation `handle_l1_reorg` runs first.
+/// The rest of `handle_l1_reorg` (L2 client lookup and forkchoice update) does not touch the signer
+/// path, so it is left out.
+///
+/// Passes today and documents the defect. The fix in the issue tags each sign request with an
+/// unwind generation and drops results from an older generation. Once the signer API carries that
+/// tag, change the assertions to expect the head to stay at 3, no signature and no announcement.
+#[tokio::test]
+async fn rg49_signed_block_requested_before_an_unwind_is_still_persisted_and_announced() {
+    let database = Arc::new(setup_test_db().await);
+    let (announced_tx, mut announced_rx) = mpsc::unbounded_channel();
+    let orchestrator = orchestrator_capturing(
+        database.clone(),
+        ForkchoiceState::from_genesis(B256::ZERO),
+        0,
+        Some(announced_tx),
+    )
+    .await;
+
+    // Block 4 executed deposit 0 from L1 block 5. The head marker is at block 4 and block 5 is in
+    // flight for signing.
+    orchestrator.handle_l1_message(deposit(0), info(5, 5)).await.unwrap();
+    database
+        .update_l1_messages_from_l2_blocks(vec![L2BlockInfoWithL1Messages {
+            block_info: info(4, 4),
+            l1_messages: vec![deposit(0).tx_hash()],
+        }])
+        .await
+        .unwrap();
+    database.set_l2_head_block_number(4).await.unwrap();
+
+    // The unwind removes deposit 0, so the head falls back to the block before it.
+    let unwind = database.unwind(3).await.unwrap();
+    assert_eq!(unwind.l2_head_block_number, Some(3));
+    assert_eq!(database.get_l2_head_block_number().await.unwrap(), 3);
+
+    // The signer now delivers the result requested before the unwind.
+    let block = DogeosBlock {
+        header: alloy_consensus::Header { number: 5, ..Default::default() },
+        ..Default::default()
+    };
+    let hash = block.hash_slow();
+    let signature = alloy_primitives::Signature::new(U256::from(1), U256::from(2), false);
+    let event = orchestrator
+        .handle_signer_event(SignerEvent::SignedBlock { block: block.clone(), signature })
+        .await
+        .unwrap();
+
+    // Current behaviour: the stale result is accepted in full.
+    assert!(
+        matches!(event, Some(ChainOrchestratorEvent::SignedBlock { .. })),
+        "the stale signed block is turned into a SignedBlock event, got {event:?}"
+    );
+    assert_eq!(
+        database.get_l2_head_block_number().await.unwrap(),
+        5,
+        "the head marker jumps from the unwound head 3 to the stale block 5"
+    );
+    assert_eq!(database.get_signature(hash).await.unwrap(), Some(signature));
+    let (announced, announced_signature) =
+        announced_rx.try_recv().expect("the stale block was announced to the network");
+    assert_eq!((announced.header.number, announced_signature), (5, signature));
 }

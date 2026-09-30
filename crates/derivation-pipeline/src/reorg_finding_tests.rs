@@ -1,4 +1,4 @@
-//! Verification test for the reorg findings F1 (fullnode halt): a derivation that fails because the
+//! Regression test for a fullnode halt after a queue gap: a derivation that fails because the
 //! node lacks the batch's L1 messages is retried without limit, and after an L1 unwind deletes
 //! the batch row the same request keeps failing (`UnknownBatch`); the pipeline has no reset, so
 //! it never yields and never becomes empty. Assertions document current behaviour.
@@ -61,9 +61,10 @@ async fn rg43_missing_messages_then_unwind_leave_the_pipeline_stuck() -> eyre::R
     // The worker only logs the error it retries on, so derive the same batch directly to show the
     // cause: the two messages are missing.
     let cache = PreFetchCache::new(db.clone(), 100, Duration::from_secs(60), 10).await?;
-    let err = derive(batch_data.clone(), BatchStatus::Consolidated, provider, cache, u64::MAX)
-        .await
-        .expect_err("the batch cannot be derived without messages 33 and 34");
+    let err =
+        derive(batch_data.clone(), BatchStatus::Consolidated, provider.clone(), cache, u64::MAX)
+            .await
+            .expect_err("the batch cannot be derived without messages 33 and 34");
     assert!(
         matches!(err, DerivationPipelineError::InvalidL1MessagesCount { expected: 2, got: 0 }),
         "got {err:?}"
@@ -73,9 +74,25 @@ async fn rg43_missing_messages_then_unwind_leave_the_pipeline_stuck() -> eyre::R
     db.unwind(batch_data.block_number - 1).await?;
     assert!(db.get_batch_by_index(12).await?.is_none());
 
-    // Even if the messages now arrive, the queued request fails with UnknownBatch forever.
+    // Even if the messages now arrive, the queued request fails with UnknownBatch forever. The
+    // worker only logs that error, so run the same request through a worker's derivation step to
+    // show the cause.
     db.insert_l1_message(message(33)).await?;
     db.insert_l1_message(message(34)).await?;
+    let (_batch_tx, batch_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (result_tx, _result_rx) = tokio::sync::mpsc::unbounded_channel();
+    let worker =
+        DerivationPipelineWorker::new(provider.clone(), db.clone(), u64::MAX, batch_rx, result_tx)
+            .await?;
+    let request = Arc::new(BatchDerivationRequest {
+        batch_info: BatchInfo { index: 12, hash: batch_data.hash },
+        target_status: BatchStatus::Consolidated,
+    });
+    let (_, err) = worker
+        .derivation_future(request)
+        .await
+        .expect_err("the batch row is gone, so the request cannot be derived");
+    assert!(matches!(err, DerivationPipelineError::UnknownBatch(12)), "got {err:?}");
     assert!(tokio::time::timeout(Duration::from_secs(2), pipeline.next()).await.is_err());
     assert_eq!(pipeline.len(), 1, "the pipeline never becomes empty");
     assert!(!pipeline.is_empty());

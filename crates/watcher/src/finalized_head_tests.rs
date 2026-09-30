@@ -4,8 +4,7 @@
 //! the synthetic head (`crates/l1_interface/src/rpc/eth_api.rs`:
 //! `Latest | Safe | Pending | Finalized => ctx.visible_block_head`). These tests drive
 //! [`L1Watcher::step`] one poll at a time against such a provider and pin what the watcher
-//! reports today. They verify the Lean reorg model's findings F1 and F13
-//! (`REORG_RUST_TEST_CASES.md` cases 1(a), 1(b), 1(d), 19, 20 and 32, in dogeos-core).
+//! reports today.
 //!
 //! Tracker rows (Reorg Issue Tracker, Private Mainnet): RG-41 (finalized = head misleads the
 //! watcher's replacement detection), RG-45 (the finalized/latest race), RG-52 (the runtime
@@ -13,7 +12,14 @@
 //! lost, rollup-node #29). Each test name starts with the RG key of the row it pins.
 //!
 //! The RG-41, RG-45 and RG-52 tests pass today and document behaviour that is not fixed; when a
-//! row is fixed, change the matching assertion instead of deleting the test. The RG-49 test is
+//! row is fixed in the watcher, change the matching assertion instead of deleting the test.
+//!
+//! The RG-41 tests document the watcher under a CONDITION: the provider always serves
+//! `finalized` = head. The fix accepted for RG-41 is a lagging finalized tag in dogeos-core's
+//! `l1_interface`, which removes the condition rather than changing the watcher, so these tests
+//! stay green after that fix (in particular
+//! `rg41_restart_from_finalized_block_number_does_not_detect_replacement`). They flip only if the
+//! watcher itself changes how it detects replacements. The RG-49 test is
 //! `#[ignore]`: it asserts the intended behaviour, fails today and carries the reason in the
 //! ignore message; run it with `--ignored`. All tests run with and without the `test-utils`
 //! feature.
@@ -267,6 +273,13 @@ fn drain(handle: &mut L1WatcherHandle) -> Vec<L1Notification> {
     out
 }
 
+/// Like [`drain`], without the signer-update (`Consensus`) notifications. Tests that compare a
+/// whole notification list use this, so they keep pinning the chain events once the RG-52 signer
+/// refresh starts sending `Consensus` notifications.
+fn drain_chain(handle: &mut L1WatcherHandle) -> Vec<L1Notification> {
+    drain(handle).into_iter().filter(|n| !matches!(n, L1Notification::Consensus(_))).collect()
+}
+
 /// `(queue index, L1 block number, deposit amount)` of every `L1Message` notification.
 fn messages(notifications: &[L1Notification]) -> Vec<(u64, u64, U256)> {
     notifications
@@ -325,7 +338,7 @@ impl Fixture {
         let l1 = SyntheticL1::new(self.chain(), self.logs());
         let (mut w, mut h) = watcher(l1.clone());
         w.step().await.expect("first poll");
-        let first = drain(&mut h);
+        let first = drain_chain(&mut h);
         // finalized == latest: the Finalized(3) notification precedes the logs of block 3.
         assert_eq!(first.first(), Some(&L1Notification::Finalized(3)));
         assert_eq!(first.get(1), Some(&L1Notification::NewBlock((&self.b3).into())));
@@ -337,7 +350,7 @@ impl Fixture {
     }
 }
 
-/// Case 1(a): blocks 2 and 3 are replaced at the same height (fork point: block 1). The watcher
+/// Blocks 2 and 3 are replaced at the same height (fork point: block 1). The watcher
 /// reports `Reorg(2)` (previous head - 1), so only block 3's message is unwound; block 2' is never
 /// read and its replacement message (queue index 1, new amount) is never delivered.
 #[tokio::test]
@@ -353,7 +366,7 @@ async fn rg41_two_block_replacement_reports_head_minus_one() {
     );
 
     w.step().await.expect("second poll");
-    let second = drain(&mut h);
+    let second = drain_chain(&mut h);
 
     assert_eq!(reorgs(&second), vec![2], "fork point is block 1, the watcher unwinds from 2");
     assert_eq!(
@@ -381,9 +394,9 @@ async fn rg41_two_block_replacement_reports_head_minus_one() {
     assert!(messages(&second).iter().all(|(queue_index, _, _)| *queue_index != 1));
 }
 
-/// Control for case 1(a): the same replacement against an L1 whose finalized block lags the head
-/// by two blocks is reported at the fork point (`Reorg(1)`), and both replaced blocks are re-read.
-/// The head-minus-one behaviour above comes from finalized == latest.
+/// Control for the two-block replacement: the same replacement against an L1 whose finalized block
+/// lags the head by two blocks is reported at the fork point (`Reorg(1)`), and both replaced blocks
+/// are re-read. The head-minus-one behaviour above comes from finalized == latest.
 #[tokio::test]
 async fn rg41_control_two_block_replacement_with_finality_lag_reports_fork_point() {
     let f = Fixture::new();
@@ -407,7 +420,7 @@ async fn rg41_control_two_block_replacement_with_finality_lag_reports_fork_point
     assert_eq!(messages(&second), vec![(1, 2, amount(1)), (2, 3, amount(1))]);
 }
 
-/// Case 1(b): the watcher polls while the served head is rolled back to block 1, then sees the
+/// The watcher polls while the served head is rolled back to block 1, then sees the
 /// replacement blocks as a plain extension. The rollback poll reports `Reorg(2)` (previous head -
 /// 1), which keeps block 2's message although block 2 is no longer served; the replacement for
 /// queue index 1 is then delivered for block 2' and, in the database, dropped by
@@ -420,7 +433,7 @@ async fn rg41_rollback_poll_then_regrowth_keeps_block_two_message() {
     // Rollback: the served head drops to B1.
     l1.serve(vec![f.b0.clone(), f.b1.clone()], vec![]);
     w.step().await.expect("rollback poll");
-    let rollback = drain(&mut h);
+    let rollback = drain_chain(&mut h);
     assert_eq!(
         rollback,
         vec![
@@ -447,7 +460,7 @@ async fn rg41_rollback_poll_then_regrowth_keeps_block_two_message() {
     assert_eq!(messages(&regrow_2), vec![(2, 3, amount(1))]);
 }
 
-/// Case 19: the replacement chain is already longer than the old head at
+/// The replacement chain is already longer than the old head at
 /// the next poll. `handle_finalized_block` clears the stored head (it is below the new finalized
 /// block) and the new head is taken as a fresh start: no `Reorg` at all, and blocks 2' and 3'
 /// are never read.
@@ -473,7 +486,7 @@ async fn rg41_longer_replacement_reports_no_reorg() {
     assert_eq!(second.last(), Some(&L1Notification::Processed(4)));
 }
 
-/// Case 1(d), fresh genesis: `step` reads `finalized` from the old chain (head B3) and `latest`
+/// Fresh genesis: `step` reads `finalized` from the old chain (head B3) and `latest`
 /// from the rolled-back chain (head B2'). `fetch_unfinalized_chain` walks down by number looking
 /// for a block that is, or is a child of, the old finalized hash; none exists, and at block 0 the
 /// walk asks for block `0.saturating_sub(1) == 0` again. The provider here stops serving block 0
@@ -514,10 +527,10 @@ async fn rg45_finalized_latest_race_walk_never_terminates_on_fresh_genesis() {
     assert_eq!(s.by_number_lookups - lookups_before, GENESIS_BUDGET + 2 + finalized_reread);
     assert_eq!(s.by_hash_lookups, 0, "the walk looks blocks up by number only");
     drop(s);
-    assert!(drain(&mut h).is_empty(), "no Reorg, NewBlock or log notification was sent");
+    assert!(drain_chain(&mut h).is_empty(), "no Reorg, NewBlock or log notification was sent");
 }
 
-/// Case 1(d), history that starts above genesis: the same race fails the step with
+/// History that starts above genesis: the same race fails the step with
 /// `MissingBlock`, and the next poll adopts the new chain with no `Reorg` at all: the old
 /// messages of blocks 2 and 3 are never unwound and block 2' is never read.
 #[tokio::test]
@@ -538,13 +551,13 @@ async fn rg45_finalized_latest_race_on_truncated_history_skips_the_reorg() {
         matches!(err, L1WatcherError::EthRequest(EthRequestError::MissingBlock(0))),
         "unexpected error {err:?}"
     );
-    assert!(drain(&mut h).is_empty());
+    assert!(drain_chain(&mut h).is_empty());
     // handle_finalized_block drained the old head before the walk failed.
     assert!(w.unfinalized_blocks.is_empty());
 
     // Next poll: no race; the watcher takes B2' as a fresh start.
     w.step().await.expect("next poll");
-    let next = drain(&mut h);
+    let next = drain_chain(&mut h);
     assert_eq!(
         next,
         vec![L1Notification::NewBlock((&b2r).into()), L1Notification::Processed(2)],
@@ -552,7 +565,7 @@ async fn rg45_finalized_latest_race_on_truncated_history_skips_the_reorg() {
     );
 }
 
-/// Case 20: a restart with finalized = head starts from the block of the highest stored message
+/// A restart with finalized = head starts from the block of the highest stored message
 /// or batch (`L1BlockStartupInfo::FinalizedBlockNumber`, because the `l1_block` table stays empty)
 /// and runs no unsafe-block check, so a replacement below that block is never seen.
 #[tokio::test]
@@ -602,7 +615,7 @@ async fn rg41_restart_from_finalized_block_number_does_not_detect_replacement() 
     drop(handle);
 }
 
-/// Case 32 (F13): the runtime signer refresh never fires. `handle_latest_block` sets
+/// The runtime signer refresh never fires. `handle_latest_block` sets
 /// `l1_state.head = latest.number` before `handle_system_contract_update` compares
 /// `latest.number != l1_state.head`, so the system contract is never read.
 #[tokio::test]

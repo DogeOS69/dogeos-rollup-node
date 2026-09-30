@@ -1,12 +1,20 @@
-//! Verification tests for the reorg findings F1 (database side; `REORG_RUST_TEST_CASES.md` cases 1,
-//! 18 and 20). They pin how the database reacts to what the L1 watcher reports when the synthetic
-//! L1's finalized block is its head. Assertions document current behaviour.
+//! Database regression tests for the reorg tracker rows below. They pin how the database reacts
+//! to what the L1 watcher reports when the synthetic L1's finalized block is its head.
 //!
 //! Tracker rows (Reorg Issue Tracker, Private Mainnet): RG-41 (a lower replaced message is kept;
 //! the `l1_block` table stays empty) and RG-44 (two batch rows for one index; the at-or-above
 //! cursor query that the RG-43 gap check relies on). Each test name starts with the RG key of the
-//! row it pins. Every test passes today and documents behaviour that is not fixed; when a row is
-//! fixed, change the matching assertion instead of deleting the test.
+//! row it pins. Every test passes today.
+//!
+//! Some tests document behaviour that a fix in this crate would change: when that happens, change
+//! the matching assertion instead of deleting the test. Others document the database under a
+//! CONDITION set up by the test and will not flip when the row is fixed elsewhere:
+//! - `rg41_head_minus_one_unwind_keeps_lower_replaced_message` hard-codes the watcher's
+//!   `unwind(2)`. The RG-41 fix (a lagging finalized tag in dogeos-core's `l1_interface`) changes
+//!   what the watcher reports, not this database behaviour.
+//! - `rg44_gap_check_query_is_at_or_above` pins the query itself. The fix belongs in the
+//!   orchestrator's gap check (check that the returned message's queue index equals `q - 1`), which
+//!   leaves this query unchanged.
 
 use crate::{
     models,
@@ -49,7 +57,7 @@ fn batch(index: u64, tag: u8, l1_block: u64) -> BatchCommitData {
     }
 }
 
-/// F1: `Reorg(head - 1)` unwinds only the head block's messages. A replacement message for a
+/// `Reorg(head - 1)` unwinds only the head block's messages. A replacement message for a
 /// lower replaced block (same queue index, new content) is then dropped by `insert_l1_message`
 /// (`on_conflict_do_nothing`), so the old content stays.
 #[tokio::test]
@@ -100,7 +108,7 @@ async fn rg44_gap_check_query_is_at_or_above() {
     assert_eq!(found[0].transaction.queue_index, 5);
 }
 
-/// Case 18: the batch table's `index` is not unique (only `hash` is). A replacement batch with
+/// The batch table's `index` is not unique (only `hash` is). A replacement batch with
 /// the same index and a new hash is inserted as a second row; `get_batch_by_index` (no ORDER BY)
 /// returns one of them and `finalize_batches_up_to_index` finalizes both. Which row is returned
 /// is up to the query planner, so the test only asserts that it is one of the two.
@@ -133,7 +141,7 @@ async fn rg44_replaced_batch_with_same_index_keeps_both_rows() {
     }
 }
 
-/// Case 20: with finalized = head, `insert_l1_block_info` skips every block (they are all at or
+/// With finalized = head, `insert_l1_block_info` skips every block (they are all at or
 /// below the finalized block), so the `l1_block` table stays empty and a restart starts from the
 /// block of the highest stored message or batch, with no unsafe-block reorg check.
 #[tokio::test]

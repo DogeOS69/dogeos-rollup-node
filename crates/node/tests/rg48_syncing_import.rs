@@ -15,6 +15,12 @@
 //! - The trigger in every test is the production `import_block` command (the entry point used by
 //!   `RemoteBlockSourceAddOn`), fed a real sequencer block whose parent the receiving Engine has
 //!   not seen. The gap itself is arranged by the test (gossip is paused on the sequencer).
+//!
+//! Run these tests with nextest, as CI does (`cargo nextest run -E 'kind(test) and not
+//! test(docker)'`), or with `--test-threads=1`. `TestFixture` names each node's data directory
+//! after the process id, the node index and the current time in nanoseconds, so two tests running
+//! in the same process can pick the same directory; plain `cargo test` then fails on macOS with an
+//! MDBX "Resource temporarily unavailable" error.
 
 use alloy_primitives::{Address, Signature, U256};
 use alloy_rpc_types_engine::PayloadStatusEnum;
@@ -210,6 +216,10 @@ async fn rg48_synced_follower_import_on_syncing_fcu_advances_mirror_but_not_data
         );
         let engine_later = engine_latest_after(&fixture, 1, 3, Duration::from_secs(15)).await?;
         println!("RG[engine-self-heal]: engine_latest after <=15s = {engine_later} (3 means Reth downloaded block 2 from its peer and canonicalized the FCU target on its own)");
+        assert_eq!(
+            engine_later, 3,
+            "Reth downloads block 2 from its peer and adopts the forkchoice target on its own"
+        );
         // Whatever the Engine did, the rollup-node database is unchanged.
         assert_eq!(follower_db.get_l2_head_block_number().await?, 1);
         assert_eq!(
@@ -263,17 +273,18 @@ async fn rg48_synced_follower_import_on_syncing_fcu_advances_mirror_but_not_data
             "RG[after-block-4]: mirror_head={mirror_after_4} db_head={db_head_after_4} engine_latest={engine_after_4} q1_mapping={q1_after_4:?}"
         );
         assert_eq!(mirror_after_4, 4);
-        if matches!(gossip_status, PayloadStatusEnum::Valid) {
-            // The head marker catches up as a number, but the mapping skipped at block 3 is never
-            // rewritten by a later import: a durable mapping gap on a node that reports healthy.
-            assert_eq!(db_head_after_4, 4);
-            assert_eq!(engine_after_4, 4);
-            assert_eq!(fixture.get_block(1).await?.header.hash, block_4.hash_slow());
-            assert_eq!(q1_after_4, None, "later VALID import does not repair the skipped mapping");
-        } else {
-            assert_eq!(db_head_after_4, 1);
-            assert_eq!(q1_after_4, None);
-        }
+        // By now Reth has fetched block 2 from its peer on its own, so block 4 connects and is
+        // VALID. The head marker catches up as a number, but the mapping skipped at block 3 is not
+        // rewritten by a later import: the mapping gap stays until the node restarts (below), on a
+        // node that reports healthy.
+        assert!(
+            matches!(gossip_status, PayloadStatusEnum::Valid),
+            "expected block 4 to be VALID once the Engine caught up, got {gossip_status:?}"
+        );
+        assert_eq!(db_head_after_4, 4);
+        assert_eq!(engine_after_4, 4);
+        assert_eq!(fixture.get_block(1).await?.header.hash, block_4.hash_slow());
+        assert_eq!(q1_after_4, None, "later VALID import does not repair the skipped mapping");
         drop(follower_db);
 
         // Restart: startup walks the persisted head down to a block the Engine has and
@@ -302,11 +313,8 @@ async fn rg48_synced_follower_import_on_syncing_fcu_advances_mirror_but_not_data
         );
         assert_eq!(mirror_restart, db_head_restart);
         assert_eq!(engine_restart, db_head_restart);
-        if engine_restart >= 3 {
-            assert_eq!(q1_restart, Some(3), "restart consolidation repairs the skipped mapping");
-        } else {
-            assert_eq!(q1_restart, None);
-        }
+        assert_eq!(engine_restart, 4, "the Engine kept block 4 across the restart");
+        assert_eq!(q1_restart, Some(3), "restart consolidation repairs the skipped mapping");
         assert_eq!(block_2.header.number, 2);
 
         Ok::<_, eyre::Report>(())
@@ -480,9 +488,15 @@ async fn rg48_gossip_path_closes_gap_and_engine_confirms_head() -> eyre::Result<
 /// CONTROLLED SETUP for the second part: the same production `import_block` command moves the
 /// sequencer-capable node's mirror to a head its Engine has not adopted (real `SYNCING` verdict,
 /// gap arranged by the test). The next slot then shows what an unconfirmed mirror head does to
-/// sequencing: `build_payload` gets `SYNCING` with no payload id and the slot fails with
-/// `MissingPayloadId` while status still reports Synced. The sequencer does not sign anything on
-/// the unconfirmed head; it stalls.
+/// sequencing: no block is sequenced or skipped within 8 seconds while status still reports
+/// Synced. The sequencer does not sign anything on the unconfirmed head; it stalls. The stall is
+/// inferred from the absence of a `BlockSequenced` or `BlockBuildingSkipped` event: the cause
+/// (`build_payload` gets `SYNCING` with no payload id, so the slot fails with `MissingPayloadId`)
+/// is only logged and is not asserted here.
+///
+/// After the restart the node resumes from the head its Engine has; that head varies between runs
+/// (block 1 or 2), so the test only checks that mirror and Engine agree and that sequencing
+/// resumes.
 #[tokio::test]
 async fn rg49_sequencer_ordinary_fcu_is_valid_and_unconfirmed_mirror_head_stalls_building(
 ) -> eyre::Result<()> {

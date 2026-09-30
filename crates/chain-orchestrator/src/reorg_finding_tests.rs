@@ -1,7 +1,6 @@
-//! Verification tests for the reorg findings F1 (queue-gap stop) and F9 (finality at zero depth)
-//! at the orchestrator level, plus the orchestrator parts of RG-49. They call the orchestrator's
-//! handlers directly with an in-memory database, a no-op network and an Engine client that either
-//! panics if called or answers from a script.
+//! Orchestrator-level regression tests for the reorg tracker rows below. They call the
+//! orchestrator's handlers directly with an in-memory database, a no-op network and an Engine
+//! client that either panics if called or answers from a script.
 //!
 //! Tracker rows (Reorg Issue Tracker, Private Mainnet): RG-43 (message sync stops on a queue gap),
 //! RG-46 (L2 finalized at zero synthetic depth cannot be undone) and RG-49 (unwind robustness:
@@ -159,7 +158,7 @@ async fn stored_queue_indices(database: &Database) -> Vec<u64> {
         .collect()
 }
 
-/// F1 (`added_deposit_stops_message_sync`): a replacement adds a deposit at or below the unwind
+/// RG-43: a replacement adds a deposit at or below the unwind
 /// point, the watcher never reads it, and the next message's queue index leaves a gap. The
 /// orchestrator rejects that message and every later one (`L1MessageQueueGap` when the index is
 /// below the V2 queue start, `L1MessageNotFound` from the queue-hash computation above it), so
@@ -228,13 +227,16 @@ async fn seed_two_committed_batches(database: &Database) {
         .unwrap();
 }
 
-/// F9: L2 blocks 6..=10 of batch 2 were finalized at zero L1 depth. A synthetic L1 reorg below
-/// batch 2's commit block deletes the batch row and (by cascade) its L2 block rows, then the
+/// RG-46: the Engine's finalized block is L2 block 10, the last block of batch 2 (in production
+/// this happens when batch 2 is finalized at zero synthetic L1 depth; here the batches are only
+/// committed and the Engine's finalized block is set directly, which gives the same state for this
+/// handler). An L1 reorg below batch 2's commit block deletes the batch row and (by cascade) its L2
+/// block rows, then the
 /// forkchoice update with the lowered safe block and no finalized value fails with
 /// `SafeBelowFinalized`. `handle_l1_reorg` returns that error after the database unwind, without
 /// the `L1Reorg` event, and the Engine keeps the old head, safe and finalized blocks.
 #[tokio::test]
-async fn rg46_l1_reorg_below_zero_depth_finalized_batch_leaves_db_and_engine_disagreeing() {
+async fn rg46_l1_reorg_below_the_engine_finalized_block_leaves_db_and_engine_disagreeing() {
     let database = Arc::new(setup_test_db().await);
     seed_two_committed_batches(&database).await;
 
@@ -354,7 +356,8 @@ async fn rg49_signed_block_requested_before_an_unwind_is_still_persisted_and_ann
 /// The test asserts the invariant that holds under every fix: the database is unwound if and only
 /// if the watcher was told to revert. Today the database is unwound and the watcher is not, so the
 /// test is ignored. A fix may order the steps differently (forkchoice first, or a compensating
-/// reset), which is why the assertion compares the two effects and does not pin either one.
+/// reset), retry the forkchoice update, return the error or reply `false`, which is why the test
+/// checks neither the result nor the reply, and compares the two effects without pinning either.
 #[tokio::test]
 #[ignore = "RG-49: RevertToL1Block unwinds the database, then fails at the forkchoice step and never resets the L1 watcher"]
 async fn rg49_admin_revert_unwinds_the_database_only_together_with_the_watcher_reset() {
@@ -362,7 +365,11 @@ async fn rg49_admin_revert_unwinds_the_database_only_together_with_the_watcher_r
     seed_two_committed_batches(&database).await;
 
     let engine_client = Arc::new(ScriptedEngineClient::new());
-    engine_client.push_fork_choice_updated(ScriptedResponse::TransportFailure);
+    // Enough failures for a fix that retries a bounded number of times (the scripted client panics
+    // once its queue is empty).
+    for _ in 0..8 {
+        engine_client.push_fork_choice_updated(ScriptedResponse::TransportFailure);
+    }
     let (watcher_commands_tx, mut watcher_commands_rx) = mpsc::unbounded_channel();
     let finalized = info(10, 10);
     let mut orchestrator = orchestrator_with_engine(
@@ -374,16 +381,16 @@ async fn rg49_admin_revert_unwinds_the_database_only_together_with_the_watcher_r
     )
     .await;
 
-    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
     let result = orchestrator
         .handle_command(ChainOrchestratorCommand::RevertToL1Block((15, reply_tx)))
         .await;
 
-    // The trigger: the forkchoice step fails after the database unwind.
-    assert!(matches!(result, Err(ChainOrchestratorError::EngineError(_))), "got {result:?}");
-    assert_eq!(engine_client.fork_choice_updated_calls(), 1);
-    // The caller is told nothing: the reply channel is dropped without a value.
-    assert!(reply_rx.await.is_err(), "the admin caller gets no reply");
+    // The trigger: the forkchoice step was attempted (and failed).
+    assert!(
+        engine_client.fork_choice_updated_calls() >= 1,
+        "the forkchoice update reached the Engine, result: {result:?}"
+    );
 
     let database_unwound = database.get_batch_by_index(2).await.unwrap().is_none();
     let watcher_reset = matches!(
@@ -444,7 +451,7 @@ async fn rg49_l1_reorg_reports_the_new_safe_block_only_if_the_engine_accepted_it
 
     let result = orchestrator.handle_l1_reorg(15).await;
 
-    assert_eq!(engine_client.fork_choice_updated_calls(), 1, "the update reached the Engine");
+    assert!(engine_client.fork_choice_updated_calls() >= 1, "the update reached the Engine");
     if let Ok(Some(ChainOrchestratorEvent::L1Reorg { l2_safe_block_info, .. })) = &result {
         assert_eq!(
             *l2_safe_block_info,
@@ -477,9 +484,8 @@ async fn rg49_l1_finalized_reports_the_new_finalized_block_only_if_the_engine_ac
 
     let result = orchestrator.handle_l1_finalized(10).await;
 
-    assert_eq!(
-        engine_client.fork_choice_updated_calls(),
-        1,
+    assert!(
+        engine_client.fork_choice_updated_calls() >= 1,
         "the update reached the Engine, result: {result:?}"
     );
     if let Ok(Some(ChainOrchestratorEvent::L1BlockFinalized(..))) = &result {
@@ -513,7 +519,7 @@ async fn rg49_batch_revert_reports_the_new_safe_head_only_if_the_engine_accepted
 
     let result = orchestrator.handle_batch_revert(2, 2, info(30, 30)).await;
 
-    assert_eq!(engine_client.fork_choice_updated_calls(), 1, "the update reached the Engine");
+    assert!(engine_client.fork_choice_updated_calls() >= 1, "the update reached the Engine");
     if let Ok(Some(ChainOrchestratorEvent::BatchReverted { safe_head, .. })) = &result {
         assert_eq!(
             safe_head,
@@ -545,7 +551,7 @@ async fn rg49_admin_revert_replies_success_only_if_the_engine_accepted_the_new_s
         .handle_command(ChainOrchestratorCommand::RevertToL1Block((15, reply_tx)))
         .await;
 
-    assert_eq!(engine_client.fork_choice_updated_calls(), 1, "the update reached the Engine");
+    assert!(engine_client.fork_choice_updated_calls() >= 1, "the update reached the Engine");
     if result.is_ok() && matches!(reply_rx.await, Ok(true)) {
         assert_eq!(
             orchestrator.engine.fcs().safe_block_info().number,
@@ -577,7 +583,7 @@ async fn rg49_update_fcs_head_replies_success_only_if_the_engine_accepted_the_he
         .handle_command(ChainOrchestratorCommand::UpdateFcsHead((info(8, 8), reply_tx)))
         .await;
 
-    assert_eq!(engine_client.fork_choice_updated_calls(), 1, "the update reached the Engine");
+    assert!(engine_client.fork_choice_updated_calls() >= 1, "the update reached the Engine");
     if result.is_ok() && reply_rx.await.is_ok() {
         assert_eq!(
             orchestrator.engine.fcs().head_block_info().number,

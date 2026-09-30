@@ -1,9 +1,9 @@
-//! Verification tests for the reorg finding F9 (`REORG_RUST_TEST_CASES.md` case 17, engine level):
-//! once L2 blocks are finalized, the forkchoice state cannot be moved below them. The L1 reorg
-//! path (`ChainOrchestrator::handle_l1_reorg`) calls `update_fcs(head, safe, None)` after the
-//! database unwind lowers the safe block; with the finalized block above that safe block the
-//! update fails with `SafeBelowFinalized`, and passing the lower finalized block explicitly fails
-//! with `FinalizedBlockNumberNotIncreasing`. Assertions document current behaviour.
+//! Engine-level regression tests for RG-46: once L2 blocks are finalized, the forkchoice state
+//! cannot be moved below them. The L1 reorg path (`ChainOrchestrator::handle_l1_reorg`) calls
+//! `update_fcs(head, safe, None)` after the database unwind lowers the safe block; with the
+//! finalized block above that safe block the update fails with `SafeBelowFinalized`, and passing
+//! the lower finalized block explicitly fails with `FinalizedBlockNumberNotIncreasing`. Assertions
+//! document current behaviour.
 //!
 //! Tracker rows (Reorg Issue Tracker, Private Mainnet): RG-46 (L2 finalized at zero synthetic depth
 //! cannot be undone). Each test name starts with the RG key of the row it pins. Every test passes
@@ -21,8 +21,8 @@ fn info(number: u64, tag: u8) -> BlockInfo {
 
 #[test]
 fn rg46_finalized_blocks_cannot_be_unfinalized_by_the_reorg_path() {
-    // L2 blocks up to 10 were finalized at zero L1 depth (their batch's FinalizeBatch sat in the
-    // synthetic head block).
+    // L2 blocks up to 10 are finalized (in production this happens when their batch is finalized
+    // at zero synthetic L1 depth).
     let finalized = info(10, 0x0a);
     let mut fcs = ForkchoiceState::new(finalized, finalized, finalized);
 

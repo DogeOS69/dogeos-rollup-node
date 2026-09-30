@@ -3,6 +3,11 @@
 //! the batch row the same request keeps failing (`UnknownBatch`); the pipeline has no reset, so
 //! it never yields and never becomes empty. Assertions document current behaviour.
 //!
+//! The test characterizes an unwind WITHOUT pipeline invalidation: it calls `Database::unwind`
+//! directly and never goes through the orchestrator. A fix that has the caller invalidate the
+//! pipeline on unwind (as proposed in rollup-node #32) would therefore not flip this test; a test
+//! for that fix has to drive the orchestrator's unwind path.
+//!
 //! Tracker rows (Reorg Issue Tracker, Private Mainnet): RG-43 (a fullnode halts derivation after a
 //! queue gap). Each test name starts with the RG key of the row it pins. Every test passes today
 //! and documents behaviour that is not fixed; when a row is fixed, change the matching assertion
@@ -74,11 +79,10 @@ async fn rg43_missing_messages_then_unwind_leave_the_pipeline_stuck() -> eyre::R
     db.unwind(batch_data.block_number - 1).await?;
     assert!(db.get_batch_by_index(12).await?.is_none());
 
-    // Even if the messages now arrive, the queued request fails with UnknownBatch forever. The
-    // worker only logs that error, so run the same request through a worker's derivation step to
-    // show the cause.
-    db.insert_l1_message(message(33)).await?;
-    db.insert_l1_message(message(34)).await?;
+    // The queued request now fails with UnknownBatch. The worker only logs that error, so run the
+    // same request through a separate worker's derivation step to show the cause. The messages
+    // stay absent until the control below: an attempt the running worker started before the
+    // unwind still holds the old batch data and could succeed if they arrived now.
     let (_batch_tx, batch_rx) = tokio::sync::mpsc::unbounded_channel();
     let (result_tx, _result_rx) = tokio::sync::mpsc::unbounded_channel();
     let worker =
@@ -97,7 +101,10 @@ async fn rg43_missing_messages_then_unwind_leave_the_pipeline_stuck() -> eyre::R
     assert_eq!(pipeline.len(), 1, "the pipeline never becomes empty");
     assert!(!pipeline.is_empty());
 
-    // Control: with the batch row back, the same request derives (the retry loop is live).
+    // Control: with the messages and the batch row back, the same request derives (the retry loop
+    // is live).
+    db.insert_l1_message(message(33)).await?;
+    db.insert_l1_message(message(34)).await?;
     db.insert_batch(batch_data.clone()).await?;
     let result = tokio::time::timeout(Duration::from_secs(10), pipeline.next())
         .await

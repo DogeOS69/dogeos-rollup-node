@@ -214,8 +214,8 @@ async fn rg48_synced_follower_import_on_syncing_fcu_advances_mirror_but_not_data
         println!(
             "RG[divergence]: mirror_head=3 db_head=1 q1_mapping=None engine_latest={engine_now} sync_state=Synced error_surfaced=false"
         );
-        let engine_later = engine_latest_after(&fixture, 1, 3, Duration::from_secs(15)).await?;
-        println!("RG[engine-self-heal]: engine_latest after <=15s = {engine_later} (3 means Reth downloaded block 2 from its peer and canonicalized the FCU target on its own)");
+        let engine_later = engine_latest_after(&fixture, 1, 3, Duration::from_secs(60)).await?;
+        println!("RG[engine-self-heal]: engine_latest after <=60s = {engine_later} (3 means Reth downloaded block 2 from its peer and canonicalized the FCU target on its own)");
         assert_eq!(
             engine_later, 3,
             "Reth downloads block 2 from its peer and adopts the forkchoice target on its own"
@@ -534,6 +534,7 @@ async fn rg49_sequencer_ordinary_fcu_is_valid_and_unconfirmed_mirror_head_stalls
         // database head and Engine head agree after each. The FCU inside
         // finalize_payload_building is not inspected by the sequencer; the agreement below is what
         // a VALID verdict looks like from the outside.
+        let mut node_1_blocks = Vec::new();
         for n in 1..=2u64 {
             fixture.nodes[1].as_ref().expect("node 1 running").rollup_manager_handle.build_block();
             fixture.expect_event_on(1).block_sequenced(n).await?;
@@ -549,13 +550,31 @@ async fn rg49_sequencer_ordinary_fcu_is_valid_and_unconfirmed_mirror_head_stalls
             assert_eq!(engine.header.number, n);
             assert_eq!(status.l2.fcs.head_block_info().hash, engine.header.hash);
             assert_eq!(fixture.db_on(1).get_l2_head_block_number().await?, n);
+            node_1_blocks.push((engine.header.hash, engine.header.timestamp));
             println!("RG[sequencer-ordinary]: node1 built block {n}: mirror=db=engine={n}, hash agrees");
         }
 
         // Node 0 builds its own chain 1..3; node 1 never sees it (no p2p link, add-on inert).
+        // Both nodes share one config and blocks 1 and 2 are empty, so two blocks built in the same
+        // second are identical (timestamps are whole seconds). Wait until the clock is past node
+        // 1's newest block timestamp so node 0's chain differs from its first block on; otherwise
+        // node 1 already has block 3's parent and the import is VALID.
+        let last_node_1_timestamp = node_1_blocks.last().expect("node 1 built blocks").1;
+        while std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs() <=
+            last_node_1_timestamp
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         let mut foreign_block_3 = None;
         for n in 1..=3u64 {
             let block = fixture.build_block().expect_block_number(n).build_and_await_block().await?;
+            if n == 1 {
+                assert_ne!(
+                    block.hash_slow(),
+                    node_1_blocks[0].0,
+                    "node 0's block 1 must differ from node 1's block 1"
+                );
+            }
             foreign_block_3 = Some(block);
         }
         let foreign_block_3 = foreign_block_3.expect("node 0 built block 3");

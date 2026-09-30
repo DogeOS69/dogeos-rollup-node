@@ -231,10 +231,12 @@ async fn seed_two_committed_batches(database: &Database) {
 /// this happens when batch 2 is finalized at zero synthetic L1 depth; here the batches are only
 /// committed and the Engine's finalized block is set directly, which gives the same state for this
 /// handler). An L1 reorg below batch 2's commit block deletes the batch row and (by cascade) its L2
-/// block rows, then the
-/// forkchoice update with the lowered safe block and no finalized value fails with
-/// `SafeBelowFinalized`. `handle_l1_reorg` returns that error after the database unwind, without
-/// the `L1Reorg` event, and the Engine keeps the old head, safe and finalized blocks.
+/// block rows, then the forkchoice update with the lowered safe block and no finalized value fails
+/// with `SafeBelowFinalized`. `handle_l1_reorg` returns that error after the database unwind,
+/// without the `L1Reorg` event, and the Engine keeps the old head, safe and finalized blocks.
+///
+/// Not shown here: the tracker row's second part, that transactions of reverted L2 blocks are not
+/// re-injected. The L2 head never moves in this test, so nothing is reverted on the Engine.
 #[tokio::test]
 async fn rg46_l1_reorg_below_the_engine_finalized_block_leaves_db_and_engine_disagreeing() {
     let database = Arc::new(setup_test_db().await);
@@ -414,20 +416,24 @@ async fn rg49_admin_revert_unwinds_the_database_only_together_with_the_watcher_r
 // test also checks that the forkchoice update reached the Engine, so it cannot pass by never
 // making the call.
 
-/// A scripted Engine client whose next forkchoice update answers `INVALID`.
+/// A scripted Engine client whose forkchoice updates answer `INVALID`. Several answers are queued
+/// so that a fix which retries or falls back to a second forkchoice update reaches the assertion
+/// instead of the scripted client's panic on an empty queue.
 fn engine_rejecting_forkchoice() -> Arc<ScriptedEngineClient> {
     let client = Arc::new(ScriptedEngineClient::new());
-    client.push_fork_choice_updated(ScriptedResponse::Ok(
-        alloy_rpc_types_engine::ForkchoiceUpdated {
-            payload_status: alloy_rpc_types_engine::PayloadStatus {
-                status: alloy_rpc_types_engine::PayloadStatusEnum::Invalid {
-                    validation_error: "rejected by the test Engine".to_string(),
+    for _ in 0..8 {
+        client.push_fork_choice_updated(ScriptedResponse::Ok(
+            alloy_rpc_types_engine::ForkchoiceUpdated {
+                payload_status: alloy_rpc_types_engine::PayloadStatus {
+                    status: alloy_rpc_types_engine::PayloadStatusEnum::Invalid {
+                        validation_error: "rejected by the test Engine".to_string(),
+                    },
+                    latest_valid_hash: None,
                 },
-                latest_valid_hash: None,
+                payload_id: None,
             },
-            payload_id: None,
-        },
-    ));
+        ));
+    }
     client
 }
 

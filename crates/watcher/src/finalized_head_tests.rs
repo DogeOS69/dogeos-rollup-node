@@ -447,7 +447,7 @@ async fn rg41_rollback_poll_then_regrowth_keeps_block_two_message() {
     assert_eq!(messages(&regrow_2), vec![(2, 3, amount(1))]);
 }
 
-/// Cases 1(b) of the task / 19: the replacement chain is already longer than the old head at
+/// Case 19: the replacement chain is already longer than the old head at
 /// the next poll. `handle_finalized_block` clears the stored head (it is below the new finalized
 /// block) and the new head is taken as a fresh start: no `Reorg` at all, and blocks 2' and 3'
 /// are never read.
@@ -596,6 +596,10 @@ async fn rg41_restart_from_finalized_block_number_does_not_detect_replacement() 
     assert!(reorgs(&seen).is_empty(), "no reorg on restart: {seen:?}");
     // Only block 3' is re-read; block 2' (queue index 1, new amount) is not.
     assert_eq!(messages(&seen), vec![(2, 3, amount(1))]);
+
+    // Stop the spawned watcher. `L1Watcher::spawn` does not return its task handle; dropping the
+    // notification receiver makes the watcher's next send fail, which ends its run loop.
+    drop(handle);
 }
 
 /// Case 32 (F13): the runtime signer refresh never fires. `handle_latest_block` sets

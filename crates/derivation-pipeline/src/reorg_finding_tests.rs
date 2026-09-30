@@ -50,7 +50,7 @@ async fn rg43_missing_messages_then_unwind_leave_the_pipeline_stuck() -> eyre::R
     db.insert_batch(batch_data.clone()).await?;
 
     let provider = MockL1Provider { db: db.clone(), blobs: HashMap::new() };
-    let mut pipeline = DerivationPipeline::new(provider, db.clone(), u64::MAX).await;
+    let mut pipeline = DerivationPipeline::new(provider.clone(), db.clone(), u64::MAX).await;
     pipeline
         .push_batch(BatchInfo { index: 12, hash: batch_data.hash }, BatchStatus::Consolidated)
         .await;
@@ -58,6 +58,16 @@ async fn rg43_missing_messages_then_unwind_leave_the_pipeline_stuck() -> eyre::R
     // The node never stored messages 33 and 34 (the queue gap): InvalidL1MessagesCount, retried.
     assert!(tokio::time::timeout(Duration::from_secs(2), pipeline.next()).await.is_err());
     assert_eq!(pipeline.len(), 1);
+    // The worker only logs the error it retries on, so derive the same batch directly to show the
+    // cause: the two messages are missing.
+    let cache = PreFetchCache::new(db.clone(), 100, Duration::from_secs(60), 10).await?;
+    let err = derive(batch_data.clone(), BatchStatus::Consolidated, provider, cache, u64::MAX)
+        .await
+        .expect_err("the batch cannot be derived without messages 33 and 34");
+    assert!(
+        matches!(err, DerivationPipelineError::InvalidL1MessagesCount { expected: 2, got: 0 }),
+        "got {err:?}"
+    );
 
     // `revertToL1Block` below the batch's commit block deletes the batch row.
     db.unwind(batch_data.block_number - 1).await?;

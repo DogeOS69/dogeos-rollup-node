@@ -3,10 +3,10 @@
 //! L1's finalized block is its head. Assertions document current behaviour.
 //!
 //! Tracker rows (Reorg Issue Tracker, Private Mainnet): RG-41 (a lower replaced message is kept;
-//! the `l1_block` table stays empty), RG-43 (the queue-gap check) and RG-44 (two batch rows for one
-//! index). Each test name starts with the RG key of the row it pins. Every test passes today and
-//! documents behaviour that is not fixed; when a row is fixed, change the matching assertion
-//! instead of deleting the test.
+//! the `l1_block` table stays empty) and RG-44 (two batch rows for one index; the at-or-above
+//! cursor query that the RG-43 gap check relies on). Each test name starts with the RG key of the
+//! row it pins. Every test passes today and documents behaviour that is not fixed; when a row is
+//! fixed, change the matching assertion instead of deleting the test.
 
 use crate::{
     models,
@@ -80,9 +80,12 @@ async fn rg41_head_minus_one_unwind_keeps_lower_replaced_message() {
 }
 
 /// The orchestrator's gap check asks for "one message at or above `q - 1`", not for `q - 1`
-/// itself.
+/// itself, so a stored message above a gap satisfies it. This pins the cursor query that the gap
+/// check relies on (tracked with the RG-44 findings). The RG-43 sync stop itself is pinned at the
+/// orchestrator level (`rg43_queue_gap_stops_l1_message_storage` in
+/// `rollup-node-chain-orchestrator`).
 #[tokio::test]
-async fn rg43_gap_check_query_is_at_or_above() {
+async fn rg44_gap_check_query_is_at_or_above() {
     let db = setup_test_db().await;
     db.insert_l1_message(message(0, 1, 1_000)).await.unwrap();
     // Queue index 1 is missing: the check for q = 2 finds nothing at or above 1.
@@ -99,8 +102,8 @@ async fn rg43_gap_check_query_is_at_or_above() {
 
 /// Case 18: the batch table's `index` is not unique (only `hash` is). A replacement batch with
 /// the same index and a new hash is inserted as a second row; `get_batch_by_index` (no ORDER BY)
-/// returns one of them (`SQLite` returns the older row) and `finalize_batches_up_to_index`
-/// finalizes both.
+/// returns one of them and `finalize_batches_up_to_index` finalizes both. Which row is returned
+/// is up to the query planner, so the test only asserts that it is one of the two.
 #[tokio::test]
 async fn rg44_replaced_batch_with_same_index_keeps_both_rows() {
     let db = setup_test_db().await;
@@ -117,7 +120,11 @@ async fn rg44_replaced_batch_with_same_index_keeps_both_rows() {
     assert_eq!(rows.len(), 2, "both rows for batch index 1 are stored");
 
     let by_index = db.get_batch_by_index(1).await.unwrap().unwrap();
-    assert_eq!(by_index.hash, old.hash, "get_batch_by_index returns the old row");
+    assert!(
+        [old.hash, replacement.hash].contains(&by_index.hash),
+        "get_batch_by_index returns one of the two rows, got {}",
+        by_index.hash
+    );
 
     db.finalize_batches_up_to_index(1, 12).await.unwrap();
     for hash in [old.hash, replacement.hash] {
@@ -138,10 +145,20 @@ async fn rg41_finalized_head_leaves_l1_block_table_empty() {
     db.insert_l1_block_info(BlockInfo { number: 4, hash: B256::repeat_byte(4) }).await.unwrap();
     assert!(db.get_l1_block_info().await.unwrap().is_empty());
 
+    // The restart point comes from the stored events (highest: the batch at L1 block 4), not
+    // from the finalized counter (5).
     db.insert_l1_message(message(0, 3, 1_000)).await.unwrap();
-    db.insert_batch(batch(1, 0xaa, 5)).await.unwrap();
+    db.insert_batch(batch(1, 0xaa, 4)).await.unwrap();
     assert_eq!(
         db.prepare_l1_watcher_start_info().await.unwrap(),
-        L1BlockStartupInfo::FinalizedBlockNumber(5)
+        L1BlockStartupInfo::FinalizedBlockNumber(4)
+    );
+
+    // Control: a block above the finalized number is stored, so the empty table above comes from
+    // the finalized check and not from an insert that never writes.
+    db.insert_l1_block_info(BlockInfo { number: 6, hash: B256::repeat_byte(6) }).await.unwrap();
+    assert_eq!(
+        db.get_l1_block_info().await.unwrap(),
+        vec![BlockInfo { number: 6, hash: B256::repeat_byte(6) }]
     );
 }

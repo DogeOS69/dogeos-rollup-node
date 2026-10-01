@@ -1347,3 +1347,6 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod finalized_head_tests;

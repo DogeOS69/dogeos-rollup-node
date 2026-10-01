@@ -460,6 +460,48 @@ async fn rg41_rollback_poll_then_regrowth_keeps_block_two_message() {
     assert_eq!(messages(&regrow_2), vec![(2, 3, amount(1))]);
 }
 
+/// Grow B0..B3 one block per poll, then drop the served head from B3 to B1 and
+/// poll three more times. `expect` is the reorg depths collected after the drop.
+async fn rg134_lowered_head_reorgs() -> Vec<u64> {
+    let f = Fixture::new();
+    let l1 = SyntheticL1::new(vec![f.b0.clone(), f.b1.clone()], f.logs());
+    let (mut w, mut h) = watcher(l1.clone());
+    w.step().await.expect("poll B1");
+    let _ = drain_chain(&mut h);
+
+    l1.serve(vec![f.b0.clone(), f.b1.clone(), f.b2.clone()], f.logs());
+    w.step().await.expect("poll B2");
+    let _ = drain_chain(&mut h);
+
+    l1.serve(vec![f.b0.clone(), f.b1.clone(), f.b2.clone(), f.b3.clone()], f.logs());
+    w.step().await.expect("poll B3");
+    let _ = drain_chain(&mut h);
+
+    l1.serve(vec![f.b0.clone(), f.b1.clone()], f.logs());
+    let mut all = Vec::new();
+    for _ in 0..3 {
+        w.step().await.expect("poll lowered head");
+        all.extend(drain_chain(&mut h));
+    }
+    reorgs(&all)
+}
+
+/// RG-134 characterization: a head lowered from B3 to B1 reports `Reorg(2)`
+/// (old head minus one), so B2's L1 message is kept. Passes today because it
+/// pins the bug; flip it when RG-134 is fixed.
+#[tokio::test]
+async fn rg134_lowered_head_reports_reorg_from_old_head_minus_one_today() {
+    assert_eq!(rg134_lowered_head_reorgs().await, vec![2]);
+}
+
+/// RG-134: the same drop must unwind to the new head (`Reorg(1)`), so B2's
+/// message from the orphaned Dogecoin block is not kept.
+#[tokio::test]
+#[ignore = "RG-134: a head lowered from B3 to B1 reports Reorg(2), so B2's L1 message is kept"]
+async fn rg134_lowered_head_reports_reorg_to_the_new_head() {
+    assert_eq!(rg134_lowered_head_reorgs().await, vec![1]);
+}
+
 /// The replacement chain is already longer than the old head at
 /// the next poll. `handle_finalized_block` clears the stored head (it is below the new finalized
 /// block) and the new head is taken as a fresh start: no `Reorg` at all, and blocks 2' and 3'

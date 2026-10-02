@@ -2,7 +2,10 @@ use crate::{BlobProvider, L1ProviderError};
 use reqwest::Client;
 use std::sync::Arc;
 
-use alloy_eips::eip4844::Blob;
+use alloy_eips::eip4844::{
+    c_kzg, env_settings::EnvKzgSettings, kzg_to_versioned_hash, Blob,
+    BlobTransactionValidationError,
+};
 use alloy_primitives::B256;
 
 /// An implementation of a blob provider client using S3.
@@ -42,6 +45,21 @@ impl BlobProvider for S3BlobProvider {
 
             let blob = Blob::try_from(blob_data.as_ref())
                 .map_err(|_| L1ProviderError::Other("Invalid blob data"))?;
+            // S3 serves raw blobs without proofs; derive the commitment from the contents.
+            let kzg_blob = c_kzg::Blob::from_bytes(blob.as_slice())
+                .map_err(BlobTransactionValidationError::KZGError)?;
+            let commitment = EnvKzgSettings::Default
+                .get()
+                .blob_to_kzg_commitment(&kzg_blob)
+                .map_err(BlobTransactionValidationError::KZGError)?;
+            let have = kzg_to_versioned_hash(commitment.to_bytes().as_ref());
+            if have != hash {
+                return Err(BlobTransactionValidationError::WrongVersionedHash {
+                    have,
+                    expected: hash,
+                }
+                .into());
+            }
             Ok(Some(Arc::new(blob)))
         } else if response.status() == 404 {
             Ok(None)

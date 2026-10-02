@@ -77,9 +77,11 @@ where
     /// forkchoice state only when the Engine returns `VALID`.
     ///
     /// The existing [`Self::update_fcs`] intentionally advances local state on `SYNCING` for
-    /// optimistic-sync callers. Derived-batch reconciliation needs the stricter behavior here so a
-    /// held batch can retry from the last confirmed local state. The raw response is returned for
-    /// classification by that caller.
+    /// optimistic-sync callers. Callers that must never run ahead of the Engine (derived-batch
+    /// reconciliation retrying from the last confirmed state, the sequencer committing a block
+    /// it just built) use this variant instead. The raw response is returned so the caller can
+    /// classify or reject a non-`VALID` verdict itself; on any such verdict, and on a transport
+    /// failure, the local state is left untouched.
     pub async fn update_fcs_checked(
         &mut self,
         head: Option<BlockInfo>,

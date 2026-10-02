@@ -42,8 +42,14 @@ use scroll_db::{
     DatabaseReadOperations, DatabaseWriteOperations,
 };
 use scroll_derivation_pipeline::DerivationPipeline;
-use scroll_engine::{Engine, ForkchoiceState, ScrollAuthApiEngineClient, ScrollEngineApi};
-use scroll_migration::{traits::ScrollMigrator, MigratorTrait};
+use scroll_engine::{
+    genesis_hash_from_chain_spec, Engine, ForkchoiceState, ScrollAuthApiEngineClient,
+    ScrollEngineApi,
+};
+use scroll_migration::{
+    traits::ScrollMigrator, MigrationInfo, MigratorTrait, ScrollDevMigrationInfo,
+    ScrollMainnetMigrationInfo, ScrollSepoliaMigrationInfo,
+};
 use scroll_network::{DogeosNetworkPrimitives, EthWireBlockWithPeer, ScrollNetworkManager};
 use scroll_wire::ScrollWireEvent;
 use std::{fmt, fs, path::PathBuf, sync::Arc};
@@ -345,14 +351,42 @@ impl ScrollRollupNodeConfig {
             )
             .await
             .expect("failed to perform migration (custom chain)");
+        }
 
-            // insert the custom chain genesis hash into the database
-            let genesis_hash = chain_spec.genesis_hash();
-            db.insert_genesis_block(genesis_hash)
-                .await
-                .expect("failed to insert genesis block (custom chain)");
-
-            tracing::info!(target: "scroll::node::args", ?genesis_hash, "Overwriting genesis hash for custom chain");
+        // Reconcile the height-0 rows with the chain genesis. The rationale
+        // (the migration seed is not the chain genesis, and why that is still
+        // reconcilable) is on `DatabaseWriteOperations::reconcile_genesis_block`.
+        // The SAME genesis source the forkchoice state uses; the fallback is the
+        // sealed `genesis_hash()`, not a recomputed header hash — see
+        // `genesis_hash_from_chain_spec` for why that matters on chikyu.
+        let genesis_hash = genesis_hash_from_chain_spec(chain_spec.clone())
+            .unwrap_or_else(|| chain_spec.genesis_hash());
+        // The genesis the static migration above seeded; NOT always `genesis_hash`.
+        let seeded_genesis = match chain_spec.chain().named() {
+            Some(NamedChain::Scroll) => ScrollMainnetMigrationInfo::genesis_hash(),
+            Some(NamedChain::ScrollSepolia) => ScrollSepoliaMigrationInfo::genesis_hash(),
+            // Dev, and every custom chain (which reuses the dev migration).
+            _ => ScrollDevMigrationInfo::genesis_hash(),
+        };
+        // `map_err` rather than `expect`: the genesis errors carry actionable
+        // Display text that a Debug-formatted panic would discard.
+        let removed = db
+            .reconcile_genesis_block(genesis_hash, seeded_genesis)
+            .await
+            .map_err(|err| eyre::eyre!("failed to reconcile the genesis block: {err}"))?;
+        // Routine, not damage: this fires on the first launch of every shipped
+        // chain (the migration seed never equals the chain genesis) and once
+        // more on upgrade from a version that left the seed beside the real
+        // genesis. INFO, so the line is not a false alarm on every bootstrap.
+        if removed > 0 {
+            tracing::info!(
+                target: "scroll::node::args",
+                removed,
+                ?genesis_hash,
+                "Reconciled the database genesis: removed block-0 rows that did not match \
+                 the chain genesis (the migration seed on first launch, or a duplicate left \
+                 by an older version)"
+            );
         }
 
         let chain_spec_fcs = || {
@@ -1084,6 +1118,93 @@ mod tests {
     use super::*;
     use clap::Parser;
     use std::path::PathBuf;
+
+    /// The startup genesis reconciliation compares the chain spec's genesis
+    /// against the height-0 rows, so it depends on knowing which genesis the
+    /// static migration seeded — and that is NOT the same value. The dev
+    /// migration hardcodes upstream Scroll's dev genesis while every spec
+    /// shipped here computes its own, so a database written before this
+    /// reconciliation existed carries a height-0 row it must recognise as its
+    /// own rather than reject as another chain's data.
+    ///
+    /// This pins the mapping `build()` relies on: which migration each shipped
+    /// spec routes to, and that the seed really does differ from the spec's
+    /// genesis. `build()` runs `named.migrate()` for `Some(named)` and the dev
+    /// migration otherwise, so all three shipped specs seed through
+    /// `ScrollDevMigrationInfo` today. Naming mainnet or chikyu later would
+    /// route it onto a different seed, and this test is what should fail then.
+    /// It also pins two facts that mapping silently depends on: chikyu's
+    /// sealed genesis differs from its recomputed header hash, and `--test`
+    /// mode's mainnet migration seeds the same genesis as the production one.
+    #[test]
+    fn genesis_seed_pairing_holds_for_shipped_chain_specs() {
+        use dogeos_chainspec::{DOGEOS_CHIKYU, DOGEOS_DEV, DOGEOS_MAINNET};
+        use scroll_migration::ScrollMainnetTestMigrationInfo;
+
+        for (name, chain_spec, expected_named) in [
+            ("mainnet", DOGEOS_MAINNET.clone(), None),
+            ("chikyu", DOGEOS_CHIKYU.clone(), None),
+            ("dev", DOGEOS_DEV.clone(), Some(NamedChain::Dev)),
+        ] {
+            assert_eq!(
+                chain_spec.chain().named(),
+                expected_named,
+                "{name} changed chain identity; re-check which migration build() routes it to \
+                 and which genesis that migration seeds"
+            );
+            // Every arm above falls through build()'s `_` case.
+            let seeded_genesis = match chain_spec.chain().named() {
+                Some(NamedChain::Scroll) => ScrollMainnetMigrationInfo::genesis_hash(),
+                Some(NamedChain::ScrollSepolia) => ScrollSepoliaMigrationInfo::genesis_hash(),
+                _ => ScrollDevMigrationInfo::genesis_hash(),
+            };
+            assert_eq!(
+                seeded_genesis,
+                ScrollDevMigrationInfo::genesis_hash(),
+                "{name} is expected to be seeded by the dev migration"
+            );
+            // THE load-bearing assertion: `genesis_hash()` returns the sealed
+            // value when a spec carries one, and that is what the EL stores at
+            // block 0, so the reconciliation must agree with it. A recomputed
+            // header hash is MAINNET's genesis for chikyu — unequal to the seed
+            // but also unequal to chikyu's own sealed genesis.
+            assert_eq!(
+                genesis_hash_from_chain_spec(chain_spec.clone()),
+                Some(chain_spec.genesis_hash()),
+                "{name}'s forkchoice genesis must be the chain spec's own genesis; a recomputed \
+                 header hash diverges from the sealed one and bricks the chain at startup"
+            );
+            assert_ne!(
+                genesis_hash_from_chain_spec(chain_spec.clone()),
+                Some(seeded_genesis),
+                "{name}'s genesis unexpectedly EQUALS the migration seed; if the two sources \
+                 have converged, reconcile_genesis_block no longer needs the seed threaded \
+                 through and this expectation should be revisited"
+            );
+        }
+
+        // The chikyu regression itself, pinned directly so the assertion above
+        // cannot go vacuous: chikyu's genesis document is byte-identical to
+        // mainnet's in every header field, so a recomputed header hash is
+        // MAINNET's genesis, not the sealed chikyu one. Should upstream reseal
+        // chikyu so the two agree, the source-of-genesis assertion above would
+        // pass with `hash_slow()` too and stop guarding anything.
+        assert_ne!(
+            DOGEOS_CHIKYU.genesis_hash(),
+            DOGEOS_CHIKYU.genesis_header().hash_slow(),
+            "chikyu's sealed genesis now equals its recomputed header hash; the genesis-source \
+             assertion above no longer distinguishes genesis_hash() from hash_slow()"
+        );
+        // `--test` migrates mainnet through ScrollMainnetTestMigrationInfo,
+        // which the seed mapping above never names: it is only correct while
+        // that variant seeds the same genesis as the production one.
+        assert_eq!(
+            ScrollMainnetTestMigrationInfo::genesis_hash(),
+            ScrollMainnetMigrationInfo::genesis_hash(),
+            "the test-mode mainnet migration seeds a different genesis than the production one; \
+             build()'s seed mapping must tell the two apart"
+        );
+    }
 
     #[derive(Debug, Parser)]
     struct ConsensusCli {

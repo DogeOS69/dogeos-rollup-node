@@ -286,6 +286,7 @@ pub async fn generate_tx(wallet: Arc<Mutex<Wallet>>) -> Bytes {
 /// Returns a default [`ScrollRollupNodeConfig`] preconfigured for testing.
 pub fn default_test_scroll_rollup_node_config() -> ScrollRollupNodeConfig {
     ScrollRollupNodeConfig {
+        code_witness: Default::default(),
         test_args: TestArgs { test: true, skip_l1_synced: false },
         network_args: RollupNodeNetworkArgs::default(),
         database_args: RollupNodeDatabaseArgs::default(),
@@ -322,6 +323,7 @@ pub fn default_test_scroll_rollup_node_config() -> ScrollRollupNodeConfig {
 /// interval.
 pub fn default_sequencer_test_scroll_rollup_node_config() -> ScrollRollupNodeConfig {
     ScrollRollupNodeConfig {
+        code_witness: Default::default(),
         test_args: TestArgs { test: true, skip_l1_synced: false },
         network_args: RollupNodeNetworkArgs::default(),
         database_args: RollupNodeDatabaseArgs::default(),

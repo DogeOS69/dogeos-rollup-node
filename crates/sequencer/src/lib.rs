@@ -12,7 +12,7 @@ use std::{
 
 use alloy_eips::eip2718::Encodable2718;
 use alloy_primitives::U256;
-use alloy_rpc_types_engine::{ExecutionData, PayloadAttributes, PayloadId};
+use alloy_rpc_types_engine::{ExecutionData, PayloadAttributes, PayloadId, PayloadStatusEnum};
 use dogeos_hardforks::DogeosHardforks;
 use dogeos_reth_engine::{BlockDataHint, ScrollPayloadAttributes};
 use dogeos_reth_primitives::{DogeosBlock, ScrollTransactionSigned};
@@ -194,7 +194,17 @@ where
         } else {
             tracing::info!(target: "rollup_node::sequencer", "Built payload with id {payload_id:?}, hash: {:#x}, number: {} containing {} transactions.", payload.block_hash, payload.block_number, payload.transactions.len());
             let block_info = BlockInfo { hash: payload.block_hash, number: payload.block_number };
-            engine.update_fcs(Some(block_info), None, None).await?;
+            let response = engine.update_fcs(Some(block_info), None, None).await?;
+            if let PayloadStatusEnum::Invalid { validation_error } = response.payload_status.status
+            {
+                // The same Engine built this payload, so rejection is unexpected. Do not pass
+                // it to the orchestrator for L1 message accounting, signing, or publication.
+                return Err(SequencerError::InvalidPayload {
+                    block_info,
+                    latest_valid_hash: response.payload_status.latest_valid_hash,
+                    validation_error,
+                });
+            }
             let expected_hash = payload.block_hash;
             let ExecutionData { payload, sidecar } =
                 ExecutionData { payload: payload.into(), sidecar: Default::default() };

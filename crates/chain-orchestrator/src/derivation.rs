@@ -243,14 +243,19 @@ impl DerivationDriver {
         let (unwind_result, outcome) = database
             .tx_mut(move |tx| async move {
                 let unwind_result = tx.unwind(ancestor).await?;
-                if let (Some(expected), Some(mut safe)) =
+                if let (Some(expected), Some(safe)) =
                     (transition_expected, unwind_result.l2_safe_block_info)
                 {
-                    // Finalized history cannot be rewound by an ordinary L1 unwind. Retaining the
-                    // finalized block as safe mirrors the previous administrative behavior while
-                    // making the intent durable in the same database transaction as the unwind.
-                    if safe.number < expected.finalized.number {
-                        safe = expected.finalized;
+                    // Reject finalized conflicts inside the transaction so the database unwind
+                    // rolls back as well. Clamping safe to finalized would leave the database
+                    // behind the Engine while reporting a successful unwind.
+                    if safe.number < expected.finalized.number ||
+                        (safe.number == expected.finalized.number && safe != expected.finalized)
+                    {
+                        return Err(ChainOrchestratorError::FinalizedFrontierConflict {
+                            target: safe,
+                            observed: expected.finalized,
+                        })
                     }
                     let head =
                         if expected.head.number < safe.number { safe } else { expected.head };

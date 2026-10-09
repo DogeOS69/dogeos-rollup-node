@@ -455,6 +455,33 @@ impl DatabaseWriteOperations for Database {
         )
     }
 
+    async fn delete_mismatched_genesis_blocks(
+        &self,
+        genesis_hash: B256,
+    ) -> Result<u64, DatabaseError> {
+        metered!(
+            DatabaseOperation::DeleteMismatchedGenesisBlocks,
+            self,
+            tx_mut(
+                move |tx| async move { tx.delete_mismatched_genesis_blocks(genesis_hash).await }
+            )
+        )
+    }
+
+    async fn reconcile_genesis_block(
+        &self,
+        genesis_hash: B256,
+        seeded_genesis: B256,
+    ) -> Result<u64, DatabaseError> {
+        metered!(
+            DatabaseOperation::ReconcileGenesisBlock,
+            self,
+            tx_mut(move |tx| async move {
+                tx.reconcile_genesis_block(genesis_hash, seeded_genesis).await
+            })
+        )
+    }
+
     async fn update_l1_messages_from_l2_blocks(
         &self,
         blocks: Vec<L2BlockInfoWithL1Messages>,
@@ -870,10 +897,10 @@ mod test {
     use crate::{
         models,
         operations::{DatabaseReadOperations, DatabaseWriteOperations},
-        test_utils::setup_test_db,
-        DatabaseConnectionProvider,
+        test_utils::{seeded_test_genesis, setup_test_db},
+        DatabaseConnectionProvider, DatabaseError,
     };
-    use alloy_primitives::B256;
+    use alloy_primitives::{Bytes, B256};
     use std::sync::Arc;
 
     use arbitrary::{Arbitrary, Unstructured};
@@ -883,7 +910,7 @@ mod test {
     use rollup_node_primitives::{
         BatchCommitData, BatchInfo, BlockInfo, L1MessageEnvelope, L2BlockInfoWithL1Messages,
     };
-    use sea_orm::EntityTrait;
+    use sea_orm::{ConnectionTrait, EntityTrait, Statement};
 
     #[tokio::test]
     async fn test_database_round_trip_batch_commit() {
@@ -1582,5 +1609,280 @@ mod test {
         let head_block_info = db.get_l2_head_block_number().await.unwrap();
 
         assert_eq!(head_block_info, block_info.number);
+    }
+
+    fn genesis_batch_commit(batch: BatchInfo, block_number: u64) -> BatchCommitData {
+        BatchCommitData {
+            hash: batch.hash,
+            index: batch.index,
+            block_number,
+            block_timestamp: 0,
+            calldata: Arc::new(alloy_primitives::Bytes::new()),
+            blob_versioned_hash: None,
+            finalized_block_number: None,
+            reverted_block_number: None,
+        }
+    }
+
+    /// The static dev migration seeds the Scroll dev genesis row; a custom
+    /// chain's real genesis is inserted separately and CANNOT overwrite it
+    /// (the insert's conflict key includes the hash). The startup
+    /// reconciliation must delete the mismatched row so highest-block
+    /// queries — the safe head among them — are deterministic.
+    #[tokio::test]
+    async fn mismatched_genesis_rows_are_reconciled() {
+        let db = setup_test_db().await;
+        // Two rows now sit at height 0: the migration's Scroll dev genesis
+        // and this "custom chain" genesis.
+        db.insert_genesis_block(B256::ZERO).await.unwrap();
+        assert_eq!(
+            db.delete_mismatched_genesis_blocks(B256::ZERO).await.unwrap(),
+            1,
+            "exactly the migration-seeded row must be removed"
+        );
+        let (safe, _) = db.get_latest_safe_l2_info().await.unwrap();
+        assert_eq!(
+            safe,
+            BlockInfo::new(0, B256::ZERO),
+            "the chain's genesis must be the safe fallback"
+        );
+        assert_eq!(
+            db.delete_mismatched_genesis_blocks(B256::ZERO).await.unwrap(),
+            0,
+            "reconciliation is idempotent"
+        );
+    }
+
+    /// A fresh database (nothing above genesis) carries only the migration's
+    /// seed: the reconciliation replaces it with the chain's genesis in one
+    /// call, so a crash between the delete and the insert cannot leave
+    /// `l2_block` without a height-0 row.
+    #[tokio::test]
+    async fn fresh_database_reconciles_the_seeded_genesis() {
+        let db = setup_test_db().await;
+        assert_eq!(
+            db.get_l2_block_info_by_number(0).await.unwrap().map(|b| b.hash),
+            Some(seeded_test_genesis()),
+            "the fixture must start from the seeded row alone"
+        );
+        assert_eq!(db.reconcile_genesis_block(B256::ZERO, seeded_test_genesis()).await.unwrap(), 1);
+        assert_eq!(
+            db.get_l2_block_info_by_number(0).await.unwrap(),
+            Some(BlockInfo::new(0, B256::ZERO))
+        );
+        assert_eq!(
+            db.reconcile_genesis_block(B256::ZERO, seeded_test_genesis()).await.unwrap(),
+            0,
+            "reconciliation is idempotent"
+        );
+        // A fresh database that already carries another chain's genesis is
+        // still refused: the foreign-row check precedes the fresh path.
+        db.insert_genesis_block(B256::repeat_byte(0xAB)).await.unwrap();
+        assert!(matches!(
+            db.reconcile_genesis_block(B256::ZERO, seeded_test_genesis()).await,
+            Err(DatabaseError::GenesisMismatch { .. })
+        ));
+    }
+
+    /// A POPULATED database written by the older custom-chain startup carries
+    /// BOTH height-0 rows (that startup inserted the real genesis without
+    /// removing the migration's). Upgrading such a node must drop the legacy
+    /// duplicate and start, not abort as a wrong-chain database —
+    /// `get_l2_block_info_by_number(0)` is unordered, so deciding on it would
+    /// brick the upgrade nondeterministically.
+    #[tokio::test]
+    async fn populated_database_reconciles_a_legacy_genesis_duplicate() {
+        let db = setup_test_db().await;
+        // Both height-0 rows, exactly as the older startup left them, under
+        // history that has already advanced past genesis.
+        db.insert_genesis_block(B256::ZERO).await.unwrap();
+        db.set_l2_head_block_number(7).await.unwrap();
+
+        assert_eq!(
+            db.reconcile_genesis_block(B256::ZERO, seeded_test_genesis()).await.unwrap(),
+            1,
+            "the legacy seeded row must be dropped, not treated as another chain's genesis"
+        );
+        assert_eq!(
+            db.get_l2_block_info_by_number(0).await.unwrap(),
+            Some(BlockInfo::new(0, B256::ZERO)),
+            "only this chain's genesis may remain at height 0"
+        );
+        assert_eq!(
+            db.reconcile_genesis_block(B256::ZERO, seeded_test_genesis()).await.unwrap(),
+            0,
+            "reconciliation is idempotent"
+        );
+
+        // With this chain's genesis absent AND the stored row not the seed, the
+        // database really does belong to another chain: still a fail-stop.
+        assert!(matches!(
+            db.reconcile_genesis_block(B256::repeat_byte(0xAB), seeded_test_genesis()).await,
+            Err(DatabaseError::GenesisMismatch { .. })
+        ));
+    }
+
+    /// A shared migration seed cannot identify retained history. Trying another chain must not
+    /// replace that marker, even when unwind has lowered the metadata anchor to zero.
+    #[tokio::test]
+    async fn populated_database_preserves_an_ambiguous_migration_seed() {
+        let db = setup_test_db().await;
+        let batch = BatchInfo::new(1, B256::repeat_byte(1));
+        let retained = BlockInfo::new(7, B256::repeat_byte(0x77));
+        db.insert_batch(genesis_batch_commit(batch, 6)).await.unwrap();
+        db.insert_blocks(vec![retained], batch).await.unwrap();
+        for anchor in [7, 0] {
+            db.set_l2_head_block_number(anchor).await.unwrap();
+            // Neither a wrong-chain attempt nor a later corrected configuration may silently
+            // claim this history without independent evidence of its original chain.
+            for configured in [B256::repeat_byte(0xAB), B256::ZERO] {
+                let error = db
+                    .reconcile_genesis_block(configured, seeded_test_genesis())
+                    .await
+                    .expect_err("shared seed must not authorize a populated replacement");
+                assert!(matches!(error, DatabaseError::GenesisAmbiguous { .. }));
+                assert!(error.to_string().contains("No genesis rows were changed"));
+                assert_eq!(
+                    db.get_l2_block_info_by_number(0).await.unwrap(),
+                    Some(BlockInfo::new(0, seeded_test_genesis()))
+                );
+                assert_eq!(db.get_l2_block_info_by_number(7).await.unwrap(), Some(retained));
+                assert_eq!(db.get_l2_head_block_number().await.unwrap(), anchor);
+            }
+        }
+    }
+
+    /// A populated database with no height-0 row at all: returning success
+    /// here would let startup run on into `get_latest_safe_l2_info`'s "there
+    /// should always be at least the genesis block" expectation — an opaque
+    /// panic, or a silently wrong safe baseline.
+    #[tokio::test]
+    async fn populated_database_without_a_genesis_row_is_reported_missing() {
+        let db = setup_test_db().await;
+        // Drop every height-0 row, including the migration's seed, then claim
+        // history above it — a truncated or corrupt database.
+        db.delete_mismatched_genesis_blocks(B256::repeat_byte(0xCD)).await.unwrap();
+        db.set_l2_head_block_number(7).await.unwrap();
+        assert_eq!(db.get_l2_block_info_by_number(0).await.unwrap(), None);
+
+        assert!(
+            matches!(
+                db.reconcile_genesis_block(B256::ZERO, seeded_test_genesis()).await,
+                Err(DatabaseError::GenesisMissing { .. })
+            ),
+            "a populated database with no genesis row must be reported, not silently accepted"
+        );
+    }
+
+    /// `unwind()` lowers the metadata anchor and can leave it at 0 with real
+    /// history still stored. Deciding fresh-vs-populated on that counter alone
+    /// would take the fresh path and graft this chain's genesis BENEATH the
+    /// retained history — masking the very state `GenesisMissing` exists to
+    /// report.
+    #[tokio::test]
+    async fn a_zero_anchor_with_stored_history_is_still_populated() {
+        let db = setup_test_db().await;
+        // History above genesis, no height-0 row, anchor at 0.
+        db.delete_mismatched_genesis_blocks(B256::repeat_byte(0xCD)).await.unwrap();
+        let batch = BatchInfo::new(1, B256::repeat_byte(1));
+        db.insert_batch(genesis_batch_commit(batch, 6)).await.unwrap();
+        db.insert_blocks(vec![BlockInfo::new(42, B256::repeat_byte(0x42))], batch).await.unwrap();
+        assert_eq!(db.get_l2_head_block_number().await.unwrap(), 0);
+        assert_eq!(db.get_l2_block_info_by_number(0).await.unwrap(), None);
+
+        assert!(
+            matches!(
+                db.reconcile_genesis_block(B256::ZERO, seeded_test_genesis()).await,
+                Err(DatabaseError::GenesisMissing { .. })
+            ),
+            "stored history must count as populated even with the anchor at zero"
+        );
+        assert_eq!(
+            db.get_l2_block_info_by_number(0).await.unwrap(),
+            None,
+            "and no genesis may be grafted beneath it"
+        );
+    }
+
+    /// A fresh database (anchor at 0, nothing above genesis) that already
+    /// carries BOTH height-0 rows — the migration's seed and the chain's
+    /// genesis, exactly as the older custom-chain startup left a node that
+    /// never derived a block. The fresh path must drop the seed and leave the
+    /// genesis it already holds as the single height-0 row.
+    #[tokio::test]
+    async fn fresh_database_reconciles_a_legacy_genesis_duplicate() {
+        let db = setup_test_db().await;
+        db.insert_genesis_block(B256::ZERO).await.unwrap();
+        assert_eq!(db.get_l2_head_block_number().await.unwrap(), 0);
+
+        assert_eq!(
+            db.reconcile_genesis_block(B256::ZERO, seeded_test_genesis()).await.unwrap(),
+            1,
+            "only the seeded duplicate may be removed"
+        );
+        assert_eq!(
+            db.get_l2_block_info_by_number(0).await.unwrap(),
+            Some(BlockInfo::new(0, B256::ZERO))
+        );
+        assert_eq!(
+            db.delete_mismatched_genesis_blocks(B256::ZERO).await.unwrap(),
+            0,
+            "the chain's genesis must be the only height-0 row left"
+        );
+    }
+
+    /// The mismatch error is the operator's only signal on a wrong-chain
+    /// database, so it must carry both sides verbatim: the configured genesis
+    /// and the height-0 row actually found.
+    #[tokio::test]
+    async fn genesis_mismatch_reports_the_configured_and_stored_hashes() {
+        let db = setup_test_db().await;
+        db.reconcile_genesis_block(B256::ZERO, seeded_test_genesis()).await.unwrap();
+        let foreign = B256::repeat_byte(0xAB);
+        db.insert_genesis_block(foreign).await.unwrap();
+
+        let Err(DatabaseError::GenesisMismatch { configured, stored }) =
+            db.reconcile_genesis_block(B256::ZERO, seeded_test_genesis()).await
+        else {
+            panic!("a foreign height-0 row must be reported as a genesis mismatch");
+        };
+        assert_eq!(configured, B256::ZERO);
+        assert_eq!(stored, Bytes::copy_from_slice(foreign.as_slice()));
+        assert_eq!(stored.to_string(), foreign.to_string(), "a well-formed hash renders as one");
+    }
+
+    /// `l2_block.block_hash` is declared 32 bytes wide, but `SQLite` does not
+    /// enforce blob lengths, so a corrupt row can hold any number of bytes.
+    /// The diagnostic must show those bytes verbatim: a zero hash standing in
+    /// for them reads as a legitimate genesis and hides the operator's one clue.
+    #[tokio::test]
+    async fn genesis_mismatch_preserves_a_malformed_stored_hash() {
+        let db = setup_test_db().await;
+        db.reconcile_genesis_block(B256::ZERO, seeded_test_genesis()).await.unwrap();
+        // Bypass the model, which only ever writes well-formed hashes.
+        let malformed: Vec<u8> = vec![0xAB, 0xCD];
+        let inner = db.inner();
+        let conn = inner.get_connection();
+        let insert = Statement::from_sql_and_values(
+            conn.get_database_backend(),
+            "INSERT INTO l2_block (block_number, block_hash, batch_index, batch_hash) \
+             VALUES (?, ?, ?, ?)",
+            vec![0u64.into(), malformed.clone().into(), 0u64.into(), B256::ZERO.to_vec().into()],
+        );
+        conn.execute(insert).await.unwrap();
+
+        let Err(DatabaseError::GenesisMismatch { configured, stored }) =
+            db.reconcile_genesis_block(B256::ZERO, seeded_test_genesis()).await
+        else {
+            panic!("a malformed height-0 row must be reported as a genesis mismatch");
+        };
+        assert_eq!(configured, B256::ZERO);
+        assert_eq!(stored, Bytes::from(malformed), "the raw stored bytes, not a zero default");
+        assert_eq!(stored.to_string(), "0xabcd", "and they render as 0x-prefixed hex");
+        // The failure leaves the row in place: a retry reports it again.
+        assert!(matches!(
+            db.reconcile_genesis_block(B256::ZERO, seeded_test_genesis()).await,
+            Err(DatabaseError::GenesisMismatch { .. })
+        ));
     }
 }

@@ -851,6 +851,88 @@ mod tests {
         assert_eq!(hold_backoff(u64::MAX), Duration::from_secs(30));
     }
 
+    async fn assert_gas_limit_mismatch_rebuilds(target_status: BatchStatus) {
+        let database = setup_test_db().await;
+        insert_batch(&database, 1, 1, target_status.is_finalized().then_some(1)).await;
+        let existing_header = ConsensusHeader {
+            parent_hash: info(SAFE, 0x11).hash,
+            number: SAFE + 1,
+            timestamp: 1_700_000_001,
+            gas_limit: 30_000_000,
+            difficulty: U256::ONE,
+            base_fee_per_gas: Some(0),
+            ..Default::default()
+        };
+        let rebuilt_header =
+            ConsensusHeader { gas_limit: existing_header.gas_limit + 1, ..existing_header.clone() };
+        let expected =
+            BlockInfo { number: rebuilt_header.number, hash: rebuilt_header.hash_slow() };
+        assert_ne!(existing_header.hash_slow(), expected.hash);
+
+        let mut derived = batch(1, target_status);
+        let attributes = &mut derived.attributes[0].attributes;
+        attributes.payload_attributes.timestamp = rebuilt_header.timestamp;
+        attributes.transactions = Some(vec![]);
+        attributes.no_tx_pool = true;
+        attributes.gas_limit = Some(rebuilt_header.gas_limit);
+
+        let asserter = Asserter::new();
+        let rpc_header = RpcHeader::from_consensus(existing_header.seal_slow(), None, None);
+        asserter.push_success(&Some(RpcBlock::<ScrollRpcTransaction, _>::empty(rpc_header)));
+        let provider = absent_block_provider(asserter);
+
+        // The mock returns the DA-specified block if reconciliation requests a rebuild.
+        let client = Arc::new(ScriptedEngineClient::new());
+        client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(
+            PayloadStatusEnum::Valid,
+            Some(PayloadId::new([7; 8])),
+        )));
+        let mut rebuilt = payload(expected.number);
+        rebuilt.block_hash = expected.hash;
+        rebuilt.parent_hash = rebuilt_header.parent_hash;
+        rebuilt.timestamp = rebuilt_header.timestamp;
+        rebuilt.gas_limit = rebuilt_header.gas_limit;
+        rebuilt.state_root = rebuilt_header.state_root;
+        rebuilt.receipts_root = rebuilt_header.receipts_root;
+        client.push_get_payload(ScriptedResponse::Ok(rebuilt));
+        client.push_new_payload(ScriptedResponse::Ok(payload_status(PayloadStatusEnum::Valid)));
+        client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Valid, None)));
+        let mut engine = engine_at_safe(client.clone());
+        let mut driver = DerivationDriver::default();
+        driver.hold_batch(derived);
+        driver.wait_for_attempt().await;
+        assert!(matches!(
+            driver.run_attempt(&provider, &mut engine, &database).await,
+            AttemptStep::Completed(_)
+        ));
+
+        assert_eq!(client.get_payload_calls(), 1, "gas-limit mismatch must trigger a rebuild");
+        assert_eq!(client.new_payload_calls(), 1);
+        assert_eq!(*engine.fcs().head_block_info(), expected);
+        assert_eq!(*engine.fcs().safe_block_info(), expected);
+        if target_status.is_finalized() {
+            assert_eq!(*engine.fcs().finalized_block_info(), expected);
+        }
+        assert_eq!(
+            database.get_l2_block_and_batch_info_by_hash(expected.hash).await.unwrap(),
+            Some((expected, BatchInfo::new(1, B256::repeat_byte(1))))
+        );
+        assert_eq!(
+            database.get_batch_status_by_hash(B256::repeat_byte(1)).await.unwrap(),
+            Some(target_status)
+        );
+    }
+
+    #[tokio::test]
+    async fn gas_limit_mismatch_rebuilds_before_advancing_safe() {
+        assert_gas_limit_mismatch_rebuilds(BatchStatus::Consolidated).await;
+    }
+
+    #[tokio::test]
+    async fn gas_limit_mismatch_rebuilds_before_advancing_finalized() {
+        assert_gas_limit_mismatch_rebuilds(BatchStatus::Finalized).await;
+    }
+
     #[tokio::test]
     async fn build_fcu_syncing_holds_then_completes_once() {
         assert_hold_then_complete(HoldBoundary::BuildFcuSyncing).await;

@@ -1,3 +1,5 @@
+use alloy_primitives::B256;
+use rollup_node_primitives::BlockInfo;
 use rollup_node_providers::L1ProviderError;
 use scroll_db::DatabaseError;
 use scroll_engine::EngineError;
@@ -16,6 +18,18 @@ pub enum SequencerError {
     /// Missing payload id after requesting a new payload.
     #[error("Missing payload id after requesting a new payload")]
     MissingPayloadId,
+    /// The Engine rejected a locally built payload in the final forkchoice update.
+    #[error(
+        "Engine returned INVALID for sequenced block {block_info:?}: latest_valid_hash={latest_valid_hash:?}, validation_error={validation_error}"
+    )]
+    InvalidPayload {
+        /// The candidate block rejected by the Engine.
+        block_info: BlockInfo,
+        /// The latest hash the Engine considers valid.
+        latest_valid_hash: Option<B256>,
+        /// The Engine validation detail.
+        validation_error: String,
+    },
     /// The sequencer encountered an error when converting a payload into a scroll block.
     #[error("Encountered an error converting a payload into a scroll block")]
     PayloadError,

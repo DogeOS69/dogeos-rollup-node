@@ -17,6 +17,8 @@ pub(crate) struct DatabaseMetrics {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, EnumIter)]
 pub(crate) enum DatabaseOperation {
     // Write operations
+    SetPendingFrontierTransition,
+    ClearPendingFrontierTransition,
     InsertL1BlockInfo,
     RemoveL1BlockInfoLeq,
     DeleteBatchFinalizationGtBlockNumber,
@@ -53,6 +55,7 @@ pub(crate) enum DatabaseOperation {
     InsertSignatures,
     InsertSignature,
     // Read operations
+    GetPendingFrontierTransition,
     GetBatchByIndex,
     GetBatchByHash,
     GetBatchStatusByHash,
@@ -77,6 +80,8 @@ impl DatabaseOperation {
     /// Returns the str representation of the [`DatabaseOperation`].
     pub(crate) const fn as_str(&self) -> &'static str {
         match self {
+            Self::SetPendingFrontierTransition => "set_pending_frontier_transition",
+            Self::ClearPendingFrontierTransition => "clear_pending_frontier_transition",
             Self::InsertL1BlockInfo => "insert_l1_block_info",
             Self::RemoveL1BlockInfoLeq => "remove_l1_block_info_leq",
             Self::DeleteBatchFinalizationGtBlockNumber => {
@@ -122,6 +127,7 @@ impl DatabaseOperation {
             Self::Unwind => "unwind",
             Self::InsertSignatures => "insert_signatures",
             Self::InsertSignature => "insert_signature",
+            Self::GetPendingFrontierTransition => "get_pending_frontier_transition",
             Self::GetBatchByIndex => "get_batch_by_index",
             Self::GetBatchByHash => "get_batch_by_hash",
             Self::GetBatchStatusByHash => "get_batch_status_by_hash",

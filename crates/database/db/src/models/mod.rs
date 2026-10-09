@@ -18,3 +18,6 @@ pub mod metadata;
 
 /// This module contains the block signature model.
 pub mod block_signature;
+
+/// This module contains the durable Engine forkchoice transition model.
+pub(crate) mod frontier_transition;

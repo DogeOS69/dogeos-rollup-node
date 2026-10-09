@@ -29,6 +29,15 @@ where
         &self.fcs
     }
 
+    /// Replaces the cached forkchoice state with state freshly observed from the execution
+    /// provider.
+    ///
+    /// This does not issue an Engine API request. It is intended for recovery after an ambiguous
+    /// Engine response, where the remote tags are authoritative for what was actually applied.
+    pub const fn replace_fcs_from_provider(&mut self, observed: ForkchoiceState) {
+        self.fcs = observed;
+    }
+
     /// Update the fork choice state and issue an update to the engine.
     pub async fn update_fcs(
         &mut self,

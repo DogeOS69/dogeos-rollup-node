@@ -46,26 +46,40 @@ impl ForkchoiceState {
     /// Creates a [`ForkchoiceState`] instance setting the `head`, `safe` and `finalized` hash to
     /// the appropriate genesis values by reading from the provider.
     pub async fn from_provider<P: Provider<Scroll>>(provider: &P) -> Option<Self> {
-        let latest_block =
-            provider.get_block(BlockId::Number(BlockNumberOrTag::Latest)).await.ok()??;
-        let mut safe_block =
-            provider.get_block(BlockId::Number(BlockNumberOrTag::Safe)).await.ok()??;
+        Self::try_from_provider(provider).await.ok().flatten()
+    }
+
+    /// Reads the forkchoice tags currently observed from the execution provider.
+    ///
+    /// Unlike [`Self::from_provider`], transport errors are preserved so callers recovering a
+    /// durable Engine transition never mistake an unavailable Engine for missing state.
+    pub async fn try_from_provider<P: Provider<Scroll>>(
+        provider: &P,
+    ) -> alloy_transport::TransportResult<Option<Self>> {
+        let latest_block = provider.get_block(BlockId::Number(BlockNumberOrTag::Latest)).await?;
+        let mut safe_block = provider.get_block(BlockId::Number(BlockNumberOrTag::Safe)).await?;
         let finalized_block =
-            provider.get_block(BlockId::Number(BlockNumberOrTag::Finalized)).await.ok()??;
+            provider.get_block(BlockId::Number(BlockNumberOrTag::Finalized)).await?;
+
+        let (Some(latest_block), Some(mut safe_block), Some(finalized_block)) =
+            (latest_block, safe_block.take(), finalized_block)
+        else {
+            return Ok(None)
+        };
 
         // Ensure safe is at least finalized.
         if safe_block.header.number < finalized_block.header.number {
             safe_block = finalized_block.clone();
         }
 
-        Some(Self {
+        Ok(Some(Self {
             head: BlockInfo { number: latest_block.header.number, hash: latest_block.header.hash },
             safe: BlockInfo { number: safe_block.header.number, hash: safe_block.header.hash },
             finalized: BlockInfo {
                 number: finalized_block.header.number,
                 hash: finalized_block.header.hash,
             },
-        })
+        }))
     }
 
     /// Creates a [`ForkchoiceState`] instance setting the `head`, `safe` and `finalized` hash to

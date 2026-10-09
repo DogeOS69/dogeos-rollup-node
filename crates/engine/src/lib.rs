@@ -14,7 +14,7 @@ pub use metrics::EngineDriverMetrics;
 mod metrics;
 
 mod payload;
-pub use payload::block_matches_attributes;
+pub use payload::{block_matches_attributes, payload_matches_attributes};
 
 mod engine;
 pub use engine::Engine;

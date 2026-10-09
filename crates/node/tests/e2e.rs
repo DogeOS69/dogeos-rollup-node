@@ -1534,11 +1534,17 @@ async fn requeues_transactions_after_l1_reorg() -> eyre::Result<()> {
     // Set the l1 as being synced.
     sequencer.l1().sync().await?;
 
-    // Let the sequencer build 10 blocks.
-    for i in 1..=10 {
-        let b = sequencer.build_block().expect_block_number(i).build_and_await_block().await?;
-        tracing::info!(target: "scroll::test", block_number = ?b.header.number, block_hash = ?b.header.hash_slow(), "Sequenced block");
-    }
+    // Build a non-empty canonical base block. The L1 reorg below keeps this block and unwinds the
+    // two blocks above it, avoiding both the genesis-reorg special case and unrelated empty
+    // changesets in Reth's persisted history.
+    let base_tx_hash = sequencer.inject_transfer().await?;
+    sequencer
+        .build_block()
+        .expect_block_number(1)
+        .expect_tx(base_tx_hash)
+        .expect_tx_count(1)
+        .build_and_await_block()
+        .await?;
 
     // Send a L1 message and wait for it to be indexed.
     sequencer.l1().add_message().at_block(2).send().await?;
@@ -1549,18 +1555,30 @@ async fn requeues_transactions_after_l1_reorg() -> eyre::Result<()> {
     sequencer.expect_event().new_l1_block().await?;
 
     // Build a L2 block with L1 message, so we can revert it later.
-    sequencer.build_block().build_and_await_block().await?;
+    sequencer.build_block().expect_block_number(2).build_and_await_block().await?;
 
     // Inject a user transaction and force the sequencer to include it in the next block
     let hash = sequencer.inject_transfer().await?;
-    sequencer.build_block().expect_tx(hash).expect_tx_count(1).build_and_await_block().await?;
+    sequencer
+        .build_block()
+        .expect_block_number(3)
+        .expect_tx(hash)
+        .expect_tx_count(1)
+        .build_and_await_block()
+        .await?;
 
     // Trigger an L1 reorg that reverts the block containing the transaction
     sequencer.l1().reorg_to(1).await?;
     sequencer.expect_event().l1_reorg().await?;
 
     // Build the next block – the reverted transaction should have been requeued
-    sequencer.build_block().expect_tx(hash).expect_tx_count(1).build_and_await_block().await?;
+    sequencer
+        .build_block()
+        .expect_block_number(2)
+        .expect_tx(hash)
+        .expect_tx_count(1)
+        .build_and_await_block()
+        .await?;
 
     Ok(())
 }

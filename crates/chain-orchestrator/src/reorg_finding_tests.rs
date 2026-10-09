@@ -8,9 +8,10 @@
 //! administrative revert that stops half way, and forkchoice answers that are not checked).
 //! Each test name starts with the RG key of the row it pins.
 //!
-//! Tests that pass today document behaviour that is not fixed; when a row is fixed, change the
-//! matching assertion instead of deleting the test. Tests marked `#[ignore]` assert the intended
-//! behaviour, fail today and carry the reason in the ignore message; run them with `--ignored`.
+//! RG-46 asserts that finalized conflicts roll back the database unwind. Other passing tests
+//! document behaviour that is not fixed; when a row is fixed, change the matching assertion
+//! instead of deleting the test. Tests marked `#[ignore]` assert the intended behaviour, fail
+//! today and carry the reason in the ignore message; run them with `--ignored`.
 
 use super::*;
 use alloy_primitives::{Address, U256};
@@ -26,7 +27,7 @@ use rollup_node_watcher::L1WatcherCommand;
 use scroll_db::test_utils::setup_test_db;
 use scroll_engine::{
     test_utils::{PanicEngineClient, ScriptedEngineClient, ScriptedResponse},
-    EngineError, FcsError, ForkchoiceState,
+    ForkchoiceState,
 };
 use scroll_network::{NetworkHandleMessage, ScrollNetworkHandle};
 
@@ -227,49 +228,59 @@ async fn seed_two_committed_batches(database: &Database) {
         .unwrap();
 }
 
-/// RG-46: the Engine's finalized block is L2 block 10, the last block of batch 2 (in production
-/// this happens when batch 2 is finalized at zero synthetic L1 depth; here the batches are only
-/// committed and the Engine's finalized block is set directly, which gives the same state for this
-/// handler). An L1 reorg below batch 2's commit block deletes the batch row and (by cascade) its L2
-/// block rows, then the forkchoice update with the lowered safe block and no finalized value fails
-/// with `SafeBelowFinalized`. `handle_l1_reorg` returns that error after the database unwind,
-/// without the `L1Reorg` event, and the Engine keeps the old head, safe and finalized blocks.
-///
-/// Not shown here: the tracker row's second part, that transactions of reverted L2 blocks are not
-/// re-injected. The L2 head never moves in this test, so nothing is reverted on the Engine.
+/// RG-46: a reorg or administrative unwind below the Engine's finalized block must fail
+/// before committing database changes. Clamping the new safe block to the old finalized block
+/// would leave the database at 5 and the Engine at 10 while reporting a successful unwind.
 #[tokio::test]
-async fn rg46_l1_reorg_below_the_engine_finalized_block_leaves_db_and_engine_disagreeing() {
-    let database = Arc::new(setup_test_db().await);
-    seed_two_committed_batches(&database).await;
+async fn rg46_finalized_conflict_rolls_back_l1_unwind() {
+    for administrative in [false, true] {
+        let database = Arc::new(setup_test_db().await);
+        seed_two_committed_batches(&database).await;
+        let (watcher_commands_tx, mut watcher_commands_rx) = mpsc::unbounded_channel();
+        let finalized = info(10, 10);
+        let mut orchestrator = orchestrator_probed(
+            database.clone(),
+            ForkchoiceState::new(finalized, finalized, finalized),
+            0,
+            Probes { watcher_commands: Some(watcher_commands_tx), ..Default::default() },
+        )
+        .await;
+        let mut events = orchestrator.event_listener();
 
-    let finalized = info(10, 10);
-    let mut orchestrator =
-        orchestrator(database.clone(), ForkchoiceState::new(finalized, finalized, finalized), 0)
-            .await;
-    let mut events = orchestrator.event_listener();
+        let result = if administrative {
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            let result = orchestrator
+                .handle_command(ChainOrchestratorCommand::RevertToL1Block((15, reply_tx)))
+                .await;
+            assert!(reply_rx.await.is_err(), "a rejected unwind must not report success");
+            result.map(|()| None)
+        } else {
+            orchestrator.handle_l1_reorg(15).await
+        };
+        assert!(
+            matches!(
+                &result,
+                Err(ChainOrchestratorError::FinalizedFrontierConflict { target, observed })
+                    if *target == info(5, 5) && *observed == finalized
+            ),
+            "administrative={administrative}: {result:?}"
+        );
 
-    let result = orchestrator.handle_l1_reorg(15).await;
-    let err = result.as_ref().unwrap_err();
-    assert!(
-        matches!(
-            err,
-            ChainOrchestratorError::EngineError(EngineError::FcsError(
-                FcsError::SafeBelowFinalized
-            ))
-        ),
-        "got {err:?}"
-    );
+        // The transaction rolled back: both batches, their L2 rows, and the frontier survive.
+        assert!(database.get_batch_by_index(2).await.unwrap().is_some());
+        assert_eq!(database.get_l2_block_info_by_number(8).await.unwrap(), Some(info(8, 8)));
+        assert_eq!(database.get_latest_safe_l2_info().await.unwrap().0, finalized);
+        assert!(database.get_pending_frontier_transition().await.unwrap().is_none());
+        assert_eq!(
+            orchestrator.engine.fcs(),
+            &ForkchoiceState::new(finalized, finalized, finalized)
+        );
+        assert!(watcher_commands_rx.try_recv().is_err(), "watcher must not reset on rejection");
 
-    // The database was unwound: batch 2 and its L2 blocks are gone; the safe block is 5.
-    assert!(database.get_batch_by_index(2).await.unwrap().is_none());
-    assert!(database.get_l2_block_info_by_number(8).await.unwrap().is_none());
-    assert_eq!(database.get_latest_safe_l2_info().await.unwrap().0.number, 5);
-    // The Engine did not move.
-    assert_eq!(orchestrator.engine.fcs(), &ForkchoiceState::new(finalized, finalized, finalized));
-
-    // The run loop only logs the error; no event is emitted.
-    orchestrator.handle_outcome(result);
-    assert!(events.next().now_or_never().is_none(), "no L1Reorg event");
+        // The notification path treats the conflict as fatal and emits no successful reorg.
+        assert!(orchestrator.handle_outcome(result).unwrap_err().is_frontier_fatal());
+        assert!(events.next().now_or_never().is_none(), "no successful unwind event");
+    }
 }
 
 /// RG-49 (rollup-node issue #30): block signing is asynchronous, and the orchestrator has no way to

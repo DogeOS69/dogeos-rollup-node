@@ -885,12 +885,13 @@ pub struct SequencerArgs {
         default_value_t = false
     )]
     pub allow_empty_blocks: bool,
-    /// The maximum number of L1 messages to include per L2 block.
+    /// The sequencer's local maximum number of L1 messages to include per L2 block.
+    /// Defaults to `numL1MessagesPerBlock` in the chain config; not a consensus limit.
     #[arg(
         long = "sequencer.max-l1-messages",
         id = "sequencer_max_l1_messages",
         value_name = "SEQUENCER_MAX_L1_MESSAGES",
-        help = "The maximum number of L1 messages to include per L2 block. If not set, defaults to the value specified in the chain config."
+        help = "The sequencer's local maximum number of L1 messages per L2 block. Defaults to numL1MessagesPerBlock in the chain config. This is sequencer policy, not a consensus limit."
     )]
     pub max_l1_messages: Option<u64>,
 }

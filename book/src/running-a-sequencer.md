@@ -127,7 +127,23 @@ The sequencer can include L1 messages in blocks using different strategies:
 --sequencer.l1-inclusion-mode finalized:2
 ```
 
-- `--sequencer.max-l1-messages <N>`: Override maximum L1 messages per block (optional)
+- `--sequencer.max-l1-messages <N>`: Set the sequencer's maximum number of L1 messages per L2 block. If omitted, it defaults to `numL1MessagesPerBlock` in the chain config.
+
+This count limit is local sequencer policy. Followers and consensus validation do not reject a
+block solely because it exceeds this count, and the proof does not enforce this per-block count
+limit. L1 message ordering and queue integrity remain subject to protocol validation.
+
+Pin the intended policy explicitly in the sequencer's deployment configuration. For example,
+to include at most 10 L1 messages per block, add:
+
+```bash
+--sequencer.max-l1-messages 10
+```
+
+The sequencer also budgets each message at its full gas limit against the configured block gas
+limit. It takes messages in queue order and stops when the next message would exceed that
+budget, so a block may contain fewer messages than the configured count. Changing this option
+does not change the consensus rules or reserve a fixed amount of gas for L2 transactions.
 
 ### Signer Configuration
 

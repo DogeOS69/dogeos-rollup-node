@@ -3,7 +3,7 @@
 //! This crate provides a simple implementation of a derivation pipeline that transforms a batch
 //! into payload attributes for block building.
 
-use alloy_primitives::{Address, Bytes, B256};
+use alloy_primitives::{Address, Bytes, B256, U256};
 use alloy_rpc_types_engine::PayloadAttributes;
 use core::{fmt::Debug, future::Future, pin::Pin, task::Poll};
 use dogeos_protocol_types::L1_MESSAGE_TX_TYPE_ID;
@@ -281,6 +281,8 @@ pub struct BatchDerivationResult {
 pub struct DerivedAttributes {
     /// The block number the attributes correspond to.
     pub block_number: u64,
+    /// The base fee recorded in the batch, checked after rebuilding the payload.
+    pub base_fee: U256,
     /// The derived payload attributes.
     pub attributes: ScrollPayloadAttributes,
 }
@@ -367,6 +369,7 @@ pub async fn derive<L1P: L1Provider + Sync + Send>(
         // construct the payload attributes.
         let attribute = DerivedAttributes {
             block_number: number,
+            base_fee: block.context.base_fee,
             attributes: ScrollPayloadAttributes {
                 payload_attributes: PayloadAttributes {
                     timestamp: block.context.timestamp,

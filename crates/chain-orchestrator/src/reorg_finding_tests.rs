@@ -228,6 +228,60 @@ async fn seed_two_committed_batches(database: &Database) {
         .unwrap();
 }
 
+#[tokio::test]
+async fn administrative_frontier_failure_stops_run_loop_without_a_held_batch() {
+    let database = Arc::new(setup_test_db().await);
+    seed_two_committed_batches(&database).await;
+    database.insert_genesis_block(B256::ZERO).await.unwrap();
+    database.set_l2_head_block_number(10).await.unwrap();
+    let client = engine_rejecting_forkchoice();
+    let fcs = ForkchoiceState::new(info(10, 10), info(10, 10), info(0, 0));
+    let mut orchestrator =
+        orchestrator_with_engine(database.clone(), fcs, 0, Probes::default(), client.clone()).await;
+    let asserter = Asserter::new();
+    for block in [info(10, 10), info(10, 10), info(0, 0)] {
+        let mut rpc_block =
+            alloy_rpc_types_eth::Block::<dogeos_rpc_types::ScrollRpcTransaction>::default();
+        rpc_block.header.inner.number = block.number;
+        rpc_block.header.hash = block.hash;
+        asserter.push_success(&Some(rpc_block));
+    }
+    orchestrator.l2_client =
+        Arc::new(ProviderBuilder::<_, _, Scroll>::default().connect_mocked_client(asserter));
+    let (commands, receiver) = mpsc::unbounded_channel();
+    orchestrator.handle_rx = receiver;
+    let (reply, response) = tokio::sync::oneshot::channel();
+    commands.send(ChainOrchestratorCommand::RevertToL1Block((15, reply))).unwrap();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        orchestrator.run_until_shutdown(std::future::pending()),
+    )
+    .await
+    .expect("a frontier command failure must stop an idle run loop");
+    assert!(result.unwrap_err().is_frontier_fatal());
+    assert!(response.await.is_err(), "must not acknowledge a failed unwind");
+    assert_eq!(client.fork_choice_updated_calls(), 1);
+    assert!(database.get_pending_frontier_transition().await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn finalized_catchup_does_not_rewind_a_later_finalized_batch() {
+    let database = Arc::new(setup_test_db().await);
+    seed_two_committed_batches(&database).await;
+    database.finalize_batches_up_to_index(2, 30).await.unwrap();
+    database.update_batch_status(B256::repeat_byte(0xb1), BatchStatus::Consolidated).await.unwrap();
+    database.update_batch_status(B256::repeat_byte(0xb2), BatchStatus::Finalized).await.unwrap();
+    let tip = info(10, 10);
+    let mut orchestrator =
+        orchestrator(database.clone(), ForkchoiceState::from_block_info(tip), 0).await;
+    orchestrator.handle_l1_finalized(30).await.unwrap();
+    assert_eq!(*orchestrator.engine.fcs().finalized_block_info(), tip);
+    assert_eq!(
+        database.get_batch_status_by_hash(B256::repeat_byte(0xb1)).await.unwrap(),
+        Some(BatchStatus::Finalized)
+    );
+}
+
 /// RG-46: a reorg or administrative unwind below the Engine's finalized block must fail
 /// before committing database changes. Clamping the new safe block to the old finalized block
 /// would leave the database at 5 and the Engine at 10 while reporting a successful unwind.
@@ -452,7 +506,6 @@ fn engine_rejecting_forkchoice() -> Arc<ScriptedEngineClient> {
 /// Engine answers `INVALID` and keeps safe at block 10. The handler still returns the `L1Reorg`
 /// event with safe block 5.
 #[tokio::test]
-#[ignore = "RG-49: handle_l1_reorg drops an INVALID forkchoice answer and reports the reorg as done"]
 async fn rg49_l1_reorg_reports_the_new_safe_block_only_if_the_engine_accepted_it() {
     let database = Arc::new(setup_test_db().await);
     seed_two_committed_batches(&database).await;
@@ -482,7 +535,6 @@ async fn rg49_l1_reorg_reports_the_new_safe_block_only_if_the_engine_accepted_it
 /// finalized L2 block becomes 5. The Engine answers `INVALID` and keeps finalized at block 0. The
 /// handler still returns the `L1BlockFinalized` event.
 #[tokio::test]
-#[ignore = "RG-49: handle_l1_finalized drops an INVALID forkchoice answer and reports the finalization as done"]
 async fn rg49_l1_finalized_reports_the_new_finalized_block_only_if_the_engine_accepted_it() {
     let database = Arc::new(setup_test_db().await);
     seed_two_committed_batches(&database).await;
@@ -518,7 +570,6 @@ async fn rg49_l1_finalized_reports_the_new_finalized_block_only_if_the_engine_ac
 /// answers `INVALID` and keeps safe at block 10. The handler still returns the `BatchReverted`
 /// event with safe head 5.
 #[tokio::test]
-#[ignore = "RG-49: handle_batch_revert drops an INVALID forkchoice answer and reports the revert as done"]
 async fn rg49_batch_revert_reports_the_new_safe_head_only_if_the_engine_accepted_it() {
     let database = Arc::new(setup_test_db().await);
     seed_two_committed_batches(&database).await;
@@ -549,7 +600,6 @@ async fn rg49_batch_revert_reports_the_new_safe_head_only_if_the_engine_accepted
 /// `RevertToL1Block`: the unwind deletes batch 2, so the safe block moves back to L2 block 5. The
 /// Engine answers `INVALID` and keeps safe at block 10. The command still replies `true`.
 #[tokio::test]
-#[ignore = "RG-49: RevertToL1Block drops an INVALID forkchoice answer and replies that the revert succeeded"]
 async fn rg49_admin_revert_replies_success_only_if_the_engine_accepted_the_new_safe_block() {
     let database = Arc::new(setup_test_db().await);
     seed_two_committed_batches(&database).await;

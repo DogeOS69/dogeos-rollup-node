@@ -2,6 +2,7 @@ use alloy_primitives::B256;
 use rollup_node_primitives::BlockInfo;
 
 pub(crate) const FRONTIER_TRANSITION_KEY: &str = "pending_frontier_transition";
+pub(crate) const CONFIRMED_FRONTIER_KEY: &str = "confirmed_frontier_transition";
 
 /// The reason a durable forkchoice transition is pending.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -42,4 +43,33 @@ pub struct PendingFrontierTransition {
     pub target: StoredForkchoiceState,
     /// The batch associated with this transition, when any.
     pub batch_hash: Option<B256>,
+}
+
+impl StoredForkchoiceState {
+    /// Checks ordering and identity at equal heights before persisting or replaying a frontier.
+    pub fn validate(&self) -> Result<(), crate::DatabaseError> {
+        for (higher, lower) in [(self.head, self.safe), (self.safe, self.finalized)] {
+            if higher.number < lower.number || (higher.number == lower.number && higher != lower) {
+                return Err(crate::DatabaseError::InvalidFrontierTransition(
+                    "expected head >= safe >= finalized with matching hashes at equal heights",
+                ))
+            }
+        }
+        Ok(())
+    }
+}
+
+impl PendingFrontierTransition {
+    /// Checks both states and the finalized boundary before storing or decoding a transition.
+    pub fn validate(&self) -> Result<(), crate::DatabaseError> {
+        self.expected.validate()?;
+        self.target.validate()?;
+        if self.target.finalized.number < self.expected.finalized.number ||
+            (self.target.finalized.number == self.expected.finalized.number &&
+                self.target.finalized != self.expected.finalized)
+        {
+            return Err(crate::DatabaseError::InvalidFrontierTransition("finalized cannot rewind"))
+        }
+        Ok(())
+    }
 }

@@ -566,6 +566,24 @@ impl DatabaseWriteOperations for Database {
 
 #[async_trait::async_trait]
 impl DatabaseReadOperations for Database {
+    async fn get_confirmed_frontier_transition(
+        &self,
+    ) -> Result<Option<PendingFrontierTransition>, DatabaseError> {
+        metered!(
+            DatabaseOperation::GetConfirmedFrontierTransition,
+            self,
+            tx(|tx| async move { tx.get_confirmed_frontier_transition().await })
+        )
+    }
+
+    async fn get_latest_finalized_l2_info(&self) -> Result<BlockInfo, DatabaseError> {
+        metered!(
+            DatabaseOperation::GetLatestFinalizedL2Info,
+            self,
+            tx(|tx| async move { tx.get_latest_finalized_l2_info().await })
+        )
+    }
+
     async fn get_pending_frontier_transition(
         &self,
     ) -> Result<Option<PendingFrontierTransition>, DatabaseError> {
@@ -963,6 +981,55 @@ mod test {
         db.clear_pending_frontier_transition().await.unwrap();
         assert_eq!(db.get_pending_frontier_transition().await.unwrap(), None);
         assert_eq!(db.get_l2_head_block_number().await.unwrap(), 2);
+        db.inner().get_connection().clone().close().await.unwrap();
+        drop(db);
+        let db = Database::new(path.to_str().unwrap()).await.unwrap();
+        assert_eq!(db.get_pending_frontier_transition().await.unwrap(), None);
+        assert_eq!(db.get_confirmed_frontier_transition().await.unwrap(), Some(updated));
+    }
+
+    #[tokio::test]
+    async fn malformed_frontier_states_are_rejected_on_write_and_read() {
+        use crate::{
+            frontier_transition_types::FRONTIER_TRANSITION_KEY, FrontierTransitionKind,
+            StoredForkchoiceState,
+        };
+        use rollup_node_primitives::Metadata;
+        let db = setup_test_db().await;
+        let low = BlockInfo::new(1, B256::repeat_byte(1));
+        let high = BlockInfo::new(2, B256::repeat_byte(2));
+        let valid = StoredForkchoiceState { head: high, safe: high, finalized: low };
+        let invalid_states = [
+            StoredForkchoiceState { head: low, ..valid },
+            StoredForkchoiceState { safe: low, finalized: high, ..valid },
+            StoredForkchoiceState { safe: BlockInfo::new(2, B256::repeat_byte(3)), ..valid },
+        ];
+        for invalid in invalid_states {
+            let transition = PendingFrontierTransition {
+                kind: FrontierTransitionKind::StartupRepair,
+                expected: valid,
+                target: invalid,
+                batch_hash: None,
+            };
+            assert!(matches!(
+                db.set_pending_frontier_transition(transition).await,
+                Err(DatabaseError::InvalidFrontierTransition(_))
+            ));
+            let row: models::metadata::ActiveModel = Metadata {
+                key: FRONTIER_TRANSITION_KEY.into(),
+                value: serde_json::to_string(&transition).unwrap(),
+            }
+            .into();
+            models::metadata::Entity::insert(row).exec(db.inner().get_connection()).await.unwrap();
+            assert!(matches!(
+                db.get_pending_frontier_transition().await,
+                Err(DatabaseError::InvalidFrontierTransition(_))
+            ));
+            models::metadata::Entity::delete_by_id(FRONTIER_TRANSITION_KEY)
+                .exec(db.inner().get_connection())
+                .await
+                .unwrap();
+        }
     }
 
     #[tokio::test]
@@ -980,7 +1047,11 @@ mod test {
                 db.get_pending_frontier_transition().await,
                 Err(DatabaseError::MetadataSerdeError(_))
             ));
-            db.clear_pending_frontier_transition().await.unwrap();
+            assert!(db.clear_pending_frontier_transition().await.is_err());
+            models::metadata::Entity::delete_by_id(FRONTIER_TRANSITION_KEY)
+                .exec(db.inner().get_connection())
+                .await
+                .unwrap();
         }
     }
 

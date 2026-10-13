@@ -26,9 +26,17 @@ pub enum ChainOrchestratorError {
     /// The execution provider did not expose all latest/safe/finalized tags needed for recovery.
     #[error("execution provider is missing latest, safe, or finalized forkchoice tags")]
     MissingEngineForkchoiceTags,
-    /// Observing the execution provider failed while frontier recovery was required.
-    #[error("failed to observe Engine forkchoice during frontier recovery: {0}")]
-    FrontierObservation(Box<Self>),
+    /// Recovery errors must stop processing, including database and RPC failures.
+    #[error("frontier recovery failed: {0}")]
+    FrontierRecovery(#[source] Box<Self>),
+    /// Safe divergence without a durable intent or canonical ancestry cannot be repaired.
+    #[error("unexplained safe frontier: database={database}, Engine={observed}")]
+    UnexplainedSafeFrontier {
+        /// The database-backed safe block.
+        database: BlockInfo,
+        /// The safe block observed from the Engine.
+        observed: BlockInfo,
+    },
     /// A durable frontier transition conflicts with the Engine state observed during recovery.
     #[error("{0}")]
     FrontierTransitionConflict(Box<FrontierTransitionConflict>),
@@ -261,13 +269,23 @@ impl CanRetry for ChainOrchestratorError {
 }
 
 impl ChainOrchestratorError {
+    /// Keep all failures within frontier recovery fail-stop, including journal I/O errors.
+    pub(crate) fn frontier_recovery(self) -> Self {
+        if self.is_frontier_fatal() {
+            self
+        } else {
+            Self::FrontierRecovery(Box::new(self))
+        }
+    }
+
     /// Returns true when continuing the run loop could process work against an unresolved Engine
     /// frontier.
     pub(crate) const fn is_frontier_fatal(&self) -> bool {
         matches!(
             self,
             Self::MissingEngineForkchoiceTags |
-                Self::FrontierObservation(_) |
+                Self::FrontierRecovery(_) |
+                Self::UnexplainedSafeFrontier { .. } |
                 Self::FrontierTransitionConflict(_) |
                 Self::FinalizedFrontierConflict { .. } |
                 Self::FrontierTransitionEngineRequest { .. } |

@@ -57,20 +57,18 @@ impl ForkchoiceState {
         provider: &P,
     ) -> alloy_transport::TransportResult<Option<Self>> {
         let latest_block = provider.get_block(BlockId::Number(BlockNumberOrTag::Latest)).await?;
-        let mut safe_block = provider.get_block(BlockId::Number(BlockNumberOrTag::Safe)).await?;
+        let safe_block = provider.get_block(BlockId::Number(BlockNumberOrTag::Safe)).await?;
         let finalized_block =
             provider.get_block(BlockId::Number(BlockNumberOrTag::Finalized)).await?;
-
-        let (Some(latest_block), Some(mut safe_block), Some(finalized_block)) =
-            (latest_block, safe_block.take(), finalized_block)
-        else {
+        let Some(latest_block) = latest_block else { return Ok(None) };
+        // A fresh execution node has no safe/finalized tags until its first FCU. Only a known
+        // genesis head permits filling absent tags; transport errors still propagate above.
+        let genesis = (latest_block.header.number == 0).then_some(&latest_block);
+        let safe_block = safe_block.as_ref().or(genesis);
+        let finalized_block = finalized_block.as_ref().or(genesis);
+        let (Some(safe_block), Some(finalized_block)) = (safe_block, finalized_block) else {
             return Ok(None)
         };
-
-        // Ensure safe is at least finalized.
-        if safe_block.header.number < finalized_block.header.number {
-            safe_block = finalized_block.clone();
-        }
 
         Ok(Some(Self {
             head: BlockInfo { number: latest_block.header.number, hash: latest_block.header.hash },

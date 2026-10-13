@@ -1,7 +1,7 @@
 use super::{models, DatabaseError, PendingFrontierTransition};
 use crate::{
-    frontier_transition_types::FRONTIER_TRANSITION_KEY, ReadConnectionProvider,
-    WriteConnectionProvider,
+    frontier_transition_types::{CONFIRMED_FRONTIER_KEY, FRONTIER_TRANSITION_KEY},
+    ReadConnectionProvider, WriteConnectionProvider,
 };
 
 use alloy_primitives::{Signature, B256};
@@ -16,6 +16,21 @@ use sea_orm::{
 };
 use std::fmt;
 
+async fn read_frontier_transition<T: ReadConnectionProvider + Sync + ?Sized>(
+    connection: &T,
+    key: &str,
+) -> Result<Option<PendingFrontierTransition>, DatabaseError> {
+    models::metadata::Entity::find_by_id(key)
+        .one(connection.get_connection())
+        .await?
+        .map(|row| {
+            let transition: PendingFrontierTransition = serde_json::from_str(&row.value)?;
+            transition.validate()?;
+            Ok(transition)
+        })
+        .transpose()
+}
+
 /// The [`DatabaseWriteOperations`] trait provides write methods for interacting with the
 /// database.
 #[async_trait::async_trait]
@@ -27,7 +42,7 @@ pub trait DatabaseWriteOperations {
         transition: PendingFrontierTransition,
     ) -> Result<(), DatabaseError>;
 
-    /// Clear the pending Engine forkchoice transition after observing its target in the Engine.
+    /// Acknowledge the pending transition, retaining its recovery witness in the same transaction.
     async fn clear_pending_frontier_transition(&self) -> Result<(), DatabaseError>;
 
     /// Insert a [`BlockInfo`] representing an L1 block into the database.
@@ -219,6 +234,7 @@ impl<T: WriteConnectionProvider + ?Sized + Sync> DatabaseWriteOperations for T {
     ) -> Result<(), DatabaseError> {
         use models::metadata::Column;
 
+        transition.validate()?;
         let transition: models::metadata::ActiveModel = Metadata {
             key: FRONTIER_TRANSITION_KEY.to_owned(),
             value: serde_json::to_string(&transition)?,
@@ -232,6 +248,27 @@ impl<T: WriteConnectionProvider + ?Sized + Sync> DatabaseWriteOperations for T {
     }
 
     async fn clear_pending_frontier_transition(&self) -> Result<(), DatabaseError> {
+        if let Some(transition) = self.get_pending_frontier_transition().await? {
+            // Head/finalized-only acknowledgements must not erase evidence of a safe rewind:
+            // Reth can lose its deferred tag write even after acknowledging a later head FCU.
+            if transition.expected.safe != transition.target.safe ||
+                self.get_confirmed_frontier_transition().await?.is_none()
+            {
+                let row: models::metadata::ActiveModel = Metadata {
+                    key: CONFIRMED_FRONTIER_KEY.to_owned(),
+                    value: serde_json::to_string(&transition)?,
+                }
+                .into();
+                models::metadata::Entity::insert(row)
+                    .on_conflict(
+                        OnConflict::column(models::metadata::Column::Key)
+                            .update_column(models::metadata::Column::Value)
+                            .to_owned(),
+                    )
+                    .exec_without_returning(self.get_connection())
+                    .await?;
+            }
+        }
         models::metadata::Entity::delete_by_id(FRONTIER_TRANSITION_KEY)
             .exec(self.get_connection())
             .await?;
@@ -551,14 +588,7 @@ impl<T: WriteConnectionProvider + ?Sized + Sync> DatabaseWriteOperations for T {
             .one(self.get_connection())
             .await?;
 
-        if let Some(batch) = batch {
-            let finalized_block_info = models::l2_block::Entity::find()
-                .filter(models::l2_block::Column::BatchHash.eq(batch.hash.clone()))
-                .order_by_desc(models::l2_block::Column::BlockNumber)
-                .one(self.get_connection())
-                .await?
-                .map(|block| block.block_info())
-                .expect("Finalized batch must have at least one L2 block.");
+        if batch.is_some() {
             models::batch_commit::Entity::update_many()
                 .filter(filter)
                 .col_expr(
@@ -568,7 +598,7 @@ impl<T: WriteConnectionProvider + ?Sized + Sync> DatabaseWriteOperations for T {
                 .exec(self.get_connection())
                 .await?;
 
-            Ok(Some(finalized_block_info))
+            Ok(Some(self.get_latest_finalized_l2_info().await?))
         } else {
             Ok(None)
         }
@@ -1021,6 +1051,14 @@ impl<T: WriteConnectionProvider + ?Sized + Sync> DatabaseWriteOperations for T {
 #[async_trait::async_trait]
 #[auto_impl::auto_impl(Arc)]
 pub trait DatabaseReadOperations {
+    /// Last acknowledged safe transition (or first intent), retained because Engine
+    /// acknowledgement does not imply fsync of its safe tag.
+    async fn get_confirmed_frontier_transition(
+        &self,
+    ) -> Result<Option<PendingFrontierTransition>, DatabaseError>;
+
+    /// Highest non-reverted L2 block in a finalized batch, or genesis.
+    async fn get_latest_finalized_l2_info(&self) -> Result<BlockInfo, DatabaseError>;
     /// Return the pending Engine forkchoice transition, if one exists.
     async fn get_pending_frontier_transition(
         &self,
@@ -1119,14 +1157,37 @@ pub trait DatabaseReadOperations {
 
 #[async_trait::async_trait]
 impl<T: ReadConnectionProvider + Sync + ?Sized> DatabaseReadOperations for T {
+    async fn get_confirmed_frontier_transition(
+        &self,
+    ) -> Result<Option<PendingFrontierTransition>, DatabaseError> {
+        read_frontier_transition(self, CONFIRMED_FRONTIER_KEY).await
+    }
+
+    async fn get_latest_finalized_l2_info(&self) -> Result<BlockInfo, DatabaseError> {
+        let row = models::l2_block::Entity::find()
+            .left_join(models::batch_commit::Entity)
+            .filter(models::l2_block::Column::Reverted.eq(false))
+            .filter(
+                Condition::any().add(models::l2_block::Column::BlockNumber.eq(0)).add(
+                    Condition::all()
+                        .add(
+                            models::batch_commit::Column::Status
+                                .eq(BatchStatus::Finalized.as_str()),
+                        )
+                        .add(models::batch_commit::Column::RevertedBlockNumber.is_null()),
+                ),
+            )
+            .order_by_desc(models::l2_block::Column::BlockNumber)
+            .one(self.get_connection())
+            .await?
+            .ok_or(DatabaseError::MissingSafeL2Frontier)?;
+        Ok(row.block_info())
+    }
+
     async fn get_pending_frontier_transition(
         &self,
     ) -> Result<Option<PendingFrontierTransition>, DatabaseError> {
-        models::metadata::Entity::find_by_id(FRONTIER_TRANSITION_KEY)
-            .one(self.get_connection())
-            .await?
-            .map(|row| serde_json::from_str(&row.value).map_err(Into::into))
-            .transpose()
+        read_frontier_transition(self, FRONTIER_TRANSITION_KEY).await
     }
 
     async fn get_batch_by_index(

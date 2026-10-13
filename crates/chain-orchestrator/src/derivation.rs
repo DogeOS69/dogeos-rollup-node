@@ -1104,27 +1104,17 @@ mod tests {
     async fn same_height_frontier_mismatch_never_builds_on_engine_hash() {
         let database = setup_database().await;
         insert_batch(&database, 1, 1, None).await;
-        let database_safe = info(SAFE, 0x11);
         let (finalized_block, finalized) = rpc_block(0, B256::ZERO, 0xf0);
         let (engine_safe_block, engine_safe) = rpc_block(SAFE, finalized.hash, 0xb1);
 
+        database.insert_genesis_block(finalized.hash).await.unwrap();
+        database.update_batch_status(B256::ZERO, BatchStatus::Consolidated).await.unwrap();
         let asserter = Asserter::new();
         asserter.push_success(&Some(engine_safe_block.clone()));
         asserter.push_success(&Some(engine_safe_block));
         asserter.push_success(&Some(finalized_block));
-        push_absent_block(&asserter);
         let provider = absent_block_provider(asserter);
-
         let client = Arc::new(ScriptedEngineClient::new());
-        client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Valid, None)));
-        client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(
-            PayloadStatusEnum::Valid,
-            Some(PayloadId::new([7; 8])),
-        )));
-        client.push_get_payload(ScriptedResponse::Ok(payload(SAFE + 1)));
-        client.push_new_payload(ScriptedResponse::Ok(payload_status(PayloadStatusEnum::Valid)));
-        client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Valid, None)));
-        client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Valid, None)));
         let mut engine =
             Engine::new(client.clone(), ForkchoiceState::new(engine_safe, engine_safe, finalized));
         let mut driver = DerivationDriver::default();
@@ -1133,17 +1123,12 @@ mod tests {
 
         assert!(matches!(
             driver.run_attempt(&provider, &mut engine, &database).await,
-            AttemptStep::Completed(_)
+            AttemptStep::Fatal(_)
         ));
 
-        let build_inputs = client
-            .fork_choice_inputs()
-            .into_iter()
-            .filter(|(_, has_attributes)| *has_attributes)
-            .collect::<Vec<_>>();
-        assert_eq!(build_inputs.len(), 1);
-        assert_eq!(build_inputs[0].0.head_block_hash, database_safe.hash);
-        assert_ne!(build_inputs[0].0.head_block_hash, engine_safe.hash);
+        assert_eq!(client.fork_choice_updated_calls(), 0);
+        assert_eq!(client.get_payload_calls(), 0);
+        assert_eq!(client.new_payload_calls(), 0);
     }
 
     #[tokio::test]

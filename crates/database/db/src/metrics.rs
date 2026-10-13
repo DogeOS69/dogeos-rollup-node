@@ -56,6 +56,8 @@ pub(crate) enum DatabaseOperation {
     InsertSignature,
     // Read operations
     GetPendingFrontierTransition,
+    GetConfirmedFrontierTransition,
+    GetLatestFinalizedL2Info,
     GetBatchByIndex,
     GetBatchByHash,
     GetBatchStatusByHash,
@@ -127,6 +129,8 @@ impl DatabaseOperation {
             Self::Unwind => "unwind",
             Self::InsertSignatures => "insert_signatures",
             Self::InsertSignature => "insert_signature",
+            Self::GetConfirmedFrontierTransition => "get_confirmed_frontier_transition",
+            Self::GetLatestFinalizedL2Info => "get_latest_finalized_l2_info",
             Self::GetPendingFrontierTransition => "get_pending_frontier_transition",
             Self::GetBatchByIndex => "get_batch_by_index",
             Self::GetBatchByHash => "get_batch_by_hash",

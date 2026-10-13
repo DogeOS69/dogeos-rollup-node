@@ -29,7 +29,7 @@ use rollup_node_chain_orchestrator::{
     ChainOrchestrator, ChainOrchestratorConfig, ChainOrchestratorHandle, Consensus, NoopConsensus,
     SystemContractConsensus,
 };
-use rollup_node_primitives::{BlockInfo, NodeConfig};
+use rollup_node_primitives::NodeConfig;
 use rollup_node_providers::{
     BlobProvidersBuilder, FullL1Provider, L1MessageProvider, SystemContractProvider,
 };
@@ -38,8 +38,8 @@ use rollup_node_sequencer::{
 };
 use rollup_node_watcher::{L1Watcher, L1WatcherCommand};
 use scroll_db::{
-    Database, DatabaseConnectionProvider, DatabaseError, DatabaseMaintenance,
-    DatabaseReadOperations, DatabaseWriteOperations,
+    Database, DatabaseConnectionProvider, DatabaseMaintenance, DatabaseReadOperations,
+    DatabaseWriteOperations,
 };
 use scroll_derivation_pipeline::DerivationPipeline;
 use scroll_engine::{Engine, ForkchoiceState, ScrollAuthApiEngineClient, ScrollEngineApi};
@@ -346,74 +346,31 @@ impl ScrollRollupNodeConfig {
             .expect("failed to perform migration (custom chain)");
         }
 
-        // Static migrations may carry an older development genesis, and custom chains reuse the
-        // development migration. Before any batch has advanced the safe frontier, canonicalize
-        // the single database genesis row to the Engine chain spec. This prevents startup
-        // recovery from treating two initialization defaults as a real same-height fork.
+        // Custom/dev chains reuse a static development seed. Normalize only an unused seed;
+        // an established or named production database must match the configured genesis.
         let (database_safe, _) = db.get_latest_safe_l2_info().await?;
-        if database_safe.number == 0 {
-            let genesis_hash = chain_spec.genesis_hash();
-            db.insert_genesis_block(genesis_hash).await?;
-            tracing::info!(
-                target: "scroll::node::args",
-                ?genesis_hash,
-                previous_genesis_hash = ?database_safe.hash,
-                "Canonicalized database genesis from chain spec"
+        let database_head = db.get_l2_head_block_number().await?;
+        let genesis = db
+            .get_l2_block_info_by_number(0)
+            .await?
+            .ok_or_else(|| eyre::eyre!("database genesis is missing"))?;
+        if genesis.hash != chain_spec.genesis_hash() {
+            eyre::ensure!(
+                (chain_spec.is_dev_chain() || chain_spec.chain().named().is_none()) &&
+                    database_safe.number == 0 &&
+                    database_head == 0,
+                "database genesis does not match the configured chain"
             );
+            db.insert_genesis_block(chain_spec.genesis_hash()).await?;
         }
 
-        let chain_spec_fcs = || {
-            ForkchoiceState::head_from_chain_spec(chain_spec.clone())
-                .expect("failed to derive forkchoice state from chain spec")
-        };
-        let mut fcs =
-            ForkchoiceState::from_provider(&l2_provider).await.unwrap_or_else(chain_spec_fcs);
-
-        let (l1_block_startup_info, mut l2_head_block_number) = db
-            .tx_mut(move |tx| async move {
-                // On startup we replay the latest batch of blocks from the database as such we set
-                // the safe block hash to the latest block hash associated with the
-                // previous consolidated batch in the database.
-                let l1_block_startup_info = tx.prepare_l1_watcher_start_info().await?;
-
-                let l2_head_block_number = tx.get_l2_head_block_number().await?;
-
-                Ok::<_, DatabaseError>((l1_block_startup_info, l2_head_block_number))
-            })
-            .await?;
-
-        // Loop to find the latest block that we have in the EN and purge L1 message mappings to
-        // account for the startup block
-        //
-        // This is necessary as there is an edge case in which the EN may not have persisted the
-        // latest block.
-        let finalized_block_number = fcs.finalized_block_info().number;
-        while l2_head_block_number > finalized_block_number {
-            tracing::info!(target: "scroll::node::args", ?l2_head_block_number, "Checking for L2 head block in EN");
-
-            // Check if the block exists in the EN and update the forkchoice state and L2 head block
-            // number
-            if let Some(block) = l2_provider
-                .get_block(l2_head_block_number.into())
-                .full()
-                .await?
-                .map(|b| b.into_consensus().map_transactions(|tx| tx.inner.into_inner()))
-            {
-                tracing::info!(target: "scroll::node::args", ?l2_head_block_number, "Found L2 head block in EN");
-                let block_info: BlockInfo = (&block).into();
-                fcs.update(Some(block_info), None, None)?;
-                db.tx_mut(move |tx| async move {
-                    tx.set_l2_head_block_number(l2_head_block_number).await?;
-                    tx.purge_l1_message_to_l2_block_mappings(Some(l2_head_block_number + 1)).await
-                })
-                .await?;
-                break;
-            }
-
-            // Decrement the L2 head block number and try again
-            tracing::info!(target: "scroll::node::args", ?l2_head_block_number, "L2 head block not found in EN, decrementing");
-            l2_head_block_number -= 1;
-        }
+        // Preserve provider errors. A failed tag lookup is not evidence of a fresh chain.
+        let fcs = ForkchoiceState::try_from_provider(&l2_provider)
+            .await?
+            .ok_or_else(|| eyre::eyre!("execution provider is missing forkchoice tags"))?;
+        let l1_block_startup_info = db.prepare_l1_watcher_start_info().await?;
+        // The orchestrator recovers safe/finalized before selecting and confirming the persisted
+        // unsafe head. Lowering the local head here could otherwise make head < old Engine safe.
 
         let chain_spec = Arc::new(chain_spec.clone());
 

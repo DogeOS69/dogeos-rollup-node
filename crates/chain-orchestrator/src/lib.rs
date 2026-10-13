@@ -1960,6 +1960,7 @@ mod run_loop_policy_tests {
             BatchDerivationResult {
                 attributes: vec![DerivedAttributes {
                     block_number: SAFE + 1,
+                    base_fee: U256::ZERO,
                     attributes: ScrollPayloadAttributes {
                         transactions: Some(vec![]),
                         ..Default::default()
@@ -2065,6 +2066,7 @@ mod run_loop_policy_tests {
             BatchDerivationResult {
                 attributes: vec![DerivedAttributes {
                     block_number: SAFE + 1,
+                    base_fee: U256::ZERO,
                     attributes: ScrollPayloadAttributes {
                         transactions: Some(vec![]),
                         ..Default::default()
@@ -2175,6 +2177,7 @@ mod run_loop_policy_tests {
             BatchDerivationResult {
                 attributes: vec![DerivedAttributes {
                     block_number: SAFE + 1,
+                    base_fee: U256::ZERO,
                     attributes: ScrollPayloadAttributes {
                         transactions: Some(vec![]),
                         ..Default::default()

@@ -7,6 +7,7 @@ use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::SolCall;
 use dogeos_chainspec::{DogeosChainSpec, DOGEOS_CHIKYU, DOGEOS_DEV, DOGEOS_MAINNET};
 use dogeos_hardforks::{DogeosHardfork, ForkCondition};
+use dogeos_reth_evm::DEFAULT_BASE_FEE_OVERHEAD;
 use dogeos_reth_primitives::DogeosBlock;
 use futures::{task::noop_waker_ref, FutureExt, StreamExt};
 use reth_chainspec::EthChainSpec;
@@ -2182,7 +2183,7 @@ pub fn read_to_bytes<P: AsRef<std::path::Path>>(path: P) -> eyre::Result<Bytes> 
     Ok(Bytes::from_str(&std::fs::read_to_string(path)?)?)
 }
 
-/// Encodes one V0 calldata batch containing deterministic transaction-free blocks.
+/// Encodes one V0 calldata batch containing deterministic transaction-free DOGEOS_DEV blocks.
 fn empty_batch_calldata(first_block: u64, block_count: u8, timestamp: u64) -> Bytes {
     let mut parent_batch_header = Vec::with_capacity(89);
     parent_batch_header.push(0);
@@ -2197,7 +2198,8 @@ fn empty_batch_calldata(first_block: u64, block_count: u8, timestamp: u64) -> By
     for number in first_block..first_block + u64::from(block_count) {
         chunk.extend_from_slice(&number.to_be_bytes());
         chunk.extend_from_slice(&timestamp.to_be_bytes());
-        chunk.extend_from_slice(&U256::ZERO.to_be_bytes::<32>());
+        // Empty blocks on the dev chain keep the base fee at the default overhead.
+        chunk.extend_from_slice(&DEFAULT_BASE_FEE_OVERHEAD.to_be_bytes::<32>());
         chunk.extend_from_slice(&SCROLL_GAS_LIMIT.to_be_bytes());
         chunk.extend_from_slice(&0u16.to_be_bytes());
         chunk.extend_from_slice(&0u16.to_be_bytes());

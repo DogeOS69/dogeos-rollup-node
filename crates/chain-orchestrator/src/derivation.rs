@@ -501,6 +501,29 @@ where
                             },
                         ));
                     }
+                    let mismatch = if payload.base_fee_per_gas != attributes.base_fee {
+                        Some(format!(
+                            "base fee: expected {}, got {}",
+                            attributes.base_fee, payload.base_fee_per_gas
+                        ))
+                    } else if attributes.attributes.transactions.as_ref() !=
+                        Some(&payload.transactions)
+                    {
+                        Some("transaction list differs from derived batch transactions".to_owned())
+                    } else {
+                        None
+                    };
+                    if let Some(reason) = mismatch {
+                        return Err(AttemptFailure::fatal(
+                            GET_PAYLOAD_METHOD,
+                            "PAYLOAD_MISMATCH",
+                            ChainOrchestratorError::DerivedPayloadMismatch {
+                                batch_info,
+                                block_number: attributes.block_number,
+                                reason,
+                            },
+                        ));
+                    }
                     let block_info: L2BlockInfoWithL1Messages =
                         (&payload).try_into().map_err(|error| {
                             AttemptFailure::fatal(
@@ -814,7 +837,11 @@ mod tests {
         let attributes =
             ScrollPayloadAttributes { transactions: Some(vec![]), ..Default::default() };
         BatchDerivationResult {
-            attributes: vec![DerivedAttributes { block_number: SAFE + 1, attributes }],
+            attributes: vec![DerivedAttributes {
+                block_number: SAFE + 1,
+                base_fee: U256::ZERO,
+                attributes,
+            }],
             batch_info: BatchInfo::new(index, B256::repeat_byte(index as u8)),
             skipped_l1_messages: vec![],
             target_status,
@@ -1132,37 +1159,56 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn builder_payload_with_wrong_parent_is_rejected_before_new_payload() {
-        let database = setup_database().await;
-        insert_batch(&database, 1, 1, None).await;
-        let client = Arc::new(ScriptedEngineClient::new());
-        client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(
-            PayloadStatusEnum::Valid,
-            Some(PayloadId::new([7; 8])),
-        )));
-        let mut wrong_payload = payload(SAFE + 1);
-        wrong_payload.parent_hash = B256::repeat_byte(0x99);
-        client.push_get_payload(ScriptedResponse::Ok(wrong_payload));
-        let mut engine = engine_at_safe(client.clone());
-        let asserter = Asserter::new();
-        push_absent_block(&asserter);
-        let provider = absent_block_provider(asserter);
-        let mut driver = DerivationDriver::default();
-        driver.hold_batch(batch(1, BatchStatus::Consolidated));
-        driver.wait_for_attempt().await;
+    async fn builder_payload_mismatches_are_rejected_before_new_payload() {
+        for field in ["parent", "number", "base_fee", "transactions"] {
+            let database = setup_database().await;
+            insert_batch(&database, 1, 1, None).await;
+            let client = Arc::new(ScriptedEngineClient::new());
+            client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(
+                PayloadStatusEnum::Valid,
+                Some(PayloadId::new([7; 8])),
+            )));
+            let mut wrong_payload = payload(SAFE + 1);
+            match field {
+                "parent" => wrong_payload.parent_hash = B256::repeat_byte(0x99),
+                "number" => wrong_payload.block_number += 1,
+                "base_fee" => wrong_payload.base_fee_per_gas = U256::from(1),
+                "transactions" => wrong_payload.transactions.push(Bytes::from_static(&[0xff])),
+                _ => unreachable!(),
+            }
+            client.push_get_payload(ScriptedResponse::Ok(wrong_payload));
+            let mut engine = engine_at_safe(client.clone());
+            let asserter = Asserter::new();
+            push_absent_block(&asserter);
+            let provider = absent_block_provider(asserter);
+            let mut driver = DerivationDriver::default();
+            driver.hold_batch(batch(1, BatchStatus::Consolidated));
+            driver.wait_for_attempt().await;
 
-        let AttemptStep::Fatal(fatal) = driver.run_attempt(&provider, &mut engine, &database).await
-        else {
-            panic!("wrong-parent builder payload must fail-stop")
-        };
-        assert_eq!(fatal.method, GET_PAYLOAD_METHOD);
-        assert_eq!(fatal.outcome, "PAYLOAD_MISMATCH");
-        assert!(matches!(*fatal.error, ChainOrchestratorError::BuiltPayloadMismatch { .. }));
-        assert_eq!(client.new_payload_calls(), 0);
-        assert_eq!(
-            database.get_batch_status_by_hash(B256::repeat_byte(1)).await.unwrap(),
-            Some(BatchStatus::Committed)
-        );
+            let AttemptStep::Fatal(fatal) =
+                driver.run_attempt(&provider, &mut engine, &database).await
+            else {
+                panic!("builder payload with wrong {field} must fail-stop")
+            };
+            assert_eq!(fatal.method, GET_PAYLOAD_METHOD);
+            assert_eq!(fatal.outcome, "PAYLOAD_MISMATCH");
+            if matches!(field, "parent" | "number") {
+                assert!(matches!(
+                    *fatal.error,
+                    ChainOrchestratorError::BuiltPayloadMismatch { .. }
+                ));
+            } else {
+                assert!(matches!(
+                    *fatal.error,
+                    ChainOrchestratorError::DerivedPayloadMismatch { .. }
+                ));
+            }
+            assert_eq!(client.new_payload_calls(), 0);
+            assert_eq!(
+                database.get_batch_status_by_hash(B256::repeat_byte(1)).await.unwrap(),
+                Some(BatchStatus::Committed)
+            );
+        }
     }
 
     #[tokio::test]
@@ -1225,8 +1271,16 @@ mod tests {
         let mut driver = DerivationDriver::default();
         driver.hold_batch(BatchDerivationResult {
             attributes: vec![
-                DerivedAttributes { block_number: SAFE + 1, attributes: first_attributes },
-                DerivedAttributes { block_number: SAFE + 2, attributes: second_attributes },
+                DerivedAttributes {
+                    block_number: SAFE + 1,
+                    base_fee: U256::ZERO,
+                    attributes: first_attributes,
+                },
+                DerivedAttributes {
+                    block_number: SAFE + 2,
+                    base_fee: U256::ZERO,
+                    attributes: second_attributes,
+                },
             ],
             batch_info: BatchInfo::new(1, B256::repeat_byte(1)),
             skipped_l1_messages: vec![],

@@ -407,6 +407,111 @@ async fn test_consolidation() -> eyre::Result<()> {
     Ok(())
 }
 
+/// Brings a synced follower to the point where it has rejected block 2 because block 2 includes
+/// an L1 message (queue index 1) that the follower has not indexed yet. Returns the nodes and the
+/// late message, which the caller delivers to the follower.
+#[allow(clippy::large_stack_frames)]
+async fn follower_missing_l1_message() -> eyre::Result<(TestFixture, TestFixture, TxL1Message)> {
+    let mut sequencer = TestFixture::builder()
+        .sequencer()
+        .with_eth_scroll_bridge(true)
+        .with_scroll_wire(true)
+        .auto_start(false)
+        .block_time(10)
+        .with_l1_message_delay(0)
+        .allow_empty_blocks(true)
+        .build()
+        .await?;
+
+    let mut follower = TestFixture::builder().followers(1).build().await?;
+    sequencer.sequencer().node.connect(&mut follower.follower(0).node).await;
+
+    // Both nodes index L1 message 0 and report L1 synced.
+    let (sender, to) = (Address::random(), Address::random());
+    sequencer.l1().add_message().sender(sender).to(to).value(1).queue_index(0).send().await?;
+    sequencer.expect_event().l1_message_committed().await?;
+    follower.l1().add_message().sender(sender).to(to).value(1).send().await?;
+    follower.expect_event().l1_message_committed().await?;
+    sequencer.l1().sync().await?;
+    follower.l1().sync().await?;
+    follower.expect_event().chain_consolidated().await?;
+
+    // Block 1 includes message 0 and is imported by the follower.
+    sequencer.build_block().expect_block_number(1).build_and_await_block().await?;
+    follower.expect_event().chain_extended(1).await?;
+
+    // Only the sequencer indexes message 1, then includes it in block 2.
+    let late_message = TxL1Message {
+        queue_index: 1,
+        gas_limit: 21000,
+        sender: Address::random(),
+        to: Address::random(),
+        value: U256::from(1),
+        input: Default::default(),
+    };
+    sequencer
+        .l1()
+        .add_message()
+        .queue_index(late_message.queue_index)
+        .gas_limit(late_message.gas_limit)
+        .sender(late_message.sender)
+        .to(late_message.to)
+        .value(late_message.value)
+        .at_block(1)
+        .send()
+        .await?;
+    sequencer.expect_event().l1_message_committed().await?;
+    sequencer.l1().new_block(5).await?;
+    sequencer.expect_event().new_l1_block().await?;
+    sequencer.build_block().expect_block_number(2).build_and_await_block().await?;
+
+    follower
+        .expect_event()
+        .where_event(|e| matches!(e, ChainOrchestratorEvent::L1MessageNotFoundInDatabase(_)))
+        .await?;
+
+    Ok((sequencer, follower, late_message))
+}
+
+/// Delivers the late L1 message to the follower's L1 watcher.
+async fn index_late_message(follower: &mut TestFixture, message: &TxL1Message) -> eyre::Result<()> {
+    follower
+        .l1()
+        .add_message()
+        .queue_index(message.queue_index)
+        .gas_limit(message.gas_limit)
+        .sender(message.sender)
+        .to(message.to)
+        .value(message.value)
+        .at_block(1)
+        .send()
+        .await?;
+    follower.expect_event().l1_message_committed().await
+}
+
+/// A block rejected for a missing L1 message is imported as soon as the follower indexes that
+/// message, without waiting for the sequencer to produce another block.
+#[allow(clippy::large_stack_frames)]
+#[tokio::test]
+async fn test_follower_retries_import_blocked_on_late_l1_message() -> eyre::Result<()> {
+    reth_tracing::init_test_tracing();
+
+    let (_sequencer, mut follower, late_message) = follower_missing_l1_message().await?;
+    index_late_message(&mut follower, &late_message).await?;
+
+    // No further block is produced: the retried import alone must extend the chain to block 2.
+    let extended = follower
+        .expect_event()
+        .where_event(|e| matches!(e, ChainOrchestratorEvent::ChainExtended(_)))
+        .await?;
+    let Some(ChainOrchestratorEvent::ChainExtended(import)) = extended.first() else {
+        eyre::bail!("expected a chain extension");
+    };
+    assert_eq!(import.chain.iter().map(|b| b.header.number).collect::<Vec<_>>(), vec![2]);
+
+    Ok(())
+}
+
 #[allow(clippy::large_stack_frames)]
 #[tokio::test]
 async fn test_chain_orchestrator_reorg_with_gap_above_head() -> eyre::Result<()> {

@@ -16,9 +16,6 @@ pub enum DatabaseError {
     /// Failed to serde the metadata value.
     #[error("failed to serde metadata value: {0}")]
     MetadataSerdeError(#[from] serde_json::Error),
-    /// A frontier transition row contains an unknown kind.
-    #[error("invalid frontier transition kind: {0}")]
-    InvalidFrontierTransitionKind(String),
     /// The database has no non-reverted batch-indexed L2 block to use as its safe frontier.
     #[error("database contains no safe L2 frontier")]
     MissingSafeL2Frontier,

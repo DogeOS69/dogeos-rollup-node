@@ -915,6 +915,76 @@ mod test {
     use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 
     #[tokio::test]
+    async fn frontier_journal_is_atomic_and_survives_database_reopen() {
+        use crate::{FrontierTransitionKind, StoredForkchoiceState};
+        use scroll_migration::{Migrator, MigratorTrait, ScrollDevMigrationInfo};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.db");
+        let db = Database::new(path.to_str().unwrap()).await.unwrap();
+        Migrator::<ScrollDevMigrationInfo>::up(db.inner().get_connection(), None).await.unwrap();
+        let block = BlockInfo::new(1, B256::repeat_byte(1));
+        let expected = StoredForkchoiceState { head: block, safe: block, finalized: block };
+        let transition = PendingFrontierTransition {
+            kind: FrontierTransitionKind::ConsolidateBatch,
+            expected,
+            target: StoredForkchoiceState {
+                head: BlockInfo::new(2, B256::repeat_byte(2)),
+                ..expected
+            },
+            batch_hash: Some(B256::repeat_byte(3)),
+        };
+        db.set_l2_head_block_number(1).await.unwrap();
+        let error = db
+            .tx_mut(move |tx| async move {
+                tx.set_l2_head_block_number(2).await?;
+                tx.set_pending_frontier_transition(transition).await?;
+                Err::<(), _>(DatabaseError::MissingSafeL2Frontier)
+            })
+            .await;
+        assert!(error.is_err());
+        assert_eq!(db.get_l2_head_block_number().await.unwrap(), 1);
+        assert_eq!(db.get_pending_frontier_transition().await.unwrap(), None);
+
+        db.tx_mut(move |tx| async move {
+            tx.set_l2_head_block_number(2).await?;
+            tx.set_pending_frontier_transition(transition).await
+        })
+        .await
+        .unwrap();
+        db.inner().get_connection().clone().close().await.unwrap();
+        drop(db);
+        let db = Database::new(path.to_str().unwrap()).await.unwrap();
+        assert_eq!(db.get_pending_frontier_transition().await.unwrap(), Some(transition));
+        let updated =
+            PendingFrontierTransition { kind: FrontierTransitionKind::UnwindL1, ..transition };
+        db.set_pending_frontier_transition(updated).await.unwrap();
+        assert_eq!(db.get_pending_frontier_transition().await.unwrap(), Some(updated));
+        db.clear_pending_frontier_transition().await.unwrap();
+        assert_eq!(db.get_pending_frontier_transition().await.unwrap(), None);
+        assert_eq!(db.get_l2_head_block_number().await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn corrupt_frontier_journal_returns_an_error() {
+        use crate::frontier_transition_types::FRONTIER_TRANSITION_KEY;
+        use rollup_node_primitives::Metadata;
+
+        let db = setup_test_db().await;
+        for value in ["{", r#"{"kind":"unknown"}"#] {
+            let row: models::metadata::ActiveModel =
+                Metadata { key: FRONTIER_TRANSITION_KEY.to_owned(), value: value.to_owned() }
+                    .into();
+            models::metadata::Entity::insert(row).exec(db.inner().get_connection()).await.unwrap();
+            assert!(matches!(
+                db.get_pending_frontier_transition().await,
+                Err(DatabaseError::MetadataSerdeError(_))
+            ));
+            db.clear_pending_frontier_transition().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn test_database_round_trip_batch_commit() {
         // Set up the test database.
         let db = setup_test_db().await;

@@ -19,7 +19,7 @@ use scroll_db::{
     PendingFrontierTransition, StoredForkchoiceState, UnwindResult,
 };
 use scroll_derivation_pipeline::BatchDerivationResult;
-use scroll_engine::{payload_matches_attributes, Engine, EngineError, ScrollEngineApi};
+use scroll_engine::{Engine, EngineError, ScrollEngineApi};
 use std::{pin::Pin, time::Duration};
 use tokio::time::{Instant, Sleep};
 
@@ -487,12 +487,8 @@ where
                         .get_payload(payload_id)
                         .await
                         .map_err(engine_request_failure(batch_info, GET_PAYLOAD_METHOD))?;
-                    if !payload_matches_attributes(
-                        expected_parent,
-                        attributes.block_number,
-                        &attributes.attributes,
-                        &payload,
-                    ) {
+                    let parent_matches = payload.parent_hash == expected_parent.hash;
+                    if !parent_matches || payload.block_number != attributes.block_number {
                         return Err(AttemptFailure::fatal(
                             GET_PAYLOAD_METHOD,
                             "PAYLOAD_MISMATCH",

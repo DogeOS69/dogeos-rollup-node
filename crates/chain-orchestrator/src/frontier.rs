@@ -6,7 +6,7 @@
 //! intent bridges database transactions and the external Engine API; normal processing never
 //! proceeds while that intent is unresolved.
 
-use crate::ChainOrchestratorError;
+use crate::{error::FrontierTransitionConflict, ChainOrchestratorError};
 use alloy_provider::Provider;
 use alloy_rpc_types_engine::PayloadStatusEnum;
 use dogeos_rpc_types::Scroll;
@@ -39,18 +39,6 @@ async fn observe_forkchoice_for_recovery<P: Provider<Scroll>>(
     observe_forkchoice(provider)
         .await
         .map_err(|error| ChainOrchestratorError::FrontierObservation(Box::new(error)))
-}
-
-fn conflict(
-    transition: PendingFrontierTransition,
-    observed: StoredForkchoiceState,
-) -> ChainOrchestratorError {
-    ChainOrchestratorError::frontier_transition_conflict(
-        transition.kind,
-        transition.expected,
-        transition.target,
-        observed,
-    )
 }
 
 /// Selects the head for a startup repair without turning a safe-only rewind into a head unwind.
@@ -129,7 +117,9 @@ where
             return Ok(true)
         }
         if observed != transition.expected {
-            return Err(conflict(transition, observed))
+            return Err(ChainOrchestratorError::FrontierTransitionConflict(Box::new(
+                FrontierTransitionConflict { transition, observed },
+            )))
         }
     }
 
@@ -152,22 +142,17 @@ where
         .await
     {
         Ok(response) => response,
-        Err(source @ EngineError::TransportError(_)) => {
-            // A transport error is ambiguous: the Engine may have applied the FCU before the
-            // response was lost. Observe remote tags before deciding that the operation failed.
-            let observed_fcs = observe_forkchoice_for_recovery(provider).await?;
-            let observed = stored_forkchoice(&observed_fcs);
-            engine.replace_fcs_from_provider(observed_fcs);
-            if observed == transition.target {
-                database.clear_pending_frontier_transition().await?;
-                return Ok(true)
+        Err(source) => {
+            if matches!(source, EngineError::TransportError(_)) {
+                // The FCU may have succeeded before the response was lost.
+                let observed_fcs = observe_forkchoice_for_recovery(provider).await?;
+                let observed = stored_forkchoice(&observed_fcs);
+                engine.replace_fcs_from_provider(observed_fcs);
+                if observed == transition.target {
+                    database.clear_pending_frontier_transition().await?;
+                    return Ok(true)
+                }
             }
-            return Err(ChainOrchestratorError::FrontierTransitionEngineRequest {
-                kind: transition.kind,
-                source,
-            })
-        }
-        Err(source @ EngineError::FcsError(_)) => {
             return Err(ChainOrchestratorError::FrontierTransitionEngineRequest {
                 kind: transition.kind,
                 source,
@@ -180,19 +165,8 @@ where
             database.clear_pending_frontier_transition().await?;
             Ok(true)
         }
-        PayloadStatusEnum::Syncing => Err(ChainOrchestratorError::FrontierTransitionStatus {
-            kind: transition.kind,
-            status: "SYNCING",
-        }),
-        PayloadStatusEnum::Accepted => Err(ChainOrchestratorError::FrontierTransitionStatus {
-            kind: transition.kind,
-            status: "ACCEPTED",
-        }),
-        PayloadStatusEnum::Invalid { .. } => {
-            Err(ChainOrchestratorError::FrontierTransitionStatus {
-                kind: transition.kind,
-                status: "INVALID",
-            })
+        status => {
+            Err(ChainOrchestratorError::FrontierTransitionStatus { kind: transition.kind, status })
         }
     }
 }

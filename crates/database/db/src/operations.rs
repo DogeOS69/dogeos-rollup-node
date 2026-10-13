@@ -1,5 +1,8 @@
 use super::{models, DatabaseError, PendingFrontierTransition};
-use crate::{ReadConnectionProvider, WriteConnectionProvider};
+use crate::{
+    frontier_transition_types::FRONTIER_TRANSITION_KEY, ReadConnectionProvider,
+    WriteConnectionProvider,
+};
 
 use alloy_primitives::{Signature, B256};
 use dogeos_reth_engine::BlockDataHint;
@@ -214,37 +217,24 @@ impl<T: WriteConnectionProvider + ?Sized + Sync> DatabaseWriteOperations for T {
         &self,
         transition: PendingFrontierTransition,
     ) -> Result<(), DatabaseError> {
-        use models::frontier_transition::Column;
+        use models::metadata::Column;
 
-        let transition: models::frontier_transition::ActiveModel = transition.into();
-        models::frontier_transition::Entity::insert(transition)
-            .on_conflict(
-                OnConflict::column(Column::Id)
-                    .update_columns([
-                        Column::Kind,
-                        Column::ExpectedHeadNumber,
-                        Column::ExpectedHeadHash,
-                        Column::ExpectedSafeNumber,
-                        Column::ExpectedSafeHash,
-                        Column::ExpectedFinalizedNumber,
-                        Column::ExpectedFinalizedHash,
-                        Column::TargetHeadNumber,
-                        Column::TargetHeadHash,
-                        Column::TargetSafeNumber,
-                        Column::TargetSafeHash,
-                        Column::TargetFinalizedNumber,
-                        Column::TargetFinalizedHash,
-                        Column::BatchHash,
-                    ])
-                    .to_owned(),
-            )
+        let transition: models::metadata::ActiveModel = Metadata {
+            key: FRONTIER_TRANSITION_KEY.to_owned(),
+            value: serde_json::to_string(&transition)?,
+        }
+        .into();
+        models::metadata::Entity::insert(transition)
+            .on_conflict(OnConflict::column(Column::Key).update_column(Column::Value).to_owned())
             .exec_without_returning(self.get_connection())
             .await?;
         Ok(())
     }
 
     async fn clear_pending_frontier_transition(&self) -> Result<(), DatabaseError> {
-        models::frontier_transition::Entity::delete_many().exec(self.get_connection()).await?;
+        models::metadata::Entity::delete_by_id(FRONTIER_TRANSITION_KEY)
+            .exec(self.get_connection())
+            .await?;
         Ok(())
     }
 
@@ -1132,10 +1122,10 @@ impl<T: ReadConnectionProvider + Sync + ?Sized> DatabaseReadOperations for T {
     async fn get_pending_frontier_transition(
         &self,
     ) -> Result<Option<PendingFrontierTransition>, DatabaseError> {
-        models::frontier_transition::Entity::find_by_id(1)
+        models::metadata::Entity::find_by_id(FRONTIER_TRANSITION_KEY)
             .one(self.get_connection())
             .await?
-            .map(TryInto::try_into)
+            .map(|row| serde_json::from_str(&row.value).map_err(Into::into))
             .transpose()
     }
 

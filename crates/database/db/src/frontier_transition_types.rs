@@ -1,9 +1,11 @@
-use crate::DatabaseError;
 use alloy_primitives::B256;
 use rollup_node_primitives::BlockInfo;
 
+pub(crate) const FRONTIER_TRANSITION_KEY: &str = "pending_frontier_transition";
+
 /// The reason a durable forkchoice transition is pending.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum FrontierTransitionKind {
     /// Apply a newly consolidated batch to Engine forkchoice.
     ConsolidateBatch,
@@ -17,35 +19,8 @@ pub enum FrontierTransitionKind {
     StartupRepair,
 }
 
-impl FrontierTransitionKind {
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::ConsolidateBatch => "consolidate_batch",
-            Self::FinalizeBatch => "finalize_batch",
-            Self::RevertBatch => "revert_batch",
-            Self::UnwindL1 => "unwind_l1",
-            Self::StartupRepair => "startup_repair",
-        }
-    }
-}
-
-impl TryFrom<&str> for FrontierTransitionKind {
-    type Error = DatabaseError;
-
-    fn try_from(value: &str) -> Result<Self, Self::Error> {
-        match value {
-            "consolidate_batch" => Ok(Self::ConsolidateBatch),
-            "finalize_batch" => Ok(Self::FinalizeBatch),
-            "revert_batch" => Ok(Self::RevertBatch),
-            "unwind_l1" => Ok(Self::UnwindL1),
-            "startup_repair" => Ok(Self::StartupRepair),
-            _ => Err(DatabaseError::InvalidFrontierTransitionKind(value.to_owned())),
-        }
-    }
-}
-
 /// A database representation of an Engine forkchoice state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StoredForkchoiceState {
     /// The forkchoice head.
     pub head: BlockInfo,
@@ -56,7 +31,8 @@ pub struct StoredForkchoiceState {
 }
 
 /// A durable intent to move Engine forkchoice from an observed state to a database-backed target.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Stored as one JSON metadata value in the same transaction as the L1-backed database change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PendingFrontierTransition {
     /// Why the transition was created.
     pub kind: FrontierTransitionKind,

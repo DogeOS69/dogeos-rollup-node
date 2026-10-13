@@ -1,25 +1,23 @@
 use alloy_json_rpc::RpcError;
 use alloy_primitives::B256;
+use alloy_rpc_types_engine::PayloadStatusEnum;
 use alloy_transport::TransportErrorKind;
 use rollup_node_primitives::{BatchInfo, BlockInfo};
 use rollup_node_sequencer::SequencerError;
 use rollup_node_signer::SignerError;
 use scroll_db::{
-    CanRetry, DatabaseError, FrontierTransitionKind, L1MessageKey, StoredForkchoiceState,
+    CanRetry, DatabaseError, FrontierTransitionKind, L1MessageKey, PendingFrontierTransition,
+    StoredForkchoiceState,
 };
 use scroll_engine::EngineError;
 
 /// Details for a durable frontier transition whose observed Engine state matches neither its
 /// expected nor target state.
 #[derive(Debug, thiserror::Error)]
-#[error(
-    "frontier transition {kind:?} conflicted with Engine state: expected={expected:?}, target={target:?}, observed={observed:?}"
-)]
+#[error("frontier transition {transition:?} conflicted with Engine state: {observed:?}")]
 pub struct FrontierTransitionConflict {
-    kind: FrontierTransitionKind,
-    expected: StoredForkchoiceState,
-    target: StoredForkchoiceState,
-    observed: StoredForkchoiceState,
+    pub(crate) transition: PendingFrontierTransition,
+    pub(crate) observed: StoredForkchoiceState,
 }
 
 /// A type that represents an error that occurred in the chain orchestrator.
@@ -65,7 +63,7 @@ pub enum ChainOrchestratorError {
         /// The pending transition kind.
         kind: FrontierTransitionKind,
         /// The Engine payload status.
-        status: &'static str,
+        status: PayloadStatusEnum,
     },
     /// An error occurred while interacting with the database.
     #[error("database error occurred: {0}")]
@@ -263,20 +261,6 @@ impl CanRetry for ChainOrchestratorError {
 }
 
 impl ChainOrchestratorError {
-    pub(crate) fn frontier_transition_conflict(
-        kind: FrontierTransitionKind,
-        expected: StoredForkchoiceState,
-        target: StoredForkchoiceState,
-        observed: StoredForkchoiceState,
-    ) -> Self {
-        Self::FrontierTransitionConflict(Box::new(FrontierTransitionConflict {
-            kind,
-            expected,
-            target,
-            observed,
-        }))
-    }
-
     /// Returns true when continuing the run loop could process work against an unresolved Engine
     /// frontier.
     pub(crate) const fn is_frontier_fatal(&self) -> bool {

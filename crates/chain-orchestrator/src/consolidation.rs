@@ -43,64 +43,38 @@ pub(crate) async fn reconcile_batch<L2P: Provider<Scroll>>(
     for (index, (attributes, current_block)) in
         batch.attributes.iter().zip(current_blocks).enumerate()
     {
-        let expected_number = match previous_derived_number {
-            Some(number) => Some(number.saturating_add(1)),
-            None if attributes.block_number > frontier.number => {
-                Some(frontier.number.saturating_add(1))
+        let sequence_parent = previous_derived_number
+            .or_else(|| (attributes.block_number > frontier.number).then_some(frontier.number));
+        if let Some(parent) = sequence_parent {
+            if parent.checked_add(1) != Some(attributes.block_number) {
+                return Err(ChainOrchestratorError::InvalidDerivedBlockSequence {
+                    batch_info: batch.batch_info,
+                    expected_block_number: parent.saturating_add(1),
+                    actual_block_number: attributes.block_number,
+                })
             }
-            None => None,
-        };
-        let sequence_is_invalid = match previous_derived_number {
-            Some(number) => number.checked_add(1) != Some(attributes.block_number),
-            None if attributes.block_number > frontier.number => {
-                frontier.number.checked_add(1) != Some(attributes.block_number)
-            }
-            None => false,
-        };
-        if sequence_is_invalid {
-            return Err(ChainOrchestratorError::InvalidDerivedBlockSequence {
-                batch_info: batch.batch_info,
-                expected_block_number: expected_number.expect("invalid sequence has an anchor"),
-                actual_block_number: attributes.block_number,
-            })
         }
         previous_derived_number = Some(attributes.block_number);
 
-        // A duplicate delivery may replay a batch whose blocks are already covered by the
-        // database-backed safe frontier. Verify that prefix against the canonical provider and
-        // treat it as idempotently complete; safe history must never be rebuilt.
-        if attributes.block_number <= frontier.number {
-            let Some(current_block) = current_block else {
-                return Err(ChainOrchestratorError::SafeBatchReplayMismatch {
-                    batch_info: batch.batch_info,
-                    block_number: attributes.block_number,
-                    frontier,
-                })
-            };
-            if current_block.header.number != attributes.block_number ||
-                !block_matches_attributes(&attributes.attributes, &current_block)
-            {
-                return Err(ChainOrchestratorError::SafeBatchReplayMismatch {
-                    batch_info: batch.batch_info,
-                    block_number: attributes.block_number,
-                    frontier,
-                })
-            }
-
-            let block_info: L2BlockInfoWithL1Messages = (&current_block).into();
-            if attributes.block_number == frontier.number && block_info.block_info != frontier {
+        let already_safe = attributes.block_number <= frontier.number;
+        let matching_block = current_block.filter(|block| {
+            block.header.number == attributes.block_number &&
+                block_matches_attributes(&attributes.attributes, block) &&
+                if already_safe {
+                    attributes.block_number < frontier.number || BlockInfo::from(block) == frontier
+                } else {
+                    block.header.parent_hash == expected_parent.hash
+                }
+        });
+        let Some(current_block) = matching_block else {
+            // Replayed safe history must match; only an unsafe suffix may be rebuilt.
+            if already_safe {
                 return Err(ChainOrchestratorError::SafeBatchReplayMismatch {
                     batch_info: batch.batch_info,
                     block_number: attributes.block_number,
                     frontier,
                 })
             }
-            expected_parent = block_info.block_info;
-            actions.push(BlockConsolidationAction::Skip(block_info));
-            continue
-        }
-
-        let Some(current_block) = current_block else {
             actions.push(BlockConsolidationAction::ReorgSuffix {
                 first_attribute_index: index,
                 expected_parent,
@@ -108,22 +82,9 @@ pub(crate) async fn reconcile_batch<L2P: Provider<Scroll>>(
             break
         };
 
-        let parent_matches = current_block.header.parent_hash == expected_parent.hash;
-        let number_matches = current_block.header.number == attributes.block_number;
-        if !parent_matches ||
-            !number_matches ||
-            !block_matches_attributes(&attributes.attributes, &current_block)
-        {
-            actions.push(BlockConsolidationAction::ReorgSuffix {
-                first_attribute_index: index,
-                expected_parent,
-            });
-            break
-        }
-
         let block_info: L2BlockInfoWithL1Messages = (&current_block).into();
         expected_parent = block_info.block_info;
-        if attributes.block_number <= fcs.finalized_block_info().number {
+        if already_safe || attributes.block_number <= fcs.finalized_block_info().number {
             actions.push(BlockConsolidationAction::Skip(block_info));
         } else {
             actions.push(BlockConsolidationAction::UpdateFcs(block_info));

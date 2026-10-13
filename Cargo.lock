@@ -3501,7 +3501,7 @@ dependencies = [
 [[package]]
 name = "dogeos-chainspec"
 version = "0.1.0"
-source = "git+https://github.com/DogeOS69/dogeos-reth.git?rev=8f0b98b056111e8f497a4c6dd78ef1f776b626a5#8f0b98b056111e8f497a4c6dd78ef1f776b626a5"
+source = "git+https://github.com/DogeOS69/dogeos-reth.git?rev=77a968db48bcbc70ba8bca242ead51f6fc2c1716#77a968db48bcbc70ba8bca242ead51f6fc2c1716"
 dependencies = [
  "alloy-chains",
  "alloy-consensus",
@@ -3524,7 +3524,7 @@ dependencies = [
 [[package]]
 name = "dogeos-hardforks"
 version = "0.1.0"
-source = "git+https://github.com/DogeOS69/dogeos-reth.git?rev=8f0b98b056111e8f497a4c6dd78ef1f776b626a5#8f0b98b056111e8f497a4c6dd78ef1f776b626a5"
+source = "git+https://github.com/DogeOS69/dogeos-reth.git?rev=77a968db48bcbc70ba8bca242ead51f6fc2c1716#77a968db48bcbc70ba8bca242ead51f6fc2c1716"
 dependencies = [
  "alloy-hardforks 0.4.7",
  "auto_impl",
@@ -3534,7 +3534,7 @@ dependencies = [
 [[package]]
 name = "dogeos-protocol-types"
 version = "0.1.0"
-source = "git+https://github.com/DogeOS69/dogeos-reth.git?rev=8f0b98b056111e8f497a4c6dd78ef1f776b626a5#8f0b98b056111e8f497a4c6dd78ef1f776b626a5"
+source = "git+https://github.com/DogeOS69/dogeos-reth.git?rev=77a968db48bcbc70ba8bca242ead51f6fc2c1716#77a968db48bcbc70ba8bca242ead51f6fc2c1716"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -3555,7 +3555,7 @@ dependencies = [
 [[package]]
 name = "dogeos-reth-consensus"
 version = "0.1.0"
-source = "git+https://github.com/DogeOS69/dogeos-reth.git?rev=8f0b98b056111e8f497a4c6dd78ef1f776b626a5#8f0b98b056111e8f497a4c6dd78ef1f776b626a5"
+source = "git+https://github.com/DogeOS69/dogeos-reth.git?rev=77a968db48bcbc70ba8bca242ead51f6fc2c1716#77a968db48bcbc70ba8bca242ead51f6fc2c1716"
 dependencies = [
  "alloy-consensus",
  "alloy-primitives",
@@ -3571,7 +3571,7 @@ dependencies = [
 [[package]]
 name = "dogeos-reth-engine"
 version = "0.1.0"
-source = "git+https://github.com/DogeOS69/dogeos-reth.git?rev=8f0b98b056111e8f497a4c6dd78ef1f776b626a5#8f0b98b056111e8f497a4c6dd78ef1f776b626a5"
+source = "git+https://github.com/DogeOS69/dogeos-reth.git?rev=77a968db48bcbc70ba8bca242ead51f6fc2c1716#77a968db48bcbc70ba8bca242ead51f6fc2c1716"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -3589,7 +3589,7 @@ dependencies = [
 [[package]]
 name = "dogeos-reth-evm"
 version = "0.1.0"
-source = "git+https://github.com/DogeOS69/dogeos-reth.git?rev=8f0b98b056111e8f497a4c6dd78ef1f776b626a5#8f0b98b056111e8f497a4c6dd78ef1f776b626a5"
+source = "git+https://github.com/DogeOS69/dogeos-reth.git?rev=77a968db48bcbc70ba8bca242ead51f6fc2c1716#77a968db48bcbc70ba8bca242ead51f6fc2c1716"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -3616,7 +3616,7 @@ dependencies = [
 [[package]]
 name = "dogeos-reth-node"
 version = "0.1.0"
-source = "git+https://github.com/DogeOS69/dogeos-reth.git?rev=8f0b98b056111e8f497a4c6dd78ef1f776b626a5#8f0b98b056111e8f497a4c6dd78ef1f776b626a5"
+source = "git+https://github.com/DogeOS69/dogeos-reth.git?rev=77a968db48bcbc70ba8bca242ead51f6fc2c1716#77a968db48bcbc70ba8bca242ead51f6fc2c1716"
 dependencies = [
  "alloy-consensus",
  "alloy-primitives",
@@ -3634,6 +3634,7 @@ dependencies = [
  "dogeos-rpc-types",
  "dogeos-scroll-wire",
  "eyre",
+ "futures",
  "reqwest 0.13.4",
  "reth-chainspec",
  "reth-db-api",
@@ -3653,6 +3654,7 @@ dependencies = [
  "reth-rpc-eth-api",
  "reth-rpc-eth-types",
  "reth-storage-api",
+ "reth-tasks",
  "reth-transaction-pool",
  "thiserror 2.0.18",
  "tokio",
@@ -3662,7 +3664,7 @@ dependencies = [
 [[package]]
 name = "dogeos-reth-payload"
 version = "0.1.0"
-source = "git+https://github.com/DogeOS69/dogeos-reth.git?rev=8f0b98b056111e8f497a4c6dd78ef1f776b626a5#8f0b98b056111e8f497a4c6dd78ef1f776b626a5"
+source = "git+https://github.com/DogeOS69/dogeos-reth.git?rev=77a968db48bcbc70ba8bca242ead51f6fc2c1716#77a968db48bcbc70ba8bca242ead51f6fc2c1716"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -3694,7 +3696,7 @@ dependencies = [
 [[package]]
 name = "dogeos-reth-primitives"
 version = "0.1.0"
-source = "git+https://github.com/DogeOS69/dogeos-reth.git?rev=8f0b98b056111e8f497a4c6dd78ef1f776b626a5#8f0b98b056111e8f497a4c6dd78ef1f776b626a5"
+source = "git+https://github.com/DogeOS69/dogeos-reth.git?rev=77a968db48bcbc70ba8bca242ead51f6fc2c1716#77a968db48bcbc70ba8bca242ead51f6fc2c1716"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -3714,7 +3716,7 @@ dependencies = [
 [[package]]
 name = "dogeos-reth-rpc"
 version = "0.1.0"
-source = "git+https://github.com/DogeOS69/dogeos-reth.git?rev=8f0b98b056111e8f497a4c6dd78ef1f776b626a5#8f0b98b056111e8f497a4c6dd78ef1f776b626a5"
+source = "git+https://github.com/DogeOS69/dogeos-reth.git?rev=77a968db48bcbc70ba8bca242ead51f6fc2c1716#77a968db48bcbc70ba8bca242ead51f6fc2c1716"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -3753,19 +3755,22 @@ dependencies = [
 [[package]]
 name = "dogeos-reth-txpool"
 version = "0.1.0"
-source = "git+https://github.com/DogeOS69/dogeos-reth.git?rev=8f0b98b056111e8f497a4c6dd78ef1f776b626a5#8f0b98b056111e8f497a4c6dd78ef1f776b626a5"
+source = "git+https://github.com/DogeOS69/dogeos-reth.git?rev=77a968db48bcbc70ba8bca242ead51f6fc2c1716#77a968db48bcbc70ba8bca242ead51f6fc2c1716"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
  "alloy-primitives",
  "derive_more",
+ "dogeos-chainspec",
  "dogeos-hardforks",
  "dogeos-protocol-types",
  "dogeos-reth-evm",
  "dogeos-reth-primitives",
  "parking_lot 0.12.5",
  "reth-chainspec",
+ "reth-eth-wire",
  "reth-evm",
+ "reth-execution-types",
  "reth-primitives-traits",
  "reth-revm",
  "reth-storage-api",
@@ -3773,13 +3778,14 @@ dependencies = [
  "reth-transaction-pool",
  "revm-scroll",
  "thiserror 2.0.18",
+ "tokio",
  "tracing",
 ]
 
 [[package]]
 name = "dogeos-rpc-types"
 version = "0.1.0"
-source = "git+https://github.com/DogeOS69/dogeos-reth.git?rev=8f0b98b056111e8f497a4c6dd78ef1f776b626a5#8f0b98b056111e8f497a4c6dd78ef1f776b626a5"
+source = "git+https://github.com/DogeOS69/dogeos-reth.git?rev=77a968db48bcbc70ba8bca242ead51f6fc2c1716#77a968db48bcbc70ba8bca242ead51f6fc2c1716"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -3798,7 +3804,7 @@ dependencies = [
 [[package]]
 name = "dogeos-scroll-wire"
 version = "0.1.0"
-source = "git+https://github.com/DogeOS69/dogeos-reth.git?rev=8f0b98b056111e8f497a4c6dd78ef1f776b626a5#8f0b98b056111e8f497a4c6dd78ef1f776b626a5"
+source = "git+https://github.com/DogeOS69/dogeos-reth.git?rev=77a968db48bcbc70ba8bca242ead51f6fc2c1716#77a968db48bcbc70ba8bca242ead51f6fc2c1716"
 dependencies = [
  "alloy-consensus",
  "alloy-primitives",

@@ -1196,6 +1196,234 @@ mod tests {
         assert_eq!(pipeline.len(), 1, "the later result must not be polled after fatal failure");
     }
 
+    const DERIVED_BASE_FEE: u64 = 40_842_015;
+
+    fn l1_message_tx(queue_index: u64) -> Bytes {
+        let message = dogeos_protocol_types::TxL1Message {
+            queue_index,
+            gas_limit: 100_000,
+            to: Address::repeat_byte(0x33),
+            value: U256::from(1_000 + queue_index),
+            sender: Address::repeat_byte(0x44),
+            input: Bytes::new(),
+        };
+        let mut encoded = Vec::with_capacity(message.eip2718_encoded_length());
+        message.eip2718_encode(&mut encoded);
+        encoded.into()
+    }
+
+    /// An opaque L2 transaction. The guard compares bytes, and only L1 messages are decoded when
+    /// the payload is converted, so the content does not need to be a valid signed transaction.
+    fn l2_tx(tag: u8) -> Bytes {
+        Bytes::from(vec![0x02, tag, tag, tag])
+    }
+
+    fn derived_batch(index: u64, blocks: Vec<(u64, Vec<Bytes>)>) -> BatchDerivationResult {
+        BatchDerivationResult {
+            attributes: blocks
+                .into_iter()
+                .enumerate()
+                .map(|(offset, (base_fee, transactions))| DerivedAttributes {
+                    block_number: SAFE + 1 + offset as u64,
+                    base_fee: U256::from(base_fee),
+                    attributes: ScrollPayloadAttributes {
+                        transactions: Some(transactions),
+                        ..Default::default()
+                    },
+                })
+                .collect(),
+            batch_info: BatchInfo::new(index, B256::repeat_byte(index as u8)),
+            skipped_l1_messages: vec![],
+            target_status: BatchStatus::Consolidated,
+        }
+    }
+
+    fn built_payload(number: u64, base_fee: u64, transactions: Vec<Bytes>) -> ExecutionPayloadV1 {
+        ExecutionPayloadV1 {
+            base_fee_per_gas: U256::from(base_fee),
+            block_hash: B256::repeat_byte(0x20 + (number - SAFE) as u8),
+            transactions,
+            ..payload(number)
+        }
+    }
+
+    /// Scripts a full successful rebuild after `getPayload`, so a missing guard is observed as a
+    /// completed consolidation rather than as an exhausted script.
+    fn script_rebuild(client: &ScriptedEngineClient, built: ExecutionPayloadV1) {
+        client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(
+            PayloadStatusEnum::Valid,
+            Some(PayloadId::new([7; 8])),
+        )));
+        client.push_get_payload(ScriptedResponse::Ok(built));
+        client.push_new_payload(ScriptedResponse::Ok(payload_status(PayloadStatusEnum::Valid)));
+        client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Valid, None)));
+    }
+
+    /// Rebuilds a one-block batch whose built payload differs from the batch, and checks that the
+    /// attempt fail-stops before `newPayload` without touching the forkchoice, the database or the
+    /// queued work.
+    async fn assert_rebuilt_payload_mismatch_fail_stops(
+        case: &str,
+        batch_block: (u64, Vec<Bytes>),
+        built: ExecutionPayloadV1,
+    ) {
+        let database = setup_test_db().await;
+        insert_batch(&database, 1, 1, None).await;
+        let client = Arc::new(ScriptedEngineClient::new());
+        let built_hash = built.block_hash;
+        script_rebuild(&client, built);
+        let mut engine = engine_at_safe(client.clone());
+        let asserter = Asserter::new();
+        push_absent_block(&asserter);
+        let provider = absent_block_provider(asserter);
+        let mut driver = DerivationDriver::default();
+        driver.hold_batch(derived_batch(1, vec![batch_block]));
+        driver.wait_for_attempt().await;
+
+        let step = driver.run_attempt(&provider, &mut engine, &database).await;
+        let AttemptStep::Fatal(fatal) = step else {
+            panic!("{case}: a rebuilt payload mismatch must fail-stop, got {step:?}")
+        };
+        assert_eq!(fatal.method, GET_PAYLOAD_METHOD, "{case}");
+        assert_eq!(fatal.outcome, "PAYLOAD_MISMATCH", "{case}");
+        let ChainOrchestratorError::DerivedPayloadMismatch { batch_info, block_number, .. } =
+            *fatal.error
+        else {
+            panic!("{case}: unexpected fatal error {:?}", fatal.error)
+        };
+        assert_eq!(batch_info, BatchInfo::new(1, B256::repeat_byte(1)), "{case}");
+        assert_eq!(block_number, SAFE + 1, "{case}");
+
+        assert_eq!(client.fork_choice_updated_calls(), 1, "{case}: only the build FCU is sent");
+        assert_eq!(client.get_payload_calls(), 1, "{case}");
+        assert_eq!(client.new_payload_calls(), 0, "{case}: the payload must not be imported");
+        assert_eq!(engine.fcs().head_block_info().number, SAFE, "{case}");
+        assert_eq!(engine.fcs().safe_block_info().number, SAFE, "{case}");
+        assert_eq!(
+            database.get_batch_status_by_hash(B256::repeat_byte(1)).await.unwrap(),
+            Some(BatchStatus::Committed),
+            "{case}: the batch must not be consolidated"
+        );
+        assert_eq!(database.get_l2_head_block_number().await.unwrap(), 0, "{case}");
+        assert_eq!(
+            database.get_l2_block_and_batch_info_by_hash(built_hash).await.unwrap(),
+            None,
+            "{case}: the rebuilt block must not be recorded"
+        );
+        assert!(!driver.is_attempt_scheduled(), "{case}: a fatal mismatch must not be retried");
+        // The run loop only polls the pipeline for the next batch while the slot can accept one.
+        assert!(!driver.can_accept_batch(), "{case}: the next batch must not be accepted");
+    }
+
+    #[tokio::test]
+    async fn rebuilt_base_fee_mismatch_fail_stops_before_new_payload() {
+        let transactions = vec![l1_message_tx(0), l2_tx(1)];
+        for (case, built_fee) in [
+            ("higher base fee", DERIVED_BASE_FEE + 1),
+            ("lower base fee", DERIVED_BASE_FEE - 1),
+            ("zero base fee", 0),
+        ] {
+            assert_rebuilt_payload_mismatch_fail_stops(
+                case,
+                (DERIVED_BASE_FEE, transactions.clone()),
+                built_payload(SAFE + 1, built_fee, transactions.clone()),
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn rebuilt_transaction_mismatch_fail_stops_before_new_payload() {
+        let derived = vec![l1_message_tx(0), l2_tx(1), l2_tx(2)];
+        for (case, built) in [
+            ("omitted L1 message", vec![l2_tx(1), l2_tx(2)]),
+            ("omitted L2 transaction", vec![l1_message_tx(0), l2_tx(1)]),
+            ("extra transaction", vec![l1_message_tx(0), l2_tx(1), l2_tx(2), l2_tx(3)]),
+            ("changed transaction", vec![l1_message_tx(0), l2_tx(1), l2_tx(9)]),
+            ("reordered transactions", vec![l1_message_tx(0), l2_tx(2), l2_tx(1)]),
+            ("changed L1 message", vec![l1_message_tx(1), l2_tx(1), l2_tx(2)]),
+            ("all transactions dropped", vec![]),
+        ] {
+            assert_rebuilt_payload_mismatch_fail_stops(
+                case,
+                (DERIVED_BASE_FEE, derived.clone()),
+                built_payload(SAFE + 1, DERIVED_BASE_FEE, built),
+            )
+            .await;
+        }
+        assert_rebuilt_payload_mismatch_fail_stops(
+            "extra transaction in an empty block",
+            (DERIVED_BASE_FEE, vec![]),
+            built_payload(SAFE + 1, DERIVED_BASE_FEE, vec![l2_tx(1)]),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn matching_rebuilt_payloads_import_and_consolidate() {
+        let database = setup_test_db().await;
+        insert_batch(&database, 1, 1, None).await;
+        let l1_message = l1_message_tx(0);
+        let with_l1_message = vec![l1_message.clone(), l2_tx(1)];
+        let derived = derived_batch(
+            1,
+            vec![(DERIVED_BASE_FEE, with_l1_message.clone()), (DERIVED_BASE_FEE + 7, vec![])],
+        );
+        let first = built_payload(SAFE + 1, DERIVED_BASE_FEE, with_l1_message);
+        let second = built_payload(SAFE + 2, DERIVED_BASE_FEE + 7, vec![]);
+        let (first_hash, second_hash) = (first.block_hash, second.block_hash);
+
+        let client = Arc::new(ScriptedEngineClient::new());
+        script_rebuild(&client, first);
+        script_rebuild(&client, second);
+        let mut engine = engine_at_safe(client.clone());
+        let asserter = Asserter::new();
+        push_absent_block(&asserter);
+        push_absent_block(&asserter);
+        let provider = absent_block_provider(asserter);
+        let mut driver = DerivationDriver::default();
+        driver.hold_batch(derived);
+        driver.wait_for_attempt().await;
+
+        let step = driver.run_attempt(&provider, &mut engine, &database).await;
+        let AttemptStep::Completed(consolidated) = step else {
+            panic!("matching rebuilt payloads must consolidate, got {step:?}")
+        };
+        let reorged: Vec<_> = consolidated
+            .block_outcomes
+            .iter()
+            .map(|outcome| match outcome {
+                BlockConsolidationOutcome::Reorged(block) => block.clone(),
+                other => panic!("expected rebuilt blocks, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(reorged.len(), 2);
+        assert_eq!(reorged[0].block_info, info(SAFE + 1, 0x21));
+        assert_eq!(reorged[0].l1_messages, vec![alloy_primitives::keccak256(&l1_message)]);
+        assert_eq!(reorged[1].block_info, info(SAFE + 2, 0x22));
+        assert!(reorged[1].l1_messages.is_empty());
+
+        assert_eq!(client.fork_choice_updated_calls(), 4);
+        assert_eq!(client.get_payload_calls(), 2);
+        assert_eq!(client.new_payload_calls(), 2);
+        assert_eq!(*engine.fcs().head_block_info(), info(SAFE + 2, 0x22));
+        assert_eq!(*engine.fcs().safe_block_info(), info(SAFE + 2, 0x22));
+        assert!(driver.can_accept_batch());
+        assert_eq!(
+            database.get_batch_status_by_hash(B256::repeat_byte(1)).await.unwrap(),
+            Some(BatchStatus::Consolidated)
+        );
+        let batch_info = BatchInfo::new(1, B256::repeat_byte(1));
+        assert_eq!(
+            database.get_l2_block_and_batch_info_by_hash(first_hash).await.unwrap(),
+            Some((info(SAFE + 1, 0x21), batch_info))
+        );
+        assert_eq!(
+            database.get_l2_block_and_batch_info_by_hash(second_hash).await.unwrap(),
+            Some((info(SAFE + 2, 0x22), batch_info))
+        );
+    }
+
     #[tokio::test]
     async fn held_batch_blocks_next_pipeline_result() {
         let mut driver = DerivationDriver::default();

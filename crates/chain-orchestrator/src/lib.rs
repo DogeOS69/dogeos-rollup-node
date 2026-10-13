@@ -1517,6 +1517,7 @@ mod run_loop_policy_tests {
     use dogeos_chainspec::{DogeosChainSpec, DOGEOS_DEV};
     use dogeos_reth_consensus::DogeosConsensus;
     use dogeos_reth_engine::ScrollPayloadAttributes;
+    use futures::FutureExt;
     use reth_network_api::noop::NoopNetwork;
     use reth_network_p2p::NoopFullBlockClient;
     use rollup_node_primitives::BatchCommitData;
@@ -1899,6 +1900,111 @@ mod run_loop_policy_tests {
 
         let _ = shutdown_tx.send(());
         assert!(run_task.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn rebuilt_payload_mismatch_terminates_run_loop() {
+        let database = Arc::new(setup_test_db().await);
+        database.insert_genesis_block(B256::ZERO).await.unwrap();
+        database.set_processed_l1_block_number(5).await.unwrap();
+        let batch_info = BatchInfo::new(1, B256::repeat_byte(1));
+        database
+            .insert_batch(BatchCommitData {
+                hash: batch_info.hash,
+                index: batch_info.index,
+                block_number: 1,
+                block_timestamp: 0,
+                calldata: Arc::new(Bytes::new()),
+                blob_versioned_hash: None,
+                finalized_block_number: None,
+                reverted_block_number: None,
+            })
+            .await
+            .unwrap();
+        database.update_batch_status(batch_info.hash, BatchStatus::Processing).await.unwrap();
+
+        // Script a full successful import after the mismatching payload, so the only thing that
+        // can stop the loop is the mismatch guard.
+        let engine_client = Arc::new(ScriptedEngineClient::new());
+        engine_client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(
+            PayloadStatusEnum::Valid,
+            Some(PayloadId::new([7; 8])),
+        )));
+        engine_client.push_get_payload(ScriptedResponse::Ok(ExecutionPayloadV1 {
+            base_fee_per_gas: U256::from(8),
+            ..payload(SAFE + 1)
+        }));
+        engine_client.push_new_payload(ScriptedResponse::Ok(PayloadStatus {
+            status: PayloadStatusEnum::Valid,
+            latest_valid_hash: None,
+        }));
+        engine_client
+            .push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Valid, None)));
+        let asserter = Asserter::new();
+        asserter.push_success(&Option::<()>::None);
+        let (mut orchestrator, _handle, notification_tx) = test_orchestrator(
+            database.clone(),
+            engine_client.clone(),
+            asserter,
+            BatchDerivationResult {
+                attributes: vec![DerivedAttributes {
+                    block_number: SAFE + 1,
+                    base_fee: U256::from(7),
+                    attributes: ScrollPayloadAttributes {
+                        transactions: Some(vec![]),
+                        ..Default::default()
+                    },
+                }],
+                batch_info,
+                skipped_l1_messages: vec![],
+                target_status: BatchStatus::Consolidated,
+            },
+        )
+        .await;
+        let mut events = orchestrator.event_listener();
+        // Later work queued behind the held batch, which must never be applied.
+        notification_tx.send(Arc::new(L1Notification::Processed(10))).await.unwrap();
+
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let run_task = tokio::spawn(orchestrator.run_until_shutdown(Box::pin(async move {
+            let _ = shutdown_rx.await;
+        })));
+        let result = time::timeout(Duration::from_secs(2), run_task)
+            .await
+            .expect("a rebuilt payload mismatch must terminate the run loop")
+            .unwrap();
+
+        assert!(
+            matches!(
+                result,
+                Err(ChainOrchestratorError::DerivedPayloadMismatch {
+                    batch_info: BatchInfo { index: 1, .. },
+                    block_number,
+                    ..
+                }) if block_number == SAFE + 1
+            ),
+            "unexpected run loop result {result:?}"
+        );
+        assert_eq!(engine_client.fork_choice_updated_calls(), 1);
+        assert_eq!(engine_client.get_payload_calls(), 1);
+        assert_eq!(engine_client.new_payload_calls(), 0);
+        assert_eq!(
+            database.get_batch_status_by_hash(batch_info.hash).await.unwrap(),
+            Some(BatchStatus::Processing),
+            "the held row must remain for restart recovery"
+        );
+        assert_eq!(database.get_l2_head_block_number().await.unwrap(), 0);
+        assert_eq!(
+            database.get_processed_l1_block_number().await.unwrap(),
+            5,
+            "work queued behind the mismatching batch must not be processed"
+        );
+        while let Some(event) = events.next().now_or_never().flatten() {
+            assert!(
+                !matches!(event, ChainOrchestratorEvent::BatchConsolidated(_)),
+                "a mismatching batch must not be reported as consolidated"
+            );
+        }
     }
 
     #[tokio::test]

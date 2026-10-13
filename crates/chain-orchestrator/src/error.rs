@@ -127,6 +127,16 @@ pub enum ChainOrchestratorError {
         /// The Engine validation detail.
         validation_error: String,
     },
+    /// A rebuilt payload differs from the data derived from its batch.
+    #[error("Rebuilt payload mismatch for batch {batch_info:?} at block {block_number}: {reason}")]
+    DerivedPayloadMismatch {
+        /// The batch being rebuilt.
+        batch_info: BatchInfo,
+        /// The expected block number.
+        block_number: u64,
+        /// The mismatched field and diagnostic detail.
+        reason: String,
+    },
     /// Attempted to reorg a batch but the safe block number does not match the derived
     /// block number - 1.
     #[error("Attempted to reorg batch {batch_info:?} for derived block number {derived_block_number} but expected safe block number is {safe_block_number} - we expect `safe block number = derived block number - 1`")]

@@ -934,7 +934,7 @@ mod test {
 
     #[tokio::test]
     async fn frontier_journal_is_atomic_and_survives_database_reopen() {
-        use crate::{FrontierTransitionKind, StoredForkchoiceState};
+        use crate::StoredForkchoiceState;
         use scroll_migration::{Migrator, MigratorTrait, ScrollDevMigrationInfo};
 
         let dir = tempfile::tempdir().unwrap();
@@ -944,19 +944,17 @@ mod test {
         let block = BlockInfo::new(1, B256::repeat_byte(1));
         let expected = StoredForkchoiceState { head: block, safe: block, finalized: block };
         let transition = PendingFrontierTransition {
-            kind: FrontierTransitionKind::ConsolidateBatch,
             expected,
             target: StoredForkchoiceState {
                 head: BlockInfo::new(2, B256::repeat_byte(2)),
                 ..expected
             },
-            batch_hash: Some(B256::repeat_byte(3)),
         };
         db.set_l2_head_block_number(1).await.unwrap();
         let error = db
             .tx_mut(move |tx| async move {
-                tx.set_l2_head_block_number(2).await?;
-                tx.set_pending_frontier_transition(transition).await?;
+                tx.set_l2_head_block_number(2).await.unwrap();
+                tx.set_pending_frontier_transition(transition).await.unwrap();
                 Err::<(), _>(DatabaseError::MissingSafeL2Frontier)
             })
             .await;
@@ -965,7 +963,7 @@ mod test {
         assert_eq!(db.get_pending_frontier_transition().await.unwrap(), None);
 
         db.tx_mut(move |tx| async move {
-            tx.set_l2_head_block_number(2).await?;
+            tx.set_l2_head_block_number(2).await.unwrap();
             tx.set_pending_frontier_transition(transition).await
         })
         .await
@@ -974,8 +972,10 @@ mod test {
         drop(db);
         let db = Database::new(path.to_str().unwrap()).await.unwrap();
         assert_eq!(db.get_pending_frontier_transition().await.unwrap(), Some(transition));
-        let updated =
-            PendingFrontierTransition { kind: FrontierTransitionKind::UnwindL1, ..transition };
+        let updated = PendingFrontierTransition {
+            target: StoredForkchoiceState { safe: transition.target.head, ..transition.target },
+            ..transition
+        };
         db.set_pending_frontier_transition(updated).await.unwrap();
         assert_eq!(db.get_pending_frontier_transition().await.unwrap(), Some(updated));
         db.clear_pending_frontier_transition().await.unwrap();
@@ -990,10 +990,7 @@ mod test {
 
     #[tokio::test]
     async fn malformed_frontier_states_are_rejected_on_write_and_read() {
-        use crate::{
-            frontier_transition_types::FRONTIER_TRANSITION_KEY, FrontierTransitionKind,
-            StoredForkchoiceState,
-        };
+        use crate::{frontier_transition_types::FRONTIER_TRANSITION_KEY, StoredForkchoiceState};
         use rollup_node_primitives::Metadata;
         let db = setup_test_db().await;
         let low = BlockInfo::new(1, B256::repeat_byte(1));
@@ -1005,12 +1002,7 @@ mod test {
             StoredForkchoiceState { safe: BlockInfo::new(2, B256::repeat_byte(3)), ..valid },
         ];
         for invalid in invalid_states {
-            let transition = PendingFrontierTransition {
-                kind: FrontierTransitionKind::StartupRepair,
-                expected: valid,
-                target: invalid,
-                batch_hash: None,
-            };
+            let transition = PendingFrontierTransition { expected: valid, target: invalid };
             assert!(matches!(
                 db.set_pending_frontier_transition(transition).await,
                 Err(DatabaseError::InvalidFrontierTransition(_))

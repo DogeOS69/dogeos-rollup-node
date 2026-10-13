@@ -4,14 +4,14 @@
 //! commits and Engine calls; an acknowledged safe intent also explains a lost Engine tag write.
 //! Local forkchoice is only a cache and cannot acknowledge a durable intent on restart.
 
-use crate::{error::FrontierTransitionConflict, ChainOrchestratorError};
+use crate::ChainOrchestratorError;
 use alloy_provider::Provider;
 use alloy_rpc_types_engine::PayloadStatusEnum;
 use dogeos_rpc_types::Scroll;
 use rollup_node_primitives::BlockInfo;
 use scroll_db::{
-    Database, DatabaseReadOperations, DatabaseWriteOperations, FrontierTransitionKind,
-    PendingFrontierTransition, StoredForkchoiceState,
+    Database, DatabaseReadOperations, DatabaseWriteOperations, PendingFrontierTransition,
+    StoredForkchoiceState,
 };
 use scroll_engine::{Engine, EngineError, ForkchoiceState, ScrollEngineApi};
 
@@ -75,24 +75,21 @@ where
                 observed.safe != transition.target.safe &&
                 !canonical_ancestor(provider, observed.safe, transition.expected.safe).await?
             {
-                return Err(ChainOrchestratorError::FrontierTransitionConflict(Box::new(
-                    FrontierTransitionConflict { transition, observed },
-                )))
+                return Err(ChainOrchestratorError::FrontierConflict {
+                    tag: "safe",
+                    target: transition.target.safe,
+                    observed: observed.safe,
+                })
             }
         }
-        if observed.finalized.number > transition.target.finalized.number ||
-            (observed.finalized.number == transition.target.finalized.number &&
-                observed.finalized != transition.target.finalized) ||
-            (observed.finalized != transition.expected.finalized &&
-                observed.finalized != transition.target.finalized &&
-                !canonical_ancestor(
-                    provider,
-                    observed.finalized,
-                    transition.target.finalized,
-                )
-                .await?)
+        // The journal already validates expected -> target; any other finalized tag must
+        // be a canonical ancestor of the target (never ahead or a same-height fork).
+        if observed.finalized != transition.expected.finalized &&
+            !canonical_ancestor(provider, observed.finalized, transition.target.finalized)
+                .await?
         {
-            return Err(ChainOrchestratorError::FinalizedFrontierConflict {
+            return Err(ChainOrchestratorError::FrontierConflict {
+                tag: "finalized",
                 target: transition.target.finalized,
                 observed: observed.finalized,
             })
@@ -117,10 +114,7 @@ where
                         return Ok(true)
                     }
                 }
-                return Err(ChainOrchestratorError::FrontierTransitionEngineRequest {
-                    kind: transition.kind,
-                    source,
-                })
+                return Err(ChainOrchestratorError::EngineError(source))
             }
         };
         match response.payload_status.status {
@@ -128,10 +122,7 @@ where
                 database.clear_pending_frontier_transition().await?;
                 Ok(true)
             }
-            status => Err(ChainOrchestratorError::FrontierTransitionStatus {
-                kind: transition.kind,
-                status,
-            }),
+            status => Err(ChainOrchestratorError::FrontierTransitionStatus(status)),
         }
     }
     .await
@@ -157,7 +148,8 @@ where
         let (safe, _) = database.get_latest_safe_l2_info().await?;
         let finalized = database.get_latest_finalized_l2_info().await?;
         if !canonical_ancestor(provider, observed.finalized, finalized).await? {
-            return Err(ChainOrchestratorError::FinalizedFrontierConflict {
+            return Err(ChainOrchestratorError::FrontierConflict {
+                tag: "finalized",
                 target: finalized,
                 observed: observed.finalized,
             })
@@ -168,8 +160,9 @@ where
                 transition.expected.safe == observed.safe && transition.target.safe == safe
             });
             if !known_transition && !canonical_ancestor(provider, observed.safe, safe).await? {
-                return Err(ChainOrchestratorError::UnexplainedSafeFrontier {
-                    database: safe,
+                return Err(ChainOrchestratorError::FrontierConflict {
+                    tag: "safe",
+                    target: safe,
                     observed: observed.safe,
                 })
             }
@@ -199,15 +192,11 @@ where
                 tx.set_l2_head_block_number(head.number).await?;
                 tx.purge_l1_message_to_l2_block_mappings(Some(head.number.saturating_add(1)))
                     .await?;
-                if target != observed {
-                    tx.set_pending_frontier_transition(PendingFrontierTransition {
-                        kind: FrontierTransitionKind::StartupRepair,
-                        expected: observed,
-                        target,
-                        batch_hash: None,
-                    })
-                    .await?;
-                }
+                tx.set_pending_frontier_transition(PendingFrontierTransition {
+                    expected: observed,
+                    target,
+                })
+                .await?;
                 Ok::<_, ChainOrchestratorError>(())
             })
             .await?;
@@ -234,7 +223,7 @@ where
         if *engine.fcs().safe_block_info() != safe {
             recover_database_frontier(provider, engine, database).await?;
         }
-        Ok(())
+        Ok::<_, ChainOrchestratorError>(())
     }
     .await
     .map_err(ChainOrchestratorError::frontier_recovery)
@@ -294,12 +283,7 @@ mod tests {
         let expected = StoredForkchoiceState { head: old, safe: old, finalized };
         let target = StoredForkchoiceState { head: old, safe, finalized };
         database
-            .set_pending_frontier_transition(PendingFrontierTransition {
-                kind: FrontierTransitionKind::UnwindL1,
-                expected,
-                target,
-                batch_hash: None,
-            })
+            .set_pending_frontier_transition(PendingFrontierTransition { expected, target })
             .await
             .unwrap();
         let provider =
@@ -326,10 +310,8 @@ mod tests {
         let target_state = StoredForkchoiceState { head: target, safe: target, finalized };
         database
             .set_pending_frontier_transition(PendingFrontierTransition {
-                kind: FrontierTransitionKind::ConsolidateBatch,
                 expected,
                 target: target_state,
-                batch_hash: Some(B256::repeat_byte(1)),
             })
             .await
             .unwrap();
@@ -394,7 +376,7 @@ mod tests {
                 Engine::new(client.clone(), ForkchoiceState::new(other, other, genesis));
             let error =
                 recover_database_frontier(&provider, &mut engine, &database).await.unwrap_err();
-            assert!(matches!(error, ChainOrchestratorError::UnexplainedSafeFrontier { .. }));
+            assert!(matches!(error, ChainOrchestratorError::FrontierConflict { tag: "safe", .. }));
             assert_eq!(client.fork_choice_updated_calls(), 0);
             assert_eq!(database.get_pending_frontier_transition().await.unwrap(), None);
             assert_eq!(database.get_l2_head_block_number().await.unwrap(), safe.number);
@@ -465,12 +447,7 @@ mod tests {
             seed_frontier(&original, genesis, safe).await;
             let expected = StoredForkchoiceState { head: old, safe: old, finalized: genesis };
             let target = StoredForkchoiceState { head: old, safe, finalized: genesis };
-            let transition = PendingFrontierTransition {
-                kind: FrontierTransitionKind::UnwindL1,
-                expected,
-                target,
-                batch_hash: None,
-            };
+            let transition = PendingFrontierTransition { expected, target };
             original.set_pending_frontier_transition(transition).await.unwrap();
             if checkpoint >= 2 {
                 original.clear_pending_frontier_transition().await.unwrap();
@@ -525,7 +502,7 @@ mod tests {
         let client = Arc::new(ScriptedEngineClient::new());
         let mut engine = Engine::new(client.clone(), ForkchoiceState::from_block_info(genesis));
         let error = recover_database_frontier(&provider, &mut engine, &database).await.unwrap_err();
-        assert!(matches!(error, ChainOrchestratorError::FinalizedFrontierConflict { .. }));
+        assert!(matches!(error, ChainOrchestratorError::FrontierConflict { tag: "finalized", .. }));
         assert_eq!(client.fork_choice_updated_calls(), 0);
         assert_eq!(database.get_pending_frontier_transition().await.unwrap(), None);
         drop(genesis_block);

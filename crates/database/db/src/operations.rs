@@ -235,6 +235,9 @@ impl<T: WriteConnectionProvider + ?Sized + Sync> DatabaseWriteOperations for T {
         use models::metadata::Column;
 
         transition.validate()?;
+        if transition.expected == transition.target {
+            return Ok(())
+        }
         let transition: models::metadata::ActiveModel = Metadata {
             key: FRONTIER_TRANSITION_KEY.to_owned(),
             value: serde_json::to_string(&transition)?,

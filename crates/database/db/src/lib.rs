@@ -10,9 +10,7 @@ mod error;
 pub use error::DatabaseError;
 
 mod frontier_transition_types;
-pub use frontier_transition_types::{
-    FrontierTransitionKind, PendingFrontierTransition, StoredForkchoiceState,
-};
+pub use frontier_transition_types::{PendingFrontierTransition, StoredForkchoiceState};
 
 mod maintenance;
 pub use maintenance::DatabaseMaintenance;

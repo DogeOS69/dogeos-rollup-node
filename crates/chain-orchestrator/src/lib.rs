@@ -23,9 +23,8 @@ use rollup_node_sequencer::{Sequencer, SequencerEvent};
 use rollup_node_signer::{SignatureAsBytes, SignerEvent, SignerHandle};
 use rollup_node_watcher::{L1Notification, L1WatcherHandle};
 use scroll_db::{
-    Database, DatabaseError, DatabaseReadOperations, DatabaseWriteOperations,
-    FrontierTransitionKind, L1MessageKey, PendingFrontierTransition, StoredForkchoiceState,
-    UnwindResult,
+    Database, DatabaseError, DatabaseReadOperations, DatabaseWriteOperations, L1MessageKey,
+    PendingFrontierTransition, StoredForkchoiceState, UnwindResult,
 };
 use scroll_derivation_pipeline::DerivationPipeline;
 use scroll_engine::{Engine, ScrollEngineApi};
@@ -786,7 +785,6 @@ impl<
                     .get_block_by_number(block_number.into())
                     .full()
                     .await
-                    .map_err(ChainOrchestratorError::from)
                     .map_err(ChainOrchestratorError::frontier_recovery)?
                     .ok_or(ChainOrchestratorError::L2BlockNotFoundInL2Client(block_number))
                     .map_err(ChainOrchestratorError::frontier_recovery)?
@@ -827,18 +825,18 @@ impl<
         // The safe transition was durably applied by `unwind_and_revalidate_held_batch`. The
         // unsafe head remains a separate, recoverable startup concern.
         if l2_head_block_info.is_some() {
-            let response =
-                self.engine.update_fcs_checked(l2_head_block_info, None, None).await.map_err(
-                    |source| ChainOrchestratorError::PostUnwindHeadEngineRequest { source },
-                )?;
+            let response = self
+                .engine
+                .update_fcs_checked(l2_head_block_info, None, None)
+                .await
+                .map_err(ChainOrchestratorError::frontier_recovery)?;
             if !matches!(
                 response.payload_status.status,
                 alloy_rpc_types_engine::PayloadStatusEnum::Valid
             ) {
-                return Err(ChainOrchestratorError::FrontierTransitionStatus {
-                    kind: FrontierTransitionKind::UnwindL1,
-                    status: response.payload_status.status,
-                })
+                return Err(ChainOrchestratorError::FrontierTransitionStatus(
+                    response.payload_status.status,
+                ))
             }
         }
 
@@ -877,32 +875,11 @@ impl<
                 // Finalize consolidated batches up to the finalized L1 block number.
                 let finalized_block_info = tx.finalize_consolidated_batches(block_number).await?;
                 if let Some(finalized) = finalized_block_info {
-                    let target_finalized = match finalized.number.cmp(&expected.finalized.number) {
-                        std::cmp::Ordering::Greater => finalized,
-                        std::cmp::Ordering::Equal if finalized == expected.finalized => {
-                            expected.finalized
-                        }
-                        std::cmp::Ordering::Equal | std::cmp::Ordering::Less => {
-                            return Err(ChainOrchestratorError::FinalizedFrontierConflict {
-                                target: finalized,
-                                observed: expected.finalized,
-                            })
-                        }
-                    };
-                    let target = StoredForkchoiceState {
-                        head: expected.head,
-                        safe: expected.safe,
-                        finalized: target_finalized,
-                    };
-                    if target != expected {
-                        tx.set_pending_frontier_transition(PendingFrontierTransition {
-                            kind: FrontierTransitionKind::FinalizeBatch,
-                            expected,
-                            target,
-                            batch_hash: None,
-                        })
-                        .await?;
-                    }
+                    tx.set_pending_frontier_transition(PendingFrontierTransition {
+                        expected,
+                        target: StoredForkchoiceState { finalized, ..expected },
+                    })
+                    .await?;
                 }
 
                 // Get all unprocessed batches that have been finalized by this L1 block
@@ -1035,37 +1012,16 @@ impl<
                 // Handle the case of a batch revert and durably record the corresponding Engine
                 // transition in the same database transaction.
                 let (safe_block_info, batch_info) = tx.get_latest_safe_l2_info().await?;
-                if safe_block_info.number < expected.finalized.number ||
-                    (safe_block_info.number == expected.finalized.number &&
-                        safe_block_info != expected.finalized)
-                {
-                    return Err(ChainOrchestratorError::FinalizedFrontierConflict {
-                        target: safe_block_info,
-                        observed: expected.finalized,
-                    })
-                }
-                let head = if expected.head.number < safe_block_info.number ||
-                    (expected.head.number == safe_block_info.number &&
-                        expected.head != safe_block_info)
-                {
+                let head = if expected.head.number <= safe_block_info.number {
                     safe_block_info
                 } else {
                     expected.head
                 };
-                let target = StoredForkchoiceState {
-                    head,
-                    safe: safe_block_info,
-                    finalized: expected.finalized,
-                };
-                if target != expected {
-                    tx.set_pending_frontier_transition(PendingFrontierTransition {
-                        kind: FrontierTransitionKind::RevertBatch,
-                        expected,
-                        target,
-                        batch_hash: None,
-                    })
-                    .await?;
-                }
+                tx.set_pending_frontier_transition(PendingFrontierTransition {
+                    expected,
+                    target: StoredForkchoiceState { head, safe: safe_block_info, ..expected },
+                })
+                .await?;
                 Ok::<_, ChainOrchestratorError>((safe_block_info, batch_info))
             })
             .await

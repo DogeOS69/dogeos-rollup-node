@@ -314,8 +314,8 @@ async fn rg46_finalized_conflict_rolls_back_l1_unwind() {
         assert!(
             matches!(
                 &result,
-                Err(ChainOrchestratorError::FinalizedFrontierConflict { target, observed })
-                    if *target == info(5, 5) && *observed == finalized
+                Err(ChainOrchestratorError::FrontierRecovery(source))
+                    if matches!(**source, ChainOrchestratorError::DatabaseError(scroll_db::DatabaseError::InvalidFrontierTransition(_)))
             ),
             "administrative={administrative}: {result:?}"
         );
@@ -406,7 +406,10 @@ async fn rg49_signed_block_requested_before_an_unwind_is_still_persisted_and_ann
     );
     assert_eq!(database.get_signature(hash).await.unwrap(), Some(signature));
     let (announced, announced_signature) =
-        announced_rx.try_recv().expect("the stale block was announced to the network");
+        tokio::time::timeout(std::time::Duration::from_secs(2), announced_rx.recv())
+            .await
+            .expect("network announcement timed out")
+            .expect("the stale block was announced to the network");
     assert_eq!((announced.header.number, announced_signature), (5, signature));
 }
 

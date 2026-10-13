@@ -39,6 +39,7 @@ pub(crate) async fn reconcile_batch<L2P: Provider<Scroll>>(
     let mut actions = Vec::with_capacity(batch.attributes.len());
     let mut expected_parent = frontier;
     let mut previous_derived_number: Option<u64> = None;
+    let mut rebuild_suffix = false;
 
     for (index, (attributes, current_block)) in
         batch.attributes.iter().zip(current_blocks).enumerate()
@@ -47,15 +48,19 @@ pub(crate) async fn reconcile_batch<L2P: Provider<Scroll>>(
             .or_else(|| (attributes.block_number > frontier.number).then_some(frontier.number));
         if let Some(parent) = sequence_parent {
             if parent.checked_add(1) != Some(attributes.block_number) {
-                return Err(ChainOrchestratorError::InvalidDerivedBlockSequence {
+                return Err(ChainOrchestratorError::DerivedPayloadMismatch {
                     batch_info: batch.batch_info,
-                    expected_block_number: parent.saturating_add(1),
-                    actual_block_number: attributes.block_number,
+                    block_number: attributes.block_number,
+                    reason: format!("non-contiguous sequence after block {parent}"),
                 })
             }
         }
         previous_derived_number = Some(attributes.block_number);
 
+        if rebuild_suffix {
+            actions.push(BlockConsolidationAction::Reorg(index));
+            continue
+        }
         let already_safe = attributes.block_number <= frontier.number;
         let matching_block = current_block.filter(|block| {
             block.header.number == attributes.block_number &&
@@ -69,17 +74,15 @@ pub(crate) async fn reconcile_batch<L2P: Provider<Scroll>>(
         let Some(current_block) = matching_block else {
             // Replayed safe history must match; only an unsafe suffix may be rebuilt.
             if already_safe {
-                return Err(ChainOrchestratorError::SafeBatchReplayMismatch {
+                return Err(ChainOrchestratorError::DerivedPayloadMismatch {
                     batch_info: batch.batch_info,
                     block_number: attributes.block_number,
-                    frontier,
+                    reason: format!("replayed block differs from safe history at {frontier}"),
                 })
             }
-            actions.push(BlockConsolidationAction::ReorgSuffix {
-                first_attribute_index: index,
-                expected_parent,
-            });
-            break
+            rebuild_suffix = true;
+            actions.push(BlockConsolidationAction::Reorg(index));
+            continue
         };
 
         let block_info: L2BlockInfoWithL1Messages = (&current_block).into();
@@ -170,13 +173,8 @@ pub(crate) enum BlockConsolidationAction {
     /// The derived attributes match the L2 chain and the safe head is already at or beyond the
     /// block, so no action is needed.
     Skip(L2BlockInfoWithL1Messages),
-    /// Rebuild the remaining derived suffix on the exact tip of the verified canonical prefix.
-    ReorgSuffix {
-        /// The first derived attribute that must be rebuilt.
-        first_attribute_index: usize,
-        /// The exact parent on which the suffix must be built.
-        expected_parent: BlockInfo,
-    },
+    /// Reorganize the chain with the derived attributes at this stable pending-batch index.
+    Reorg(usize),
 }
 
 impl BlockConsolidationAction {
@@ -192,7 +190,7 @@ impl BlockConsolidationAction {
 
     /// Returns true if the action is to perform a reorg.
     pub(crate) const fn is_reorg(&self) -> bool {
-        matches!(self, Self::ReorgSuffix { .. })
+        matches!(self, Self::Reorg(_))
     }
 
     /// Consumes the action and returns the block info if the action is to update the safe head or
@@ -200,7 +198,7 @@ impl BlockConsolidationAction {
     pub(crate) fn into_block_info(self) -> Option<L2BlockInfoWithL1Messages> {
         match self {
             Self::UpdateFcs(info) | Self::Skip(info) => Some(info),
-            Self::ReorgSuffix { .. } => None,
+            Self::Reorg(_) => None,
         }
     }
 }
@@ -212,10 +210,7 @@ impl std::fmt::Display for BlockConsolidationAction {
                 write!(f, "UpdateSafeHead to block {}", info.block_info.number)
             }
             Self::Skip(info) => write!(f, "Skip block {}", info.block_info.number),
-            Self::ReorgSuffix { first_attribute_index, expected_parent } => write!(
-                f,
-                "Reorg derived suffix at index {first_attribute_index} on parent {expected_parent}"
-            ),
+            Self::Reorg(index) => write!(f, "Reorg with derived attributes at index {index}"),
         }
     }
 }

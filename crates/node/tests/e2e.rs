@@ -667,14 +667,11 @@ async fn can_bridge_blocks() -> eyre::Result<()> {
     Ok(())
 }
 
-/// Restart both a sequencer and a follower with a fresh Engine and SQLite connection at each
+/// Restart both a sequencer and a follower with a fresh Engine and `SQLite` connection at each
 /// durable finalization checkpoint. No new block is built after FCU, so tag persistence may lag.
 #[tokio::test]
 async fn restart_recovers_frontier_checkpoints_on_sequencer_and_follower() -> eyre::Result<()> {
-    use scroll_db::{
-        DatabaseConnectionProvider, FrontierTransitionKind, PendingFrontierTransition,
-        StoredForkchoiceState,
-    };
+    use scroll_db::{DatabaseConnectionProvider, PendingFrontierTransition, StoredForkchoiceState};
     use scroll_engine::{ScrollAuthApiEngineClient, ScrollEngineApi};
 
     for checkpoint in 0..3 {
@@ -713,10 +710,8 @@ async fn restart_recovers_frontier_checkpoints_on_sequencer_and_follower() -> ey
                         tx.update_batch_status(batch.hash, BatchStatus::Finalized).await?;
                         tx.set_l2_head_block_number(tip.number).await?;
                         tx.set_pending_frontier_transition(PendingFrontierTransition {
-                            kind: FrontierTransitionKind::FinalizeBatch,
                             expected,
                             target,
-                            batch_hash: Some(batch.hash),
                         })
                         .await
                     }
@@ -2183,7 +2178,7 @@ pub fn read_to_bytes<P: AsRef<std::path::Path>>(path: P) -> eyre::Result<Bytes> 
     Ok(Bytes::from_str(&std::fs::read_to_string(path)?)?)
 }
 
-/// Encodes one V0 calldata batch containing deterministic transaction-free DOGEOS_DEV blocks.
+/// Encodes one V0 calldata batch containing deterministic transaction-free `DOGEOS_DEV` blocks.
 fn empty_batch_calldata(first_block: u64, block_count: u8, timestamp: u64) -> Bytes {
     let mut parent_batch_header = Vec::with_capacity(89);
     parent_batch_header.push(0);

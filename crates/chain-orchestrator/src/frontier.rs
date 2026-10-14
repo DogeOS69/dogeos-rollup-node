@@ -66,9 +66,8 @@ where
         };
         let mut observed = stored_forkchoice(engine.fcs());
         if observed != transition.expected && observed != transition.target {
-            let observed_fcs = observe_forkchoice(provider).await?;
-            observed = stored_forkchoice(&observed_fcs);
-            engine.replace_fcs_from_provider(observed_fcs);
+            engine.replace_fcs_from_provider(observe_forkchoice(provider).await?);
+            observed = stored_forkchoice(engine.fcs());
             // Unsafe head can advance independently; safe must be explained by this intent or
             // by a delayed persistence write on the same canonical chain.
             if observed.safe != transition.expected.safe &&
@@ -94,7 +93,7 @@ where
                 observed: observed.finalized,
             })
         }
-        let response = match engine
+        match engine
             .update_fcs_checked(
                 Some(transition.target.head),
                 Some(transition.target.safe),
@@ -102,28 +101,21 @@ where
             )
             .await
         {
-            Ok(response) => response,
-            Err(source) => {
-                if matches!(source, EngineError::TransportError(_)) {
-                    // The Engine may have applied FCU before losing the HTTP response.
-                    let observed_fcs = observe_forkchoice(provider).await?;
-                    let observed = stored_forkchoice(&observed_fcs);
-                    engine.replace_fcs_from_provider(observed_fcs);
-                    if observed == transition.target {
-                        database.clear_pending_frontier_transition().await?;
-                        return Ok(true)
-                    }
+            Ok(response) => match response.payload_status.status {
+                PayloadStatusEnum::Valid => {}
+                status => return Err(ChainOrchestratorError::FrontierTransitionStatus(status)),
+            },
+            Err(source @ EngineError::TransportError(_)) => {
+                // The Engine may have applied FCU before losing the HTTP response.
+                engine.replace_fcs_from_provider(observe_forkchoice(provider).await?);
+                if stored_forkchoice(engine.fcs()) != transition.target {
+                    return Err(ChainOrchestratorError::EngineError(source))
                 }
-                return Err(ChainOrchestratorError::EngineError(source))
             }
-        };
-        match response.payload_status.status {
-            PayloadStatusEnum::Valid => {
-                database.clear_pending_frontier_transition().await?;
-                Ok(true)
-            }
-            status => Err(ChainOrchestratorError::FrontierTransitionStatus(status)),
+            Err(source) => return Err(ChainOrchestratorError::EngineError(source)),
         }
+        database.clear_pending_frontier_transition().await?;
+        Ok(true)
     }
     .await
     .map_err(ChainOrchestratorError::frontier_recovery)
@@ -207,12 +199,12 @@ where
     .map_err(ChainOrchestratorError::frontier_recovery)
 }
 
-/// Cheap runtime guard. Full startup recovery must run once before entering the event loop.
+/// Reconciles and returns the database safe frontier. Startup recovery must run before the loop.
 pub(crate) async fn ensure_database_frontier<P, EC>(
     provider: &P,
     engine: &mut Engine<EC>,
     database: &Database,
-) -> Result<(), ChainOrchestratorError>
+) -> Result<BlockInfo, ChainOrchestratorError>
 where
     P: Provider<Scroll>,
     EC: ScrollEngineApi + Sync + Send + 'static,
@@ -223,7 +215,7 @@ where
         if *engine.fcs().safe_block_info() != safe {
             recover_database_frontier(provider, engine, database).await?;
         }
-        Ok::<_, ChainOrchestratorError>(())
+        Ok::<_, ChainOrchestratorError>(safe)
     }
     .await
     .map_err(ChainOrchestratorError::frontier_recovery)
@@ -246,6 +238,16 @@ mod tests {
         ForkchoiceState,
     };
     use std::sync::Arc;
+
+    fn mock_engine(
+        asserter: Asserter,
+        fcs: ForkchoiceState,
+    ) -> (impl Provider<Scroll>, Arc<ScriptedEngineClient>, Engine<ScriptedEngineClient>) {
+        let provider = ProviderBuilder::<_, _, Scroll>::default().connect_mocked_client(asserter);
+        let client = Arc::new(ScriptedEngineClient::new());
+        let engine = Engine::new(client.clone(), fcs);
+        (provider, client, engine)
+    }
 
     fn rpc_block(
         number: u64,
@@ -286,11 +288,9 @@ mod tests {
             .set_pending_frontier_transition(PendingFrontierTransition { expected, target })
             .await
             .unwrap();
-        let provider =
-            ProviderBuilder::<_, _, Scroll>::default().connect_mocked_client(Asserter::new());
-        let client = Arc::new(ScriptedEngineClient::new());
+        let (provider, client, mut engine) =
+            mock_engine(Asserter::new(), ForkchoiceState::new(old, safe, finalized));
         client.push_fork_choice_updated(ScriptedResponse::Ok(valid_fcu()));
-        let mut engine = Engine::new(client.clone(), ForkchoiceState::new(old, safe, finalized));
         apply_pending_frontier_transition(&provider, &mut engine, &database).await.unwrap();
         assert_eq!(
             client.fork_choice_updated_calls(),
@@ -322,13 +322,11 @@ mod tests {
         asserter.push_success(&Some(target_block.clone()));
         asserter.push_success(&Some(target_block));
         asserter.push_success(&Some(finalized_block));
-        let provider = ProviderBuilder::<_, _, Scroll>::default().connect_mocked_client(asserter);
-        let client = Arc::new(ScriptedEngineClient::new());
-        client.push_fork_choice_updated(ScriptedResponse::TransportFailure);
-        let mut engine = Engine::new(
-            client,
+        let (provider, client, mut engine) = mock_engine(
+            asserter,
             ForkchoiceState::new(expected.head, expected.safe, expected.finalized),
         );
+        client.push_fork_choice_updated(ScriptedResponse::TransportFailure);
 
         assert!(apply_pending_frontier_transition(&provider, &mut engine, &database)
             .await
@@ -369,11 +367,8 @@ mod tests {
             let (other_block, other) = rpc_block(engine_number, genesis.hash, 0xb1);
             let asserter = Asserter::new();
             push_tags(&asserter, &other_block, &other_block, &genesis_block);
-            let provider =
-                ProviderBuilder::<_, _, Scroll>::default().connect_mocked_client(asserter);
-            let client = Arc::new(ScriptedEngineClient::new());
-            let mut engine =
-                Engine::new(client.clone(), ForkchoiceState::new(other, other, genesis));
+            let (provider, client, mut engine) =
+                mock_engine(asserter, ForkchoiceState::new(other, other, genesis));
             let error =
                 recover_database_frontier(&provider, &mut engine, &database).await.unwrap_err();
             assert!(matches!(error, ChainOrchestratorError::FrontierConflict { tag: "safe", .. }));
@@ -398,10 +393,9 @@ mod tests {
         for block in [&old_block, &safe_block, &safe_block, &head_block] {
             asserter.push_success(&Some(block.clone()));
         }
-        let provider = ProviderBuilder::<_, _, Scroll>::default().connect_mocked_client(asserter);
-        let client = Arc::new(ScriptedEngineClient::new());
+        let (provider, client, mut engine) =
+            mock_engine(asserter, ForkchoiceState::new(head, old, genesis));
         client.push_fork_choice_updated(ScriptedResponse::Ok(valid_fcu()));
-        let mut engine = Engine::new(client.clone(), ForkchoiceState::new(head, old, genesis));
         recover_database_frontier(&provider, &mut engine, &database).await.unwrap();
         assert_eq!(
             stored_forkchoice(engine.fcs()),
@@ -424,10 +418,9 @@ mod tests {
         push_tags(&asserter, &safe_block, &safe_block, &genesis_block);
         asserter.push_success(&Some(genesis_block));
         asserter.push_success(&Some(safe_block));
-        let provider = ProviderBuilder::<_, _, Scroll>::default().connect_mocked_client(asserter);
-        let client = Arc::new(ScriptedEngineClient::new());
+        let (provider, client, mut engine) =
+            mock_engine(asserter, ForkchoiceState::new(safe, safe, genesis));
         client.push_fork_choice_updated(ScriptedResponse::Ok(valid_fcu()));
-        let mut engine = Engine::new(client.clone(), ForkchoiceState::new(safe, safe, genesis));
         recover_database_frontier(&provider, &mut engine, &database).await.unwrap();
         assert_eq!(engine.fcs(), &ForkchoiceState::from_block_info(safe));
         assert_eq!(client.fork_choice_updated_calls(), 1);
@@ -462,14 +455,12 @@ mod tests {
                 if checkpoint % 2 == 0 { &old_block } else { &safe_block },
                 &genesis_block,
             );
-            let provider =
-                ProviderBuilder::<_, _, Scroll>::default().connect_mocked_client(asserter);
-            let client = Arc::new(ScriptedEngineClient::new());
+            // A new Engine cache must learn actual provider tags before recovery.
+            let (provider, client, mut engine) =
+                mock_engine(asserter, ForkchoiceState::from_block_info(genesis));
             for _ in 0..2 {
                 client.push_fork_choice_updated(ScriptedResponse::Ok(valid_fcu()));
             }
-            // A new Engine cache must learn actual provider tags before recovery.
-            let mut engine = Engine::new(client.clone(), ForkchoiceState::from_block_info(genesis));
             recover_database_frontier(&provider, &mut engine, &database).await.unwrap();
             assert_eq!(
                 engine.fcs(),
@@ -498,9 +489,8 @@ mod tests {
         seed_frontier(&database, genesis, safe).await;
         let asserter = Asserter::new();
         push_tags(&asserter, &safe_block, &safe_block, &safe_block);
-        let provider = ProviderBuilder::<_, _, Scroll>::default().connect_mocked_client(asserter);
-        let client = Arc::new(ScriptedEngineClient::new());
-        let mut engine = Engine::new(client.clone(), ForkchoiceState::from_block_info(genesis));
+        let (provider, client, mut engine) =
+            mock_engine(asserter, ForkchoiceState::from_block_info(genesis));
         let error = recover_database_frontier(&provider, &mut engine, &database).await.unwrap_err();
         assert!(matches!(error, ChainOrchestratorError::FrontierConflict { tag: "finalized", .. }));
         assert_eq!(client.fork_choice_updated_calls(), 0);
@@ -522,12 +512,8 @@ mod tests {
             assert_eq!(observed, (number == 0).then_some(ForkchoiceState::from_block_info(info)));
         }
         let database = setup_test_db().await;
-        let provider =
-            ProviderBuilder::<_, _, Scroll>::default().connect_mocked_client(Asserter::new());
-        let mut engine = Engine::new(
-            Arc::new(ScriptedEngineClient::new()),
-            ForkchoiceState::from_genesis(B256::ZERO),
-        );
+        let (provider, _, mut engine) =
+            mock_engine(Asserter::new(), ForkchoiceState::from_genesis(B256::ZERO));
         let error = recover_database_frontier(&provider, &mut engine, &database).await.unwrap_err();
         assert!(matches!(error, ChainOrchestratorError::FrontierRecovery(source)
             if matches!(*source, ChainOrchestratorError::RpcError(_))));
@@ -544,10 +530,8 @@ mod tests {
             .exec(database.inner().get_connection())
             .await
             .unwrap();
-        let provider =
-            ProviderBuilder::<_, _, Scroll>::default().connect_mocked_client(Asserter::new());
-        let client = Arc::new(ScriptedEngineClient::new());
-        let mut engine = Engine::new(client.clone(), ForkchoiceState::from_genesis(B256::ZERO));
+        let (provider, client, mut engine) =
+            mock_engine(Asserter::new(), ForkchoiceState::from_genesis(B256::ZERO));
         assert!(ensure_database_frontier(&provider, &mut engine, &database)
             .await
             .unwrap_err()

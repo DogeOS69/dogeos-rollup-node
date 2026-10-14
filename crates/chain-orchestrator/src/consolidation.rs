@@ -6,7 +6,7 @@ use rollup_node_primitives::{
     BatchConsolidationOutcome, BatchInfo, BatchStatus, BlockInfo, L2BlockInfoWithL1Messages,
 };
 use scroll_derivation_pipeline::BatchDerivationResult;
-use scroll_engine::{block_matches_attributes, ForkchoiceState};
+use scroll_engine::block_matches_attributes;
 
 /// Reconciles a batch of derived attributes with the L2 chain to produce a reconciliation result.
 ///
@@ -16,7 +16,6 @@ use scroll_engine::{block_matches_attributes, ForkchoiceState};
 pub(crate) async fn reconcile_batch<L2P: Provider<Scroll>>(
     l2_provider: L2P,
     batch: &BatchDerivationResult,
-    fcs: &ForkchoiceState,
     frontier: BlockInfo,
 ) -> Result<BatchReconciliationResult, ChainOrchestratorError> {
     let mut futures = FuturesOrdered::new();
@@ -57,13 +56,10 @@ pub(crate) async fn reconcile_batch<L2P: Provider<Scroll>>(
         }
         previous_derived_number = Some(attributes.block_number);
 
-        if rebuild_suffix {
-            actions.push(BlockConsolidationAction::Reorg(index));
-            continue
-        }
         let already_safe = attributes.block_number <= frontier.number;
         let matching_block = current_block.filter(|block| {
-            block.header.number == attributes.block_number &&
+            !rebuild_suffix &&
+                block.header.number == attributes.block_number &&
                 block_matches_attributes(&attributes.attributes, block) &&
                 if already_safe {
                     attributes.block_number < frontier.number || BlockInfo::from(block) == frontier
@@ -87,7 +83,7 @@ pub(crate) async fn reconcile_batch<L2P: Provider<Scroll>>(
 
         let block_info: L2BlockInfoWithL1Messages = (&current_block).into();
         expected_parent = block_info.block_info;
-        if already_safe || attributes.block_number <= fcs.finalized_block_info().number {
+        if already_safe {
             actions.push(BlockConsolidationAction::Skip(block_info));
         } else {
             actions.push(BlockConsolidationAction::UpdateFcs(block_info));

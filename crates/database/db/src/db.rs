@@ -935,12 +935,10 @@ mod test {
     #[tokio::test]
     async fn frontier_journal_is_atomic_and_survives_database_reopen() {
         use crate::StoredForkchoiceState;
-        use scroll_migration::{Migrator, MigratorTrait, ScrollDevMigrationInfo};
 
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("journal.db");
-        let db = Database::new(path.to_str().unwrap()).await.unwrap();
-        Migrator::<ScrollDevMigrationInfo>::up(db.inner().get_connection(), None).await.unwrap();
+        let original = setup_test_db().await;
+        let path = original.tmp_dir().unwrap().path().join("test.db");
+        let db = &original;
         let block = BlockInfo::new(1, B256::repeat_byte(1));
         let expected = StoredForkchoiceState { head: block, safe: block, finalized: block };
         let transition = PendingFrontierTransition {
@@ -969,7 +967,6 @@ mod test {
         .await
         .unwrap();
         db.inner().get_connection().clone().close().await.unwrap();
-        drop(db);
         let db = Database::new(path.to_str().unwrap()).await.unwrap();
         assert_eq!(db.get_pending_frontier_transition().await.unwrap(), Some(transition));
         let updated = PendingFrontierTransition {
@@ -989,7 +986,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn malformed_frontier_states_are_rejected_on_write_and_read() {
+    async fn invalid_frontier_journal_is_rejected_on_write_read_and_acknowledgement() {
         use crate::{frontier_transition_types::FRONTIER_TRANSITION_KEY, StoredForkchoiceState};
         use rollup_node_primitives::Metadata;
         let db = setup_test_db().await;
@@ -1000,44 +997,25 @@ mod test {
             StoredForkchoiceState { head: low, ..valid },
             StoredForkchoiceState { safe: low, finalized: high, ..valid },
             StoredForkchoiceState { safe: BlockInfo::new(2, B256::repeat_byte(3)), ..valid },
+            StoredForkchoiceState { finalized: BlockInfo::new(1, B256::repeat_byte(3)), ..valid },
         ];
+        let mut rows = vec![("{".to_owned(), false), (r#"{"kind":"unknown"}"#.to_owned(), false)];
         for invalid in invalid_states {
             let transition = PendingFrontierTransition { expected: valid, target: invalid };
             assert!(matches!(
                 db.set_pending_frontier_transition(transition).await,
                 Err(DatabaseError::InvalidFrontierTransition(_))
             ));
-            let row: models::metadata::ActiveModel = Metadata {
-                key: FRONTIER_TRANSITION_KEY.into(),
-                value: serde_json::to_string(&transition).unwrap(),
-            }
-            .into();
-            models::metadata::Entity::insert(row).exec(db.inner().get_connection()).await.unwrap();
-            assert!(matches!(
-                db.get_pending_frontier_transition().await,
-                Err(DatabaseError::InvalidFrontierTransition(_))
-            ));
-            models::metadata::Entity::delete_by_id(FRONTIER_TRANSITION_KEY)
-                .exec(db.inner().get_connection())
-                .await
-                .unwrap();
+            rows.push((serde_json::to_string(&transition).unwrap(), true));
         }
-    }
-
-    #[tokio::test]
-    async fn corrupt_frontier_journal_returns_an_error() {
-        use crate::frontier_transition_types::FRONTIER_TRANSITION_KEY;
-        use rollup_node_primitives::Metadata;
-
-        let db = setup_test_db().await;
-        for value in ["{", r#"{"kind":"unknown"}"#] {
+        for (value, invalid_state) in rows {
             let row: models::metadata::ActiveModel =
-                Metadata { key: FRONTIER_TRANSITION_KEY.to_owned(), value: value.to_owned() }
-                    .into();
+                Metadata { key: FRONTIER_TRANSITION_KEY.into(), value }.into();
             models::metadata::Entity::insert(row).exec(db.inner().get_connection()).await.unwrap();
             assert!(matches!(
-                db.get_pending_frontier_transition().await,
-                Err(DatabaseError::MetadataSerdeError(_))
+                (invalid_state, db.get_pending_frontier_transition().await),
+                (true, Err(DatabaseError::InvalidFrontierTransition(_))) |
+                    (false, Err(DatabaseError::MetadataSerdeError(_)))
             ));
             assert!(db.clear_pending_frontier_transition().await.is_err());
             models::metadata::Entity::delete_by_id(FRONTIER_TRANSITION_KEY)

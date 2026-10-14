@@ -1,6 +1,7 @@
 //! Contains tests related to RN and EN sync.
 
 use alloy_primitives::{b256, Address, B256, U256};
+use alloy_signer_local::PrivateKeySigner;
 use dogeos_chainspec::{DOGEOS_CHIKYU, DOGEOS_DEV};
 use dogeos_protocol_types::TxL1Message;
 use futures::StreamExt;
@@ -410,8 +411,13 @@ async fn test_consolidation() -> eyre::Result<()> {
 /// Brings a synced follower to the point where it has rejected block 2 because block 2 includes
 /// an L1 message (queue index 1) that the follower has not indexed yet. Returns the nodes and the
 /// late message, which the caller delivers to the follower.
+///
+/// With a `signer`, the sequencer signs with it and both nodes use system contract consensus with
+/// it as the authorized signer; otherwise both use noop consensus.
 #[allow(clippy::large_stack_frames)]
-async fn follower_missing_l1_message() -> eyre::Result<(TestFixture, TestFixture, TxL1Message)> {
+async fn follower_missing_l1_message(
+    signer: Option<PrivateKeySigner>,
+) -> eyre::Result<(TestFixture, TestFixture, TxL1Message)> {
     let mut sequencer = TestFixture::builder()
         .sequencer()
         .with_eth_scroll_bridge(true)
@@ -419,11 +425,15 @@ async fn follower_missing_l1_message() -> eyre::Result<(TestFixture, TestFixture
         .auto_start(false)
         .block_time(10)
         .with_l1_message_delay(0)
-        .allow_empty_blocks(true)
-        .build()
-        .await?;
-
-    let mut follower = TestFixture::builder().followers(1).build().await?;
+        .allow_empty_blocks(true);
+    let mut follower = TestFixture::builder().followers(1);
+    if let Some(signer) = signer {
+        let authorized_signer = Some(signer.address());
+        sequencer = sequencer.with_consensus_system_contract(authorized_signer).with_signer(signer);
+        follower = follower.with_consensus_system_contract(authorized_signer);
+    }
+    let mut sequencer = sequencer.build().await?;
+    let mut follower = follower.build().await?;
     sequencer.sequencer().node.connect(&mut follower.follower(0).node).await;
 
     // Both nodes index L1 message 0 and report L1 synced.
@@ -496,7 +506,7 @@ async fn index_late_message(follower: &mut TestFixture, message: &TxL1Message) -
 async fn test_follower_retries_import_blocked_on_late_l1_message() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    let (_sequencer, mut follower, late_message) = follower_missing_l1_message().await?;
+    let (_sequencer, mut follower, late_message) = follower_missing_l1_message(None).await?;
     index_late_message(&mut follower, &late_message).await?;
 
     // No further block is produced: the retried import alone must extend the chain to block 2.
@@ -508,6 +518,37 @@ async fn test_follower_retries_import_blocked_on_late_l1_message() -> eyre::Resu
         eyre::bail!("expected a chain extension");
     };
     assert_eq!(import.chain.iter().map(|b| b.header.number).collect::<Vec<_>>(), vec![2]);
+
+    Ok(())
+}
+
+/// A held block that no longer passes consensus when its L1 message arrives (here, because the
+/// authorized signer rotated in between) is dropped instead of retried, so the peer that relayed
+/// it while it was valid is not penalized.
+#[allow(clippy::large_stack_frames)]
+#[tokio::test]
+async fn test_follower_drops_blocked_import_after_signer_rotation() -> eyre::Result<()> {
+    reth_tracing::init_test_tracing();
+
+    let (_sequencer, mut follower, late_message) =
+        follower_missing_l1_message(Some(PrivateKeySigner::random())).await?;
+    follower.l1().signer_update(Address::random()).await?;
+    index_late_message(&mut follower, &late_message).await?;
+
+    let outcome = follower
+        .expect_event()
+        .where_event(|e| {
+            matches!(
+                e,
+                ChainOrchestratorEvent::BlockedImportDropped(_) |
+                    ChainOrchestratorEvent::BlockFailedConsensusChecks(..)
+            )
+        })
+        .await?;
+    assert!(
+        matches!(outcome.first(), Some(ChainOrchestratorEvent::BlockedImportDropped(_))),
+        "expected the held block to be dropped without a retry, got {outcome:?}"
+    );
 
     Ok(())
 }

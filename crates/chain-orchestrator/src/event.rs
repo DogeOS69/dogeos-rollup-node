@@ -102,6 +102,9 @@ pub enum ChainOrchestratorEvent {
     },
     /// An L1 message was not found in the database.
     L1MessageNotFoundInDatabase(L1MessageKey),
+    /// A peer block held for a late L1 message was dropped without a retry, because its height
+    /// is finalized or it no longer passes consensus checks.
+    BlockedImportDropped(B256),
     /// A block contains invalid L1 messages.
     L1MessageMismatch {
         /// The expected L1 messages hash.

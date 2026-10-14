@@ -143,7 +143,7 @@ pub struct ChainOrchestrator<
     event_sender: Option<EventSender<ChainOrchestratorEvent>>,
     /// The metrics handler.
     metric_handler: MetricsHandler,
-    /// The latest peer block whose import failed because it includes an L1 message this node has
+    /// The highest peer block whose import failed because it includes an L1 message this node has
     /// not indexed yet, retried once that message is committed.
     blocked_import: Option<BlockedImport>,
 }
@@ -552,7 +552,6 @@ impl<
                 }
             },
             ChainOrchestratorCommand::RevertToL1Block((block_number, tx)) => {
-                self.blocked_import = None;
                 self.sync_state.l1_mut().set_syncing();
                 self.derivation_driver.cancel_attempt();
                 let (unwind_result, held_outcome) =
@@ -629,6 +628,8 @@ impl<
         &mut self,
         ancestor: u64,
     ) -> Result<(UnwindResult, HeldReorgOutcome), ChainOrchestratorError> {
+        // A held block import may depend on L1 messages that the unwind removes.
+        self.blocked_import = None;
         let (unwind_result, outcome) =
             self.derivation_driver.unwind_and_revalidate(&self.database, ancestor).await?;
         match outcome {
@@ -773,7 +774,6 @@ impl<
         &mut self,
         block_number: u64,
     ) -> Result<Option<ChainOrchestratorEvent>, ChainOrchestratorError> {
-        self.blocked_import = None;
         self.derivation_driver.cancel_attempt();
         let (unwind_result, held_outcome) =
             self.unwind_and_revalidate_held_batch(block_number).await?;
@@ -1043,85 +1043,142 @@ impl<
         match event {
             ScrollNetworkManagerEvent::NewBlock(block_with_peer) => {
                 self.notify(ChainOrchestratorEvent::NewBlockReceived(block_with_peer.clone()));
-                let result = metered!(
-                    Task::L2BlockImport,
-                    self,
-                    handle_block_from_peer(block_with_peer.clone())
-                );
-                self.track_blocked_import(block_with_peer, &result);
-                result
+                self.import_peer_block(block_with_peer).await
             }
         }
     }
 
-    /// Keeps the latest peer block whose import failed on an L1 message that has not been indexed
+    /// Imports a block received from a peer, holding it if the import is blocked on an L1 message
+    /// that has not been indexed yet.
+    async fn import_peer_block(
+        &mut self,
+        block_with_peer: NewBlockWithPeer,
+    ) -> Result<Option<ChainOrchestratorEvent>, ChainOrchestratorError> {
+        let result =
+            metered!(Task::L2BlockImport, self, handle_block_from_peer(block_with_peer.clone()));
+        self.track_blocked_import(block_with_peer, &result);
+        result
+    }
+
+    /// Holds the highest peer block whose import failed on an L1 message that has not been indexed
     /// yet, so it can be retried when that message arrives instead of waiting for the next block.
-    /// A chain import that reaches the kept block's height supersedes it.
+    /// A chain import that reaches the held block's height supersedes it.
     fn track_blocked_import(
         &mut self,
         block_with_peer: NewBlockWithPeer,
         result: &Result<Option<ChainOrchestratorEvent>, ChainOrchestratorError>,
     ) {
+        let held_number =
+            self.blocked_import.as_ref().map(|held| held.block_with_peer.block.number);
+        let block_number = block_with_peer.block.number;
+        let block_hash = block_with_peer.block.hash_slow();
+
         if let Err(ChainOrchestratorError::L1MessageNotFound(L1MessageKey::TransactionHash(
             missing_l1_message,
         ))) = result
         {
+            if held_number.is_some_and(|held_number| held_number > block_number) {
+                tracing::debug!(
+                    target: "scroll::chain_orchestrator",
+                    block_number,
+                    ?block_hash,
+                    ?held_number,
+                    "Not holding block import below the held one"
+                );
+                return;
+            }
             tracing::info!(
                 target: "scroll::chain_orchestrator",
-                block_number = block_with_peer.block.number,
-                block_hash = ?block_with_peer.block.hash_slow(),
+                block_number,
+                ?block_hash,
                 ?missing_l1_message,
                 "Holding block import until its L1 message is indexed"
             );
             self.blocked_import =
                 Some(BlockedImport { block_with_peer, missing_l1_message: *missing_l1_message });
-        } else if self.blocked_import.as_ref().is_some_and(|blocked| {
-            supersedes_blocked_import(
-                result,
-                block_with_peer.block.number,
-                blocked.block_with_peer.block.number,
-            )
-        }) {
+        } else if held_number
+            .is_some_and(|held_number| supersedes_blocked_import(result, block_number, held_number))
+        {
+            tracing::debug!(
+                target: "scroll::chain_orchestrator",
+                block_number,
+                ?block_hash,
+                ?held_number,
+                "Chain import reached the held block import's height; dropping it"
+            );
             self.blocked_import = None;
         }
     }
 
-    /// Returns whether a handled L1 notification may unblock the held block import: the missing
-    /// L1 message was committed, or the L1 watcher reports it is synced.
+    /// Returns whether a handled L1 notification committed the L1 message the held block import is
+    /// waiting on.
     fn unblocks_import(&self, notification: &L1Notification) -> bool {
-        let Some(blocked) = &self.blocked_import else { return false };
-        match notification {
-            L1Notification::L1Message { message, .. } => {
-                message.tx_hash() == blocked.missing_l1_message
-            }
-            L1Notification::Synced => true,
-            _ => false,
-        }
+        self.blocked_import.as_ref().is_some_and(|blocked| {
+            matches!(
+                notification,
+                L1Notification::L1Message { message, .. }
+                    if message.tx_hash() == blocked.missing_l1_message
+            )
+        })
     }
 
     /// Retries the held block import through the regular peer block path, which also decides
-    /// whether a held fork block is still worth importing. A block the finalized head has passed
-    /// is dropped instead, because that path would penalize its peer. A retry that fails on a
-    /// still missing L1 message holds the block again.
+    /// whether a held fork block is still worth importing. A retry that fails on a still missing
+    /// L1 message holds the block again.
+    ///
+    /// The block is dropped without a retry when its height is already finalized, or when it no
+    /// longer passes consensus checks (for example, after the authorized signer rotated). In both
+    /// cases the regular path would penalize the peer that relayed a block that was valid when it
+    /// was announced.
     async fn retry_blocked_import(
         &mut self,
     ) -> Result<Option<ChainOrchestratorEvent>, ChainOrchestratorError> {
         let Some(BlockedImport { block_with_peer, .. }) = self.blocked_import.take() else {
             return Ok(None);
         };
-        if block_with_peer.block.number <= self.engine.fcs().finalized_block_info().number {
-            return Ok(None);
+        let block_number = block_with_peer.block.number;
+        let block_hash = block_with_peer.block.hash_slow();
+
+        let finalized_number = self.engine.fcs().finalized_block_info().number;
+        if block_number <= finalized_number {
+            tracing::info!(
+                target: "scroll::chain_orchestrator",
+                block_number,
+                ?block_hash,
+                finalized_number,
+                "Dropping held block import: its height is finalized"
+            );
+            return Ok(Some(ChainOrchestratorEvent::BlockedImportDropped(block_hash)));
+        }
+        if let Err(err) =
+            self.consensus.validate_new_block(&block_with_peer.block, &block_with_peer.signature)
+        {
+            tracing::info!(
+                target: "scroll::chain_orchestrator",
+                block_number,
+                ?block_hash,
+                ?err,
+                "Dropping held block import: it no longer passes consensus checks"
+            );
+            return Ok(Some(ChainOrchestratorEvent::BlockedImportDropped(block_hash)));
         }
 
         tracing::info!(
             target: "scroll::chain_orchestrator",
-            block_number = block_with_peer.block.number,
-            block_hash = ?block_with_peer.block.hash_slow(),
+            block_number,
+            ?block_hash,
             "Retrying block import blocked on an L1 message"
         );
-        let result =
-            metered!(Task::L2BlockImport, self, handle_block_from_peer(block_with_peer.clone()));
-        self.track_blocked_import(block_with_peer, &result);
+        let result = self.import_peer_block(block_with_peer).await;
+        if let Err(err) = &result {
+            tracing::warn!(
+                target: "scroll::chain_orchestrator",
+                block_number,
+                ?block_hash,
+                ?err,
+                "Retried block import failed"
+            );
+        }
         result
     }
 

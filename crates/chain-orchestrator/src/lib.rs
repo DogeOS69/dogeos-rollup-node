@@ -143,7 +143,7 @@ pub struct ChainOrchestrator<
     event_sender: Option<EventSender<ChainOrchestratorEvent>>,
     /// The metrics handler.
     metric_handler: MetricsHandler,
-    /// The highest peer block whose import failed because it includes an L1 message this node has
+    /// The latest peer block whose import failed because it includes an L1 message this node has
     /// not indexed yet, retried once that message is committed.
     blocked_import: Option<BlockedImport>,
 }
@@ -1060,8 +1060,10 @@ impl<
         result
     }
 
-    /// Holds the highest peer block whose import failed on an L1 message that has not been indexed
+    /// Holds the latest peer block whose import failed on an L1 message that has not been indexed
     /// yet, so it can be retried when that message arrives instead of waiting for the next block.
+    /// A newer failure replaces the held block even if it is lower: height alone cannot tell
+    /// which block is still valid (a fork may win on timestamp, or the signer may have rotated).
     /// A chain import that reaches the held block's height supersedes it.
     fn track_blocked_import(
         &mut self,
@@ -1077,20 +1079,11 @@ impl<
             missing_l1_message,
         ))) = result
         {
-            if held_number.is_some_and(|held_number| held_number > block_number) {
-                tracing::debug!(
-                    target: "scroll::chain_orchestrator",
-                    block_number,
-                    ?block_hash,
-                    ?held_number,
-                    "Not holding block import below the held one"
-                );
-                return;
-            }
             tracing::info!(
                 target: "scroll::chain_orchestrator",
                 block_number,
                 ?block_hash,
+                ?held_number,
                 ?missing_l1_message,
                 "Holding block import until its L1 message is indexed"
             );

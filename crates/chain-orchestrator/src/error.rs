@@ -148,9 +148,9 @@ pub enum ChainOrchestratorError {
         /// The derived block number.
         derived_block_number: u64,
     },
-    /// The Engine safe block is at or below the database's safe block but is not a database
-    /// block, so the Engine is on a fork the database has left.
-    #[error("Engine safe block {engine_safe:?} is not on the database's chain (database safe block {db_safe:?}) before reconciling batch {batch_info:?}")]
+    /// Reth's canonical chain does not contain the database's safe block, so the Engine is on a
+    /// fork the database has left.
+    #[error("Engine is not on the database's chain before reconciling batch {batch_info:?}: database safe block {db_safe:?}, Reth canonical block at that height {reth_canonical:?}, Engine safe block {engine_safe:?}")]
     SafeFrontierMismatch {
         /// The batch being reconciled.
         batch_info: BatchInfo,
@@ -158,6 +158,8 @@ pub enum ChainOrchestratorError {
         engine_safe: BlockInfo,
         /// The database's latest safe block.
         db_safe: BlockInfo,
+        /// Reth's canonical block at the database's safe height, if it has one.
+        reth_canonical: Option<BlockInfo>,
     },
     /// The forkchoice update that moves the Engine to the database's blocks after an L1 reorg or
     /// a batch revert failed or was rejected, so the Engine and the database disagree.

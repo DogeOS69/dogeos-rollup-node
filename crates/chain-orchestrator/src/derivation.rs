@@ -10,13 +10,13 @@ use alloy_provider::Provider;
 use alloy_rpc_types_engine::{ForkchoiceUpdated, PayloadId, PayloadStatus, PayloadStatusEnum};
 use dogeos_rpc_types::Scroll;
 use rollup_node_primitives::{
-    BatchConsolidationOutcome, BatchInfo, BatchStatus, BlockConsolidationOutcome,
+    BatchConsolidationOutcome, BatchInfo, BatchStatus, BlockConsolidationOutcome, BlockInfo,
     L2BlockInfoWithL1Messages,
 };
 use scroll_db::{Database, DatabaseReadOperations, DatabaseWriteOperations, UnwindResult};
 use scroll_derivation_pipeline::BatchDerivationResult;
 use scroll_engine::{Engine, EngineError, ScrollEngineApi};
-use std::{cmp::Ordering, pin::Pin, time::Duration};
+use std::{pin::Pin, time::Duration};
 use tokio::time::{Instant, Sleep};
 
 const INITIAL_HOLD_BACKOFF_MS: u64 = 2_000;
@@ -376,35 +376,53 @@ where
     EC: ScrollEngineApi + Sync + Send + 'static,
 {
     let batch_info = batch.batch_info;
-    // An Engine safe block at or below the database's safe block must be a database block.
+    // The batch extends the database's safe block, so the Engine's chain must contain it.
     // Otherwise the Engine kept a fork the database has left, for example when the forkchoice
-    // update after an L1 reorg or batch revert was lost, and the batch would be reconciled against
-    // that fork. The Engine is behind when its latest safe tag was not persisted, and ahead after a
-    // crash between a derivation forkchoice update and the database commit.
+    // update after an L1 reorg or batch revert was lost, and reconciliation, which matches blocks
+    // by number, would continue that fork. Reth's canonical block at that height is checked
+    // because the Engine's safe tag can sit above the database's (after a crash before the
+    // database commit) or below it (when Reth did not persist its latest safe tag). The block
+    // may only be missing below the tag's height when Reth lost blocks; the reorg number check
+    // then halts. Genesis comes from the chain spec and cannot fork.
     let engine_safe = *engine.fcs().safe_block_info();
-    let database_error = |error| {
+    let (db_safe, _) = database.get_latest_safe_l2_info().await.map_err(|error| {
         AttemptFailure::fatal(
-            "getSafeL2Info",
+            "getLatestSafeL2Info",
             "ERROR",
             ChainOrchestratorError::DatabaseError(error),
         )
-    };
-    let (db_safe, _) = database.get_latest_safe_l2_info().await.map_err(database_error)?;
-    let on_database_chain = match engine_safe.number.cmp(&db_safe.number) {
-        Ordering::Greater => true,
-        Ordering::Equal => engine_safe == db_safe,
-        Ordering::Less => database
-            .get_l2_block_and_batch_info_by_hash(engine_safe.hash)
+    })?;
+    if db_safe.number > 0 {
+        let reth_canonical = l2_client
+            .get_block_by_number(db_safe.number.into())
             .await
-            .map_err(database_error)?
-            .is_some_and(|(block, _)| block == engine_safe),
-    };
-    if !on_database_chain {
-        return Err(AttemptFailure::fatal(
-            "reconcileBatch",
-            "SAFE_FRONTIER_MISMATCH",
-            ChainOrchestratorError::SafeFrontierMismatch { batch_info, engine_safe, db_safe },
-        ));
+            .map_err(|error| {
+                AttemptFailure::fatal(
+                    "getL2BlockByNumber",
+                    "ERROR",
+                    ChainOrchestratorError::RpcError(error),
+                )
+            })?
+            .map(|block| BlockInfo { number: block.header.number, hash: block.header.hash });
+        let on_database_chain = match reth_canonical {
+            Some(canonical) => {
+                canonical == db_safe &&
+                    (engine_safe.number != db_safe.number || engine_safe == db_safe)
+            }
+            None => engine_safe.number < db_safe.number,
+        };
+        if !on_database_chain {
+            return Err(AttemptFailure::fatal(
+                "reconcileBatch",
+                "SAFE_FRONTIER_MISMATCH",
+                ChainOrchestratorError::SafeFrontierMismatch {
+                    batch_info,
+                    engine_safe,
+                    db_safe,
+                    reth_canonical,
+                },
+            ));
+        }
     }
     let reconciliation = reconcile_batch(l2_client, batch, engine.fcs())
         .await
@@ -674,7 +692,7 @@ mod tests {
     use super::*;
     use crate::{ChainOrchestratorStatus, SyncState};
     use alloy_consensus::Header as ConsensusHeader;
-    use alloy_primitives::{Address, Bloom, Bytes, Sealable, B256, U256};
+    use alloy_primitives::{Address, Bloom, Bytes, Sealable, Sealed, B256, U256};
     use alloy_provider::ProviderBuilder;
     use alloy_rpc_types_engine::{ExecutionPayloadV1, PayloadId};
     use alloy_rpc_types_eth::{Block as RpcBlock, Header as RpcHeader};
@@ -779,6 +797,14 @@ mod tests {
 
     fn push_absent_block(asserter: &Asserter) {
         asserter.push_success(&Option::<()>::None);
+    }
+
+    /// Answers a block-by-number request with Reth's canonical `block`.
+    fn push_canonical_block(asserter: &Asserter, block: BlockInfo) {
+        let header = ConsensusHeader { number: block.number, ..Default::default() };
+        let rpc_header =
+            RpcHeader::from_consensus(Sealed::new_unchecked(header, block.hash), None, None);
+        asserter.push_success(&Some(RpcBlock::<ScrollRpcTransaction, _>::empty(rpc_header)));
     }
 
     fn push_matching_empty_block(
@@ -1275,13 +1301,17 @@ mod tests {
     /// block 20 and a replacement batch at L1 block 21 move the safe block to B, which the Engine
     /// keeps. An L1 reorg to block 15 removes both, so the database is back at A, and the
     /// forkchoice update that would move the Engine back to A is lost. Batch 2 follows at L1
-    /// block 16. Returns A and B.
+    /// block 16. Block `SAFE - 1` of batch 1 is their common ancestor. Returns A and B.
     async fn database_back_at_a_after_lost_unwind_fcu(
         database: &Database,
     ) -> (BlockInfo, BlockInfo) {
         let block_a = info(SAFE, 0xaa);
         let block_b = info(SAFE, 0x11);
-        insert_batch_with_block(database, 0xa1, 10, block_a).await;
+        insert_batch_with_block(database, 0xa1, 10, info(SAFE - 1, 0x10)).await;
+        database
+            .insert_blocks(vec![block_a], BatchInfo::new(1, B256::repeat_byte(0xa1)))
+            .await
+            .unwrap();
         database.set_batch_revert_block_number_for_batch_range(1, 1, info(20, 0x20)).await.unwrap();
         insert_batch_with_block(database, 0xb1, 21, block_b).await;
         assert_eq!(database.get_latest_safe_l2_info().await.unwrap().0, block_b);
@@ -1354,6 +1384,7 @@ mod tests {
         else {
             panic!("a batch reconciled against the fork the database left must fail-stop")
         };
+        assert_eq!(fatal.outcome, "SAFE_FRONTIER_MISMATCH");
         assert!(matches!(
             *fatal.error,
             ChainOrchestratorError::SafeFrontierMismatch { engine_safe, db_safe, .. }
@@ -1363,48 +1394,86 @@ mod tests {
         assert_eq!(*engine.fcs().safe_block_info(), block_b);
     }
 
-    /// The Engine safe block is one block behind the database's, as after a restart where Reth did
-    /// not persist its latest safe tag. A block of the database's chain lets batch 2 consolidate;
-    /// a block the database does not hold fail-stops.
+    /// Batch 2 matches a child of B in its first block and rebuilds its second block. Returns the
+    /// derived batch, the scripted Engine and the provider, which first answers Reth's canonical
+    /// block at the database's safe height with `canonical`.
+    fn matching_prefix_attempt(
+        canonical: BlockInfo,
+    ) -> (BatchDerivationResult, Arc<ScriptedEngineClient>, impl Provider<Scroll>, BlockInfo) {
+        let mut derived = batch(2, BatchStatus::Consolidated);
+        let mut second = derived.attributes[0].clone();
+        second.block_number = SAFE + 2;
+        derived.attributes.push(second);
+        let asserter = Asserter::new();
+        push_canonical_block(&asserter, canonical);
+        let child = push_matching_empty_block(&asserter, &derived.attributes[0].attributes);
+        push_absent_block(&asserter);
+        let client = Arc::new(ScriptedEngineClient::new());
+        client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Valid, None)));
+        let mut built = payload(SAFE + 2);
+        built.parent_hash = child.hash;
+        script_rebuild(&client, built);
+        (derived, client, absent_block_provider(asserter), child)
+    }
+
+    /// The Engine's safe tag lags at the common ancestor `SAFE - 1`, as after a restart where Reth
+    /// did not persist its latest safe tag. If Reth's canonical chain holds A, batch 2
+    /// consolidates; if it still holds B, the attempt fail-stops before any Engine call.
     #[tokio::test]
-    async fn engine_safe_behind_the_database_safe_block() {
-        for (engine_safe, on_database_chain) in
-            [(info(SAFE - 1, 0x10), true), (info(SAFE - 1, 0xbb), false)]
-        {
+    async fn engine_safe_tag_behind_the_database_safe_block() {
+        for reth_on_a in [true, false] {
             let database = setup_test_db().await;
-            insert_batch_with_block(&database, 0xa1, 10, info(SAFE - 1, 0x10)).await;
-            database
-                .insert_blocks(vec![info(SAFE, 0x11)], BatchInfo::new(1, B256::repeat_byte(0xa1)))
-                .await
-                .unwrap();
-            insert_batch(&database, 2, 16, None).await;
-            let derived = batch(2, BatchStatus::Consolidated);
-            let asserter = Asserter::new();
-            let canonical = push_matching_empty_block(&asserter, &derived.attributes[0].attributes);
-            let provider = absent_block_provider(asserter);
-            let client = Arc::new(ScriptedEngineClient::new());
-            client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(
-                PayloadStatusEnum::Valid,
-                None,
-            )));
+            let (block_a, block_b) = database_back_at_a_after_lost_unwind_fcu(&database).await;
+            let canonical = if reth_on_a { block_a } else { block_b };
+            let (derived, client, provider, _) = matching_prefix_attempt(canonical);
             let mut engine =
-                Engine::new(client.clone(), ForkchoiceState::from_block_info(engine_safe));
+                Engine::new(client.clone(), ForkchoiceState::from_block_info(info(SAFE - 1, 0x10)));
             let mut driver = DerivationDriver::default();
             driver.hold_batch(derived);
             driver.wait_for_attempt().await;
 
             let step = driver.run_attempt(&provider, &mut engine, &database).await;
-            if on_database_chain {
+            if reth_on_a {
                 assert!(matches!(step, AttemptStep::Completed(_)), "got {step:?}");
-                assert_eq!(*engine.fcs().safe_block_info(), canonical);
+                assert_eq!(engine.fcs().safe_block_info().number, SAFE + 2);
             } else {
                 let AttemptStep::Fatal(fatal) = step else {
-                    panic!("an Engine safe block off the database's chain must fail-stop")
+                    panic!("a lagging safe tag over Reth's chain on B must fail-stop, got {step:?}")
                 };
-                assert_eq!(fatal.outcome, "SAFE_FRONTIER_MISMATCH");
+                assert!(matches!(
+                    *fatal.error,
+                    ChainOrchestratorError::SafeFrontierMismatch { db_safe, reth_canonical, .. }
+                        if db_safe == block_a && reth_canonical == Some(block_b)
+                ));
                 assert_eq!(client.fork_choice_updated_calls(), 0);
             }
         }
+    }
+
+    /// The Engine's safe tag is above the database's safe block on the fork it left, as when the
+    /// replacement batch was longer than A or the node restarted after the fail-stop with Reth's
+    /// safe tag on B's child.
+    #[tokio::test]
+    async fn engine_safe_tag_above_the_database_safe_block_on_another_fork_fail_stops() {
+        let database = setup_test_db().await;
+        let (block_a, block_b) = database_back_at_a_after_lost_unwind_fcu(&database).await;
+        let (derived, client, provider, child_of_b) = matching_prefix_attempt(block_b);
+        let mut engine = Engine::new(client.clone(), ForkchoiceState::from_block_info(child_of_b));
+        let mut driver = DerivationDriver::default();
+        driver.hold_batch(derived);
+        driver.wait_for_attempt().await;
+
+        let step = driver.run_attempt(&provider, &mut engine, &database).await;
+        let AttemptStep::Fatal(fatal) = step else {
+            panic!("a safe tag above the database on the fork it left must fail-stop, got {step:?}")
+        };
+        assert_eq!(fatal.outcome, "SAFE_FRONTIER_MISMATCH");
+        assert!(matches!(
+            *fatal.error,
+            ChainOrchestratorError::SafeFrontierMismatch { db_safe, reth_canonical, .. }
+                if db_safe == block_a && reth_canonical == Some(block_b)
+        ));
+        assert_eq!(client.fork_choice_updated_calls(), 0);
     }
 
     #[tokio::test]
@@ -1416,6 +1485,7 @@ mod tests {
         script_rebuild(&client, payload(SAFE + 1));
         let mut engine = engine_at_safe(client.clone());
         let asserter = Asserter::new();
+        push_canonical_block(&asserter, info(SAFE, 0x11));
         push_absent_block(&asserter);
         let provider = absent_block_provider(asserter);
         let mut driver = DerivationDriver::default();
@@ -1474,6 +1544,7 @@ mod tests {
         insert_batch(&database, 2, 16, None).await;
         let derived = batch(2, BatchStatus::Consolidated);
         let asserter = Asserter::new();
+        push_canonical_block(&asserter, info(SAFE, 0x11));
         let canonical = push_matching_empty_block(&asserter, &derived.attributes[0].attributes);
         let provider = absent_block_provider(asserter);
         let client = Arc::new(ScriptedEngineClient::new());

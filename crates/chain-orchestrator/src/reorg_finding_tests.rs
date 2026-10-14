@@ -557,6 +557,52 @@ async fn rg49_batch_revert_reports_the_new_safe_head_only_if_the_engine_accepted
     }
 }
 
+/// `handle_batch_revert`: a `SYNCING` answer is not success either. The local forkchoice state
+/// must stay at the block the Engine actually holds, or the next batch would be checked against a
+/// safe block the Engine never adopted.
+#[tokio::test]
+async fn rg49_batch_revert_fails_on_a_syncing_forkchoice_answer() {
+    let database = Arc::new(setup_test_db().await);
+    seed_two_committed_batches(&database).await;
+    let engine_client = Arc::new(ScriptedEngineClient::new());
+    engine_client.push_fork_choice_updated(ScriptedResponse::Ok(
+        alloy_rpc_types_engine::ForkchoiceUpdated {
+            payload_status: alloy_rpc_types_engine::PayloadStatus {
+                status: alloy_rpc_types_engine::PayloadStatusEnum::Syncing,
+                latest_valid_hash: None,
+            },
+            payload_id: None,
+        },
+    ));
+    let fcs = ForkchoiceState::new(info(10, 10), info(10, 10), info(0, 0));
+    let mut orchestrator = orchestrator_with_engine(
+        database,
+        fcs.clone(),
+        0,
+        Probes::default(),
+        engine_client.clone(),
+    )
+    .await;
+    orchestrator.sync_state.l2_mut().set_synced();
+
+    let result = orchestrator.handle_batch_revert(2, 2, info(30, 30)).await;
+
+    assert_eq!(engine_client.fork_choice_updated_calls(), 1);
+    assert!(
+        matches!(
+            &result,
+            Err(ChainOrchestratorError::UnwindForkchoiceUpdateFailed {
+                operation: "batch revert",
+                db_safe: Some(db_safe),
+                engine_safe,
+                ..
+            }) if *db_safe == info(5, 5) && *engine_safe == info(10, 10)
+        ),
+        "got {result:?}"
+    );
+    assert_eq!(orchestrator.engine.fcs(), &fcs);
+}
+
 /// `RevertToL1Block`: the unwind deletes batch 2, so the safe block moves back to L2 block 5. The
 /// Engine answers `INVALID` and keeps safe at block 10. The command still replies `true`.
 #[tokio::test]

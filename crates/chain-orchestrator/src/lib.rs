@@ -830,21 +830,23 @@ impl<
     }
 
     /// Moves the Engine to the database's head and safe blocks after an L1 reorg or a batch
-    /// revert. An Engine error or an `INVALID` answer would leave the Engine on blocks the database
-    /// no longer holds, so both return [`ChainOrchestratorError::UnwindForkchoiceUpdateFailed`],
-    /// which stops the run loop.
+    /// revert. Any answer other than `VALID`, or an Engine error, would leave the Engine on blocks
+    /// the database no longer holds, so it returns
+    /// [`ChainOrchestratorError::UnwindForkchoiceUpdateFailed`], which stops the run loop. The
+    /// local forkchoice state only moves on `VALID`.
     async fn update_fcs_after_unwind(
         &mut self,
         operation: &'static str,
         head: Option<BlockInfo>,
         safe: Option<BlockInfo>,
     ) -> Result<(), ChainOrchestratorError> {
-        let reason = match self.engine.update_fcs(head, safe, None).await {
+        let reason = match self.engine.update_fcs_checked(head, safe, None).await {
             Ok(response) => match response.payload_status.status {
+                PayloadStatusEnum::Valid => return Ok(()),
                 PayloadStatusEnum::Invalid { validation_error } => {
                     format!("Engine returned INVALID: {validation_error}")
                 }
-                _ => return Ok(()),
+                status => format!("Engine returned {status}"),
             },
             Err(error) => error.to_string(),
         };

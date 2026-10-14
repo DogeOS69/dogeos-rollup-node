@@ -1,5 +1,6 @@
 use alloy_json_rpc::RpcError;
 use alloy_primitives::B256;
+use alloy_rpc_types_engine::PayloadStatusEnum;
 use alloy_transport::TransportErrorKind;
 use rollup_node_primitives::{BatchInfo, BlockInfo};
 use rollup_node_sequencer::SequencerError;
@@ -10,6 +11,25 @@ use scroll_engine::EngineError;
 /// A type that represents an error that occurred in the chain orchestrator.
 #[derive(Debug, thiserror::Error)]
 pub enum ChainOrchestratorError {
+    /// The execution provider did not expose all latest/safe/finalized tags needed for recovery.
+    #[error("execution provider is missing latest, safe, or finalized forkchoice tags")]
+    MissingEngineForkchoiceTags,
+    /// Recovery errors must stop processing, including database and RPC failures.
+    #[error("frontier recovery failed: {0}")]
+    FrontierRecovery(#[source] Box<Self>),
+    /// A database frontier conflicts with an unexplained Engine tag.
+    #[error("conflicting {tag} frontier: database={target}, Engine={observed}")]
+    FrontierConflict {
+        /// The forkchoice tag being checked.
+        tag: &'static str,
+        /// The database-backed target.
+        target: BlockInfo,
+        /// The Engine's observed block.
+        observed: BlockInfo,
+    },
+    /// The Engine did not accept a frontier update.
+    #[error("Engine returned {0} during frontier update")]
+    FrontierTransitionStatus(PayloadStatusEnum),
     /// An error occurred while interacting with the database.
     #[error("database error occurred: {0}")]
     DatabaseError(#[from] DatabaseError),
@@ -125,7 +145,7 @@ pub enum ChainOrchestratorError {
         /// The latest hash the Engine considers valid.
         latest_valid_hash: Option<B256>,
         /// The Engine validation detail.
-        validation_error: String,
+        validation_error: Box<str>,
     },
     /// A rebuilt payload differs from the data derived from its batch.
     #[error("Rebuilt payload mismatch for batch {batch_info:?} at block {block_number}: {reason}")]
@@ -159,5 +179,29 @@ impl CanRetry for ChainOrchestratorError {
             Self::DatabaseError(err) => err.can_retry(),
             _ => false,
         }
+    }
+}
+
+impl ChainOrchestratorError {
+    /// Keep all failures within frontier recovery fail-stop, including journal I/O errors.
+    pub(crate) fn frontier_recovery(error: impl Into<Self>) -> Self {
+        let error = error.into();
+        if error.is_frontier_fatal() {
+            error
+        } else {
+            Self::FrontierRecovery(Box::new(error))
+        }
+    }
+
+    /// Returns true when continuing the run loop could process work against an unresolved Engine
+    /// frontier.
+    pub(crate) const fn is_frontier_fatal(&self) -> bool {
+        matches!(
+            self,
+            Self::MissingEngineForkchoiceTags |
+                Self::FrontierRecovery(_) |
+                Self::FrontierConflict { .. } |
+                Self::FrontierTransitionStatus(_)
+        )
     }
 }

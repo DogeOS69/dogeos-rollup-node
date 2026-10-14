@@ -4,7 +4,7 @@ use crate::{
     metrics::{DatabaseMetrics, DatabaseOperation, DatabaseOperationMetrics},
     service::{query::DatabaseQuery, retry::Retry, DatabaseService, DatabaseServiceError},
     DatabaseConnectionProvider, DatabaseReadOperations, DatabaseWriteOperations, L1MessageKey,
-    UnwindResult,
+    PendingFrontierTransition, UnwindResult,
 };
 use alloy_primitives::{Signature, B256};
 use dogeos_reth_engine::BlockDataHint;
@@ -148,6 +148,25 @@ macro_rules! metered {
 
 #[async_trait::async_trait]
 impl DatabaseWriteOperations for Database {
+    async fn set_pending_frontier_transition(
+        &self,
+        transition: PendingFrontierTransition,
+    ) -> Result<(), DatabaseError> {
+        metered!(
+            DatabaseOperation::SetPendingFrontierTransition,
+            self,
+            tx_mut(move |tx| async move { tx.set_pending_frontier_transition(transition).await })
+        )
+    }
+
+    async fn clear_pending_frontier_transition(&self) -> Result<(), DatabaseError> {
+        metered!(
+            DatabaseOperation::ClearPendingFrontierTransition,
+            self,
+            tx_mut(move |tx| async move { tx.clear_pending_frontier_transition().await })
+        )
+    }
+
     async fn insert_l1_block_info(&self, block_info: BlockInfo) -> Result<(), DatabaseError> {
         metered!(
             DatabaseOperation::InsertL1BlockInfo,
@@ -547,6 +566,34 @@ impl DatabaseWriteOperations for Database {
 
 #[async_trait::async_trait]
 impl DatabaseReadOperations for Database {
+    async fn get_confirmed_frontier_transition(
+        &self,
+    ) -> Result<Option<PendingFrontierTransition>, DatabaseError> {
+        metered!(
+            DatabaseOperation::GetConfirmedFrontierTransition,
+            self,
+            tx(|tx| async move { tx.get_confirmed_frontier_transition().await })
+        )
+    }
+
+    async fn get_latest_finalized_l2_info(&self) -> Result<BlockInfo, DatabaseError> {
+        metered!(
+            DatabaseOperation::GetLatestFinalizedL2Info,
+            self,
+            tx(|tx| async move { tx.get_latest_finalized_l2_info().await })
+        )
+    }
+
+    async fn get_pending_frontier_transition(
+        &self,
+    ) -> Result<Option<PendingFrontierTransition>, DatabaseError> {
+        metered!(
+            DatabaseOperation::GetPendingFrontierTransition,
+            self,
+            tx(|tx| async move { tx.get_pending_frontier_transition().await })
+        )
+    }
+
     async fn get_batch_by_index(
         &self,
         batch_index: u64,
@@ -883,7 +930,100 @@ mod test {
     use rollup_node_primitives::{
         BatchCommitData, BatchInfo, BlockInfo, L1MessageEnvelope, L2BlockInfoWithL1Messages,
     };
-    use sea_orm::EntityTrait;
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+
+    #[tokio::test]
+    async fn frontier_journal_is_atomic_and_survives_database_reopen() {
+        use crate::StoredForkchoiceState;
+
+        let original = setup_test_db().await;
+        let path = original.tmp_dir().unwrap().path().join("test.db");
+        let db = &original;
+        let block = BlockInfo::new(1, B256::repeat_byte(1));
+        let expected = StoredForkchoiceState { head: block, safe: block, finalized: block };
+        let transition = PendingFrontierTransition {
+            expected,
+            target: StoredForkchoiceState {
+                head: BlockInfo::new(2, B256::repeat_byte(2)),
+                ..expected
+            },
+        };
+        db.set_l2_head_block_number(1).await.unwrap();
+        let error = db
+            .tx_mut(move |tx| async move {
+                tx.set_l2_head_block_number(2).await.unwrap();
+                tx.set_pending_frontier_transition(transition).await.unwrap();
+                Err::<(), _>(DatabaseError::MissingSafeL2Frontier)
+            })
+            .await;
+        assert!(error.is_err());
+        assert_eq!(db.get_l2_head_block_number().await.unwrap(), 1);
+        assert_eq!(db.get_pending_frontier_transition().await.unwrap(), None);
+
+        db.tx_mut(move |tx| async move {
+            tx.set_l2_head_block_number(2).await.unwrap();
+            tx.set_pending_frontier_transition(transition).await
+        })
+        .await
+        .unwrap();
+        db.inner().get_connection().clone().close().await.unwrap();
+        let db = Database::new(path.to_str().unwrap()).await.unwrap();
+        assert_eq!(db.get_pending_frontier_transition().await.unwrap(), Some(transition));
+        let updated = PendingFrontierTransition {
+            target: StoredForkchoiceState { safe: transition.target.head, ..transition.target },
+            ..transition
+        };
+        db.set_pending_frontier_transition(updated).await.unwrap();
+        assert_eq!(db.get_pending_frontier_transition().await.unwrap(), Some(updated));
+        db.clear_pending_frontier_transition().await.unwrap();
+        assert_eq!(db.get_pending_frontier_transition().await.unwrap(), None);
+        assert_eq!(db.get_l2_head_block_number().await.unwrap(), 2);
+        db.inner().get_connection().clone().close().await.unwrap();
+        drop(db);
+        let db = Database::new(path.to_str().unwrap()).await.unwrap();
+        assert_eq!(db.get_pending_frontier_transition().await.unwrap(), None);
+        assert_eq!(db.get_confirmed_frontier_transition().await.unwrap(), Some(updated));
+    }
+
+    #[tokio::test]
+    async fn invalid_frontier_journal_is_rejected_on_write_read_and_acknowledgement() {
+        use crate::{frontier_transition_types::FRONTIER_TRANSITION_KEY, StoredForkchoiceState};
+        use rollup_node_primitives::Metadata;
+        let db = setup_test_db().await;
+        let low = BlockInfo::new(1, B256::repeat_byte(1));
+        let high = BlockInfo::new(2, B256::repeat_byte(2));
+        let valid = StoredForkchoiceState { head: high, safe: high, finalized: low };
+        let invalid_states = [
+            StoredForkchoiceState { head: low, ..valid },
+            StoredForkchoiceState { safe: low, finalized: high, ..valid },
+            StoredForkchoiceState { safe: BlockInfo::new(2, B256::repeat_byte(3)), ..valid },
+            StoredForkchoiceState { finalized: BlockInfo::new(1, B256::repeat_byte(3)), ..valid },
+        ];
+        let mut rows = vec![("{".to_owned(), false), (r#"{"kind":"unknown"}"#.to_owned(), false)];
+        for invalid in invalid_states {
+            let transition = PendingFrontierTransition { expected: valid, target: invalid };
+            assert!(matches!(
+                db.set_pending_frontier_transition(transition).await,
+                Err(DatabaseError::InvalidFrontierTransition(_))
+            ));
+            rows.push((serde_json::to_string(&transition).unwrap(), true));
+        }
+        for (value, invalid_state) in rows {
+            let row: models::metadata::ActiveModel =
+                Metadata { key: FRONTIER_TRANSITION_KEY.into(), value }.into();
+            models::metadata::Entity::insert(row).exec(db.inner().get_connection()).await.unwrap();
+            assert!(matches!(
+                (invalid_state, db.get_pending_frontier_transition().await),
+                (true, Err(DatabaseError::InvalidFrontierTransition(_))) |
+                    (false, Err(DatabaseError::MetadataSerdeError(_)))
+            ));
+            assert!(db.clear_pending_frontier_transition().await.is_err());
+            models::metadata::Entity::delete_by_id(FRONTIER_TRANSITION_KEY)
+                .exec(db.inner().get_connection())
+                .await
+                .unwrap();
+        }
+    }
 
     #[tokio::test]
     async fn test_database_round_trip_batch_commit() {
@@ -1363,6 +1503,33 @@ mod test {
         // Should return the highest safe block (block 201)
         let latest_safe = db.get_latest_safe_l2_info().await.unwrap();
         assert_eq!(latest_safe, (safe_block_2, batch_info));
+    }
+
+    #[tokio::test]
+    async fn insert_genesis_block_replaces_the_migration_seed() {
+        let db = setup_test_db().await;
+        let canonical_hash = B256::repeat_byte(0x42);
+
+        db.insert_genesis_block(canonical_hash).await.unwrap();
+
+        let genesis_rows = models::l2_block::Entity::find()
+            .filter(models::l2_block::Column::BlockNumber.eq(0))
+            .all(db.inner().get_connection())
+            .await
+            .unwrap();
+        assert_eq!(genesis_rows.len(), 1);
+        assert_eq!(genesis_rows[0].block_info(), BlockInfo::new(0, canonical_hash));
+    }
+
+    #[tokio::test]
+    async fn missing_safe_l2_frontier_is_an_error() {
+        let db = setup_test_db().await;
+        models::l2_block::Entity::delete_many().exec(db.inner().get_connection()).await.unwrap();
+
+        assert!(matches!(
+            db.get_latest_safe_l2_info().await,
+            Err(DatabaseError::MissingSafeL2Frontier)
+        ));
     }
 
     #[tokio::test]

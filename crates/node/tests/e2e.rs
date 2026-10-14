@@ -7,6 +7,7 @@ use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::SolCall;
 use dogeos_chainspec::{DogeosChainSpec, DOGEOS_CHIKYU, DOGEOS_DEV, DOGEOS_MAINNET};
 use dogeos_hardforks::{DogeosHardfork, ForkCondition};
+use dogeos_reth_evm::DEFAULT_BASE_FEE_OVERHEAD;
 use dogeos_reth_primitives::DogeosBlock;
 use futures::{task::noop_waker_ref, FutureExt, StreamExt};
 use reth_chainspec::EthChainSpec;
@@ -663,6 +664,111 @@ async fn can_bridge_blocks() -> eyre::Result<()> {
         panic!("Failed to receive block from scroll-wire network");
     }
 
+    Ok(())
+}
+
+/// Restart both a sequencer and a follower with a fresh Engine and `SQLite` connection at each
+/// durable finalization checkpoint. No new block is built after FCU, so tag persistence may lag.
+#[tokio::test]
+async fn restart_recovers_frontier_checkpoints_on_sequencer_and_follower() -> eyre::Result<()> {
+    use scroll_db::{DatabaseConnectionProvider, PendingFrontierTransition, StoredForkchoiceState};
+    use scroll_engine::{ScrollAuthApiEngineClient, ScrollEngineApi};
+
+    for checkpoint in 0..3 {
+        let mut fixture = TestFixture::builder()
+            .sequencer()
+            .followers(1)
+            .allow_empty_blocks(true)
+            .build()
+            .await?;
+        fixture.l1().sync().await?;
+        let block = fixture.build_block().expect_block_number(1).build_and_await_block().await?;
+        fixture.expect_event_on(1).chain_extended(1).await?;
+        let tip = BlockInfo::from(&block);
+        let genesis = BlockInfo::new(0, fixture.chain_spec.genesis_hash());
+        let expected = StoredForkchoiceState { head: tip, safe: genesis, finalized: genesis };
+        let target = StoredForkchoiceState { head: tip, safe: tip, finalized: tip };
+        let mut databases = Vec::new();
+        for node in fixture.nodes.iter().flatten() {
+            let database = node.rollup_manager_handle.get_database_handle().await?;
+            let batch = BatchCommitData {
+                hash: B256::repeat_byte(0xb1),
+                index: 1,
+                block_number: 1,
+                block_timestamp: 1,
+                calldata: Arc::new(Bytes::new()),
+                blob_versioned_hash: None,
+                finalized_block_number: Some(1),
+                reverted_block_number: None,
+            };
+            database
+                .tx_mut(move |tx| {
+                    let batch = batch.clone();
+                    async move {
+                        tx.insert_batch(batch.clone()).await?;
+                        tx.insert_blocks(vec![tip], (&batch).into()).await?;
+                        tx.update_batch_status(batch.hash, BatchStatus::Finalized).await?;
+                        tx.set_l2_head_block_number(tip.number).await?;
+                        tx.set_pending_frontier_transition(PendingFrontierTransition {
+                            expected,
+                            target,
+                        })
+                        .await
+                    }
+                })
+                .await?;
+            if checkpoint > 0 {
+                let client = ScrollAuthApiEngineClient::new(
+                    node.node.inner.add_ons_handle.rpc_server_handles.auth.http_client(),
+                );
+                let response = client
+                    .fork_choice_updated_v1(
+                        alloy_rpc_types_engine::ForkchoiceState {
+                            head_block_hash: tip.hash,
+                            safe_block_hash: tip.hash,
+                            finalized_block_hash: tip.hash,
+                        },
+                        None,
+                    )
+                    .await?;
+                assert!(matches!(
+                    response.payload_status.status,
+                    alloy_rpc_types_engine::PayloadStatusEnum::Valid
+                ));
+            }
+            if checkpoint == 2 {
+                database.clear_pending_frontier_transition().await?;
+            }
+            databases.push(database);
+        }
+        for (node_index, database) in databases.iter().enumerate() {
+            fixture.shutdown_node(node_index).await?;
+            database.inner().get_connection().clone().close().await?;
+        }
+        drop(databases);
+        for node_index in 0..2 {
+            fixture.start_node(node_index).await?;
+            let node = fixture.nodes[node_index].as_ref().unwrap();
+            let database = node.rollup_manager_handle.get_database_handle().await?;
+            assert_eq!(database.get_pending_frontier_transition().await?, None);
+            assert_eq!(database.get_latest_finalized_l2_info().await?, tip);
+            for tag in
+                [BlockNumberOrTag::Latest, BlockNumberOrTag::Safe, BlockNumberOrTag::Finalized]
+            {
+                let block =
+                    node.node.rpc.inner.eth_api().block_by_number(tag, false).await?.unwrap();
+                assert_eq!(
+                    BlockInfo::from(&block.header),
+                    tip,
+                    "checkpoint {checkpoint}, node {node_index}, tag {tag}"
+                );
+            }
+        }
+        // Shut down while the fixture still owns its files.
+        for node_index in 0..2 {
+            fixture.shutdown_node(node_index).await?;
+        }
+    }
     Ok(())
 }
 
@@ -2072,7 +2178,7 @@ pub fn read_to_bytes<P: AsRef<std::path::Path>>(path: P) -> eyre::Result<Bytes> 
     Ok(Bytes::from_str(&std::fs::read_to_string(path)?)?)
 }
 
-/// Encodes one V0 calldata batch containing deterministic transaction-free blocks.
+/// Encodes one V0 calldata batch containing deterministic transaction-free `DOGEOS_DEV` blocks.
 fn empty_batch_calldata(first_block: u64, block_count: u8, timestamp: u64) -> Bytes {
     let mut parent_batch_header = Vec::with_capacity(89);
     parent_batch_header.push(0);
@@ -2087,7 +2193,8 @@ fn empty_batch_calldata(first_block: u64, block_count: u8, timestamp: u64) -> By
     for number in first_block..first_block + u64::from(block_count) {
         chunk.extend_from_slice(&number.to_be_bytes());
         chunk.extend_from_slice(&timestamp.to_be_bytes());
-        chunk.extend_from_slice(&U256::ZERO.to_be_bytes::<32>());
+        // Empty blocks on the dev chain keep the base fee at the default overhead.
+        chunk.extend_from_slice(&DEFAULT_BASE_FEE_OVERHEAD.to_be_bytes::<32>());
         chunk.extend_from_slice(&SCROLL_GAS_LIMIT.to_be_bytes());
         chunk.extend_from_slice(&0u16.to_be_bytes());
         chunk.extend_from_slice(&0u16.to_be_bytes());

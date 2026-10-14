@@ -86,6 +86,7 @@ pub struct ScriptedEngineClient {
     new_payload: Mutex<VecDeque<ScriptedResponse<PayloadStatus>>>,
     fork_choice_updated: Mutex<VecDeque<ScriptedResponse<ForkchoiceUpdated>>>,
     get_payload: Mutex<VecDeque<ScriptedResponse<ExecutionPayloadV1>>>,
+    fork_choice_inputs: Mutex<Vec<(ForkchoiceState, bool)>>,
     new_payload_calls: AtomicU64,
     fork_choice_updated_calls: AtomicU64,
     get_payload_calls: AtomicU64,
@@ -129,6 +130,11 @@ impl ScriptedEngineClient {
     pub fn get_payload_calls(&self) -> u64 {
         self.get_payload_calls.load(Ordering::SeqCst)
     }
+
+    /// Returns every forkchoice input and whether the call supplied payload attributes.
+    pub fn fork_choice_inputs(&self) -> Vec<(ForkchoiceState, bool)> {
+        self.fork_choice_inputs.lock().expect("scripted input mutex poisoned").clone()
+    }
 }
 
 #[async_trait::async_trait]
@@ -143,10 +149,14 @@ impl ScrollEngineApi for ScriptedEngineClient {
 
     async fn fork_choice_updated_v1(
         &self,
-        _fork_choice_state: ForkchoiceState,
-        _payload_attributes: Option<ScrollPayloadAttributes>,
+        fork_choice_state: ForkchoiceState,
+        payload_attributes: Option<ScrollPayloadAttributes>,
     ) -> ScrollEngineApiResult<ForkchoiceUpdated> {
         self.fork_choice_updated_calls.fetch_add(1, Ordering::SeqCst);
+        self.fork_choice_inputs
+            .lock()
+            .expect("scripted input mutex poisoned")
+            .push((fork_choice_state, payload_attributes.is_some()));
         resolve(&self.fork_choice_updated, "fork_choice_updated_v1").await
     }
 

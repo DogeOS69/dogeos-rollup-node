@@ -3,10 +3,10 @@ use alloy_provider::Provider;
 use dogeos_rpc_types::Scroll;
 use futures::{stream::FuturesOrdered, TryStreamExt};
 use rollup_node_primitives::{
-    BatchConsolidationOutcome, BatchInfo, BatchStatus, L2BlockInfoWithL1Messages,
+    BatchConsolidationOutcome, BatchInfo, BatchStatus, BlockInfo, L2BlockInfoWithL1Messages,
 };
 use scroll_derivation_pipeline::BatchDerivationResult;
-use scroll_engine::{block_matches_attributes, ForkchoiceState};
+use scroll_engine::block_matches_attributes;
 
 /// Reconciles a batch of derived attributes with the L2 chain to produce a reconciliation result.
 ///
@@ -16,10 +16,10 @@ use scroll_engine::{block_matches_attributes, ForkchoiceState};
 pub(crate) async fn reconcile_batch<L2P: Provider<Scroll>>(
     l2_provider: L2P,
     batch: &BatchDerivationResult,
-    fcs: &ForkchoiceState,
+    frontier: BlockInfo,
 ) -> Result<BatchReconciliationResult, ChainOrchestratorError> {
     let mut futures = FuturesOrdered::new();
-    for (index, attributes) in batch.attributes.iter().enumerate() {
+    for attributes in &batch.attributes {
         let l2_provider = &l2_provider;
         let fut = async move {
             // Fetch the block corresponding to the derived attributes from the L2 provider.
@@ -29,36 +29,67 @@ pub(crate) async fn reconcile_batch<L2P: Provider<Scroll>>(
                 .await?
                 .map(|b| b.into_consensus().map_transactions(|tx| tx.inner.into_inner()));
 
-            let current_block = if let Some(block) = current_block {
-                block
-            } else {
-                // The block does not exist, a reorg is needed.
-                return Ok::<_, ChainOrchestratorError>(BlockConsolidationAction::Reorg(index));
-            };
-
-            // Check if the block matches the derived attributes.
-            if block_matches_attributes(&attributes.attributes, &current_block) {
-                // Extract the block info with L1 messages.
-                let block_info: L2BlockInfoWithL1Messages = (&current_block).into();
-
-                // The derived attributes match the L2 chain but are associated with a block
-                // number less than or equal to the finalized block, so skip.
-                if attributes.block_number <= fcs.finalized_block_info().number {
-                    Ok::<_, ChainOrchestratorError>(BlockConsolidationAction::Skip(block_info))
-                } else {
-                    // The block matches the derived attributes but is above the finalized block,
-                    // so we need to update the fcs.
-                    Ok::<_, ChainOrchestratorError>(BlockConsolidationAction::UpdateFcs(block_info))
-                }
-            } else {
-                // The block does not match the derived attributes, a reorg is needed.
-                Ok::<_, ChainOrchestratorError>(BlockConsolidationAction::Reorg(index))
-            }
+            Ok::<_, ChainOrchestratorError>(current_block)
         };
         futures.push_back(fut);
     }
 
-    let actions: Vec<BlockConsolidationAction> = futures.try_collect().await?;
+    let current_blocks: Vec<_> = futures.try_collect().await?;
+    let mut actions = Vec::with_capacity(batch.attributes.len());
+    let mut expected_parent = frontier;
+    let mut previous_derived_number: Option<u64> = None;
+    let mut rebuild_suffix = false;
+
+    for (index, (attributes, current_block)) in
+        batch.attributes.iter().zip(current_blocks).enumerate()
+    {
+        let sequence_parent = previous_derived_number
+            .or_else(|| (attributes.block_number > frontier.number).then_some(frontier.number));
+        if let Some(parent) = sequence_parent {
+            if parent.checked_add(1) != Some(attributes.block_number) {
+                return Err(ChainOrchestratorError::DerivedPayloadMismatch {
+                    batch_info: batch.batch_info,
+                    block_number: attributes.block_number,
+                    reason: format!("non-contiguous sequence after block {parent}"),
+                })
+            }
+        }
+        previous_derived_number = Some(attributes.block_number);
+
+        let already_safe = attributes.block_number <= frontier.number;
+        let matching_block = current_block.filter(|block| {
+            !rebuild_suffix &&
+                block.header.number == attributes.block_number &&
+                block_matches_attributes(&attributes.attributes, block) &&
+                if already_safe {
+                    attributes.block_number < frontier.number || BlockInfo::from(block) == frontier
+                } else {
+                    block.header.parent_hash == expected_parent.hash
+                }
+        });
+        let Some(current_block) = matching_block else {
+            // Replayed safe history must match; only an unsafe suffix may be rebuilt.
+            if already_safe {
+                return Err(ChainOrchestratorError::DerivedPayloadMismatch {
+                    batch_info: batch.batch_info,
+                    block_number: attributes.block_number,
+                    reason: format!("replayed block differs from safe history at {frontier}"),
+                })
+            }
+            rebuild_suffix = true;
+            actions.push(BlockConsolidationAction::Reorg(index));
+            continue
+        };
+
+        let block_info: L2BlockInfoWithL1Messages = (&current_block).into();
+        expected_parent = block_info.block_info;
+        if already_safe {
+            actions.push(BlockConsolidationAction::Skip(block_info));
+        } else {
+            actions.push(BlockConsolidationAction::UpdateFcs(block_info));
+        }
+    }
+
     Ok(BatchReconciliationResult {
         batch_info: batch.batch_info,
         actions,

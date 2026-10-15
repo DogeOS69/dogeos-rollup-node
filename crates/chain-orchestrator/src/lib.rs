@@ -155,6 +155,8 @@ struct BlockedImport {
     block_with_peer: NewBlockWithPeer,
     /// The hash of the first L1 message in the import that was not found in the database.
     missing_l1_message: B256,
+    /// Ancestors encountered while downloading the held block's branch.
+    ancestors: Vec<B256>,
 }
 
 impl<
@@ -1054,20 +1056,26 @@ impl<
         &mut self,
         block_with_peer: NewBlockWithPeer,
     ) -> Result<Option<ChainOrchestratorEvent>, ChainOrchestratorError> {
-        let result =
-            metered!(Task::L2BlockImport, self, handle_block_from_peer(block_with_peer.clone()));
-        self.track_blocked_import(block_with_peer, &result);
+        let mut ancestors = vec![block_with_peer.block.parent_hash];
+        let result = metered!(
+            Task::L2BlockImport,
+            self,
+            handle_block_from_peer(block_with_peer.clone(), &mut ancestors)
+        );
+        self.track_blocked_import(block_with_peer, ancestors, &result);
         result
     }
 
     /// Holds the latest peer block whose import failed on an L1 message that has not been indexed
     /// yet, so it can be retried when that message arrives instead of waiting for the next block.
-    /// A newer failure replaces the held block even if it is lower: height alone cannot tell
-    /// which block is still valid (a fork may win on timestamp, or the signer may have rotated).
+    /// A delayed ancestor does not replace a held descendant that still passes consensus.
+    /// Other failures replace the held block even if lower: a fork may win on timestamp, or the
+    /// signer may have rotated. Height alone cannot tell which block is still valid.
     /// A chain import that reaches the held block's height supersedes it.
     fn track_blocked_import(
         &mut self,
         block_with_peer: NewBlockWithPeer,
+        ancestors: Vec<B256>,
         result: &Result<Option<ChainOrchestratorEvent>, ChainOrchestratorError>,
     ) {
         let held_number =
@@ -1079,6 +1087,24 @@ impl<
             missing_l1_message,
         ))) = result
         {
+            if self.blocked_import.as_ref().is_some_and(|held| {
+                held.ancestors.contains(&block_hash) &&
+                    self.consensus
+                        .validate_new_block(
+                            &held.block_with_peer.block,
+                            &held.block_with_peer.signature,
+                        )
+                        .is_ok()
+            }) {
+                tracing::debug!(
+                    target: "scroll::chain_orchestrator",
+                    block_number,
+                    ?block_hash,
+                    ?held_number,
+                    "Keeping held descendant after a delayed ancestor announcement"
+                );
+                return;
+            }
             tracing::info!(
                 target: "scroll::chain_orchestrator",
                 block_number,
@@ -1087,8 +1113,11 @@ impl<
                 ?missing_l1_message,
                 "Holding block import until its L1 message is indexed"
             );
-            self.blocked_import =
-                Some(BlockedImport { block_with_peer, missing_l1_message: *missing_l1_message });
+            self.blocked_import = Some(BlockedImport {
+                block_with_peer,
+                missing_l1_message: *missing_l1_message,
+                ancestors,
+            });
         } else if held_number
             .is_some_and(|held_number| supersedes_blocked_import(result, block_number, held_number))
         {
@@ -1179,6 +1208,7 @@ impl<
     async fn handle_block_from_peer(
         &mut self,
         block_with_peer: NewBlockWithPeer,
+        ancestors: &mut Vec<B256>,
     ) -> Result<Option<ChainOrchestratorEvent>, ChainOrchestratorError> {
         tracing::debug!(target: "scroll::chain_orchestrator", block_hash = ?block_with_peer.block.header.hash_slow(), block_number = ?block_with_peer.block.number, peer_id = ?block_with_peer.peer_id, "Received new block from peer");
 
@@ -1255,6 +1285,8 @@ impl<
             } else {
                 vec![block_with_peer.block.clone()]
             };
+
+            ancestors.extend(new_headers.iter().map(|block| block.parent_hash));
 
             // If the first header in the new headers has a parent hash that matches the current
             // head hash, we can import the chain.
@@ -1354,6 +1386,8 @@ impl<
                 .into_iter()
                 .map(|b| b.into_block())
                 .collect();
+
+            ancestors.extend(headers.iter().map(|block| block.hash_slow()));
 
             let mut index = None;
             for (i, header) in headers.iter().enumerate() {
@@ -1814,6 +1848,99 @@ mod run_loop_policy_tests {
         orchestrator.derivation_driver.hold_batch(derived);
 
         (orchestrator, handle, notification_tx)
+    }
+
+    #[tokio::test]
+    async fn delayed_ancestor_preserves_held_descendant_but_lower_fork_replaces_it() {
+        let database = Arc::new(setup_test_db().await);
+        let (mut orchestrator, _handle, _notifications) = test_orchestrator(
+            database,
+            Arc::new(ScriptedEngineClient::new()),
+            Asserter::new(),
+            BatchDerivationResult {
+                attributes: vec![],
+                batch_info: BatchInfo::new(1, B256::repeat_byte(1)),
+                skipped_l1_messages: vec![],
+                target_status: BatchStatus::Consolidated,
+            },
+        )
+        .await;
+        let message = TxL1Message {
+            queue_index: 0,
+            gas_limit: 21000,
+            sender: Address::ZERO,
+            to: Address::ZERO,
+            value: U256::ZERO,
+            input: Bytes::new(),
+        };
+        let mut ancestor = DogeosBlock::default();
+        ancestor.header.number = SAFE + 1;
+        ancestor.header.parent_hash = info(SAFE, 0x11).hash;
+        ancestor.header.timestamp = 1;
+        ancestor.body.transactions.push(message.clone().into());
+        let mut descendant = DogeosBlock::default();
+        descendant.header.number = SAFE + 2;
+        descendant.header.parent_hash = ancestor.hash_slow();
+        descendant.header.timestamp = 2;
+        let announced = |block| NewBlockWithPeer {
+            block,
+            peer_id: alloy_primitives::B512::ZERO,
+            signature: alloy_primitives::Signature::test_signature(),
+        };
+        // The descendant's import fetched its ancestor, and validation found the missing message.
+        let validation =
+            orchestrator.validate_l1_messages(&[ancestor.clone(), descendant.clone()]).await;
+        assert!(matches!(validation, Err(ChainOrchestratorError::L1MessageNotFound(_))));
+        orchestrator.track_blocked_import(
+            announced(descendant.clone()),
+            vec![ancestor.hash_slow()],
+            &validation.map(|()| None),
+        );
+        assert_eq!(
+            orchestrator.blocked_import.as_ref().unwrap().block_with_peer.block.hash_slow(),
+            descendant.hash_slow()
+        );
+        // Its ancestor's first gossip announcement arrives later; this is not a competing fork.
+        let result = orchestrator.import_peer_block(announced(ancestor.clone())).await;
+        assert!(matches!(result, Err(ChainOrchestratorError::L1MessageNotFound(_))));
+        assert_eq!(
+            orchestrator.blocked_import.as_ref().unwrap().block_with_peer.block.hash_slow(),
+            descendant.hash_slow(),
+            "a delayed ancestor must not discard the known descendant waiting on the same message"
+        );
+
+        let mut fork = ancestor.clone();
+        fork.header.timestamp = descendant.timestamp + 1;
+        let result = orchestrator.import_peer_block(announced(fork.clone())).await;
+        assert!(matches!(result, Err(ChainOrchestratorError::L1MessageNotFound(_))));
+        assert_eq!(
+            orchestrator.blocked_import.as_ref().unwrap().block_with_peer.block.hash_slow(),
+            fork.hash_slow(),
+            "a lower competing fork must still be able to replace the held block"
+        );
+
+        // The same ancestor must replace a descendant whose signature is no longer authorized.
+        let result = Err(ChainOrchestratorError::L1MessageNotFound(L1MessageKey::TransactionHash(
+            message.tx_hash(),
+        )));
+        orchestrator.track_blocked_import(
+            announced(descendant),
+            vec![ancestor.hash_slow()],
+            &result,
+        );
+        let incoming = announced(ancestor);
+        let signer = reth_primitives_traits::crypto::secp256k1::recover_signer(
+            &incoming.signature,
+            rollup_node_primitives::sig_encode_hash(&incoming.block.header),
+        )
+        .unwrap();
+        orchestrator.consensus = Box::new(crate::consensus::SystemContractConsensus::new(signer));
+        let result = orchestrator.import_peer_block(incoming.clone()).await;
+        assert!(matches!(result, Err(ChainOrchestratorError::L1MessageNotFound(_))));
+        assert_eq!(
+            orchestrator.blocked_import.as_ref().unwrap().block_with_peer.block.hash_slow(),
+            incoming.block.hash_slow()
+        );
     }
 
     #[test]

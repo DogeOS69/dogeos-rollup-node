@@ -12,7 +12,7 @@ use reth_tokio_util::EventStream;
 use rollup_node::{
     test_utils::{
         default_test_scroll_rollup_node_config, generate_tx, setup_engine, EventAssertions,
-        TestFixture,
+        NetworkHelperProvider, TestFixture,
     },
     BlobProviderArgs, ChainOrchestratorArgs, ConsensusArgs, EngineDriverArgs, L1ProviderArgs,
     PprofArgs, RollupNodeDatabaseArgs, RollupNodeGasPriceOracleArgs, RollupNodeNetworkArgs,
@@ -22,6 +22,7 @@ use rollup_node_chain_orchestrator::ChainOrchestratorEvent;
 use rollup_node_primitives::BlockInfo;
 use rollup_node_sequencer::L1MessageInclusionMode;
 use rollup_node_watcher::L1Notification;
+use scroll_db::DatabaseReadOperations;
 use std::{path::PathBuf, sync::Arc};
 
 #[tokio::test]
@@ -410,14 +411,16 @@ async fn test_consolidation() -> eyre::Result<()> {
 
 /// Brings a synced follower to the point where it has rejected block 2 because block 2 includes
 /// an L1 message (queue index 1) that the follower has not indexed yet. Returns the nodes and the
-/// late message, which the caller delivers to the follower.
+/// late message and block 2, which the caller can deliver to the follower. When `announce` is
+/// false, gossip is disabled before block 2 so the caller can announce blocks out of order.
 ///
 /// With a `signer`, the sequencer signs with it and both nodes use system contract consensus with
 /// it as the authorized signer; otherwise both use noop consensus.
 #[allow(clippy::large_stack_frames)]
 async fn follower_missing_l1_message(
     signer: Option<PrivateKeySigner>,
-) -> eyre::Result<(TestFixture, TestFixture, TxL1Message)> {
+    announce: bool,
+) -> eyre::Result<(TestFixture, TestFixture, TxL1Message, dogeos_reth_primitives::DogeosBlock)> {
     let mut sequencer = TestFixture::builder()
         .sequencer()
         .with_eth_scroll_bridge(true)
@@ -473,14 +476,19 @@ async fn follower_missing_l1_message(
     sequencer.expect_event().l1_message_committed().await?;
     sequencer.l1().new_block(5).await?;
     sequencer.expect_event().new_l1_block().await?;
-    sequencer.build_block().expect_block_number(2).build_and_await_block().await?;
+    if !announce {
+        sequencer.sequencer().rollup_manager_handle.set_gossip(false).await?;
+    }
+    let block = sequencer.build_block().expect_block_number(2).build_and_await_block().await?;
 
-    follower
-        .expect_event()
-        .where_event(|e| matches!(e, ChainOrchestratorEvent::L1MessageNotFoundInDatabase(_)))
-        .await?;
+    if announce {
+        follower
+            .expect_event()
+            .where_event(|e| matches!(e, ChainOrchestratorEvent::L1MessageNotFoundInDatabase(_)))
+            .await?;
+    }
 
-    Ok((sequencer, follower, late_message))
+    Ok((sequencer, follower, late_message, block))
 }
 
 /// Delivers the late L1 message to the follower's L1 watcher.
@@ -506,7 +514,8 @@ async fn index_late_message(follower: &mut TestFixture, message: &TxL1Message) -
 async fn test_follower_retries_import_blocked_on_late_l1_message() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    let (_sequencer, mut follower, late_message) = follower_missing_l1_message(None).await?;
+    let (_sequencer, mut follower, late_message, _) =
+        follower_missing_l1_message(None, true).await?;
     index_late_message(&mut follower, &late_message).await?;
 
     // No further block is produced: the retried import alone must extend the chain to block 2.
@@ -522,6 +531,61 @@ async fn test_follower_retries_import_blocked_on_late_l1_message() -> eyre::Resu
     Ok(())
 }
 
+/// A descendant announced before its ancestor remains the retry target. The follower must
+/// import the whole downloaded chain after the late message arrives, without another new block.
+#[allow(clippy::large_stack_frames)]
+#[tokio::test]
+async fn test_follower_keeps_blocked_descendant_after_delayed_ancestor() -> eyre::Result<()> {
+    reth_tracing::init_test_tracing();
+    let (mut sequencer, mut follower, late_message, ancestor) =
+        follower_missing_l1_message(None, false).await?;
+    sequencer.build_block().expect_block_number(3).build_and_await_block().await?;
+    let descendant = sequencer.build_block().expect_block_number(4).build_and_await_block().await?;
+    // Wait until signing finishes while gossip is still disabled.
+    sequencer
+        .expect_event()
+        .where_event(|event| {
+            matches!(
+                event, ChainOrchestratorEvent::SignedBlock { block, .. } if block.number == 4
+            )
+        })
+        .await?;
+    let handle = &sequencer.sequencer().rollup_manager_handle;
+    let database = handle.get_database_handle().await?;
+    let descendant_signature = database.get_signature(descendant.hash_slow()).await?.unwrap();
+    let ancestor_signature = database.get_signature(ancestor.hash_slow()).await?.unwrap();
+    handle.set_gossip(true).await?;
+
+    // Block 4 causes a download of blocks 2..=4 and is held on block 2's missing message.
+    sequencer.network().announce_block(descendant.clone(), descendant_signature).await?;
+    follower
+        .expect_event()
+        .where_event(|event| {
+            matches!(event, ChainOrchestratorEvent::L1MessageNotFoundInDatabase(_))
+        })
+        .await?;
+    // Block 2's first announcement arrives later. It must not replace block 4 in the slot.
+    sequencer.network().announce_block(ancestor, ancestor_signature).await?;
+    follower
+        .expect_event()
+        .where_event(|event| {
+            matches!(event, ChainOrchestratorEvent::L1MessageNotFoundInDatabase(_))
+        })
+        .await?;
+    index_late_message(&mut follower, &late_message).await?;
+
+    let events = follower
+        .expect_event()
+        .where_event(|event| matches!(event, ChainOrchestratorEvent::ChainExtended(_)))
+        .await?;
+    let Some(ChainOrchestratorEvent::ChainExtended(import)) = events.first() else {
+        eyre::bail!("expected a chain extension");
+    };
+    assert_eq!(import.chain.iter().map(|block| block.number).collect::<Vec<_>>(), vec![2, 3, 4]);
+    assert_eq!(follower.get_block(0).await?.header.hash, descendant.hash_slow());
+    Ok(())
+}
+
 /// A held block that no longer passes consensus when its L1 message arrives (here, because the
 /// authorized signer rotated in between) is dropped instead of retried, so the peer that relayed
 /// it while it was valid is not penalized.
@@ -530,8 +594,8 @@ async fn test_follower_retries_import_blocked_on_late_l1_message() -> eyre::Resu
 async fn test_follower_drops_blocked_import_after_signer_rotation() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    let (_sequencer, mut follower, late_message) =
-        follower_missing_l1_message(Some(PrivateKeySigner::random())).await?;
+    let (_sequencer, mut follower, late_message, _) =
+        follower_missing_l1_message(Some(PrivateKeySigner::random()), true).await?;
     follower.l1().signer_update(Address::random()).await?;
     index_late_message(&mut follower, &late_message).await?;
 

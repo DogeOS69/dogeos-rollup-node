@@ -2085,7 +2085,7 @@ pub fn read_to_bytes<P: AsRef<std::path::Path>>(path: P) -> eyre::Result<Bytes> 
     Ok(Bytes::from_str(&std::fs::read_to_string(path)?)?)
 }
 
-/// Encodes one V0 calldata batch containing deterministic transaction-free DOGEOS_DEV blocks.
+/// Encodes one V0 calldata batch containing deterministic transaction-free `DOGEOS_DEV` blocks.
 fn empty_batch_calldata(first_block: u64, block_count: u8, timestamp: u64) -> Bytes {
     let mut parent_batch_header = Vec::with_capacity(89);
     parent_batch_header.push(0);

@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-cab92a1d.js";
+            window.path_to_searchindex_js = "searchindex-b8775153.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-e2c7dee6.js"></script>
@@ -318,6 +318,24 @@ provider)</li>
 <ul>
 <li><code>--rollup-node-db.path &lt;PATH&gt;</code>: Custom database path (default: <code>&lt;datadir&gt;/scroll.db</code>)</li>
 </ul>
+<p><strong>Genesis reconciliation at startup.</strong> On every launch the node reconciles the block-0 rows of
+the rollup database with the configured chain’s genesis hash. The static migrations seed a fixed
+genesis row (upstream Scroll’s dev genesis for dev and custom chains) that is not the chain’s
+own genesis, and older versions inserted the real genesis beside it without removing the seed.
+On a fresh database the seed is replaced by the chain’s genesis on the first launch; on a
+database written by an older version the duplicate seed is removed the first time the new
+version starts. Both are expected one-time mutations, logged at INFO with the number of removed
+rows, not a sign of damage. A block-0 row that is neither the chain’s genesis nor the migration
+seed means the database belongs to another chain, and a populated database with no block-0 row
+at all is treated as truncated or corrupt; both refuse to start with an actionable message
+instead of running on a wrong safe baseline. To recover from a mismatch, point
+<code>--rollup-node-db.path</code> at the database that belongs to the configured chain. A missing block-0
+row requires restoring a valid backup or re-deriving into a new rollup database; keep the old
+database for investigation. A populated legacy database containing only the shared migration seed
+also refuses startup: that seed cannot identify which chain owns the history, and replacing it
+could relabel another chain’s data. This includes legitimate older dev databases. Verify the chain
+and database path, then restore a backup with the correct genesis marker or re-derive into a new
+rollup database. No genesis rows are changed on refusal; the execution-layer database is not affected.</p>
 <h4 id="network-configuration"><a class="header" href="#network-configuration">Network Configuration</a></h4>
 <ul>
 <li><code>--network.bridge</code>: Enable bridging blocks from eth wire to scroll wire protocol (default: true)</li>
@@ -582,6 +600,28 @@ documentation.</p>
 <li><code>--sequencer.payload-building-duration &lt;MS&gt;</code>: Time allocated for building each payload in milliseconds (default: <code>800</code>)</li>
 <li><code>--sequencer.allow-empty-blocks</code>: Allow production of empty blocks when no transactions are available (default: <code>false</code>)</li>
 </ul>
+<h3 id="code-witness-budget"><a class="header" href="#code-witness-budget">Code Witness Budget</a></h3>
+<p>Transaction admission and payload building share a budget for distinct contract bytecode:</p>
+<ul>
+<li><code>--scroll.max-code-witness-bytes &lt;BYTES&gt;</code>: Default <code>33554432</code> (32 MiB). Applies to each admission
+simulation and to the union of code accessed by an entire candidate block.</li>
+<li><code>--txpool.code-witness-max-steps &lt;STEPS&gt;</code>: Default <code>1000000</code>. Bounds interpreter instructions
+in each admission simulation.</li>
+<li><code>--txpool.code-witness-max-inflight &lt;COUNT&gt;</code>: Default <code>64</code>. Bounds waiting and executing
+validations together. <code>--txpool.additional-validation-tasks</code> controls validation workers.</li>
+</ul>
+<p>All three new limits must be nonzero. Admission errors distinguish code overflow from exhausted
+simulation work or queue capacity and allow retry. The builder checks the actual block state,
+deduplicates repeated code across transactions, and skips pool transactions before committing
+their state if the union exceeds the budget. Mandatory transaction or system-call overflow fails
+the candidate. Reads in reverted executions still count.</p>
+<p>When a candidate with multiple L1 messages fails, the sequencer retries on a later slot with a
+shorter prefix of the same queue. It restores the configured prefix size after success or a
+parent change. The Engine API does not preserve the specific builder failure, so other failures
+may also temporarily reduce the number of L1 messages per candidate. A message that exceeds the
+budget by itself is reported as a failure and is never skipped.</p>
+<p>This is a local code-byte policy. Trie nodes and witness encoding overhead are additional, so
+32 MiB is not a bound on total witness size or a measured prover-capacity guarantee.</p>
 <h3 id="fee-configuration"><a class="header" href="#fee-configuration">Fee Configuration</a></h3>
 <ul>
 <li><code>--sequencer.fee-recipient &lt;ADDRESS&gt;</code>: Address to receive block rewards and transaction fees (default: <code>0x5300000000000000000000000000000000000005</code> - Scroll fee vault)</li>
@@ -600,8 +640,19 @@ documentation.</p>
 <pre><code class="language-bash">--sequencer.l1-inclusion-mode finalized:2
 </code></pre>
 <ul>
-<li><code>--sequencer.max-l1-messages &lt;N&gt;</code>: Override maximum L1 messages per block (optional)</li>
+<li><code>--sequencer.max-l1-messages &lt;N&gt;</code>: Set the sequencer’s maximum number of L1 messages per L2 block. If omitted, it defaults to <code>numL1MessagesPerBlock</code> in the chain config.</li>
 </ul>
+<p>This count limit is local sequencer policy. Followers and consensus validation do not reject a
+block solely because it exceeds this count, and the proof does not enforce this per-block count
+limit. L1 message ordering and queue integrity remain subject to protocol validation.</p>
+<p>Pin the intended policy explicitly in the sequencer’s deployment configuration. For example,
+to include at most 10 L1 messages per block, add:</p>
+<pre><code class="language-bash">--sequencer.max-l1-messages 10
+</code></pre>
+<p>The sequencer also budgets each message at its full gas limit against the configured block gas
+limit. It takes messages in queue order and stops when the next message would exceed that
+budget, so a block may contain fewer messages than the configured count. Changing this option
+does not change the consensus rules or reserve a fixed amount of gas for L2 transactions.</p>
 <h3 id="signer-configuration-1"><a class="header" href="#signer-configuration-1">Signer Configuration</a></h3>
 <p><strong>Mutually exclusive options (choose one):</strong></p>
 <ul>

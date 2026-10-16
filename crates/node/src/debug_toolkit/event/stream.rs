@@ -153,6 +153,7 @@ pub fn event_type_name(event: &ChainOrchestratorEvent) -> String {
         ChainOrchestratorEvent::L1MessageNotFoundInDatabase(_) => {
             "L1MessageNotFoundInDatabase".to_string()
         }
+        ChainOrchestratorEvent::BlockedImportDropped(_) => "BlockedImportDropped".to_string(),
         ChainOrchestratorEvent::BlockFailedConsensusChecks(_, _) => {
             "BlockFailedConsensusChecks".to_string()
         }
@@ -232,6 +233,9 @@ pub fn format_event_short(event: &ChainOrchestratorEvent) -> String {
         }
         ChainOrchestratorEvent::L1MessageNotFoundInDatabase(key) => {
             format!("L1MessageNotFoundInDatabase {{ key: {:?} }}", key)
+        }
+        ChainOrchestratorEvent::BlockedImportDropped(hash) => {
+            format!("BlockedImportDropped {{ hash: {:?} }}", hash)
         }
         ChainOrchestratorEvent::BlockFailedConsensusChecks(hash, peer) => {
             format!(

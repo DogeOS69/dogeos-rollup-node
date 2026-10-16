@@ -233,7 +233,8 @@ async fn seed_two_committed_batches(database: &Database) {
 /// handler). An L1 reorg below batch 2's commit block deletes the batch row and (by cascade) its L2
 /// block rows, then the forkchoice update with the lowered safe block and no finalized value fails
 /// with `SafeBelowFinalized`. `handle_l1_reorg` returns that error after the database unwind,
-/// without the `L1Reorg` event, and the Engine keeps the old head, safe and finalized blocks.
+/// without the `L1Reorg` event, and the Engine keeps the old head, safe and finalized blocks. The
+/// error is `UnwindForkchoiceUpdateFailed`, so the run loop now stops instead of only logging it.
 ///
 /// Not shown here: the tracker row's second part, that transactions of reverted L2 blocks are not
 /// re-injected. The L2 head never moves in this test, so nothing is reverted on the Engine.
@@ -253,9 +254,14 @@ async fn rg46_l1_reorg_below_the_engine_finalized_block_leaves_db_and_engine_dis
     assert!(
         matches!(
             err,
-            ChainOrchestratorError::EngineError(EngineError::FcsError(
-                FcsError::SafeBelowFinalized
-            ))
+            ChainOrchestratorError::UnwindForkchoiceUpdateFailed {
+                operation: "L1 reorg",
+                db_safe: Some(db_safe),
+                engine_safe,
+                reason,
+            } if *db_safe == info(5, 5) &&
+                *engine_safe == finalized &&
+                *reason == EngineError::FcsError(FcsError::SafeBelowFinalized).to_string()
         ),
         "got {err:?}"
     );
@@ -267,7 +273,7 @@ async fn rg46_l1_reorg_below_the_engine_finalized_block_leaves_db_and_engine_dis
     // The Engine did not move.
     assert_eq!(orchestrator.engine.fcs(), &ForkchoiceState::new(finalized, finalized, finalized));
 
-    // The run loop only logs the error; no event is emitted.
+    // No event is emitted.
     orchestrator.handle_outcome(result);
     assert!(events.next().now_or_never().is_none(), "no L1Reorg event");
 }
@@ -418,7 +424,8 @@ async fn rg49_admin_revert_unwinds_the_database_only_together_with_the_watcher_r
 // assertion is the same in every test and holds under any fix: the handler either fails, or it
 // reports success only when the Engine's forkchoice state holds what the handler reported. Each
 // test also checks that the forkchoice update reached the Engine, so it cannot pass by never
-// making the call.
+// making the call. `handle_l1_reorg` and `handle_batch_revert` are fixed: they fail with
+// `UnwindForkchoiceUpdateFailed`, which stops the run loop.
 
 /// A scripted Engine client whose forkchoice updates answer `INVALID`. Several answers are queued
 /// so that a fix which retries or falls back to a second forkchoice update reaches the assertion
@@ -445,7 +452,6 @@ fn engine_rejecting_forkchoice() -> Arc<ScriptedEngineClient> {
 /// Engine answers `INVALID` and keeps safe at block 10. The handler still returns the `L1Reorg`
 /// event with safe block 5.
 #[tokio::test]
-#[ignore = "RG-49: handle_l1_reorg drops an INVALID forkchoice answer and reports the reorg as done"]
 async fn rg49_l1_reorg_reports_the_new_safe_block_only_if_the_engine_accepted_it() {
     let database = Arc::new(setup_test_db().await);
     seed_two_committed_batches(&database).await;
@@ -462,6 +468,13 @@ async fn rg49_l1_reorg_reports_the_new_safe_block_only_if_the_engine_accepted_it
     let result = orchestrator.handle_l1_reorg(15).await;
 
     assert!(engine_client.fork_choice_updated_calls() >= 1, "the update reached the Engine");
+    assert!(
+        matches!(
+            result,
+            Err(ChainOrchestratorError::UnwindForkchoiceUpdateFailed { operation: "L1 reorg", .. })
+        ),
+        "got {result:?}"
+    );
     if let Ok(Some(ChainOrchestratorEvent::L1Reorg { l2_safe_block_info, .. })) = &result {
         assert_eq!(
             *l2_safe_block_info,
@@ -511,7 +524,6 @@ async fn rg49_l1_finalized_reports_the_new_finalized_block_only_if_the_engine_ac
 /// answers `INVALID` and keeps safe at block 10. The handler still returns the `BatchReverted`
 /// event with safe head 5.
 #[tokio::test]
-#[ignore = "RG-49: handle_batch_revert drops an INVALID forkchoice answer and reports the revert as done"]
 async fn rg49_batch_revert_reports_the_new_safe_head_only_if_the_engine_accepted_it() {
     let database = Arc::new(setup_test_db().await);
     seed_two_committed_batches(&database).await;
@@ -530,6 +542,16 @@ async fn rg49_batch_revert_reports_the_new_safe_head_only_if_the_engine_accepted
     let result = orchestrator.handle_batch_revert(2, 2, info(30, 30)).await;
 
     assert!(engine_client.fork_choice_updated_calls() >= 1, "the update reached the Engine");
+    assert!(
+        matches!(
+            result,
+            Err(ChainOrchestratorError::UnwindForkchoiceUpdateFailed {
+                operation: "batch revert",
+                ..
+            })
+        ),
+        "got {result:?}"
+    );
     if let Ok(Some(ChainOrchestratorEvent::BatchReverted { safe_head, .. })) = &result {
         assert_eq!(
             safe_head,
@@ -537,6 +559,52 @@ async fn rg49_batch_revert_reports_the_new_safe_head_only_if_the_engine_accepted
             "the BatchReverted event reports a safe head the Engine did not accept"
         );
     }
+}
+
+/// `handle_batch_revert`: a `SYNCING` answer is not success either. The local forkchoice state
+/// must stay at the block the Engine actually holds, or the next batch would be checked against a
+/// safe block the Engine never adopted.
+#[tokio::test]
+async fn rg49_batch_revert_fails_on_a_syncing_forkchoice_answer() {
+    let database = Arc::new(setup_test_db().await);
+    seed_two_committed_batches(&database).await;
+    let engine_client = Arc::new(ScriptedEngineClient::new());
+    engine_client.push_fork_choice_updated(ScriptedResponse::Ok(
+        alloy_rpc_types_engine::ForkchoiceUpdated {
+            payload_status: alloy_rpc_types_engine::PayloadStatus {
+                status: alloy_rpc_types_engine::PayloadStatusEnum::Syncing,
+                latest_valid_hash: None,
+            },
+            payload_id: None,
+        },
+    ));
+    let fcs = ForkchoiceState::new(info(10, 10), info(10, 10), info(0, 0));
+    let mut orchestrator = orchestrator_with_engine(
+        database,
+        fcs.clone(),
+        0,
+        Probes::default(),
+        engine_client.clone(),
+    )
+    .await;
+    orchestrator.sync_state.l2_mut().set_synced();
+
+    let result = orchestrator.handle_batch_revert(2, 2, info(30, 30)).await;
+
+    assert_eq!(engine_client.fork_choice_updated_calls(), 1);
+    assert!(
+        matches!(
+            &result,
+            Err(ChainOrchestratorError::UnwindForkchoiceUpdateFailed {
+                operation: "batch revert",
+                db_safe: Some(db_safe),
+                engine_safe,
+                ..
+            }) if *db_safe == info(5, 5) && *engine_safe == info(10, 10)
+        ),
+        "got {result:?}"
+    );
+    assert_eq!(orchestrator.engine.fcs(), &fcs);
 }
 
 /// `RevertToL1Block`: the unwind deletes batch 2, so the safe block moves back to L2 block 5. The

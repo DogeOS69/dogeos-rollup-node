@@ -148,6 +148,32 @@ pub enum ChainOrchestratorError {
         /// The derived block number.
         derived_block_number: u64,
     },
+    /// Reth's canonical chain does not contain the database's safe block, so the Engine is on a
+    /// fork the database has left.
+    #[error("Engine is not on the database's chain before reconciling batch {batch_info:?}: database safe block {db_safe:?}, Reth canonical block at that height {reth_canonical:?}, Engine safe block {engine_safe:?}")]
+    SafeFrontierMismatch {
+        /// The batch being reconciled.
+        batch_info: BatchInfo,
+        /// The Engine's safe block.
+        engine_safe: BlockInfo,
+        /// The database's latest safe block.
+        db_safe: BlockInfo,
+        /// Reth's canonical block at the database's safe height, if it has one.
+        reth_canonical: Option<BlockInfo>,
+    },
+    /// The forkchoice update that moves the Engine to the database's blocks after an L1 reorg or
+    /// a batch revert failed or was rejected, so the Engine and the database disagree.
+    #[error("Forkchoice update after {operation} failed, Engine safe block {engine_safe:?} does not follow database safe block {db_safe:?}: {reason}")]
+    UnwindForkchoiceUpdateFailed {
+        /// The operation that changed the database.
+        operation: &'static str,
+        /// The safe block the database moved to, if it changed.
+        db_safe: Option<BlockInfo>,
+        /// The Engine's safe block after the failed update.
+        engine_safe: BlockInfo,
+        /// The Engine error or `INVALID` validation detail.
+        reason: String,
+    },
     /// An error occurred while handling rollup node primitives.
     #[error("An error occurred while handling rollup node primitives: {0}")]
     RollupNodePrimitiveError(rollup_node_primitives::RollupNodePrimitiveError),

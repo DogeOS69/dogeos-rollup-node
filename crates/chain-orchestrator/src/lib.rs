@@ -4,7 +4,7 @@
 use alloy_eips::Encodable2718;
 use alloy_primitives::{b256, bytes::Bytes, keccak256, B256};
 use alloy_provider::Provider;
-use alloy_rpc_types_engine::ExecutionPayloadV1;
+use alloy_rpc_types_engine::{ExecutionPayloadV1, PayloadStatusEnum};
 use dogeos_hardforks::DogeosHardforks;
 use dogeos_protocol_types::{ScrollTxEnvelope, TxL1Message};
 use dogeos_reth_primitives::DogeosBlock;
@@ -310,6 +310,10 @@ impl<
                     self.derivation_driver.can_accept_batch(),
                 ) => {
                     let result = self.handle_l1_notification(notification.clone()).await;
+                    if let Err(err @ ChainOrchestratorError::UnwindForkchoiceUpdateFailed { .. }) = result {
+                        tracing::error!(target: "scroll::chain_orchestrator", source = %err, "Engine did not follow the database after an L1 reorg or batch revert; fail-stopping");
+                        return Err(err)
+                    }
                     let unblocks_import = result.is_ok() && self.unblocks_import(&notification);
                     self.handle_outcome(result);
                     if unblocks_import {
@@ -844,7 +848,8 @@ impl<
 
         // TODO: Add retry logic
         if l2_head_block_info.is_some() || l2_safe_block_info.is_some() {
-            self.engine.update_fcs(l2_head_block_info, l2_safe_block_info, None).await?;
+            self.update_fcs_after_unwind("L1 reorg", l2_head_block_info, l2_safe_block_info)
+                .await?;
         }
 
         // Add all reverted transactions to the transaction pool.
@@ -862,6 +867,35 @@ impl<
         };
 
         Ok(Some(event))
+    }
+
+    /// Moves the Engine to the database's head and safe blocks after an L1 reorg or a batch
+    /// revert. Any answer other than `VALID`, or an Engine error, would leave the Engine on blocks
+    /// the database no longer holds, so it returns
+    /// [`ChainOrchestratorError::UnwindForkchoiceUpdateFailed`], which stops the run loop. The
+    /// local forkchoice state only moves on `VALID`.
+    async fn update_fcs_after_unwind(
+        &mut self,
+        operation: &'static str,
+        head: Option<BlockInfo>,
+        safe: Option<BlockInfo>,
+    ) -> Result<(), ChainOrchestratorError> {
+        let reason = match self.engine.update_fcs_checked(head, safe, None).await {
+            Ok(response) => match response.payload_status.status {
+                PayloadStatusEnum::Valid => return Ok(()),
+                PayloadStatusEnum::Invalid { validation_error } => {
+                    format!("Engine returned INVALID: {validation_error}")
+                }
+                status => format!("Engine returned {status}"),
+            },
+            Err(error) => error.to_string(),
+        };
+        Err(ChainOrchestratorError::UnwindForkchoiceUpdateFailed {
+            operation,
+            db_safe: safe,
+            engine_safe: *self.engine.fcs().safe_block_info(),
+            reason,
+        })
     }
 
     /// Handles a finalized event by updating the chain orchestrator L1 finalized block, returning
@@ -1005,7 +1039,7 @@ impl<
         // Update the forkchoice state to the new safe block.
         if self.sync_state.is_synced() {
             tracing::info!(target: "scroll::chain_orchestrator", ?safe_block_info, "Updating safe head to block after batch revert");
-            self.engine.update_fcs(None, Some(safe_block_info), None).await?;
+            self.update_fcs_after_unwind("batch revert", None, Some(safe_block_info)).await?;
         }
 
         Ok(Some(ChainOrchestratorEvent::BatchReverted { batch_info, safe_head: safe_block_info }))
@@ -1777,7 +1811,7 @@ mod run_loop_policy_tests {
 
     fn payload(number: u64) -> ExecutionPayloadV1 {
         ExecutionPayloadV1 {
-            parent_hash: B256::ZERO,
+            parent_hash: B256::repeat_byte(0x11),
             fee_recipient: Address::ZERO,
             state_root: B256::ZERO,
             receipts_root: B256::ZERO,
@@ -2598,6 +2632,87 @@ mod run_loop_policy_tests {
             "the surviving held row must remain for restart recovery"
         );
         assert!(database.get_batch_by_index(2).await.unwrap().is_none());
+    }
+
+    /// The silent-divergence path from #42, up to the lost forkchoice update. Batch 1 ended at
+    /// block `SAFE` = A, then a batch revert at L1 block 20 and a replacement batch at L1 block 21
+    /// moved the Engine's safe block to B. An L1 reorg to block 15 removes both, so the database
+    /// goes back to A, and the Engine rejects the forkchoice update to A.
+    #[tokio::test]
+    async fn rejected_forkchoice_update_after_l1_reorg_stops_the_run_loop() {
+        let database = Arc::new(setup_test_db().await);
+        database.insert_genesis_block(B256::ZERO).await.unwrap();
+        let block_a = info(SAFE, 0xaa);
+        let block_b = info(SAFE, 0x11);
+        for (tag, l1_block, block) in [(0xa1, 10, block_a), (0xb1, 21, block_b)] {
+            let hash = B256::repeat_byte(tag);
+            database
+                .insert_batch(BatchCommitData {
+                    hash,
+                    index: 1,
+                    block_number: l1_block,
+                    block_timestamp: 0,
+                    calldata: Arc::new(Bytes::new()),
+                    blob_versioned_hash: None,
+                    finalized_block_number: None,
+                    reverted_block_number: None,
+                })
+                .await
+                .unwrap();
+            database.insert_blocks(vec![block], BatchInfo::new(1, hash)).await.unwrap();
+            if block == block_a {
+                database
+                    .set_batch_revert_block_number_for_batch_range(1, 1, info(20, 0x20))
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let engine_client = Arc::new(ScriptedEngineClient::new());
+        engine_client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(
+            PayloadStatusEnum::Invalid { validation_error: "rejected by the test Engine".into() },
+            None,
+        )));
+        let (mut orchestrator, _handle, notification_tx) = test_orchestrator(
+            database.clone(),
+            engine_client.clone(),
+            Asserter::new(),
+            BatchDerivationResult {
+                attributes: vec![],
+                batch_info: BatchInfo::new(2, B256::repeat_byte(2)),
+                skipped_l1_messages: vec![],
+                target_status: BatchStatus::Consolidated,
+            },
+        )
+        .await;
+        orchestrator.derivation_driver = DerivationDriver::default();
+        orchestrator.sync_state.l2_mut().set_synced();
+        assert_eq!(*orchestrator.engine.fcs().safe_block_info(), block_b);
+
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let run_task = tokio::spawn(orchestrator.run_until_shutdown(Box::pin(async move {
+            let _ = shutdown_rx.await;
+        })));
+        notification_tx.send(Arc::new(L1Notification::Reorg(15))).await.unwrap();
+        let result = time::timeout(Duration::from_secs(2), run_task)
+            .await
+            .expect("a rejected post-reorg forkchoice update must stop the run loop")
+            .unwrap();
+
+        let Err(ChainOrchestratorError::UnwindForkchoiceUpdateFailed {
+            operation,
+            db_safe,
+            engine_safe,
+            ..
+        }) = result
+        else {
+            panic!("expected UnwindForkchoiceUpdateFailed, got {result:?}")
+        };
+        assert_eq!(operation, "L1 reorg");
+        assert_eq!(db_safe, Some(block_a));
+        assert_eq!(engine_safe, block_b);
+        assert_eq!(engine_client.fork_choice_updated_calls(), 1);
+        assert_eq!(database.get_latest_safe_l2_info().await.unwrap().0, block_a);
     }
 }
 

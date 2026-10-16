@@ -110,6 +110,7 @@ where
                     self.config.sequencer_args.payload_building_duration,
                 ),
                 block_da_size_limit: Some(constants::DEFAULT_PAYLOAD_SIZE_LIMIT),
+                ..Default::default()
             }))
             .network(network_builder)
             .consensus(DogeosConsensusBuilder)

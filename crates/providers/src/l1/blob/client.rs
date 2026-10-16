@@ -171,6 +171,10 @@ impl BlobProvider for BeaconClientProvider {
         // cache the other blobs and return the matched blob.
         let maybe_blob = blobs.iter().position(|blob| blob.to_kzg_versioned_hash() == hash.0);
         if let Some(position) = maybe_blob {
+            // Cache hits bypass verification, so authenticate every sidecar before caching any.
+            for blob in &blobs {
+                blob.verify_blob_kzg_proof()?;
+            }
             let blob = Arc::new(*blobs.remove(position).blob);
             let mut cache = self.cache.lock().await;
             for (hash, blob) in

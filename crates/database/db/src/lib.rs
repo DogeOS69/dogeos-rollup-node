@@ -32,3 +32,6 @@ pub use transaction::{DatabaseTransactionProvider, TXMut, TX};
 
 #[cfg(feature = "test-utils")]
 pub mod test_utils;
+
+#[cfg(all(test, feature = "test-utils"))]
+mod reorg_finding_tests;

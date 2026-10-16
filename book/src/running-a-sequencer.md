@@ -108,6 +108,32 @@ For development and testing, you can bypass signer requirements with the `--test
 - `--sequencer.payload-building-duration <MS>`: Time allocated for building each payload in milliseconds (default: `800`)
 - `--sequencer.allow-empty-blocks`: Allow production of empty blocks when no transactions are available (default: `false`)
 
+### Code Witness Budget
+
+Transaction admission and payload building share a budget for distinct contract bytecode:
+
+- `--scroll.max-code-witness-bytes <BYTES>`: Default `33554432` (32 MiB). Applies to each admission
+  simulation and to the union of code accessed by an entire candidate block.
+- `--txpool.code-witness-max-steps <STEPS>`: Default `1000000`. Bounds interpreter instructions
+  in each admission simulation.
+- `--txpool.code-witness-max-inflight <COUNT>`: Default `64`. Bounds waiting and executing
+  validations together. `--txpool.additional-validation-tasks` controls validation workers.
+
+All three new limits must be nonzero. Admission errors distinguish code overflow from exhausted
+simulation work or queue capacity and allow retry. The builder checks the actual block state,
+deduplicates repeated code across transactions, and skips pool transactions before committing
+their state if the union exceeds the budget. Mandatory transaction or system-call overflow fails
+the candidate. Reads in reverted executions still count.
+
+When a candidate with multiple L1 messages fails, the sequencer retries on a later slot with a
+shorter prefix of the same queue. It restores the configured prefix size after success or a
+parent change. The Engine API does not preserve the specific builder failure, so other failures
+may also temporarily reduce the number of L1 messages per candidate. A message that exceeds the
+budget by itself is reported as a failure and is never skipped.
+
+This is a local code-byte policy. Trie nodes and witness encoding overhead are additional, so
+32 MiB is not a bound on total witness size or a measured prover-capacity guarantee.
+
 ### Fee Configuration
 
 - `--sequencer.fee-recipient <ADDRESS>`: Address to receive block rewards and transaction fees (default: `0x5300000000000000000000000000000000000005` - Scroll fee vault)
@@ -127,7 +153,23 @@ The sequencer can include L1 messages in blocks using different strategies:
 --sequencer.l1-inclusion-mode finalized:2
 ```
 
-- `--sequencer.max-l1-messages <N>`: Override maximum L1 messages per block (optional)
+- `--sequencer.max-l1-messages <N>`: Set the sequencer's maximum number of L1 messages per L2 block. If omitted, it defaults to `numL1MessagesPerBlock` in the chain config.
+
+This count limit is local sequencer policy. Followers and consensus validation do not reject a
+block solely because it exceeds this count, and the proof does not enforce this per-block count
+limit. L1 message ordering and queue integrity remain subject to protocol validation.
+
+Pin the intended policy explicitly in the sequencer's deployment configuration. For example,
+to include at most 10 L1 messages per block, add:
+
+```bash
+--sequencer.max-l1-messages 10
+```
+
+The sequencer also budgets each message at its full gas limit against the configured block gas
+limit. It takes messages in queue order and stops when the next message would exceed that
+budget, so a block may contain fewer messages than the configured count. Changing this option
+does not change the consensus rules or reserve a fixed amount of gas for L2 transactions.
 
 ### Signer Configuration
 

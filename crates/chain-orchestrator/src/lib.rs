@@ -403,12 +403,30 @@ impl<
                 }
             }
             SequencerEvent::PayloadReady(payload_id) => {
-                let block = self
+                let block = match self
                     .sequencer
                     .as_mut()
                     .expect("sequencer must be present")
                     .finalize_payload_building(payload_id, &mut self.engine)
-                    .await?;
+                    .await
+                {
+                    Ok(block) => block,
+                    Err(err) => {
+                        // Terminal for this slot: the sequencer commits, signs and
+                        // announces nothing on failure, so there is no block to wait
+                        // for. Emit the skipped event instead of a bare error because
+                        // the remote-source builder waits for `BlockSequenced` or
+                        // `BlockBuildingSkipped` and nothing else would wake it.
+                        self.metric_handler.finish_block_building_recording(None);
+                        tracing::error!(
+                            target: "scroll::chain_orchestrator",
+                            ?payload_id,
+                            source = %err,
+                            "Failed to finalize the built payload; skipping the slot"
+                        );
+                        return Ok(Some(ChainOrchestratorEvent::BlockBuildingSkipped));
+                    }
+                };
 
                 self.metric_handler.finish_block_building_recording(block.as_ref());
 
@@ -1521,6 +1539,7 @@ mod run_loop_policy_tests {
     use reth_network_p2p::NoopFullBlockClient;
     use rollup_node_primitives::BatchCommitData;
     use rollup_node_providers::{test_utils::MockL1Provider, ScrollRootProvider};
+    use rollup_node_sequencer::{L1MessageInclusionMode, PayloadBuildingConfig, SequencerConfig};
     use scroll_db::test_utils::setup_test_db;
     use scroll_derivation_pipeline::{BatchDerivationResult, DerivedAttributes};
     use scroll_engine::{
@@ -1650,6 +1669,26 @@ mod run_loop_policy_tests {
         (orchestrator, handle, notification_tx)
     }
 
+    /// A sequencer over the test database, driven by hand (no automatic slots).
+    fn test_sequencer(database: Arc<Database>) -> Sequencer<TestL1Provider, DogeosChainSpec> {
+        Sequencer::new(
+            Arc::new(MockL1Provider { db: database, blobs: Default::default() }),
+            SequencerConfig {
+                chain_spec: DOGEOS_DEV.clone(),
+                fee_recipient: Address::ZERO,
+                auto_start: false,
+                payload_building_config: PayloadBuildingConfig {
+                    block_gas_limit: 30_000_000,
+                    max_l1_messages_per_block: 4,
+                    l1_message_inclusion_mode: L1MessageInclusionMode::default(),
+                },
+                block_time: 1_000,
+                payload_building_duration: 0,
+                allow_empty_blocks: true,
+            },
+        )
+    }
+
     #[test]
     fn l1_notification_receiver_requires_synced_idle_derivation() {
         for (l2_synced, pipeline_empty, can_accept_batch, expected) in [
@@ -1669,6 +1708,41 @@ mod run_loop_policy_tests {
                  can_accept_batch={can_accept_batch}"
             );
         }
+    }
+
+    /// A payload the sequencer refuses to finalize must still end the slot with a terminal
+    /// event: the remote-source builder waits for `BlockSequenced` or `BlockBuildingSkipped`
+    /// and nothing else would wake it, so a bare error would park it forever. The scripted
+    /// payload carries a `block_hash` unrelated to its contents and no forkchoice update is
+    /// scripted, so the failure lands before the engine is asked to adopt anything.
+    #[tokio::test]
+    async fn payload_ready_failure_emits_block_building_skipped() {
+        let database = Arc::new(setup_test_db().await);
+        let engine_client = Arc::new(ScriptedEngineClient::new());
+        engine_client.push_get_payload(ScriptedResponse::Ok(payload(SAFE + 1)));
+        let asserter = Asserter::new();
+        let (mut orchestrator, _handle, _notification_tx) = test_orchestrator(
+            database.clone(),
+            engine_client.clone(),
+            asserter,
+            BatchDerivationResult {
+                attributes: vec![],
+                batch_info: BatchInfo::new(1, B256::repeat_byte(1)),
+                skipped_l1_messages: vec![],
+                target_status: BatchStatus::Consolidated,
+            },
+        )
+        .await;
+        orchestrator.sequencer = Some(test_sequencer(database));
+
+        let event = orchestrator
+            .handle_sequencer_event(SequencerEvent::PayloadReady(PayloadId::new([7; 8])))
+            .await
+            .expect("a finalization failure ends the slot instead of surfacing as an error");
+
+        assert_eq!(event, Some(ChainOrchestratorEvent::BlockBuildingSkipped));
+        assert_eq!(engine_client.fork_choice_updated_calls(), 0);
+        assert_eq!(*orchestrator.engine.fcs().head_block_info(), info(SAFE, 0x11));
     }
 
     #[tokio::test]

@@ -108,6 +108,32 @@ For development and testing, you can bypass signer requirements with the `--test
 - `--sequencer.payload-building-duration <MS>`: Time allocated for building each payload in milliseconds (default: `800`)
 - `--sequencer.allow-empty-blocks`: Allow production of empty blocks when no transactions are available (default: `false`)
 
+### Code Witness Budget
+
+Transaction admission and payload building share a budget for distinct contract bytecode:
+
+- `--scroll.max-code-witness-bytes <BYTES>`: Default `33554432` (32 MiB). Applies to each admission
+  simulation and to the union of code accessed by an entire candidate block.
+- `--txpool.code-witness-max-steps <STEPS>`: Default `1000000`. Bounds interpreter instructions
+  in each admission simulation.
+- `--txpool.code-witness-max-inflight <COUNT>`: Default `64`. Bounds waiting and executing
+  validations together. `--txpool.additional-validation-tasks` controls validation workers.
+
+All three new limits must be nonzero. Admission errors distinguish code overflow from exhausted
+simulation work or queue capacity and allow retry. The builder checks the actual block state,
+deduplicates repeated code across transactions, and skips pool transactions before committing
+their state if the union exceeds the budget. Mandatory transaction or system-call overflow fails
+the candidate. Reads in reverted executions still count.
+
+When a candidate with multiple L1 messages fails, the sequencer retries on a later slot with a
+shorter prefix of the same queue. It restores the configured prefix size after success or a
+parent change. The Engine API does not preserve the specific builder failure, so other failures
+may also temporarily reduce the number of L1 messages per candidate. A message that exceeds the
+budget by itself is reported as a failure and is never skipped.
+
+This is a local code-byte policy. Trie nodes and witness encoding overhead are additional, so
+32 MiB is not a bound on total witness size or a measured prover-capacity guarantee.
+
 ### Fee Configuration
 
 - `--sequencer.fee-recipient <ADDRESS>`: Address to receive block rewards and transaction fees (default: `0x5300000000000000000000000000000000000005` - Scroll fee vault)

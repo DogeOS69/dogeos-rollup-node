@@ -521,6 +521,7 @@ async fn can_sequence_blocks_with_private_key_file() -> eyre::Result<()> {
 
     let chain_spec = (*DOGEOS_DEV).clone();
     let rollup_manager_args = ScrollRollupNodeConfig {
+        code_witness: Default::default(),
         test_args: TestArgs {
             test: false, // disable test mode to enable real signing
             skip_l1_synced: false,
@@ -627,6 +628,7 @@ async fn can_sequence_blocks_with_hex_key_file_without_prefix() -> eyre::Result<
 
     let chain_spec = (*DOGEOS_DEV).clone();
     let rollup_manager_args = ScrollRollupNodeConfig {
+        code_witness: Default::default(),
         test_args: TestArgs {
             test: false, // disable test mode to enable real signing
             skip_l1_synced: false,

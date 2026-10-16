@@ -7,6 +7,7 @@ use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::SolCall;
 use dogeos_chainspec::{DogeosChainSpec, DOGEOS_CHIKYU, DOGEOS_DEV, DOGEOS_MAINNET};
 use dogeos_hardforks::{DogeosHardfork, ForkCondition};
+use dogeos_reth_evm::DEFAULT_BASE_FEE_OVERHEAD;
 use dogeos_reth_primitives::DogeosBlock;
 use futures::{task::noop_waker_ref, FutureExt, StreamExt};
 use reth_chainspec::EthChainSpec;
@@ -788,21 +789,29 @@ async fn shutdown_consolidates_most_recent_batch_on_startup() -> eyre::Result<()
         .await?;
 
     // Lets iterate over all blocks expected to be derived from the first batch commit.
-    let consolidation_outcome = loop {
-        let event = rnm_events.next().await;
-        if let Some(ChainOrchestratorEvent::BatchConsolidated(consolidation_outcome)) = event {
-            break consolidation_outcome;
+    let consolidation_outcome = time::timeout(Duration::from_secs(30), async {
+        loop {
+            let event = rnm_events.next().await.expect("orchestrator event stream must stay open");
+            if let ChainOrchestratorEvent::BatchConsolidated(consolidation_outcome) = event {
+                break consolidation_outcome;
+            }
         }
-    };
+    })
+    .await
+    .expect("batch 1 must consolidate before shutdown");
     assert_eq!(consolidation_outcome.blocks.len(), 4, "Expected 4 blocks to be consolidated");
 
     l1_notification_tx.notification_tx.send(Arc::new(L1Notification::Synced)).await?;
-    loop {
-        if matches!(rnm_events.next().await, Some(ChainOrchestratorEvent::ChainConsolidated { .. }))
-        {
-            break;
+    time::timeout(Duration::from_secs(30), async {
+        loop {
+            let event = rnm_events.next().await.expect("orchestrator event stream must stay open");
+            if matches!(event, ChainOrchestratorEvent::ChainConsolidated { .. }) {
+                break;
+            }
         }
-    }
+    })
+    .await
+    .expect("initial chain consolidation must finish before shutdown");
 
     // Start the second batch, then stop while its remote Engine effects are only partially applied.
     l1_notification_tx
@@ -918,11 +927,15 @@ async fn shutdown_consolidates_most_recent_batch_on_startup() -> eyre::Result<()
     let (recovered_blocks, recovered_outcome) = time::timeout(Duration::from_secs(10), async {
         let mut recovered_blocks = Vec::new();
         loop {
-            match rnm_events.next().await {
-                Some(ChainOrchestratorEvent::BlockConsolidated(outcome)) => {
+            match rnm_events
+                .next()
+                .await
+                .expect("restarted orchestrator event stream must stay open")
+            {
+                ChainOrchestratorEvent::BlockConsolidated(outcome) => {
                     recovered_blocks.push(outcome.block_info().block_info.number);
                 }
-                Some(ChainOrchestratorEvent::BatchConsolidated(outcome))
+                ChainOrchestratorEvent::BatchConsolidated(outcome)
                     if outcome.batch_info.index == batch_1_data.index =>
                 {
                     break (recovered_blocks, outcome)
@@ -2072,7 +2085,7 @@ pub fn read_to_bytes<P: AsRef<std::path::Path>>(path: P) -> eyre::Result<Bytes> 
     Ok(Bytes::from_str(&std::fs::read_to_string(path)?)?)
 }
 
-/// Encodes one V0 calldata batch containing deterministic transaction-free blocks.
+/// Encodes one V0 calldata batch containing deterministic transaction-free `DOGEOS_DEV` blocks.
 fn empty_batch_calldata(first_block: u64, block_count: u8, timestamp: u64) -> Bytes {
     let mut parent_batch_header = Vec::with_capacity(89);
     parent_batch_header.push(0);
@@ -2087,7 +2100,9 @@ fn empty_batch_calldata(first_block: u64, block_count: u8, timestamp: u64) -> By
     for number in first_block..first_block + u64::from(block_count) {
         chunk.extend_from_slice(&number.to_be_bytes());
         chunk.extend_from_slice(&timestamp.to_be_bytes());
-        chunk.extend_from_slice(&U256::ZERO.to_be_bytes::<32>());
+        // Empty dev-chain blocks stay at the protocol's default base-fee overhead: genesis
+        // starts below that floor and these blocks never add an EIP-1559 congestion component.
+        chunk.extend_from_slice(&DEFAULT_BASE_FEE_OVERHEAD.to_be_bytes::<32>());
         chunk.extend_from_slice(&SCROLL_GAS_LIMIT.to_be_bytes());
         chunk.extend_from_slice(&0u16.to_be_bytes());
         chunk.extend_from_slice(&0u16.to_be_bytes());

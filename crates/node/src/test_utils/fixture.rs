@@ -465,6 +465,7 @@ impl TestFixtureBuilder {
     /// Returns the default rollup node config.
     fn default_config() -> ScrollRollupNodeConfig {
         ScrollRollupNodeConfig {
+            code_witness: Default::default(),
             test_args: TestArgs { test: true, skip_l1_synced: false },
             network_args: RollupNodeNetworkArgs::default(),
             database_args: RollupNodeDatabaseArgs::default(),

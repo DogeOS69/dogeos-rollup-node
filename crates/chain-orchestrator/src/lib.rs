@@ -143,6 +143,20 @@ pub struct ChainOrchestrator<
     event_sender: Option<EventSender<ChainOrchestratorEvent>>,
     /// The metrics handler.
     metric_handler: MetricsHandler,
+    /// The latest peer block whose import failed because it includes an L1 message this node has
+    /// not indexed yet, retried once that message is committed.
+    blocked_import: Option<BlockedImport>,
+}
+
+/// A peer block whose import is waiting on an L1 message that has not been indexed yet.
+#[derive(Debug)]
+struct BlockedImport {
+    /// The block as announced by the peer.
+    block_with_peer: NewBlockWithPeer,
+    /// The hash of the first L1 message in the import that was not found in the database.
+    missing_l1_message: B256,
+    /// Ancestors encountered while downloading the held block's branch.
+    ancestors: Vec<B256>,
 }
 
 impl<
@@ -188,6 +202,7 @@ impl<
                 handle_rx,
                 event_sender: None,
                 metric_handler: MetricsHandler::default(),
+                blocked_import: None,
             },
             handle,
         ))
@@ -294,12 +309,17 @@ impl<
                     self.derivation_pipeline.is_empty(),
                     self.derivation_driver.can_accept_batch(),
                 ) => {
-                    let result = self.handle_l1_notification(notification).await;
+                    let result = self.handle_l1_notification(notification.clone()).await;
                     if let Err(err @ ChainOrchestratorError::UnwindForkchoiceUpdateFailed { .. }) = result {
                         tracing::error!(target: "scroll::chain_orchestrator", source = %err, "Engine did not follow the database after an L1 reorg or batch revert; fail-stopping");
                         return Err(err)
                     }
+                    let unblocks_import = result.is_ok() && self.unblocks_import(&notification);
                     self.handle_outcome(result);
+                    if unblocks_import {
+                        let result = self.retry_blocked_import().await;
+                        self.handle_outcome(result);
+                    }
                 }
 
             }
@@ -407,12 +427,30 @@ impl<
                 }
             }
             SequencerEvent::PayloadReady(payload_id) => {
-                let block = self
+                let block = match self
                     .sequencer
                     .as_mut()
                     .expect("sequencer must be present")
                     .finalize_payload_building(payload_id, &mut self.engine)
-                    .await?;
+                    .await
+                {
+                    Ok(block) => block,
+                    Err(err) => {
+                        // Terminal for this slot: the sequencer commits, signs and
+                        // announces nothing on failure, so there is no block to wait
+                        // for. Emit the skipped event instead of a bare error because
+                        // the remote-source builder waits for `BlockSequenced` or
+                        // `BlockBuildingSkipped` and nothing else would wake it.
+                        self.metric_handler.finish_block_building_recording(None);
+                        tracing::error!(
+                            target: "scroll::chain_orchestrator",
+                            ?payload_id,
+                            source = %err,
+                            "Failed to finalize the built payload; skipping the slot"
+                        );
+                        return Ok(Some(ChainOrchestratorEvent::BlockBuildingSkipped));
+                    }
+                };
 
                 self.metric_handler.finish_block_building_recording(block.as_ref());
 
@@ -614,6 +652,8 @@ impl<
         &mut self,
         ancestor: u64,
     ) -> Result<(UnwindResult, HeldReorgOutcome), ChainOrchestratorError> {
+        // A held block import may depend on L1 messages that the unwind removes.
+        self.blocked_import = None;
         let (unwind_result, outcome) =
             self.derivation_driver.unwind_and_revalidate(&self.database, ancestor).await?;
         match outcome {
@@ -1057,15 +1097,170 @@ impl<
         match event {
             ScrollNetworkManagerEvent::NewBlock(block_with_peer) => {
                 self.notify(ChainOrchestratorEvent::NewBlockReceived(block_with_peer.clone()));
-                metered!(Task::L2BlockImport, self, handle_block_from_peer(block_with_peer))
+                self.import_peer_block(block_with_peer).await
             }
         }
+    }
+
+    /// Imports a block received from a peer, holding it if the import is blocked on an L1 message
+    /// that has not been indexed yet.
+    async fn import_peer_block(
+        &mut self,
+        block_with_peer: NewBlockWithPeer,
+    ) -> Result<Option<ChainOrchestratorEvent>, ChainOrchestratorError> {
+        let mut ancestors = vec![block_with_peer.block.parent_hash];
+        let result = metered!(
+            Task::L2BlockImport,
+            self,
+            handle_block_from_peer(block_with_peer.clone(), &mut ancestors)
+        );
+        self.track_blocked_import(block_with_peer, ancestors, &result);
+        result
+    }
+
+    /// Holds the latest peer block whose import failed on an L1 message that has not been indexed
+    /// yet, so it can be retried when that message arrives instead of waiting for the next block.
+    /// A delayed ancestor does not replace a held descendant that still passes consensus.
+    /// Other failures replace the held block even if lower: a fork may win on timestamp, or the
+    /// signer may have rotated. Height alone cannot tell which block is still valid.
+    /// A chain import that reaches the held block's height supersedes it.
+    fn track_blocked_import(
+        &mut self,
+        block_with_peer: NewBlockWithPeer,
+        ancestors: Vec<B256>,
+        result: &Result<Option<ChainOrchestratorEvent>, ChainOrchestratorError>,
+    ) {
+        let held_number =
+            self.blocked_import.as_ref().map(|held| held.block_with_peer.block.number);
+        let block_number = block_with_peer.block.number;
+        let block_hash = block_with_peer.block.hash_slow();
+
+        if let Err(ChainOrchestratorError::L1MessageNotFound(L1MessageKey::TransactionHash(
+            missing_l1_message,
+        ))) = result
+        {
+            if self.blocked_import.as_ref().is_some_and(|held| {
+                held.ancestors.contains(&block_hash) &&
+                    self.consensus
+                        .validate_new_block(
+                            &held.block_with_peer.block,
+                            &held.block_with_peer.signature,
+                        )
+                        .is_ok()
+            }) {
+                tracing::debug!(
+                    target: "scroll::chain_orchestrator",
+                    block_number,
+                    ?block_hash,
+                    ?held_number,
+                    "Keeping held descendant after a delayed ancestor announcement"
+                );
+                return;
+            }
+            tracing::info!(
+                target: "scroll::chain_orchestrator",
+                block_number,
+                ?block_hash,
+                ?held_number,
+                ?missing_l1_message,
+                "Holding block import until its L1 message is indexed"
+            );
+            self.blocked_import = Some(BlockedImport {
+                block_with_peer,
+                missing_l1_message: *missing_l1_message,
+                ancestors,
+            });
+        } else if held_number
+            .is_some_and(|held_number| supersedes_blocked_import(result, block_number, held_number))
+        {
+            tracing::debug!(
+                target: "scroll::chain_orchestrator",
+                block_number,
+                ?block_hash,
+                ?held_number,
+                "Chain import reached the held block import's height; dropping it"
+            );
+            self.blocked_import = None;
+        }
+    }
+
+    /// Returns whether a handled L1 notification committed the L1 message the held block import is
+    /// waiting on.
+    fn unblocks_import(&self, notification: &L1Notification) -> bool {
+        self.blocked_import.as_ref().is_some_and(|blocked| {
+            matches!(
+                notification,
+                L1Notification::L1Message { message, .. }
+                    if message.tx_hash() == blocked.missing_l1_message
+            )
+        })
+    }
+
+    /// Retries the held block import through the regular peer block path, which also decides
+    /// whether a held fork block is still worth importing. A retry that fails on a still missing
+    /// L1 message holds the block again.
+    ///
+    /// The block is dropped without a retry when its height is already finalized, or when it no
+    /// longer passes consensus checks (for example, after the authorized signer rotated). In both
+    /// cases the regular path would penalize the peer that relayed a block that was valid when it
+    /// was announced.
+    async fn retry_blocked_import(
+        &mut self,
+    ) -> Result<Option<ChainOrchestratorEvent>, ChainOrchestratorError> {
+        let Some(BlockedImport { block_with_peer, .. }) = self.blocked_import.take() else {
+            return Ok(None);
+        };
+        let block_number = block_with_peer.block.number;
+        let block_hash = block_with_peer.block.hash_slow();
+
+        let finalized_number = self.engine.fcs().finalized_block_info().number;
+        if block_number <= finalized_number {
+            tracing::info!(
+                target: "scroll::chain_orchestrator",
+                block_number,
+                ?block_hash,
+                finalized_number,
+                "Dropping held block import: its height is finalized"
+            );
+            return Ok(Some(ChainOrchestratorEvent::BlockedImportDropped(block_hash)));
+        }
+        if let Err(err) =
+            self.consensus.validate_new_block(&block_with_peer.block, &block_with_peer.signature)
+        {
+            tracing::info!(
+                target: "scroll::chain_orchestrator",
+                block_number,
+                ?block_hash,
+                ?err,
+                "Dropping held block import: it no longer passes consensus checks"
+            );
+            return Ok(Some(ChainOrchestratorEvent::BlockedImportDropped(block_hash)));
+        }
+
+        tracing::info!(
+            target: "scroll::chain_orchestrator",
+            block_number,
+            ?block_hash,
+            "Retrying block import blocked on an L1 message"
+        );
+        let result = self.import_peer_block(block_with_peer).await;
+        if let Err(err) = &result {
+            tracing::warn!(
+                target: "scroll::chain_orchestrator",
+                block_number,
+                ?block_hash,
+                ?err,
+                "Retried block import failed"
+            );
+        }
+        result
     }
 
     /// Handles a new block received from a peer.
     async fn handle_block_from_peer(
         &mut self,
         block_with_peer: NewBlockWithPeer,
+        ancestors: &mut Vec<B256>,
     ) -> Result<Option<ChainOrchestratorEvent>, ChainOrchestratorError> {
         tracing::debug!(target: "scroll::chain_orchestrator", block_hash = ?block_with_peer.block.header.hash_slow(), block_number = ?block_with_peer.block.number, peer_id = ?block_with_peer.peer_id, "Received new block from peer");
 
@@ -1142,6 +1337,8 @@ impl<
             } else {
                 vec![block_with_peer.block.clone()]
             };
+
+            ancestors.extend(new_headers.iter().map(|block| block.parent_hash));
 
             // If the first header in the new headers has a parent hash that matches the current
             // head hash, we can import the chain.
@@ -1241,6 +1438,8 @@ impl<
                 .into_iter()
                 .map(|b| b.into_block())
                 .collect();
+
+            ancestors.extend(headers.iter().map(|block| block.hash_slow()));
 
             let mut index = None;
             for (i, header) in headers.iter().enumerate() {
@@ -1504,6 +1703,25 @@ impl<
     }
 }
 
+/// Returns whether handling a peer block at `block_number` supersedes a held import at
+/// `blocked_number`: only a chain import that reaches the held height does. Rejections, such as a
+/// block failing consensus checks, leave the held import in place.
+const fn supersedes_blocked_import(
+    result: &Result<Option<ChainOrchestratorEvent>, ChainOrchestratorError>,
+    block_number: u64,
+    blocked_number: u64,
+) -> bool {
+    block_number >= blocked_number &&
+        matches!(
+            result,
+            Ok(Some(
+                ChainOrchestratorEvent::ChainExtended(_) |
+                    ChainOrchestratorEvent::ChainReorged(_) |
+                    ChainOrchestratorEvent::OptimisticSync(_)
+            ))
+        )
+}
+
 /// Computes the queue hash by taking the previous queue hash and performing a 2-to-1 hash with the
 /// current transaction hash using keccak. It then applies a mask to the last 32 bits as these bits
 /// are used to store the timestamp at which the message was enqueued in the contract. For the first
@@ -1551,10 +1769,12 @@ mod run_loop_policy_tests {
     use dogeos_chainspec::{DogeosChainSpec, DOGEOS_DEV};
     use dogeos_reth_consensus::DogeosConsensus;
     use dogeos_reth_engine::ScrollPayloadAttributes;
+    use futures::FutureExt;
     use reth_network_api::noop::NoopNetwork;
     use reth_network_p2p::NoopFullBlockClient;
     use rollup_node_primitives::BatchCommitData;
     use rollup_node_providers::{test_utils::MockL1Provider, ScrollRootProvider};
+    use rollup_node_sequencer::{L1MessageInclusionMode, PayloadBuildingConfig, SequencerConfig};
     use scroll_db::test_utils::setup_test_db;
     use scroll_derivation_pipeline::{BatchDerivationResult, DerivedAttributes};
     use scroll_engine::{
@@ -1684,6 +1904,119 @@ mod run_loop_policy_tests {
         (orchestrator, handle, notification_tx)
     }
 
+    #[tokio::test]
+    async fn delayed_ancestor_preserves_held_descendant_but_lower_fork_replaces_it() {
+        let database = Arc::new(setup_test_db().await);
+        let (mut orchestrator, _handle, _notifications) = test_orchestrator(
+            database,
+            Arc::new(ScriptedEngineClient::new()),
+            Asserter::new(),
+            BatchDerivationResult {
+                attributes: vec![],
+                batch_info: BatchInfo::new(1, B256::repeat_byte(1)),
+                skipped_l1_messages: vec![],
+                target_status: BatchStatus::Consolidated,
+            },
+        )
+        .await;
+        let message = TxL1Message {
+            queue_index: 0,
+            gas_limit: 21000,
+            sender: Address::ZERO,
+            to: Address::ZERO,
+            value: U256::ZERO,
+            input: Bytes::new(),
+        };
+        let mut ancestor = DogeosBlock::default();
+        ancestor.header.number = SAFE + 1;
+        ancestor.header.parent_hash = info(SAFE, 0x11).hash;
+        ancestor.header.timestamp = 1;
+        ancestor.body.transactions.push(message.clone().into());
+        let mut descendant = DogeosBlock::default();
+        descendant.header.number = SAFE + 2;
+        descendant.header.parent_hash = ancestor.hash_slow();
+        descendant.header.timestamp = 2;
+        let announced = |block| NewBlockWithPeer {
+            block,
+            peer_id: alloy_primitives::B512::ZERO,
+            signature: alloy_primitives::Signature::test_signature(),
+        };
+        // The descendant's import fetched its ancestor, and validation found the missing message.
+        let validation =
+            orchestrator.validate_l1_messages(&[ancestor.clone(), descendant.clone()]).await;
+        assert!(matches!(validation, Err(ChainOrchestratorError::L1MessageNotFound(_))));
+        orchestrator.track_blocked_import(
+            announced(descendant.clone()),
+            vec![ancestor.hash_slow()],
+            &validation.map(|()| None),
+        );
+        assert_eq!(
+            orchestrator.blocked_import.as_ref().unwrap().block_with_peer.block.hash_slow(),
+            descendant.hash_slow()
+        );
+        // Its ancestor's first gossip announcement arrives later; this is not a competing fork.
+        let result = orchestrator.import_peer_block(announced(ancestor.clone())).await;
+        assert!(matches!(result, Err(ChainOrchestratorError::L1MessageNotFound(_))));
+        assert_eq!(
+            orchestrator.blocked_import.as_ref().unwrap().block_with_peer.block.hash_slow(),
+            descendant.hash_slow(),
+            "a delayed ancestor must not discard the known descendant waiting on the same message"
+        );
+
+        let mut fork = ancestor.clone();
+        fork.header.timestamp = descendant.timestamp + 1;
+        let result = orchestrator.import_peer_block(announced(fork.clone())).await;
+        assert!(matches!(result, Err(ChainOrchestratorError::L1MessageNotFound(_))));
+        assert_eq!(
+            orchestrator.blocked_import.as_ref().unwrap().block_with_peer.block.hash_slow(),
+            fork.hash_slow(),
+            "a lower competing fork must still be able to replace the held block"
+        );
+
+        // The same ancestor must replace a descendant whose signature is no longer authorized.
+        let result = Err(ChainOrchestratorError::L1MessageNotFound(L1MessageKey::TransactionHash(
+            message.tx_hash(),
+        )));
+        orchestrator.track_blocked_import(
+            announced(descendant),
+            vec![ancestor.hash_slow()],
+            &result,
+        );
+        let incoming = announced(ancestor);
+        let signer = reth_primitives_traits::crypto::secp256k1::recover_signer(
+            &incoming.signature,
+            rollup_node_primitives::sig_encode_hash(&incoming.block.header),
+        )
+        .unwrap();
+        orchestrator.consensus = Box::new(crate::consensus::SystemContractConsensus::new(signer));
+        let result = orchestrator.import_peer_block(incoming.clone()).await;
+        assert!(matches!(result, Err(ChainOrchestratorError::L1MessageNotFound(_))));
+        assert_eq!(
+            orchestrator.blocked_import.as_ref().unwrap().block_with_peer.block.hash_slow(),
+            incoming.block.hash_slow()
+        );
+    }
+
+    /// A sequencer over the test database, driven by hand (no automatic slots).
+    fn test_sequencer(database: Arc<Database>) -> Sequencer<TestL1Provider, DogeosChainSpec> {
+        Sequencer::new(
+            Arc::new(MockL1Provider { db: database, blobs: Default::default() }),
+            SequencerConfig {
+                chain_spec: DOGEOS_DEV.clone(),
+                fee_recipient: Address::ZERO,
+                auto_start: false,
+                payload_building_config: PayloadBuildingConfig {
+                    block_gas_limit: 30_000_000,
+                    max_l1_messages_per_block: 4,
+                    l1_message_inclusion_mode: L1MessageInclusionMode::default(),
+                },
+                block_time: 1_000,
+                payload_building_duration: 0,
+                allow_empty_blocks: true,
+            },
+        )
+    }
+
     #[test]
     fn l1_notification_receiver_requires_synced_idle_derivation() {
         for (l2_synced, pipeline_empty, can_accept_batch, expected) in [
@@ -1703,6 +2036,73 @@ mod run_loop_policy_tests {
                  can_accept_batch={can_accept_batch}"
             );
         }
+    }
+
+    #[test]
+    fn only_a_chain_import_at_its_height_supersedes_a_blocked_import() {
+        const BLOCKED: u64 = 10;
+        let peer = alloy_primitives::B512::ZERO;
+        let import = || ChainImport {
+            chain: vec![],
+            peer_id: peer,
+            signature: alloy_primitives::Signature::test_signature(),
+            result: ForkchoiceUpdated::new(PayloadStatus::from_status(PayloadStatusEnum::Valid)),
+        };
+
+        for (block_number, result, expected) in [
+            (BLOCKED, Ok(Some(ChainOrchestratorEvent::ChainExtended(import()))), true),
+            (BLOCKED + 1, Ok(Some(ChainOrchestratorEvent::ChainReorged(import()))), true),
+            (BLOCKED - 1, Ok(Some(ChainOrchestratorEvent::ChainExtended(import()))), false),
+            (
+                BLOCKED + 1,
+                Ok(Some(ChainOrchestratorEvent::BlockFailedConsensusChecks(B256::ZERO, peer))),
+                false,
+            ),
+            (BLOCKED, Ok(Some(ChainOrchestratorEvent::BlockAlreadyKnown(B256::ZERO, peer))), false),
+            (BLOCKED + 1, Ok(None), false),
+            (BLOCKED + 1, Err(ChainOrchestratorError::InvalidBlock), false),
+        ] {
+            assert_eq!(
+                supersedes_blocked_import(&result, block_number, BLOCKED),
+                expected,
+                "block_number={block_number}, result={result:?}"
+            );
+        }
+    }
+
+    /// A payload the sequencer refuses to finalize must still end the slot with a terminal
+    /// event: the remote-source builder waits for `BlockSequenced` or `BlockBuildingSkipped`
+    /// and nothing else would wake it, so a bare error would park it forever. The scripted
+    /// payload carries a `block_hash` unrelated to its contents and no forkchoice update is
+    /// scripted, so the failure lands before the engine is asked to adopt anything.
+    #[tokio::test]
+    async fn payload_ready_failure_emits_block_building_skipped() {
+        let database = Arc::new(setup_test_db().await);
+        let engine_client = Arc::new(ScriptedEngineClient::new());
+        engine_client.push_get_payload(ScriptedResponse::Ok(payload(SAFE + 1)));
+        let asserter = Asserter::new();
+        let (mut orchestrator, _handle, _notification_tx) = test_orchestrator(
+            database.clone(),
+            engine_client.clone(),
+            asserter,
+            BatchDerivationResult {
+                attributes: vec![],
+                batch_info: BatchInfo::new(1, B256::repeat_byte(1)),
+                skipped_l1_messages: vec![],
+                target_status: BatchStatus::Consolidated,
+            },
+        )
+        .await;
+        orchestrator.sequencer = Some(test_sequencer(database));
+
+        let event = orchestrator
+            .handle_sequencer_event(SequencerEvent::PayloadReady(PayloadId::new([7; 8])))
+            .await
+            .expect("a finalization failure ends the slot instead of surfacing as an error");
+
+        assert_eq!(event, Some(ChainOrchestratorEvent::BlockBuildingSkipped));
+        assert_eq!(engine_client.fork_choice_updated_calls(), 0);
+        assert_eq!(*orchestrator.engine.fcs().head_block_info(), info(SAFE, 0x11));
     }
 
     #[tokio::test]
@@ -1933,6 +2333,111 @@ mod run_loop_policy_tests {
 
         let _ = shutdown_tx.send(());
         assert!(run_task.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn rebuilt_payload_mismatch_terminates_run_loop() {
+        let database = Arc::new(setup_test_db().await);
+        database.insert_genesis_block(B256::ZERO).await.unwrap();
+        database.set_processed_l1_block_number(5).await.unwrap();
+        let batch_info = BatchInfo::new(1, B256::repeat_byte(1));
+        database
+            .insert_batch(BatchCommitData {
+                hash: batch_info.hash,
+                index: batch_info.index,
+                block_number: 1,
+                block_timestamp: 0,
+                calldata: Arc::new(Bytes::new()),
+                blob_versioned_hash: None,
+                finalized_block_number: None,
+                reverted_block_number: None,
+            })
+            .await
+            .unwrap();
+        database.update_batch_status(batch_info.hash, BatchStatus::Processing).await.unwrap();
+
+        // Script a full successful import after the mismatching payload, so the only thing that
+        // can stop the loop is the mismatch guard.
+        let engine_client = Arc::new(ScriptedEngineClient::new());
+        engine_client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(
+            PayloadStatusEnum::Valid,
+            Some(PayloadId::new([7; 8])),
+        )));
+        engine_client.push_get_payload(ScriptedResponse::Ok(ExecutionPayloadV1 {
+            base_fee_per_gas: U256::from(8),
+            ..payload(SAFE + 1)
+        }));
+        engine_client.push_new_payload(ScriptedResponse::Ok(PayloadStatus {
+            status: PayloadStatusEnum::Valid,
+            latest_valid_hash: None,
+        }));
+        engine_client
+            .push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Valid, None)));
+        let asserter = Asserter::new();
+        asserter.push_success(&Option::<()>::None);
+        let (mut orchestrator, _handle, notification_tx) = test_orchestrator(
+            database.clone(),
+            engine_client.clone(),
+            asserter,
+            BatchDerivationResult {
+                attributes: vec![DerivedAttributes {
+                    block_number: SAFE + 1,
+                    base_fee: U256::from(7),
+                    attributes: ScrollPayloadAttributes {
+                        transactions: Some(vec![]),
+                        ..Default::default()
+                    },
+                }],
+                batch_info,
+                skipped_l1_messages: vec![],
+                target_status: BatchStatus::Consolidated,
+            },
+        )
+        .await;
+        let mut events = orchestrator.event_listener();
+        // Later work queued behind the held batch, which must never be applied.
+        notification_tx.send(Arc::new(L1Notification::Processed(10))).await.unwrap();
+
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let run_task = tokio::spawn(orchestrator.run_until_shutdown(Box::pin(async move {
+            let _ = shutdown_rx.await;
+        })));
+        let result = time::timeout(Duration::from_secs(2), run_task)
+            .await
+            .expect("a rebuilt payload mismatch must terminate the run loop")
+            .unwrap();
+
+        assert!(
+            matches!(
+                result,
+                Err(ChainOrchestratorError::DerivedPayloadMismatch {
+                    batch_info: BatchInfo { index: 1, .. },
+                    block_number,
+                    ..
+                }) if block_number == SAFE + 1
+            ),
+            "unexpected run loop result {result:?}"
+        );
+        assert_eq!(engine_client.fork_choice_updated_calls(), 1);
+        assert_eq!(engine_client.get_payload_calls(), 1);
+        assert_eq!(engine_client.new_payload_calls(), 0);
+        assert_eq!(
+            database.get_batch_status_by_hash(batch_info.hash).await.unwrap(),
+            Some(BatchStatus::Processing),
+            "the held row must remain for restart recovery"
+        );
+        assert_eq!(database.get_l2_head_block_number().await.unwrap(), 0);
+        assert_eq!(
+            database.get_processed_l1_block_number().await.unwrap(),
+            5,
+            "work queued behind the mismatching batch must not be processed"
+        );
+        while let Some(event) = events.next().now_or_never().flatten() {
+            assert!(
+                !matches!(event, ChainOrchestratorEvent::BatchConsolidated(_)),
+                "a mismatching batch must not be reported as consolidated"
+            );
+        }
     }
 
     #[tokio::test]

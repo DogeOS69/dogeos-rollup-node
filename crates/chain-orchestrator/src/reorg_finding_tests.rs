@@ -346,8 +346,12 @@ async fn rg49_signed_block_requested_before_an_unwind_is_still_persisted_and_ann
         "the head marker jumps from the unwound head 3 to the stale block 5"
     );
     assert_eq!(database.get_signature(hash).await.unwrap(), Some(signature));
+    // The network probe forwards announcements from a separate task.
     let (announced, announced_signature) =
-        announced_rx.try_recv().expect("the stale block was announced to the network");
+        tokio::time::timeout(std::time::Duration::from_secs(5), announced_rx.recv())
+            .await
+            .expect("the network announcement should arrive")
+            .expect("the announcement channel should remain open");
     assert_eq!((announced.header.number, announced_signature), (5, signature));
 }
 

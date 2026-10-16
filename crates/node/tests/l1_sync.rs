@@ -816,6 +816,22 @@ async fn test_l1_sync_commit_batch_after_reboot() -> eyre::Result<()> {
 async fn test_l1_sync_finalize_batch_after_reboot() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
+    // Indexing only records the L1 event; finalization is applied asynchronously by the
+    // derivation pipeline. Wait for its observable result without consuming event backlog.
+    async fn wait_for_finalized_head(fixture: &TestFixture, target: u64) -> eyre::Result<u64> {
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                let finalized = fixture.get_status(0).await?.l2.fcs.finalized_block_info().number;
+                if finalized >= target {
+                    return Ok(finalized);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .map_err(|_| eyre::eyre!("Timed out waiting for finalized L2 block {target}"))?
+    }
+
     // Step 1: Setup and complete L1 sync
     let mut fixture = TestFixture::builder()
         .followers(1)
@@ -828,13 +844,18 @@ async fn test_l1_sync_finalize_batch_after_reboot() -> eyre::Result<()> {
     fixture.expect_event().l1_synced().await?;
 
     // Step 2: Send BatchCommit transactions (batches 0-6)
+    let mut batch_three_head = 0;
     for i in 0..=6 {
         let commit_batch_tx = read_test_transaction("commitBatch", i)?;
         fixture.anvil_inject_tx(commit_batch_tx).await?;
+        if i > 0 {
+            fixture.expect_event().batch_consolidated().await?;
+        }
+        if i == 3 {
+            batch_three_head = fixture.get_status(0).await?.l2.fcs.safe_block_info().number;
+        }
     }
-    for _ in 1..=6 {
-        fixture.expect_event().batch_consolidated().await?;
-    }
+    assert!(batch_three_head > 0, "Batch 3 should contain L2 blocks");
 
     let status_after_commit = fixture.get_status(0).await?;
     let safe_after_commit = status_after_commit.l2.fcs.safe_block_info().number;
@@ -849,8 +870,10 @@ async fn test_l1_sync_finalize_batch_after_reboot() -> eyre::Result<()> {
         fixture.expect_event().batch_finalize_indexed().await?;
     }
 
-    let status_before_reboot = fixture.get_status(0).await?;
-    let finalized_before_reboot = status_before_reboot.l2.fcs.finalized_block_info().number;
+    // With one slot per epoch, two additional L1 blocks finalize the last event.
+    fixture.anvil_mine_blocks(2).await?;
+    let finalized_before_reboot = wait_for_finalized_head(&fixture, batch_three_head).await?;
+    assert_eq!(finalized_before_reboot, batch_three_head);
     tracing::info!("Finalized head before reboot: {}", finalized_before_reboot);
     assert!(finalized_before_reboot > 0, "Finalized head should have advanced");
 
@@ -872,9 +895,12 @@ async fn test_l1_sync_finalize_batch_after_reboot() -> eyre::Result<()> {
     fixture.l1().sync().await?;
     fixture.expect_event().l1_synced().await?;
 
-    // Step 6: Verify finalized head continues to advance
-    let status_after_reboot = fixture.get_status(0).await?;
-    let finalized_after_reboot = status_after_reboot.l2.fcs.finalized_block_info().number;
+    // Finalize the newly indexed events after the restarted watcher has caught up.
+    fixture.anvil_mine_blocks(2).await?;
+
+    // Step 7: Verify finalized head continues to advance
+    let finalized_after_reboot = wait_for_finalized_head(&fixture, safe_after_commit).await?;
+    assert_eq!(finalized_after_reboot, safe_after_commit);
     tracing::info!("Finalized head after reboot: {}", finalized_after_reboot);
     assert!(
         finalized_after_reboot > finalized_before_reboot,

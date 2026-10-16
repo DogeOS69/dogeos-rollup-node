@@ -423,12 +423,30 @@ impl<
                 }
             }
             SequencerEvent::PayloadReady(payload_id) => {
-                let block = self
+                let block = match self
                     .sequencer
                     .as_mut()
                     .expect("sequencer must be present")
                     .finalize_payload_building(payload_id, &mut self.engine)
-                    .await?;
+                    .await
+                {
+                    Ok(block) => block,
+                    Err(err) => {
+                        // Terminal for this slot: the sequencer commits, signs and
+                        // announces nothing on failure, so there is no block to wait
+                        // for. Emit the skipped event instead of a bare error because
+                        // the remote-source builder waits for `BlockSequenced` or
+                        // `BlockBuildingSkipped` and nothing else would wake it.
+                        self.metric_handler.finish_block_building_recording(None);
+                        tracing::error!(
+                            target: "scroll::chain_orchestrator",
+                            ?payload_id,
+                            source = %err,
+                            "Failed to finalize the built payload; skipping the slot"
+                        );
+                        return Ok(Some(ChainOrchestratorEvent::BlockBuildingSkipped));
+                    }
+                };
 
                 self.metric_handler.finish_block_building_recording(block.as_ref());
 
@@ -1717,10 +1735,12 @@ mod run_loop_policy_tests {
     use dogeos_chainspec::{DogeosChainSpec, DOGEOS_DEV};
     use dogeos_reth_consensus::DogeosConsensus;
     use dogeos_reth_engine::ScrollPayloadAttributes;
+    use futures::FutureExt;
     use reth_network_api::noop::NoopNetwork;
     use reth_network_p2p::NoopFullBlockClient;
     use rollup_node_primitives::BatchCommitData;
     use rollup_node_providers::{test_utils::MockL1Provider, ScrollRootProvider};
+    use rollup_node_sequencer::{L1MessageInclusionMode, PayloadBuildingConfig, SequencerConfig};
     use scroll_db::test_utils::setup_test_db;
     use scroll_derivation_pipeline::{BatchDerivationResult, DerivedAttributes};
     use scroll_engine::{
@@ -1943,6 +1963,26 @@ mod run_loop_policy_tests {
         );
     }
 
+    /// A sequencer over the test database, driven by hand (no automatic slots).
+    fn test_sequencer(database: Arc<Database>) -> Sequencer<TestL1Provider, DogeosChainSpec> {
+        Sequencer::new(
+            Arc::new(MockL1Provider { db: database, blobs: Default::default() }),
+            SequencerConfig {
+                chain_spec: DOGEOS_DEV.clone(),
+                fee_recipient: Address::ZERO,
+                auto_start: false,
+                payload_building_config: PayloadBuildingConfig {
+                    block_gas_limit: 30_000_000,
+                    max_l1_messages_per_block: 4,
+                    l1_message_inclusion_mode: L1MessageInclusionMode::default(),
+                },
+                block_time: 1_000,
+                payload_building_duration: 0,
+                allow_empty_blocks: true,
+            },
+        )
+    }
+
     #[test]
     fn l1_notification_receiver_requires_synced_idle_derivation() {
         for (l2_synced, pipeline_empty, can_accept_batch, expected) in [
@@ -1994,6 +2034,41 @@ mod run_loop_policy_tests {
                 "block_number={block_number}, result={result:?}"
             );
         }
+    }
+
+    /// A payload the sequencer refuses to finalize must still end the slot with a terminal
+    /// event: the remote-source builder waits for `BlockSequenced` or `BlockBuildingSkipped`
+    /// and nothing else would wake it, so a bare error would park it forever. The scripted
+    /// payload carries a `block_hash` unrelated to its contents and no forkchoice update is
+    /// scripted, so the failure lands before the engine is asked to adopt anything.
+    #[tokio::test]
+    async fn payload_ready_failure_emits_block_building_skipped() {
+        let database = Arc::new(setup_test_db().await);
+        let engine_client = Arc::new(ScriptedEngineClient::new());
+        engine_client.push_get_payload(ScriptedResponse::Ok(payload(SAFE + 1)));
+        let asserter = Asserter::new();
+        let (mut orchestrator, _handle, _notification_tx) = test_orchestrator(
+            database.clone(),
+            engine_client.clone(),
+            asserter,
+            BatchDerivationResult {
+                attributes: vec![],
+                batch_info: BatchInfo::new(1, B256::repeat_byte(1)),
+                skipped_l1_messages: vec![],
+                target_status: BatchStatus::Consolidated,
+            },
+        )
+        .await;
+        orchestrator.sequencer = Some(test_sequencer(database));
+
+        let event = orchestrator
+            .handle_sequencer_event(SequencerEvent::PayloadReady(PayloadId::new([7; 8])))
+            .await
+            .expect("a finalization failure ends the slot instead of surfacing as an error");
+
+        assert_eq!(event, Some(ChainOrchestratorEvent::BlockBuildingSkipped));
+        assert_eq!(engine_client.fork_choice_updated_calls(), 0);
+        assert_eq!(*orchestrator.engine.fcs().head_block_info(), info(SAFE, 0x11));
     }
 
     #[tokio::test]
@@ -2224,6 +2299,111 @@ mod run_loop_policy_tests {
 
         let _ = shutdown_tx.send(());
         assert!(run_task.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn rebuilt_payload_mismatch_terminates_run_loop() {
+        let database = Arc::new(setup_test_db().await);
+        database.insert_genesis_block(B256::ZERO).await.unwrap();
+        database.set_processed_l1_block_number(5).await.unwrap();
+        let batch_info = BatchInfo::new(1, B256::repeat_byte(1));
+        database
+            .insert_batch(BatchCommitData {
+                hash: batch_info.hash,
+                index: batch_info.index,
+                block_number: 1,
+                block_timestamp: 0,
+                calldata: Arc::new(Bytes::new()),
+                blob_versioned_hash: None,
+                finalized_block_number: None,
+                reverted_block_number: None,
+            })
+            .await
+            .unwrap();
+        database.update_batch_status(batch_info.hash, BatchStatus::Processing).await.unwrap();
+
+        // Script a full successful import after the mismatching payload, so the only thing that
+        // can stop the loop is the mismatch guard.
+        let engine_client = Arc::new(ScriptedEngineClient::new());
+        engine_client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(
+            PayloadStatusEnum::Valid,
+            Some(PayloadId::new([7; 8])),
+        )));
+        engine_client.push_get_payload(ScriptedResponse::Ok(ExecutionPayloadV1 {
+            base_fee_per_gas: U256::from(8),
+            ..payload(SAFE + 1)
+        }));
+        engine_client.push_new_payload(ScriptedResponse::Ok(PayloadStatus {
+            status: PayloadStatusEnum::Valid,
+            latest_valid_hash: None,
+        }));
+        engine_client
+            .push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Valid, None)));
+        let asserter = Asserter::new();
+        asserter.push_success(&Option::<()>::None);
+        let (mut orchestrator, _handle, notification_tx) = test_orchestrator(
+            database.clone(),
+            engine_client.clone(),
+            asserter,
+            BatchDerivationResult {
+                attributes: vec![DerivedAttributes {
+                    block_number: SAFE + 1,
+                    base_fee: U256::from(7),
+                    attributes: ScrollPayloadAttributes {
+                        transactions: Some(vec![]),
+                        ..Default::default()
+                    },
+                }],
+                batch_info,
+                skipped_l1_messages: vec![],
+                target_status: BatchStatus::Consolidated,
+            },
+        )
+        .await;
+        let mut events = orchestrator.event_listener();
+        // Later work queued behind the held batch, which must never be applied.
+        notification_tx.send(Arc::new(L1Notification::Processed(10))).await.unwrap();
+
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let run_task = tokio::spawn(orchestrator.run_until_shutdown(Box::pin(async move {
+            let _ = shutdown_rx.await;
+        })));
+        let result = time::timeout(Duration::from_secs(2), run_task)
+            .await
+            .expect("a rebuilt payload mismatch must terminate the run loop")
+            .unwrap();
+
+        assert!(
+            matches!(
+                result,
+                Err(ChainOrchestratorError::DerivedPayloadMismatch {
+                    batch_info: BatchInfo { index: 1, .. },
+                    block_number,
+                    ..
+                }) if block_number == SAFE + 1
+            ),
+            "unexpected run loop result {result:?}"
+        );
+        assert_eq!(engine_client.fork_choice_updated_calls(), 1);
+        assert_eq!(engine_client.get_payload_calls(), 1);
+        assert_eq!(engine_client.new_payload_calls(), 0);
+        assert_eq!(
+            database.get_batch_status_by_hash(batch_info.hash).await.unwrap(),
+            Some(BatchStatus::Processing),
+            "the held row must remain for restart recovery"
+        );
+        assert_eq!(database.get_l2_head_block_number().await.unwrap(), 0);
+        assert_eq!(
+            database.get_processed_l1_block_number().await.unwrap(),
+            5,
+            "work queued behind the mismatching batch must not be processed"
+        );
+        while let Some(event) = events.next().now_or_never().flatten() {
+            assert!(
+                !matches!(event, ChainOrchestratorEvent::BatchConsolidated(_)),
+                "a mismatching batch must not be reported as consolidated"
+            );
+        }
     }
 
     #[tokio::test]

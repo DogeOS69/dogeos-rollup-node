@@ -90,8 +90,9 @@ pub enum ChainOrchestratorEvent {
     L2ConsolidatedBlockCommitted(L2BlockInfoWithL1Messages),
     /// A new block has been sequenced by the sequencer.
     BlockSequenced(DogeosBlock),
-    /// Block building was skipped because the built payload was empty and empty blocks are
-    /// disabled.
+    /// Block building ended without a block: the built payload was empty and empty blocks are
+    /// disabled, or finalizing the payload failed before the orchestrator accepted it for signing
+    /// or announcement (the orchestrator logs the failure).
     BlockBuildingSkipped,
     /// A new block has been signed by the signer.
     SignedBlock {

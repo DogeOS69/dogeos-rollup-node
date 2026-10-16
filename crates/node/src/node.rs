@@ -103,13 +103,17 @@ where
 
         ComponentsBuilder::default()
             .node_types::<N>()
-            .pool(DogeosPoolBuilder::default())
+            .pool(
+                DogeosPoolBuilder::default()
+                    .with_code_witness_config(self.config.code_witness.validation_config()),
+            )
             .executor(DogeosExecutorBuilder::default())
             .payload(BasicPayloadServiceBuilder::new(DogeosPayloadBuilderBuilder {
                 payload_building_time_limit: Duration::from_millis(
                     self.config.sequencer_args.payload_building_duration,
                 ),
                 block_da_size_limit: Some(constants::DEFAULT_PAYLOAD_SIZE_LIMIT),
+                max_code_witness_bytes: self.config.code_witness.max_code_witness_bytes,
             }))
             .network(network_builder)
             .consensus(DogeosConsensusBuilder)

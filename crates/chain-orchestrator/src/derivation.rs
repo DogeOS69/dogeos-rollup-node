@@ -434,6 +434,28 @@ where
                     .get_payload(payload_id)
                     .await
                     .map_err(engine_request_failure(batch_info, GET_PAYLOAD_METHOD))?;
+                let mismatch = if payload.base_fee_per_gas != attributes.base_fee {
+                    Some(format!(
+                        "base fee: expected {}, got {}",
+                        attributes.base_fee, payload.base_fee_per_gas
+                    ))
+                } else if attributes.attributes.transactions.as_ref() != Some(&payload.transactions)
+                {
+                    Some("transaction list differs from derived batch transactions".to_owned())
+                } else {
+                    None
+                };
+                if let Some(reason) = mismatch {
+                    return Err(AttemptFailure::fatal(
+                        GET_PAYLOAD_METHOD,
+                        "PAYLOAD_MISMATCH",
+                        ChainOrchestratorError::DerivedPayloadMismatch {
+                            batch_info,
+                            block_number: attributes.block_number,
+                            reason,
+                        },
+                    ));
+                }
                 let block_info: L2BlockInfoWithL1Messages =
                     (&payload).try_into().map_err(|error| {
                         AttemptFailure::fatal(
@@ -678,7 +700,11 @@ mod tests {
         BatchDerivationResult {
             attributes: vec![DerivedAttributes {
                 block_number: SAFE + 1,
-                attributes: ScrollPayloadAttributes::default(),
+                base_fee: U256::ZERO,
+                attributes: ScrollPayloadAttributes {
+                    transactions: Some(vec![]),
+                    ..Default::default()
+                },
             }],
             batch_info: BatchInfo::new(index, B256::repeat_byte(index as u8)),
             skipped_l1_messages: vec![],

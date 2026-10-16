@@ -1829,7 +1829,11 @@ mod run_loop_policy_tests {
             BatchDerivationResult {
                 attributes: vec![DerivedAttributes {
                     block_number: SAFE + 1,
-                    attributes: ScrollPayloadAttributes::default(),
+                    base_fee: U256::ZERO,
+                    attributes: ScrollPayloadAttributes {
+                        transactions: Some(vec![]),
+                        ..Default::default()
+                    },
                 }],
                 batch_info,
                 skipped_l1_messages: vec![],
@@ -1931,7 +1935,11 @@ mod run_loop_policy_tests {
             BatchDerivationResult {
                 attributes: vec![DerivedAttributes {
                     block_number: SAFE + 1,
-                    attributes: ScrollPayloadAttributes::default(),
+                    base_fee: U256::ZERO,
+                    attributes: ScrollPayloadAttributes {
+                        transactions: Some(vec![]),
+                        ..Default::default()
+                    },
                 }],
                 batch_info,
                 skipped_l1_messages: vec![],
@@ -2039,7 +2047,11 @@ mod run_loop_policy_tests {
             BatchDerivationResult {
                 attributes: vec![DerivedAttributes {
                     block_number: SAFE + 1,
-                    attributes: ScrollPayloadAttributes::default(),
+                    base_fee: U256::ZERO,
+                    attributes: ScrollPayloadAttributes {
+                        transactions: Some(vec![]),
+                        ..Default::default()
+                    },
                 }],
                 batch_info,
                 skipped_l1_messages: vec![],
@@ -2083,3 +2095,6 @@ mod run_loop_policy_tests {
         assert!(database.get_batch_by_index(2).await.unwrap().is_none());
     }
 }
+
+#[cfg(test)]
+mod reorg_finding_tests;

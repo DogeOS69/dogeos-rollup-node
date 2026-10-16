@@ -921,6 +921,9 @@ pub struct SignerArgs {
 /// The arguments for the rpc.
 #[derive(Debug, Default, Clone, clap::Args)]
 pub struct RpcArgs {
+    /// Enable the experimental bounded parent-state proof RPC on Eth-enabled transports.
+    #[arg(long = "rpc.experimental-multiproof")]
+    pub experimental_multiproof: bool,
     /// A boolean to represent if the rollup node basic rpc should be enabled.
     #[arg(long = "rpc.rollup-node", default_value_t = true, action = ArgAction::Set, help = "Enable the rollup node basic RPC namespace(default: true)")]
     pub basic_enabled: bool,
@@ -1089,6 +1092,32 @@ mod tests {
     struct ConsensusCli {
         #[command(flatten)]
         consensus: ConsensusArgs,
+    }
+
+    #[derive(Debug, clap::Parser)]
+    struct RpcTestCli {
+        #[command(flatten)]
+        rpc: RpcArgs,
+    }
+
+    #[test]
+    fn experimental_multiproof_requires_explicit_opt_in() {
+        use clap::Parser;
+
+        assert!(!RpcArgs::default().experimental_multiproof);
+        let defaults = RpcTestCli::try_parse_from(["node"]).unwrap();
+        assert!(!defaults.rpc.experimental_multiproof);
+        let admin = RpcTestCli::try_parse_from(["node", "--rpc.rollup-node-admin"]).unwrap();
+        assert!(!admin.rpc.experimental_multiproof);
+        let enabled = RpcTestCli::try_parse_from([
+            "node",
+            "--rpc.experimental-multiproof",
+            "--rpc.rollup-node=false",
+        ])
+        .unwrap();
+        assert!(enabled.rpc.experimental_multiproof);
+        assert!(!enabled.rpc.basic_enabled);
+        assert!(!enabled.rpc.admin_enabled);
     }
 
     fn rotation_watchdog_config() -> ScrollRollupNodeConfig {

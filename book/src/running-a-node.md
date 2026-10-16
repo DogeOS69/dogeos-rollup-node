@@ -165,6 +165,76 @@ These can be used as reliable blob sources without requiring your own beacon nod
 - `--rpc.rollup-node=false`: Disable the rollup node basic RPC namespace(default: enabled) (provides rollup-specific methods)
 - `--rpc.rollup-node-admin`: Enable the rollup node admin RPC namespace (provides rollup-specific methods)
 
+#### Experimental Parent-State Multiproof RPC
+
+`--rpc.experimental-multiproof` enables `dogeos_getProofs` on transports whose API
+selection includes `eth`. It defaults off and is independent of the rollup basic
+and admin flags. For a local HTTP experiment, add
+`--http --http.addr 127.0.0.1 --http.api eth,debug --rpc.experimental-multiproof`
+to the node's normal chain and data-directory arguments. Set
+`--rpc.eth-proof-window` to cover the retained parent states you intend to query;
+its default of zero permits only the latest state. The local fixtures use 16.
+The method is never
+automatically added to the authenticated Engine endpoint. Removing the flag
+disables it after restart.
+
+The method accepts one object parameter:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "dogeos_getProofs",
+  "params": [{
+    "blockHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+    "targets": [{
+      "address": "0x5300000000000000000000000000000000000002",
+      "storageKeys": ["0x0000000000000000000000000000000000000000000000000000000000000009"]
+    }]
+  }]
+}
+```
+
+Replace the example hash with a retained canonical block hash. It selects that
+block's **post-state**; a block materializer passes its parent hash. The result is
+an array of ordinary EIP-1186 proofs in target order, with storage proofs in key
+order. Tags, block numbers, empty target lists, duplicate accounts and duplicate
+keys are rejected. Zero-key targets are supported, including accounts with
+nonempty storage.
+
+The initial limits are four accounts, four keys per account, eight keys total,
+64 KiB raw JSON params before typed deserialization, and a 4 MiB serialized
+response. Existing global transport limits still apply. Two jobs share admission
+across transports, with fail-fast overload handling; they also use the ordinary
+proof guard and history window. The shared-guard wait is at most one second and
+the RPC deadline is 30 seconds. Cancellation does not preempt synchronous proof
+work: the actual worker retains its permits until it exits. The response cap
+bounds output, not intermediate historical reconstruction memory.
+
+Only method-not-found (`-32601`) permits a compatible client to fall back to
+individual `eth_getProof` calls. Invalid params (`-32602`), resource errors
+(`-32005` with `data.kind`), historical-state errors and invalid proofs must remain
+explicit failures. The node checks canonicality at resolution; clients still
+authenticate returned proofs against their expected parent header's state root.
+
+The local integration target is `cargo test -p rollup-node --test multiproof`.
+It includes real-node transport checks, exact proof comparisons and a Tsuki
+fixture. The ignored `serve_multiproof_fixture` and
+`serve_tsuki_multiproof_fixture` tests expose temporary local nodes for external
+comparisons. Set `MULTIPROOF_FIXTURE_DIR` to a fresh directory and run the selected
+test with `-- --ignored --exact <test-name> --nocapture`. It writes `manifest.json`
+and the matching `genesis.json`; create a `stop` file in that directory to finish
+early, otherwise it stops after 15 minutes. The Tsuki fixture enables `debug`
+for real execution witnesses. Core artifact equality and performance require
+separate comparisons against this running node.
+
+The manifest and lockfile pin the published compact dependency family containing
+the multiproof adapter. Build and test with `--locked`; no local path overrides
+are needed. When using shared build resources, use the orchestrator's build-lock
+wrapper. The
+fixed image in the existing compose example does not contain these source edits;
+use the experiment binary with a fresh temporary data directory.
+
 ### Example Configurations
 
 #### Scroll Mainnet Follower

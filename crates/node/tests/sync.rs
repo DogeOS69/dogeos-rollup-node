@@ -38,6 +38,7 @@ async fn test_should_consolidate_to_block_15k() -> eyre::Result<()> {
     };
 
     let node_config = ScrollRollupNodeConfig {
+        code_witness: Default::default(),
         test_args: TestArgs { test: false, skip_l1_synced: false },
         network_args: RollupNodeNetworkArgs {
             enable_eth_scroll_wire_bridge: false,
@@ -542,6 +543,7 @@ async fn test_chain_orchestrator_l1_reorg() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
     let node_config = default_test_scroll_rollup_node_config();
     let sequencer_node_config = ScrollRollupNodeConfig {
+        code_witness: Default::default(),
         test_args: TestArgs { test: true, skip_l1_synced: false },
         network_args: RollupNodeNetworkArgs {
             enable_eth_scroll_wire_bridge: false,

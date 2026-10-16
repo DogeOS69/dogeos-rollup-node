@@ -19,6 +19,7 @@ use clap::ArgAction;
 use dogeos_chainspec::{ChainConfig, DogeosChainSpec, ScrollChainConfig, SCROLL_FEE_VAULT_ADDRESS};
 use dogeos_hardforks::DogeosHardforks;
 use dogeos_reth_consensus::DogeosConsensus;
+use dogeos_reth_node::CodeWitnessArgs;
 use dogeos_rpc_types::Scroll;
 use reth_chainspec::EthChainSpec;
 use reth_network::NetworkProtocols;
@@ -69,6 +70,9 @@ pub struct TestArgs {
 /// A struct that represents the arguments for the rollup node.
 #[derive(Debug, Clone, clap::Args)]
 pub struct ScrollRollupNodeConfig {
+    /// Code witness limits shared by transaction admission and payload building.
+    #[command(flatten)]
+    pub code_witness: CodeWitnessArgs,
     /// Test-related arguments
     #[command(flatten)]
     pub test_args: TestArgs,
@@ -1354,8 +1358,44 @@ mod tests {
         consensus: ConsensusArgs,
     }
 
+    #[derive(Debug, Parser)]
+    struct RollupCli {
+        #[command(flatten)]
+        config: ScrollRollupNodeConfig,
+    }
+
+    #[test]
+    fn shared_code_witness_arguments_parse_in_rollup_node() {
+        let cli = RollupCli::try_parse_from([
+            "rollup-node",
+            "--scroll.max-code-witness-bytes",
+            "4096",
+            "--txpool.code-witness-max-steps",
+            "2000",
+            "--txpool.code-witness-max-inflight",
+            "16",
+        ])
+        .unwrap();
+        let config = cli.config.code_witness.validation_config();
+        assert_eq!(config.max_code_witness_bytes, 4096);
+        assert_eq!(config.max_steps, 2000);
+        assert_eq!(config.max_inflight, 16);
+    }
+
+    #[test]
+    fn shared_code_witness_arguments_reject_zero() {
+        for flag in [
+            "--scroll.max-code-witness-bytes",
+            "--txpool.code-witness-max-steps",
+            "--txpool.code-witness-max-inflight",
+        ] {
+            assert!(RollupCli::try_parse_from(["rollup-node", flag, "0"]).is_err());
+        }
+    }
+
     fn rotation_watchdog_config() -> ScrollRollupNodeConfig {
         ScrollRollupNodeConfig {
+            code_witness: Default::default(),
             test_args: TestArgs::default(),
             consensus_args: ConsensusArgs {
                 algorithm: ConsensusAlgorithm::SystemContract,
@@ -1729,6 +1769,7 @@ mod tests {
     #[test]
     fn test_validate_sequencer_enabled_without_any_signer_fails() {
         let config = ScrollRollupNodeConfig {
+            code_witness: Default::default(),
             test_args: TestArgs::default(),
             sequencer_args: SequencerArgs { sequencer_enabled: true, ..Default::default() },
             signer_args: SignerArgs { key_file: None, aws_kms_key_id: None, private_key: None },
@@ -1762,6 +1803,7 @@ mod tests {
     #[test]
     fn test_validate_remote_source_enabled_without_url_fails() {
         let config = ScrollRollupNodeConfig {
+            code_witness: Default::default(),
             test_args: TestArgs::default(),
             sequencer_args: SequencerArgs::default(),
             signer_args: SignerArgs::default(),
@@ -1795,6 +1837,7 @@ mod tests {
     #[test]
     fn test_validate_sequencer_enabled_with_both_signers_fails() {
         let config = ScrollRollupNodeConfig {
+            code_witness: Default::default(),
             test_args: TestArgs::default(),
             sequencer_args: SequencerArgs { sequencer_enabled: true, ..Default::default() },
             signer_args: SignerArgs {
@@ -1829,6 +1872,7 @@ mod tests {
     #[test]
     fn test_validate_sequencer_enabled_with_key_file_succeeds() {
         let config = ScrollRollupNodeConfig {
+            code_witness: Default::default(),
             test_args: TestArgs::default(),
             sequencer_args: SequencerArgs { sequencer_enabled: true, ..Default::default() },
             signer_args: SignerArgs {
@@ -1857,6 +1901,7 @@ mod tests {
     #[test]
     fn test_validate_sequencer_enabled_with_aws_kms_succeeds() {
         let config = ScrollRollupNodeConfig {
+            code_witness: Default::default(),
             test_args: TestArgs::default(),
             sequencer_args: SequencerArgs { sequencer_enabled: true, ..Default::default() },
             signer_args: SignerArgs {
@@ -1885,6 +1930,7 @@ mod tests {
     #[test]
     fn test_validate_sequencer_disabled_without_any_signer_succeeds() {
         let config = ScrollRollupNodeConfig {
+            code_witness: Default::default(),
             test_args: TestArgs::default(),
             sequencer_args: SequencerArgs { sequencer_enabled: false, ..Default::default() },
             signer_args: SignerArgs { key_file: None, aws_kms_key_id: None, private_key: None },

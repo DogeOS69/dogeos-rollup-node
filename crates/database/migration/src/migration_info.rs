@@ -81,3 +81,18 @@ impl MigrationInfo for ScrollSepoliaMigrationInfo {
         DOGEOS_CHIKYU_GENESIS_HASH
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dogeos_chainspec::DOGEOS_CHIKYU;
+    use reth_chainspec::EthChainSpec;
+
+    #[test]
+    fn chikyu_migration_uses_the_computed_network_genesis() {
+        let expected = b256!("f9f7c524dce38b51a4d28ec2f18680773e5ba9d3f5f430d0e05f92cfeb65b1bc");
+        assert_eq!(ScrollSepoliaMigrationInfo::genesis_hash(), expected);
+        assert_eq!(DOGEOS_CHIKYU.genesis_hash(), expected);
+        assert_eq!(DOGEOS_CHIKYU.genesis_header().hash_slow(), expected);
+    }
+}

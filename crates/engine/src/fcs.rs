@@ -178,15 +178,33 @@ pub fn genesis_hash_from_chain_spec<CS: EthChainSpec<Header: BlockHeader>>(
     match chain_spec.chain().named() {
         Some(NamedChain::Scroll) => Some(DOGEOS_MAINNET_GENESIS_HASH),
         Some(NamedChain::ScrollSepolia) => Some(DOGEOS_CHIKYU_GENESIS_HASH),
-        // `genesis_hash()` returns the SEALED hash when the spec carries one and
-        // recomputes only otherwise. `genesis_header().hash_slow()` always
-        // recomputes, and the two differ: chikyu's genesis document is
-        // byte-identical to mainnet's in every field the header is built from,
-        // so recomputing yields MAINNET's genesis hash for chikyu. Using it
-        // made the database, the forkchoice fallback and the EL disagree on
-        // chikyu's block 0 — a fresh node diverged at the first finalized
-        // notification and an existing one failed startup outright.
+        // Use the chain spec's identity for both built-in DogeOS networks and custom genesis
+        // files. Built-in Chikyu now computes this hash from the same network document as the
+        // custom-file path, so the execution layer and forkchoice fallback agree on block 0.
         Some(NamedChain::Dev) | None => Some(chain_spec.genesis_hash()),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_primitives::b256;
+    use dogeos_chainspec::{DogeosChainSpec, DOGEOS_CHIKYU};
+    use std::sync::Arc;
+
+    #[test]
+    fn chikyu_forkchoice_matches_the_network_genesis() {
+        let expected = b256!("f9f7c524dce38b51a4d28ec2f18680773e5ba9d3f5f430d0e05f92cfeb65b1bc");
+        let custom =
+            Arc::new(DogeosChainSpec::from_custom_genesis(DOGEOS_CHIKYU.genesis().clone()));
+        for spec in [DOGEOS_CHIKYU.clone(), custom] {
+            assert_eq!(spec.genesis_header().hash_slow(), expected);
+            assert_eq!(genesis_hash_from_chain_spec(spec.clone()), Some(expected));
+            assert_eq!(
+                ForkchoiceState::head_from_chain_spec(spec),
+                Some(ForkchoiceState::from_genesis(expected))
+            );
+        }
     }
 }

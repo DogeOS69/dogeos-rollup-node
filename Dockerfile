@@ -1,7 +1,8 @@
 FROM rust:1.93-bookworm AS chef
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates=20250419~deb12u2 \
+    ca-certificates \
+    && dpkg --compare-versions "$(dpkg-query -W -f='${Version}' ca-certificates)" ge 20250419~deb12u2 \
     && rm -rf /var/lib/apt/lists/*
 
 ARG CARGO_FEATURES=""
@@ -53,7 +54,8 @@ RUN --mount=target=. \
 
 FROM debian:bookworm-slim
 
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates=20250419~deb12u2 curl sqlite3 && \
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl sqlite3 && \
+    dpkg --compare-versions "$(dpkg-query -W -f='${Version}' ca-certificates)" ge 20250419~deb12u2 && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

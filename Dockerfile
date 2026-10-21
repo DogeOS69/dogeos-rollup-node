@@ -1,5 +1,9 @@
 FROM rust:1.93-bookworm AS chef
 
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates=20250419~deb12u2 \
+    && rm -rf /var/lib/apt/lists/*
+
 ARG CARGO_FEATURES=""
 ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
 
@@ -49,7 +53,7 @@ RUN --mount=target=. \
 
 FROM debian:bookworm-slim
 
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl sqlite3 && \
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates=20250419~deb12u2 curl sqlite3 && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

@@ -743,7 +743,8 @@ mod tests {
             gas_used: 0,
             timestamp: 0,
             extra_data: Bytes::new(),
-            base_fee_per_gas: U256::ZERO,
+            // What `batch()` derives, so a rebuilt payload matches unless a test says otherwise.
+            base_fee_per_gas: U256::from(DERIVED_BASE_FEE),
             block_hash: B256::repeat_byte(0x22),
             transactions: vec![],
         }
@@ -758,7 +759,7 @@ mod tests {
         BatchDerivationResult {
             attributes: vec![DerivedAttributes {
                 block_number: SAFE + 1,
-                base_fee: U256::ZERO,
+                base_fee: U256::from(DERIVED_BASE_FEE),
                 attributes: ScrollPayloadAttributes {
                     transactions: Some(vec![]),
                     ..Default::default()
@@ -951,7 +952,7 @@ mod tests {
             timestamp: 1_700_000_001,
             gas_limit: 30_000_000,
             difficulty: U256::ONE,
-            base_fee_per_gas: Some(0),
+            base_fee_per_gas: Some(DERIVED_BASE_FEE),
             ..Default::default()
         };
         let rebuilt_header =

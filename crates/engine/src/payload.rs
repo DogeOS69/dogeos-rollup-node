@@ -222,35 +222,43 @@ mod tests {
         }
     }
 
+    /// The transaction lists differ, so the block is not the one the batch describes. Split
+    /// from the timestamp case below: with the base fee compared too, a single test that got
+    /// everything wrong at once would no longer say which comparison caught it.
     #[test]
-    fn test_mismatched_payloads() -> eyre::Result<()> {
+    fn test_transaction_mismatch() -> eyre::Result<()> {
         let mut bytes = [0u8; 1024];
         generators::rng().fill(bytes.as_mut_slice());
         let mut unstructured = Unstructured::new(&bytes);
 
-        let parent_hash = B256::arbitrary(&mut unstructured)?;
-        let transactions = Vec::<ScrollTxEnvelope>::arbitrary(&mut unstructured)?;
-        let prev_randao = B256::arbitrary(&mut unstructured)?;
-        let timestamp = u64::arbitrary(&mut unstructured)?;
-        let difficulty = U256::arbitrary(&mut unstructured)?;
-        let extra_data = Bytes::arbitrary(&mut unstructured)?;
+        let transactions = vec![ScrollTxEnvelope::arbitrary(&mut unstructured)?];
 
-        let attributes = ScrollPayloadAttributes::default();
+        // Everything else agrees: the attributes carry no transactions, the block carries some.
+        let attributes =
+            ScrollPayloadAttributes { transactions: Some(vec![]), ..Default::default() };
         let block = DogeosBlock {
-            header: Header {
-                parent_hash,
-                timestamp,
-                difficulty,
-                extra_data,
-                mix_hash: prev_randao,
-                ..Default::default()
-            },
+            header: Header { base_fee_per_gas: Some(0), ..Default::default() },
             body: alloy_consensus::BlockBody { transactions, ..Default::default() },
         };
 
         assert!(!block_matches_attributes(&attributes, U256::ZERO, &block));
-
         Ok(())
+    }
+
+    #[test]
+    fn test_timestamp_mismatch() {
+        let attributes = ScrollPayloadAttributes {
+            payload_attributes: PayloadAttributes { timestamp: 1, ..Default::default() },
+            transactions: Some(vec![]),
+            ..Default::default()
+        };
+        let block = |timestamp| DogeosBlock {
+            header: Header { timestamp, base_fee_per_gas: Some(0), ..Default::default() },
+            body: Default::default(),
+        };
+
+        assert!(block_matches_attributes(&attributes, U256::ZERO, &block(1)));
+        assert!(!block_matches_attributes(&attributes, U256::ZERO, &block(2)));
     }
 
     /// A block that agrees with the batch in every other respect, but not on the base fee, is
@@ -276,6 +284,17 @@ mod tests {
                 !block_matches_attributes(&attributes, base_fee, &block(wrong)),
                 "base_fee_per_gas={wrong:?} was treated as a match"
             );
+
+            // A batch whose decoded base fee does not fit in a header's `u64` cannot match any
+            // block. The comparison is in `U256`, so it says so rather than truncating; whether
+            // such a batch should be rejected as malformed earlier, at decode time, is a separate
+            // question from this predicate.
+            for out_of_range in [U256::from(u64::MAX) + U256::from(1), U256::MAX] {
+                assert!(
+                    !block_matches_attributes(&attributes, out_of_range, &block(Some(u64::MAX))),
+                    "an out-of-range batch base fee {out_of_range} was treated as a match"
+                );
+            }
         }
     }
 }

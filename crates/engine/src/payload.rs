@@ -1,4 +1,4 @@
-use alloy_primitives::B64;
+use alloy_primitives::{B64, U256};
 use dogeos_reth_engine::ScrollPayloadAttributes;
 use reth_primitives_traits::{AlloyBlockHeader, Block, BlockBody};
 
@@ -10,8 +10,28 @@ use tracing::debug;
 ///    - gas limits are equal when the attributes specify a gas limit.
 ///    - `prev_randaos` are equal.
 ///    - `block_data_hint` matches the block data if present.
-pub fn block_matches_attributes<B: Block>(attributes: &ScrollPayloadAttributes, block: &B) -> bool {
+///    - the base fee equals `base_fee`, the value the batch recorded for this block.
+///
+/// `base_fee` is carried next to the attributes rather than inside them, because the Engine API
+/// does not take a base fee: the payload builder derives it from the parent and the system
+/// config. A follower whose block disagrees with the batch must reorg to the DA version, so a
+/// base-fee difference is a mismatch like any other.
+pub fn block_matches_attributes<B: Block>(
+    attributes: &ScrollPayloadAttributes,
+    base_fee: U256,
+    block: &B,
+) -> bool {
     let header = block.header();
+
+    if header.base_fee_per_gas().map(U256::from) != Some(base_fee) {
+        debug!(
+            target: "scroll::engine::driver",
+            expected = ?base_fee,
+            got = ?header.base_fee_per_gas(),
+            "reorg: mismatch in base_fee"
+        );
+        return false;
+    }
 
     if attributes.gas_limit.is_some_and(|gas_limit| gas_limit != header.gas_limit()) {
         debug!(
@@ -129,6 +149,7 @@ mod tests {
             .collect::<Vec<Bytes>>();
         let prev_randao = B256::arbitrary(&mut unstructured)?;
         let timestamp = u64::arbitrary(&mut unstructured)?;
+        let base_fee = u64::arbitrary(&mut unstructured)?;
         let block_data_hint = BlockDataHint::default();
 
         let attributes = ScrollPayloadAttributes {
@@ -148,12 +169,13 @@ mod tests {
                 extra_data: block_data_hint.extra_data.unwrap_or_default(),
                 state_root: block_data_hint.state_root.unwrap_or_default(),
                 mix_hash: prev_randao,
+                base_fee_per_gas: Some(base_fee),
                 ..Default::default()
             },
             body: alloy_consensus::BlockBody { transactions, ..Default::default() },
         };
 
-        assert!(block_matches_attributes(&attributes, &block));
+        assert!(block_matches_attributes(&attributes, U256::from(base_fee), &block));
 
         Ok(())
     }
@@ -161,8 +183,14 @@ mod tests {
     #[test]
     fn test_payload_gas_limit_equivalence() {
         let gas_limit = 30_000_000;
+        let base_fee = U256::from(1_015_680_000u64);
         let block = DogeosBlock {
-            header: Header { gas_limit, timestamp: 1_700_000_001, ..Default::default() },
+            header: Header {
+                gas_limit,
+                timestamp: 1_700_000_001,
+                base_fee_per_gas: Some(base_fee.to()),
+                ..Default::default()
+            },
             body: Default::default(),
         };
         let mut attributes = ScrollPayloadAttributes {
@@ -186,7 +214,7 @@ mod tests {
             ] {
                 attributes.gas_limit = gas_limit;
                 assert_eq!(
-                    block_matches_attributes(&attributes, &block),
+                    block_matches_attributes(&attributes, base_fee, &block),
                     expected_match,
                     "gas_limit={gas_limit:?}, state_root={state_root:?}"
                 );
@@ -220,8 +248,34 @@ mod tests {
             body: alloy_consensus::BlockBody { transactions, ..Default::default() },
         };
 
-        assert!(!block_matches_attributes(&attributes, &block));
+        assert!(!block_matches_attributes(&attributes, U256::ZERO, &block));
 
         Ok(())
+    }
+
+    /// A block that agrees with the batch in every other respect, but not on the base fee, is
+    /// not a match: the follower has to reorg to the DA version.
+    #[test]
+    fn test_base_fee_mismatch_is_not_a_match() {
+        let base_fee = U256::from(1_015_680_000u64);
+        let attributes = ScrollPayloadAttributes {
+            payload_attributes: PayloadAttributes { timestamp: 1, ..Default::default() },
+            transactions: Some(vec![]),
+            no_tx_pool: true,
+            ..Default::default()
+        };
+        let block = |base_fee_per_gas| DogeosBlock {
+            header: Header { timestamp: 1, base_fee_per_gas, ..Default::default() },
+            body: Default::default(),
+        };
+
+        assert!(block_matches_attributes(&attributes, base_fee, &block(Some(base_fee.to()))));
+        for wrong in [Some(base_fee.to::<u64>() - 1), Some(base_fee.to::<u64>() + 1), Some(0), None]
+        {
+            assert!(
+                !block_matches_attributes(&attributes, base_fee, &block(wrong)),
+                "base_fee_per_gas={wrong:?} was treated as a match"
+            );
+        }
     }
 }

@@ -10,8 +10,8 @@
 //! `handle_latest_block` stores the new L1 head before `handle_system_contract_update`
 //! compares against it, so the standby never sequences block 4. Passing needs two watcher
 //! changes: re-read the signer on every new L1 head, and keep that update out of the
-//! watcher's notification-count check, which today counts it against the block's logs.
-//! Either change alone still fails. Remove the `#[ignore]` once both are fixed. Until then,
+//! watcher's log-based notification-count check, which would reject it. Either change
+//! alone still fails. Remove the `#[ignore]` once both are fixed. Until then,
 //! followers pick up a rotation by exiting and restarting
 //! (`--consensus.exit-on-signer-rotation`).
 
@@ -195,7 +195,7 @@ async fn expect_import(
     fixture.expect_event_on(0).timeout(PHASE_TIMEOUT).chain_extended(height).await?;
     ensure!(
         canonical_hash(fixture, height).await? == hash,
-        "follower imported a different block at {height}, expected {hash}"
+        "node imported a different block at {height}, expected {hash}"
     );
     Ok(())
 }
@@ -275,8 +275,12 @@ async fn rotation() -> eyre::Result<()> {
             .await
             .wrap_err("prestarted follower failed to import old-signer block")?;
     }
-    for rpc in [&old_rpc, &new_rpc, &follower_rpc] {
-        ensure!(rpc.reads().contains(&old_address), "startup did not read old signer from RPC");
+    for (label, rpc) in [("old", &old_rpc), ("standby", &new_rpc), ("follower", &follower_rpc)] {
+        ensure!(
+            rpc.reads().contains(&old_address),
+            "{label}: startup did not read old signer from RPC; {}",
+            reads()
+        );
     }
     tracing::info!(%common_parent, "all three running nodes imported old-signer block 3");
 

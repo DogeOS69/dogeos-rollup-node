@@ -8,11 +8,25 @@ use arbitrary::Arbitrary;
 use rand::Rng;
 use rollup_node_primitives::{L1BlockStartupInfo, NodeConfig};
 use rollup_node_watcher::{
-    random, test_utils::provider::MockProvider, Block, L1Notification, L1Watcher,
+    random, test_utils::provider::MockProvider, Block, L1Notification, L1Watcher, L1WatcherHandle,
 };
 const LOGS_QUERY_BLOCK_RANGE: u64 = 500;
 const L1_LIVENESS_THRESHOLD: u64 = 60;
 const L1_LIVENESS_CHECK_INTERVAL: u64 = 12;
+
+/// Returns the next notification, skipping the ones every indexing step sends besides the block
+/// events: `Processed`, `Synced` and the signer update.
+async fn next_block_event(watcher: &mut L1WatcherHandle) -> Arc<L1Notification> {
+    loop {
+        let notification = watcher.l1_notification_receiver().recv().await.unwrap();
+        if !matches!(
+            notification.as_ref(),
+            L1Notification::Processed(_) | L1Notification::Synced | L1Notification::Consensus(_)
+        ) {
+            return notification;
+        }
+    }
+}
 
 // Generate a set blocks that will be fed to the l1 watcher.
 // Every fork_cycle blocks, generates a small reorg.
@@ -95,11 +109,7 @@ async fn test_should_detect_reorg() -> eyre::Result<()> {
     for (latest, finalized) in latest_blocks[1..].iter().zip(finalized_blocks[1..].iter()) {
         // check finalized first.
         if finalized_number < finalized.header.number {
-            let mut notification = l1_watcher.l1_notification_receiver().recv().await.unwrap();
-            // skip the `L1Notification::Processed` notifications
-            if matches!(notification.as_ref(), L1Notification::Processed(_)) {
-                notification = l1_watcher.l1_notification_receiver().recv().await.unwrap();
-            }
+            let notification = next_block_event(&mut l1_watcher).await;
             assert_eq!(notification.as_ref(), &L1Notification::Finalized(finalized.header.number));
         }
 
@@ -107,17 +117,7 @@ async fn test_should_detect_reorg() -> eyre::Result<()> {
             continue;
         }
 
-        let mut notification = l1_watcher.l1_notification_receiver().recv().await.unwrap();
-
-        // skip the `L1Notification::Processed` notifications
-        if matches!(notification.as_ref(), L1Notification::Processed(_)) {
-            notification = l1_watcher.l1_notification_receiver().recv().await.unwrap();
-        }
-
-        // skip the `L1Notification::Synced` notifications
-        if matches!(notification.as_ref(), L1Notification::Synced) {
-            notification = l1_watcher.l1_notification_receiver().recv().await.unwrap();
-        }
+        let notification = next_block_event(&mut l1_watcher).await;
 
         // check latest for reorg or new block.
         if latest_number > latest.header.number {
@@ -205,11 +205,7 @@ async fn test_should_fetch_gap_in_unfinalized_blocks() -> eyre::Result<()> {
     for (latest, finalized) in latest_blocks[1..].iter().zip(finalized_blocks[1..].iter()) {
         // check finalized first.
         if finalized_number < finalized.header.number {
-            let mut notification = l1_watcher.l1_notification_receiver().recv().await.unwrap();
-            // skip the `L1Notification::Processed` notifications
-            if matches!(notification.as_ref(), L1Notification::Processed(_)) {
-                notification = l1_watcher.l1_notification_receiver().recv().await.unwrap();
-            }
+            let notification = next_block_event(&mut l1_watcher).await;
             assert_eq!(notification.as_ref(), &L1Notification::Finalized(finalized.header.number));
         }
 
@@ -217,17 +213,7 @@ async fn test_should_fetch_gap_in_unfinalized_blocks() -> eyre::Result<()> {
             continue;
         }
 
-        let mut notification = l1_watcher.l1_notification_receiver().recv().await.unwrap();
-
-        // skip the `L1Notification::Processed` notifications
-        if matches!(notification.as_ref(), L1Notification::Processed(_)) {
-            notification = l1_watcher.l1_notification_receiver().recv().await.unwrap();
-        }
-
-        // skip the `L1Notification::Synced` notifications
-        if matches!(notification.as_ref(), L1Notification::Synced) {
-            notification = l1_watcher.l1_notification_receiver().recv().await.unwrap();
-        }
+        let notification = next_block_event(&mut l1_watcher).await;
 
         assert_eq!(notification.as_ref(), &L1Notification::NewBlock((&latest.header).into()));
 

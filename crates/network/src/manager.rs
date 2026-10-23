@@ -58,7 +58,8 @@ pub struct ScrollNetworkManager<N, CS> {
     peer_state: HashMap<PeerId, LruCache<B256>>,
     /// The constant value that must be added to the block number to get the total difficulty.
     td_constant: U128,
-    /// The authorized signer for the network.
+    /// The signer whose blocks are gossiped over eth-wire; `None` gossips every block. The chain
+    /// orchestrator keeps it on the consensus signer.
     authorized_signer: Option<Address>,
     /// Whether to gossip blocks to peers.
     #[cfg(feature = "test-utils")]
@@ -359,6 +360,12 @@ impl<
             }
             NetworkHandleMessage::BlockImportOutcome(outcome) => {
                 self.on_block_import_result(outcome).await;
+            }
+            NetworkHandleMessage::UpdateAuthorizedSigner(signer) => {
+                // A node started without a signer keeps gossiping every block.
+                if let Some(authorized_signer) = self.authorized_signer.as_mut() {
+                    *authorized_signer = signer;
+                }
             }
             NetworkHandleMessage::Shutdown(tx) => {
                 tx.send(()).unwrap()

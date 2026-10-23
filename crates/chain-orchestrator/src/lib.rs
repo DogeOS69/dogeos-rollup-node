@@ -658,6 +658,10 @@ impl<
             }
             L1Notification::Consensus(update) => {
                 self.consensus.update_config(update);
+                // The network checks the signer before gossiping a block over eth-wire.
+                if let Some(signer) = self.consensus.authorized_signer() {
+                    self.network.handle().update_authorized_signer(signer);
+                }
                 Ok(None)
             }
             L1Notification::NewBlock(block_info) => self.handle_l1_new_block(*block_info).await,

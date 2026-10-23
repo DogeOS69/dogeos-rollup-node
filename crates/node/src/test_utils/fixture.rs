@@ -488,7 +488,6 @@ impl TestFixtureBuilder {
             rpc_args: RpcArgs { basic_enabled: true, admin_enabled: true },
             remote_block_source_args: Default::default(),
             pprof_args: PprofArgs::default(),
-            require_l1_data_fee_buffer: false,
         }
     }
 

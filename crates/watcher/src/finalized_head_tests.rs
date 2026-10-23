@@ -13,7 +13,7 @@
 //!
 //! The RG-41 and RG-45 tests pass today and document behaviour that is not fixed; when a row is
 //! fixed in the watcher, change the matching assertion instead of deleting the test. The RG-52
-//! test pins the fix.
+//! tests pin the fix.
 //!
 //! The RG-41 tests document the watcher under a CONDITION: the provider always serves
 //! `finalized` = head. The fix accepted for RG-41 is a lagging finalized tag in dogeos-core's
@@ -57,6 +57,10 @@ struct Served {
     by_hash_lookups: u64,
     signer: Address,
     storage_reads: u64,
+    /// How many of the next `get_logs` calls fail.
+    failing_log_queries: u64,
+    /// How many of the next storage reads fail.
+    failing_storage_reads: u64,
 }
 
 /// A synthetic L1 provider: `finalized` and `latest` both return the served head.
@@ -146,7 +150,13 @@ impl Provider for SyntheticL1 {
     }
 
     async fn get_logs(&self, filter: &Filter) -> TransportResult<Vec<Log>> {
-        let s = self.0.lock().unwrap();
+        let mut s = self.0.lock().unwrap();
+        if s.failing_log_queries > 0 {
+            s.failing_log_queries -= 1;
+            return Err(alloy_transport::TransportErrorKind::custom_str(
+                "injected log query failure",
+            ));
+        }
         let from = filter.get_from_block().unwrap_or(0);
         let to = filter.get_to_block().unwrap_or(u64::MAX);
         // A range that starts above the served head is answered with an empty list, as
@@ -165,10 +175,19 @@ impl Provider for SyntheticL1 {
     ) -> RpcWithBlock<(Address, U256), StorageValue> {
         let value = {
             let mut s = self.0.lock().unwrap();
-            s.storage_reads += 1;
-            U256::from_be_slice(s.signer.as_slice())
+            if s.failing_storage_reads > 0 {
+                s.failing_storage_reads -= 1;
+                None
+            } else {
+                s.storage_reads += 1;
+                Some(U256::from_be_slice(s.signer.as_slice()))
+            }
         };
-        RpcWithBlock::new_provider(move |_| ProviderCall::Ready(Some(Ok(value))))
+        RpcWithBlock::new_provider(move |_| {
+            ProviderCall::Ready(Some(value.ok_or_else(|| {
+                alloy_transport::TransportErrorKind::custom_str("injected storage read failure")
+            })))
+        })
     }
 
     fn get_transaction_by_hash(
@@ -714,6 +733,55 @@ async fn rg52_runtime_signer_refresh_reads_the_system_contract_on_every_new_head
     assert_eq!(signers(&replaced), vec![new_signer]);
     assert_eq!(l1.state().storage_reads, 4, "one read per new head");
     assert_eq!(w.l1_state.head, 5);
+}
+
+/// A step that fails after storing a new head (log query or signer read) does not lose the
+/// rotation: the next step at the same head reads the signer again and sends it before it
+/// reports the head processed.
+#[tokio::test]
+async fn rg52_signer_refresh_is_retried_at_the_same_head_after_a_failed_step() {
+    for fail_logs in [true, false] {
+        let f = Fixture::new();
+        let l1 = SyntheticL1::new(f.chain(), f.logs());
+        l1.state().signer = Address::repeat_byte(0xaa);
+        let (mut w, mut h) = watcher(l1.clone());
+
+        w.step().await.expect("poll at head 3");
+        drain(&mut h);
+
+        // Rotate the signer and extend the chain by one block that carries a deposit.
+        let new_signer = Address::repeat_byte(0xbb);
+        l1.state().signer = new_signer;
+        let b4 = header(4, 0, &f.b3);
+        let mut chain = f.chain();
+        chain.push(b4.clone());
+        l1.serve(chain, vec![deposit(&b4, 3, 0)]);
+
+        // One of the two queries the step makes at the new head fails.
+        if fail_logs {
+            l1.state().failing_log_queries = 1;
+        } else {
+            l1.state().failing_storage_reads = 1;
+        }
+
+        assert!(w.step().await.is_err(), "the injected failure fails the step");
+        let failed = drain(&mut h);
+        assert!(signers(&failed).is_empty(), "{failed:?}");
+        assert!(!failed.contains(&L1Notification::Processed(4)), "{failed:?}");
+
+        w.step().await.expect("retry at the same head");
+        let retried = drain(&mut h);
+
+        assert_eq!(signers(&retried), vec![new_signer], "fail_logs={fail_logs}");
+
+        let signer_at =
+            retried.iter().position(|n| matches!(n, L1Notification::Consensus(_))).unwrap();
+        let processed_at = retried
+            .iter()
+            .position(|n| *n == L1Notification::Processed(4))
+            .expect("head 4 processed");
+        assert!(signer_at < processed_at, "{retried:?}");
+    }
 }
 
 /// RG-49 (rollup-node issue #29): a reset queued while the watcher is blocked sending on the old

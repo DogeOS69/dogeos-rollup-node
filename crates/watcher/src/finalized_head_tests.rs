@@ -657,6 +657,49 @@ async fn rg41_restart_from_finalized_block_number_does_not_detect_replacement() 
     drop(handle);
 }
 
+/// Startup waits for missing L1 blocks and resumes when they are available.
+#[tokio::test]
+async fn startup_waits_for_missing_blocks() {
+    let f = Fixture::new();
+    for (chain, startup_info, head) in [
+        (vec![], L1BlockStartupInfo::None, &f.b3),
+        (
+            vec![f.b0.clone(), f.b1.clone()],
+            L1BlockStartupInfo::UnsafeBlocks(vec![(&f.b3).into()]),
+            &f.b1,
+        ),
+    ] {
+        let l1 = SyntheticL1::new(chain, vec![]);
+        let provider = l1.clone();
+        let config = NodeConfig { start_l1_block: 1, ..NodeConfig::mainnet() };
+        let task = tokio::spawn(async move {
+            L1Watcher::spawn(
+                provider,
+                startup_info,
+                Arc::new(config),
+                500,
+                60,
+                12,
+                #[cfg(feature = "test-utils")]
+                false,
+            )
+            .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!task.is_finished(), "startup waits for the missing block");
+
+        l1.serve(f.chain(), vec![]);
+        let (_tx, mut handle) = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("startup resumes when blocks are available")
+            .expect("startup does not panic");
+        let notifications = drain(&mut handle);
+        assert_eq!(notifications.first(), Some(&L1Notification::Finalized(head.number)));
+        assert_eq!(notifications.get(1), Some(&L1Notification::NewBlock(head.into())));
+    }
+}
+
 /// The runtime signer refresh never fires. `handle_latest_block` sets
 /// `l1_state.head = latest.number` before `handle_system_contract_update` compares
 /// `latest.number != l1_state.head`, so the system contract is never read.

@@ -334,5 +334,35 @@ async fn rotation() -> eyre::Result<()> {
         standby_hash == follower_hash,
         "block 4 differs: standby {standby_hash}, follower {follower_hash}"
     );
+
+    // The retired sequencer runs in manual mode (`block_time(0)`) so that blocks 1-3 are
+    // deterministic. It never sequences on its own, so "it stops producing" cannot be observed
+    // directly. Importing the new signer's block shows that its consensus moved to the new
+    // signer, and that same signer check is what stops automatic sequencing.
+    expect_import(&mut old, 4, block.hash_slow(), new_address)
+        .await
+        .wrap_err("retired sequencer did not adopt new signer")?;
+
+    // Manual builds skip the sequencing check, so the retired sequencer can still sign a block
+    // with the old key. The follower must refuse it.
+    let stale = old.build_block().build_and_await_block().await?;
+    let stale_hash = stale.hash_slow();
+    follower
+        .expect_event_on(0)
+        .timeout(PHASE_TIMEOUT)
+        .extract(|event| {
+            matches!(
+                event,
+                ChainOrchestratorEvent::BlockFailedConsensusChecks(hash, _) if *hash == stale_hash
+            )
+            .then_some(())
+        })
+        .await
+        .wrap_err_with(|| {
+            format!(
+                "follower did not refuse old-signer block {} ({stale_hash})",
+                stale.header.number
+            )
+        })?;
     Ok(())
 }

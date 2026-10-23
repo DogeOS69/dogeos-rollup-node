@@ -1,20 +1,20 @@
-//! Materialized L1 RPC state -> production watcher -> running Reth signer adoption.
+//! A signer rotation on L1 reaches three running nodes through the production L1 watcher.
 //!
-//! The RPC fixture models `l1_interface`'s replay output: `SystemConfig` storage changes
-//! with a new synthetic L1 head, and latest/safe/finalized coincide. It does not
-//! execute `RotateSequencerSigner` proofs or replay. No consensus notifications are
-//! injected, and all three nodes remain running throughout the handoff.
+//! A small HTTP server stands in for the L1 RPC. It serves a rotation the way dogeos-core's
+//! `l1_interface` does after applying a `RotateSequencerSigner` transaction: the `SystemConfig`
+//! signer slot changes together with a new L1 head, and the latest, safe and finalized blocks are
+//! the same block. It does not run the rotation transaction itself. No notification is injected,
+//! and no node is restarted or reconfigured during the test.
 //!
-//! The test asserts the intended behaviour and fails today, so it is `#[ignore]`d (RG-52);
-//! run it with `--ignored`. A running watcher never re-reads the signer slot:
-//! `handle_latest_block` stores the new L1 head before `handle_system_contract_update`
-//! compares against it, so the standby never sequences block 4. Passing needs two watcher
-//! changes: re-read the signer on every new L1 head, and deliver that update without counting
-//! it in the watcher's log-based notification-count check, which would reject it. Either
-//! change alone still fails. When both are fixed, remove the `#[ignore]` and update
-//! `rg52_runtime_signer_refresh_never_reads_the_system_contract` in the watcher tests. Until
-//! then, followers pick up a rotation by exiting and restarting
-//! (`--consensus.exit-on-signer-rotation`).
+//! The test asserts the intended behaviour and fails today, so it is `#[ignore]`d (RG-52); run it
+//! with `--ignored`. A running watcher never re-reads the signer slot: `handle_latest_block`
+//! stores the new L1 head before `handle_system_contract_update` compares against it, so the
+//! standby never sequences block 4. Passing needs two watcher changes: re-read the signer on every
+//! new L1 head, and keep that update out of the watcher's log-based notification-count check,
+//! which would otherwise reject it. Either change alone still fails. With both, remove the
+//! `#[ignore]` and update `rg52_runtime_signer_refresh_never_reads_the_system_contract` in the
+//! watcher tests. Until then, only a follower started with `--consensus.exit-on-signer-rotation`
+//! picks up a rotation, by exiting so that its supervisor restarts it.
 
 use alloy_primitives::{Address, B256, U256};
 use alloy_rpc_types_eth::Block;
@@ -39,7 +39,11 @@ use std::{
 use tokio::time::{sleep, timeout};
 
 const PHASE_TIMEOUT: Duration = Duration::from_secs(15);
+/// Fires only if the test hangs, for example in a node startup, which has no phase timeout. A
+/// slow run fails earlier, in a phase timeout with a diagnostic message.
+const HANG_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// The L1 the fixture serves: one block and one signer slot value per height.
 #[derive(Debug)]
 struct MaterializedL1 {
     blocks: Vec<Block>,
@@ -89,6 +93,8 @@ impl L1Rpc {
         let server = ServerBuilder::default().build("127.0.0.1:0").await?;
         let url = format!("http://{}", server.local_addr()?).parse()?;
         let reads = Arc::new(Mutex::new(Vec::new()));
+        let system_contract =
+            NodeConfig::from_chainspec(&*DOGEOS_DEV)?.address_book.system_contract_address;
         let mut rpc = RpcModule::new(state);
         rpc.register_method("eth_getBlockByNumber", |params, state, _| {
             let (tag, full): (String, bool) = params.parse()?;
@@ -107,10 +113,6 @@ impl L1Rpc {
         let storage_reads = reads.clone();
         rpc.register_method("eth_getStorageAt", move |params, state, _| {
             let (address, slot, tag): (Address, U256, String) = params.parse()?;
-            let system_contract = NodeConfig::from_chainspec(&*DOGEOS_DEV)
-                .unwrap()
-                .address_book
-                .system_contract_address;
             if address != system_contract || slot != U256::from(0x67) || tag != "latest" {
                 return Err(rpc_error("unexpected SystemConfig address, slot, or block tag"));
             }
@@ -166,8 +168,8 @@ async fn wait_processed(fixture: &TestFixture, height: u64, label: &str) -> eyre
     match waited {
         Ok(result) => result,
         Err(_) => eyre::bail!(
-            "{label}: production watcher did not process L1 {height}; processed {}",
-            processed(fixture).await?
+            "{label}: production watcher did not process L1 {height}; processed {:?}",
+            processed(fixture).await
         ),
     }
 }
@@ -229,9 +231,9 @@ async fn canonical_hash(fixture: &TestFixture, height: u64) -> eyre::Result<B256
 #[ignore = "RG-52: a running L1 watcher never re-reads the SystemConfig signer, so the standby never sequences"]
 async fn running_nodes_discover_materialized_signer_rotation() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
-    timeout(Duration::from_secs(120), rotation())
+    timeout(HANG_TIMEOUT, rotation())
         .await
-        .wrap_err("live signer rotation exceeded whole-test deadline")?
+        .wrap_err_with(|| format!("live signer rotation hung for {HANG_TIMEOUT:?}"))?
 }
 
 async fn rotation() -> eyre::Result<()> {
@@ -284,7 +286,7 @@ async fn rotation() -> eyre::Result<()> {
             .wrap_err("standby failed to import old-signer block")?;
         expect_import(&mut follower, height, common_parent, old_address)
             .await
-            .wrap_err("prestarted follower failed to import old-signer block")?;
+            .wrap_err("follower failed to import old-signer block")?;
     }
     for (label, rpc) in [("old", &old_rpc), ("standby", &new_rpc), ("follower", &follower_rpc)] {
         ensure!(
@@ -295,8 +297,8 @@ async fn rotation() -> eyre::Result<()> {
     }
     tracing::info!(%common_parent, "all three running nodes imported old-signer block 3");
 
-    // One atomic materialization: no node config, process, notification sender,
-    // consensus object, or network signer is changed by the test.
+    // The rotation is one atomic change of the served L1. The test changes no node config,
+    // process, notification sender, consensus object or network signer.
     state.lock().unwrap().advance(new_address);
     for (fixture, label) in [(&old, "old"), (&new, "standby"), (&follower, "follower")] {
         wait_processed(fixture, 2, label).await.wrap_err_with(reads)?;
@@ -325,12 +327,12 @@ async fn rotation() -> eyre::Result<()> {
     }
     expect_import(&mut follower, 4, block.hash_slow(), new_address)
         .await
-        .wrap_err("prestarted follower did not adopt new signer")?;
+        .wrap_err("follower did not adopt new signer")?;
     let (standby_hash, follower_hash) =
         (canonical_hash(&new, 4).await?, canonical_hash(&follower, 4).await?);
     ensure!(
         standby_hash == follower_hash,
-        "block 4 differs: standby {standby_hash}, continuously running follower {follower_hash}"
+        "block 4 differs: standby {standby_hash}, follower {follower_hash}"
     );
     Ok(())
 }

@@ -39,9 +39,9 @@ use std::{
 use tokio::time::{sleep, timeout};
 
 const PHASE_TIMEOUT: Duration = Duration::from_secs(15);
-/// Fires only if the test hangs, for example in a node startup, which has no phase timeout. A
-/// slow run fails earlier, in a phase timeout with a diagnostic message.
-const HANG_TIMEOUT: Duration = Duration::from_secs(300);
+/// Longer than all phase timeouts together, so a slow run still fails in a phase timeout with its
+/// diagnostic. It only catches a hang, for example in a node startup, which has no timeout.
+const HANG_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// The L1 the fixture serves: one block and one signer slot value per height.
 #[derive(Debug)]
@@ -335,10 +335,10 @@ async fn rotation() -> eyre::Result<()> {
         "block 4 differs: standby {standby_hash}, follower {follower_hash}"
     );
 
-    // The retired sequencer runs in manual mode (`block_time(0)`) so that blocks 1-3 are
-    // deterministic. It never sequences on its own, so "it stops producing" cannot be observed
-    // directly. Importing the new signer's block shows that its consensus moved to the new
-    // signer, and that same signer check is what stops automatic sequencing.
+    // The retired sequencer has automatic sequencing off (the fixture default), which keeps
+    // blocks 1-3 deterministic, so "it stops producing" cannot be observed directly. Importing
+    // the new signer's block shows that its consensus now holds the new signer, which is the
+    // value its automatic slots would be checked against.
     expect_import(&mut old, 4, block.hash_slow(), new_address)
         .await
         .wrap_err("retired sequencer did not adopt new signer")?;

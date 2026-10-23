@@ -1718,7 +1718,7 @@ const fn supersedes_blocked_import(
         )
 }
 
-/// Fold a transaction hash into the full 256-bit DogeOS message queue commitment.
+/// Fold a transaction hash into the full 256-bit `DogeOS` message queue commitment.
 fn hash_msg_queue(rolling_hash: B256, tx_hash: B256) -> B256 {
     let mut input = [0u8; 64];
     input[..32].copy_from_slice(rolling_hash.as_slice());

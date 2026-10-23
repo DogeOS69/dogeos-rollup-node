@@ -27,7 +27,12 @@ mod metrics;
 pub use metrics::DerivationPipelineMetrics;
 
 use crate::data_source::CodecDataSource;
-use std::{boxed::Box, sync::Arc, time::Instant, vec::Vec};
+use std::{
+    boxed::Box,
+    sync::Arc,
+    time::{Duration, Instant},
+    vec::Vec,
+};
 
 /// The derivation pipeline that derives [`BatchDerivationResult`] from [`BatchInfo`].
 ///
@@ -101,6 +106,26 @@ impl Stream for DerivationPipeline {
 /// The maximum number of concurrent batch derivation futures.
 const DERIVATION_PIPELINE_WORKER_CONCURRENCY: usize = 3;
 
+/// The delay before the first derivation retry.
+const DERIVATION_RETRY_INITIAL_DELAY: Duration = Duration::from_secs(1);
+/// The longest delay between derivation retries.
+const DERIVATION_RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
+
+#[derive(Debug)]
+struct RetryDelay(Duration);
+
+impl RetryDelay {
+    fn next(&mut self) -> Duration {
+        let delay = self.0;
+        self.0 = (delay * 2).min(DERIVATION_RETRY_MAX_DELAY);
+        delay
+    }
+
+    fn reset(&mut self) {
+        self.0 = DERIVATION_RETRY_INITIAL_DELAY;
+    }
+}
+
 /// A structure holding the current unresolved futures for the derivation pipeline.
 #[derive(Debug)]
 pub struct DerivationPipelineWorker<P> {
@@ -110,6 +135,8 @@ pub struct DerivationPipelineWorker<P> {
     result_sender: UnboundedSender<BatchDerivationResult>,
     /// The active batch derivation futures.
     futures: FuturesOrdered<DerivationPipelineFuture>,
+    /// The delay before the next derivation retry.
+    retry_delay: RetryDelay,
     /// A reference to the database.
     database: Arc<Database>,
     /// A cache for pre-fetching derivation pipeline data from the database.
@@ -138,6 +165,7 @@ impl<P> DerivationPipelineWorker<P> {
             batch_receiver,
             result_sender,
             futures: FuturesOrdered::new(),
+            retry_delay: RetryDelay(DERIVATION_RETRY_INITIAL_DELAY),
             database,
             cache,
             l1_provider,
@@ -202,14 +230,20 @@ where
                 Some(result) = self.futures.next() => {
                     match result {
                         Ok(res) => {
+                            self.retry_delay.reset();
                             if self.result_sender.send(res).is_err() {
                                 tracing::info!(target: "scroll::derivation_pipeline", "Result channel closed, shutting down derivation pipeline worker");
                                 break;
                             }
                         }
                         Err((batch_info, err)) => {
-                            tracing::error!(target: "scroll::derivation_pipeline", ?batch_info, ?err, "Failed to derive payload attributes");
-                            self.futures.push_front(self.derivation_future(batch_info));
+                            let retry_in = self.retry_delay.next();
+                            tracing::error!(target: "scroll::derivation_pipeline", ?batch_info, ?err, ?retry_in, "Failed to derive payload attributes");
+                            let fut = self.derivation_future(batch_info);
+                            self.futures.push_front(Box::pin(async move {
+                                tokio::time::sleep(retry_in).await;
+                                fut.await
+                            }));
                         }
                     }
                 }
@@ -515,6 +549,15 @@ mod tests {
             input: bytes!("8ef1332e0000000000000000000000007f2b8c31f88b6006c382775eea88297ec1e3e9050000000000000000000000006ea73e05adc79974b931123675ea8f78ffdacdf000000000000000000000000000000000000000000000000000470de4df820000000000000000000000000000000000000000000000000000000000000000002200000000000000000000000000000000000000000000000000000000000000a000000000000000000000000000000000000000000000000000000000000000a4232e8748000000000000000000000000982fe4a7cbd74bb3422ebe46333c3e8046c12c7f000000000000000000000000982fe4a7cbd74bb3422ebe46333c3e8046c12c7f00000000000000000000000000000000000000000000000000470de4df8200000000000000000000000000000000000000000000000000000000000000000080000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"),
         },
     };
+
+    #[test]
+    fn test_retry_delay() {
+        let mut delay = RetryDelay(DERIVATION_RETRY_INITIAL_DELAY);
+        let delays: Vec<_> = (0..7).map(|_| delay.next().as_secs()).collect();
+        assert_eq!(delays, [1, 2, 4, 8, 16, 30, 30]);
+        delay.reset();
+        assert_eq!(delay.next(), Duration::from_secs(1));
+    }
 
     #[test]
     fn test_should_reject_l1_message_transaction_from_batch_data() {

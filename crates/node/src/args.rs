@@ -151,7 +151,8 @@ impl ScrollRollupNodeConfig {
             }
             if self.consensus_args.authorized_signer.is_some() {
                 return Err("--consensus.exit-on-signer-rotation cannot be used with \
-                     --consensus.authorized-signer because restart would re-pin the same signer"
+                     --consensus.authorized-signer because every restart would apply the pinned \
+                     signer again until the L1 watcher first reports the signer"
                     .to_string());
             }
             if self.consensus_args.algorithm != ConsensusAlgorithm::SystemContract {
@@ -450,6 +451,15 @@ impl ScrollRollupNodeConfig {
             l1_provider.filter(|_| !self.test_args.test || is_anvil_provider)
         {
             tracing::info!(target: "scroll::node::args", ?l1_block_startup_info, "Starting L1 watcher");
+            if self.consensus_args.algorithm == ConsensusAlgorithm::SystemContract &&
+                self.consensus_args.authorized_signer.is_some()
+            {
+                tracing::warn!(
+                    target: "scroll::node::args",
+                    "--consensus.authorized-signer applies only until the L1 watcher first reports \
+                     the signer; the node then follows the L1 signer"
+                );
+            }
 
             let (notification_tx, handle) = L1Watcher::spawn(
                 provider,
@@ -612,7 +622,7 @@ pub struct ConsensusArgs {
     /// Exit the process (code 70) when the authorized signer in the L1 system contract rotates
     /// away from the watchdog's first successful L1 observation after startup. Intended for
     /// follower nodes run under a supervisor with a restart policy; the restart re-reads the
-    /// signer. Sequencer rotation remains a manual operation.
+    /// signer. Running nodes also adopt a rotation from L1 without a restart.
     #[arg(long = "consensus.exit-on-signer-rotation", default_value_t = false)]
     pub exit_on_signer_rotation: bool,
 }
@@ -731,7 +741,9 @@ pub struct RollupNodeNetworkArgs {
         value_name = "NETWORK_SEQUENCER_URL"
     )]
     pub sequencer_url: Option<String>,
-    /// The valid signer address for the network.
+    /// The valid signer address for the network. With system-contract consensus, a configured or
+    /// default value is only the startup signer: after each L1 signer update the node uses the
+    /// consensus signer instead.
     #[arg(long = "network.valid_signer", value_name = "VALID_SIGNER")]
     pub signer_address: Option<Address>,
     /// Temporary: enable the legacy geth-to-Reth downloaded-header transform for the one-way
@@ -1160,7 +1172,8 @@ mod tests {
         assert_eq!(
             config.validate().unwrap_err(),
             "--consensus.exit-on-signer-rotation cannot be used with \
-             --consensus.authorized-signer because restart would re-pin the same signer"
+             --consensus.authorized-signer because every restart would apply the pinned \
+             signer again until the L1 watcher first reports the signer"
         );
     }
 

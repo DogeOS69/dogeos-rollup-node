@@ -3,8 +3,8 @@
 //! The watchdog polls the authorized-signer slot and resolves when a rotation away from its
 //! baseline is confirmed. Its baseline is the first successful watchdog read, so a rotation in
 //! the window between the node's startup read and that first read will not be detected until the
-//! next rotation. The caller is responsible for shutting down the process; restarting under a
-//! supervisor is the signer-refresh mechanism.
+//! next rotation. The caller is responsible for shutting down the process so that a supervisor
+//! restarts it. Running nodes also adopt a rotation from the L1 watcher without a restart.
 
 use alloy_primitives::Address;
 use alloy_provider::ProviderBuilder;

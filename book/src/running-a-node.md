@@ -129,7 +129,8 @@ These can be used as reliable blob sources without requiring your own beacon nod
     - `system-contract` (default): Validates blocks against authorized signer from L1
     - `noop`: No consensus validation (testing only)
 - `--consensus.authorized-signer <ADDRESS>`: Static authorized signer address (when using system-contract without L1
-  provider)
+  provider). With an L1 provider it applies only until the L1 watcher first reports the signer after startup; from then on
+  the node follows the L1 signer.
 
 #### Database Configuration
 
@@ -140,7 +141,8 @@ These can be used as reliable blob sources without requiring your own beacon nod
 - `--network.bridge`: Enable bridging blocks from eth wire to scroll wire protocol (default: true)
 - `--network.scroll-wire`: Enable the scroll wire protocol (default: true)
 - `--network.sequencer-url <URL>`: Sequencer RPC URL for following the sequencer
-- `--network.valid_signer <ADDRESS>`: Valid signer address for network validation
+- `--network.valid_signer <ADDRESS>`: Valid signer address for network validation. With system-contract consensus, a
+  configured or default value is only the startup signer: after each L1 signer update the node uses the consensus signer.
 
 #### Chain Orchestrator Configuration
 

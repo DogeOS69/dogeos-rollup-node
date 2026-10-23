@@ -91,14 +91,14 @@ rm -rf volumes
 
 ## Follower Restart on Signer Rotation
 
-Follower nodes can opt in to `--consensus.exit-on-signer-rotation`. The node confirms a changed
-authorized signer from L1, shuts down, and exits with code `70` so an external supervisor can
-restart it and load the new signer. Configure a restart policy such as Docker Compose
-`restart: unless-stopped`, Kubernetes, or systemd `Restart=on-failure` before enabling the flag.
+Running nodes adopt a new authorized signer from L1 on the next L1 head, without a restart.
+Follower nodes can still opt in to `--consensus.exit-on-signer-rotation`: the node confirms a
+changed authorized signer from L1, shuts down, and exits with code `70` so an external supervisor
+can restart it. Configure a restart policy such as Docker Compose `restart: unless-stopped`,
+Kubernetes, or systemd `Restart=on-failure` before enabling the flag.
 
-Do not enable this on sequencer nodes or combine it with
-`--consensus.authorized-signer`; sequencer rotation remains a manual operation, and a pinned
-signer would remain pinned after restart.
+Do not enable this on sequencer nodes or combine it with `--consensus.authorized-signer`; a
+restart would apply the pinned signer again until the L1 watcher first reports the signer.
 
 ---
 

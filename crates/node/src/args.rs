@@ -732,7 +732,9 @@ pub struct RollupNodeNetworkArgs {
         value_name = "NETWORK_SEQUENCER_URL"
     )]
     pub sequencer_url: Option<String>,
-    /// The valid signer address for the network.
+    /// The valid signer address for the network. With system-contract consensus, a configured or
+    /// default value is only the startup signer: after each L1 signer update the node uses the
+    /// consensus signer instead.
     #[arg(long = "network.valid_signer", value_name = "VALID_SIGNER")]
     pub signer_address: Option<Address>,
     /// Temporary: enable the legacy geth-to-Reth downloaded-header transform for the one-way

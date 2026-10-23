@@ -210,6 +210,7 @@ where
     /// Spawn a new [`L1Watcher`], starting at `start_block`. The watcher will iterate the L1,
     /// returning [`L1Notification`] in the returned channel.
     /// Runs as a critical task, so a panic shuts down the node.
+    #[allow(clippy::too_many_arguments)]
     pub async fn spawn(
         task_executor: &reth_tasks::TaskExecutor,
         execution_provider: EP,

@@ -34,8 +34,8 @@ pub use rpc::{
 };
 
 mod rollup;
-pub use rollup::{safety_stop_requested, IsDevChain};
 use rollup::RollupManagerAddOn;
+pub use rollup::{safety_stop_requested, IsDevChain};
 use scroll_network::{DogeosNetworkPrimitives, EthWireBlockWithPeer};
 use tokio::sync::mpsc::{Receiver, UnboundedReceiver};
 

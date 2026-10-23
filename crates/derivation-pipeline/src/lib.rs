@@ -116,6 +116,8 @@ const DERIVATION_RETRY_INITIAL_DELAY: Duration = Duration::from_secs(1);
 /// The longest delay between derivation retries.
 const DERIVATION_RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
 
+/// The wait before retrying a batch that failed to derive: doubles after each failure, up to the
+/// cap.
 #[derive(Debug)]
 struct RetryDelay(Duration);
 
@@ -126,7 +128,7 @@ impl RetryDelay {
         delay
     }
 
-    fn reset(&mut self) {
+    const fn reset(&mut self) {
         self.0 = DERIVATION_RETRY_INITIAL_DELAY;
     }
 }
@@ -678,9 +680,13 @@ mod tests {
 
         // construct the pipeline.
         let mock_l1_provider = MockL1Provider { db: db.clone(), blobs: HashMap::new() };
-        let mut pipeline =
-            DerivationPipeline::new(&reth_tasks::TaskExecutor::test(), mock_l1_provider, db, u64::MAX)
-                .await;
+        let mut pipeline = DerivationPipeline::new(
+            &reth_tasks::TaskExecutor::test(),
+            mock_l1_provider,
+            db,
+            u64::MAX,
+        )
+        .await;
 
         // as long as we don't call `push_batch`, pipeline should not return attributes.
         pipeline

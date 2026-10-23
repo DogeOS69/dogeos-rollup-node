@@ -126,16 +126,13 @@ fn main() {
         std::process::exit(EXIT_CODE_SIGNER_ROTATION);
     }
 
-    if safety_stop_requested() {
-        if let Err(err) = &result {
-            eprintln!("Error: {err:?}");
-        }
-        std::process::exit(EXIT_CODE_SAFETY_STOP);
-    }
-
     if let Err(err) = result {
         eprintln!("Error: {err:?}");
-        std::process::exit(1);
+        // Only a safety stop that ended the run gets its own code. One raised while a signal
+        // shutdown is already under way (for example because the Engine stopped first) leaves
+        // the run's result `Ok`, so that shutdown still exits 0.
+        let code = if safety_stop_requested() { EXIT_CODE_SAFETY_STOP } else { 1 };
+        std::process::exit(code);
     }
 }
 

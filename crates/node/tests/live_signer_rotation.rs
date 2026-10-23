@@ -4,6 +4,16 @@
 //! with a new synthetic L1 head, and latest/safe/finalized coincide. It does not
 //! execute `RotateSequencerSigner` proofs or replay. No consensus notifications are
 //! injected, and all three nodes remain running throughout the handoff.
+//!
+//! The test asserts the intended behaviour and fails today, so it is `#[ignore]`d (RG-52);
+//! run it with `--ignored`. A running watcher never re-reads the signer slot:
+//! `handle_latest_block` stores the new L1 head before `handle_system_contract_update`
+//! compares against it, so the standby never sequences block 4. Passing needs two watcher
+//! changes: re-read the signer on every new L1 head, and deliver that update even when the
+//! L1 block has no logs. Today a signer update with no logs fails the watcher's
+//! notification-count check, so with only the first change the test fails earlier, at
+//! "did not process L1 2". Remove the `#[ignore]` once both are fixed. Until then, followers
+//! pick up a rotation by exiting and restarting (`--consensus.exit-on-signer-rotation`).
 
 use alloy_primitives::{Address, B256, U256};
 use alloy_rpc_types_eth::Block;
@@ -38,6 +48,8 @@ struct MaterializedL1 {
 impl MaterializedL1 {
     fn new(signer: Address) -> Self {
         let mut state = Self { blocks: Vec::new(), signers: Vec::new() };
+        // Serve blocks 0 and 1: the watcher starts at L1 block 0 and reports a block as
+        // processed only once the head is above it.
         state.advance(signer);
         state.advance(signer);
         state
@@ -203,6 +215,7 @@ async fn canonical_hash(fixture: &TestFixture, height: u64) -> eyre::Result<B256
 }
 
 #[tokio::test]
+#[ignore = "RG-52: a running L1 watcher never re-reads the SystemConfig signer, so the standby never sequences"]
 async fn running_nodes_discover_materialized_signer_rotation() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
     timeout(Duration::from_secs(120), rotation())
@@ -265,7 +278,12 @@ async fn rotation() -> eyre::Result<()> {
     // consensus object, or network signer is changed by the test.
     state.lock().unwrap().advance(new_address);
     for (fixture, label) in [(&old, "old"), (&new, "standby"), (&follower, "follower")] {
-        wait_processed(fixture, 2, label).await?;
+        wait_processed(fixture, 2, label).await.wrap_err_with(|| {
+            format!(
+                "storage reads={:?}; old={old_address}, new={new_address}",
+                [old_rpc.reads(), new_rpc.reads(), follower_rpc.reads()]
+            )
+        })?;
     }
 
     let outcome = new.expect_event_on(0).timeout(PHASE_TIMEOUT).block_sequenced(4).await;

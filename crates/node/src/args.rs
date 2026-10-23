@@ -613,7 +613,7 @@ pub struct ConsensusArgs {
     /// Exit the process (code 70) when the authorized signer in the L1 system contract rotates
     /// away from the watchdog's first successful L1 observation after startup. Intended for
     /// follower nodes run under a supervisor with a restart policy; the restart re-reads the
-    /// signer. Sequencer rotation remains a manual operation.
+    /// signer. Running nodes also adopt a rotation from L1 without a restart.
     #[arg(long = "consensus.exit-on-signer-rotation", default_value_t = false)]
     pub exit_on_signer_rotation: bool,
 }

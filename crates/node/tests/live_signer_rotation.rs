@@ -234,7 +234,7 @@ async fn rotation() -> eyre::Result<()> {
     let follower_rpc = L1Rpc::start(state.clone()).await?;
     let reads = || {
         format!(
-            "storage reads={:?}; old={old_address}, new={new_address}",
+            "storage reads [old, standby, follower]={:?}; old={old_address}, new={new_address}",
             [old_rpc.reads(), new_rpc.reads(), follower_rpc.reads()]
         )
     };
@@ -302,7 +302,11 @@ async fn rotation() -> eyre::Result<()> {
     })?;
     ensure!(block.header.parent_hash == common_parent, "standby did not extend common parent");
     for (label, rpc) in [("old", &old_rpc), ("standby", &new_rpc), ("follower", &follower_rpc)] {
-        ensure!(rpc.reads().contains(&new_address), "{label}: watcher did not refresh signer");
+        ensure!(
+            rpc.reads().contains(&new_address),
+            "{label}: watcher did not refresh signer; {}",
+            reads()
+        );
     }
     expect_import(&mut follower, 4, block.hash_slow(), new_address)
         .await

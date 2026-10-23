@@ -11,8 +11,9 @@
 //! Each test name starts with the RG key of the row it pins.
 //!
 //! Tests that pass today document behaviour that is not fixed; when a row is fixed, change the
-//! matching assertion instead of deleting the test. Tests marked `#[ignore]` assert the intended
-//! behaviour, fail today and carry the reason in the ignore message; run them with `--ignored`.
+//! matching assertion instead of deleting the test. The RG-52 test pins fixed behaviour. Tests
+//! marked `#[ignore]` assert the intended behaviour, fail today and carry the reason in the
+//! ignore message; run them with `--ignored`.
 
 use super::*;
 use alloy_primitives::{Address, U256};

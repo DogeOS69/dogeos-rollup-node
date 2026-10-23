@@ -19,6 +19,8 @@ pub trait Consensus: Send + Sync + Debug {
     ) -> Result<(), ConsensusError>;
     /// Returns a boolean indicating whether the sequencer should sequence a block.
     fn should_sequence_block(&self, sequencer: &Address) -> bool;
+    /// Returns the only signer whose blocks are accepted, or `None` if signers are not checked.
+    fn authorized_signer(&self) -> Option<Address>;
 }
 
 /// A no-op consensus instance.
@@ -39,6 +41,10 @@ impl Consensus for NoopConsensus {
 
     fn should_sequence_block(&self, _sequencer: &Address) -> bool {
         true
+    }
+
+    fn authorized_signer(&self) -> Option<Address> {
+        None
     }
 }
 
@@ -74,13 +80,15 @@ impl SystemContractConsensus {
 impl Consensus for SystemContractConsensus {
     fn update_config(&mut self, update: &ConsensusUpdate) {
         match update {
-            ConsensusUpdate::AuthorizedSigner(signer) => {
+            // The L1 watcher sends the signer with every new L1 head; log only a change.
+            ConsensusUpdate::AuthorizedSigner(signer) if *signer != self.authorized_signer => {
                 tracing::info!(
                     target: "scroll::consensus",
                     "Authorized signer updated to: {signer}"
                 );
                 self.authorized_signer = *signer
             }
+            ConsensusUpdate::AuthorizedSigner(_) => {}
         };
     }
 
@@ -104,6 +112,10 @@ impl Consensus for SystemContractConsensus {
 
     fn should_sequence_block(&self, sequencer: &Address) -> bool {
         sequencer == &self.authorized_signer
+    }
+
+    fn authorized_signer(&self) -> Option<Address> {
+        Some(self.authorized_signer)
     }
 }
 

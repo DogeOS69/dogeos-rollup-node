@@ -129,7 +129,8 @@ These can be used as reliable blob sources without requiring your own beacon nod
     - `system-contract` (default): Validates blocks against authorized signer from L1
     - `noop`: No consensus validation (testing only)
 - `--consensus.authorized-signer <ADDRESS>`: Static authorized signer address (when using system-contract without L1
-  provider)
+  provider). With an L1 provider it is only the startup signer: the node replaces it with the L1 signer on the next
+  L1 head.
 
 #### Database Configuration
 

@@ -87,6 +87,12 @@ impl RollupManagerAddOn {
                     chain_orchestrator.run_until_shutdown(shutdown.ignore_guard()).await
                 {
                     if error.is_safety_stop() {
+                        tracing::error!(
+                            target: "scroll::node",
+                            exit_code = crate::constants::EXIT_CODE_SAFETY_STOP,
+                            %error,
+                            "Safety stop: the node's state may be wrong, so a restart alone will not fix it; shutting down"
+                        );
                         SAFETY_STOP_REQUESTED.store(true, Ordering::SeqCst);
                     }
                     panic!("fatal chain orchestrator error: {error}");

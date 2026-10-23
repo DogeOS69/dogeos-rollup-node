@@ -59,11 +59,7 @@ fn main() {
         async move |builder, args| {
             info!(target: "reth::cli", "Launching node");
 
-            // Modify the chain spec based on the CLI args.
             let config = builder.config().clone();
-            let mut chain_spec = (*config.chain).clone();
-            chain_spec.config.l1_data_fee_buffer_check = args.require_l1_data_fee_buffer;
-            let config = config.with_chain(chain_spec);
             let watchdog = args.signer_rotation_watchdog(config.chain.as_ref())?;
 
             // Launch the node.

@@ -25,3 +25,26 @@ impl ChainSpecParser for DogeosChainSpecParser {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_primitives::b256;
+    use dogeos_hardforks::DogeosHardforks;
+    use reth_chainspec::EthChainSpec;
+
+    #[test]
+    fn chikyu_cli_matches_custom_genesis_loading() {
+        let builtin = DogeosChainSpecParser::parse("dogeos-chikyu").unwrap();
+        let json = serde_json::to_string(builtin.genesis()).unwrap();
+        let custom = DogeosChainSpecParser::parse(&json).unwrap();
+        assert_eq!(builtin, custom);
+        assert_eq!(
+            builtin.genesis_hash(),
+            b256!("f9f7c524dce38b51a4d28ec2f18680773e5ba9d3f5f430d0e05f92cfeb65b1bc")
+        );
+        assert_eq!(builtin.config.l1_config.l1_chain_id, 111_111);
+        assert!(!builtin.is_tsuki_active_at_timestamp(1_790_030_899));
+        assert!(builtin.is_tsuki_active_at_timestamp(1_790_030_900));
+    }
+}

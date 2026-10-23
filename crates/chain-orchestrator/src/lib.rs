@@ -664,6 +664,11 @@ impl<
                 self.consensus.update_config(update);
                 // Peers would reject a block this node started before losing authorization.
                 if was_authorized && !authorized(&*self.consensus) {
+                    tracing::warn!(
+                        target: "scroll::chain_orchestrator",
+                        ?local_signer,
+                        "This node's signer is no longer authorized; dropping any block in progress"
+                    );
                     if let Some(sequencer) = self.sequencer.as_mut() {
                         sequencer.cancel_payload_building_job();
                     }

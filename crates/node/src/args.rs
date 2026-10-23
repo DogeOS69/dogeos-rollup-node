@@ -451,6 +451,15 @@ impl ScrollRollupNodeConfig {
             l1_provider.filter(|_| !self.test_args.test || is_anvil_provider)
         {
             tracing::info!(target: "scroll::node::args", ?l1_block_startup_info, "Starting L1 watcher");
+            if self.consensus_args.algorithm == ConsensusAlgorithm::SystemContract &&
+                self.consensus_args.authorized_signer.is_some()
+            {
+                tracing::warn!(
+                    target: "scroll::node::args",
+                    "--consensus.authorized-signer applies only until the L1 watcher first reports \
+                     the signer; the node then follows the L1 signer"
+                );
+            }
 
             let (notification_tx, handle) = L1Watcher::spawn(
                 provider,

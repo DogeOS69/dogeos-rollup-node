@@ -60,7 +60,8 @@ impl<N: FullNetwork> ScrollNetworkHandle<N> {
         self.send_message(NetworkHandleMessage::AnnounceBlock { block, signature });
     }
 
-    /// Replaces the signer whose blocks the network gossips over eth-wire.
+    /// Replaces the signer whose blocks the network gossips over eth-wire, if one is set. A
+    /// network started without one keeps gossiping every block.
     pub fn update_authorized_signer(&self, signer: Address) {
         self.send_message(NetworkHandleMessage::UpdateAuthorizedSigner(signer));
     }

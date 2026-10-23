@@ -9,12 +9,11 @@
 //! run it with `--ignored`. A running watcher never re-reads the signer slot:
 //! `handle_latest_block` stores the new L1 head before `handle_system_contract_update`
 //! compares against it, so the standby never sequences block 4. Passing needs two watcher
-//! changes: re-read the signer on every new L1 head, and deliver that update even when the
-//! L1 block has no logs. Today a signer update with no logs fails the watcher's
-//! notification-count check, so a fix that only adds the re-read still fails: either at
-//! "did not process L1 2", or at block 4 with the new signer already in the storage reads.
-//! Remove the `#[ignore]` once both are fixed. Until then, followers pick up a rotation by
-//! exiting and restarting (`--consensus.exit-on-signer-rotation`).
+//! changes: re-read the signer on every new L1 head, and keep that update out of the
+//! watcher's notification-count check, which today counts it against the block's logs.
+//! Either change alone still fails. Remove the `#[ignore]` once both are fixed. Until then,
+//! followers pick up a rotation by exiting and restarting
+//! (`--consensus.exit-on-signer-rotation`).
 
 use alloy_primitives::{Address, B256, U256};
 use alloy_rpc_types_eth::Block;
@@ -233,6 +232,12 @@ async fn rotation() -> eyre::Result<()> {
     let old_rpc = L1Rpc::start(state.clone()).await?;
     let new_rpc = L1Rpc::start(state.clone()).await?;
     let follower_rpc = L1Rpc::start(state.clone()).await?;
+    let reads = || {
+        format!(
+            "storage reads={:?}; old={old_address}, new={new_address}",
+            [old_rpc.reads(), new_rpc.reads(), follower_rpc.reads()]
+        )
+    };
 
     let mut old = old_rpc
         .configure(TestFixture::builder().sequencer())
@@ -257,7 +262,7 @@ async fn rotation() -> eyre::Result<()> {
     old.sequencer().node.connect(&mut follower.nodes[0].as_mut().unwrap().node).await;
     new.sequencer().node.connect(&mut follower.nodes[0].as_mut().unwrap().node).await;
     for (fixture, label) in [(&old, "old"), (&new, "standby"), (&follower, "follower")] {
-        wait_processed(fixture, 1, label).await?;
+        wait_processed(fixture, 1, label).await.wrap_err_with(reads)?;
     }
     let mut common_parent = B256::ZERO;
     for height in 1..=3 {
@@ -279,21 +284,16 @@ async fn rotation() -> eyre::Result<()> {
     // consensus object, or network signer is changed by the test.
     state.lock().unwrap().advance(new_address);
     for (fixture, label) in [(&old, "old"), (&new, "standby"), (&follower, "follower")] {
-        wait_processed(fixture, 2, label).await.wrap_err_with(|| {
-            format!(
-                "storage reads={:?}; old={old_address}, new={new_address}",
-                [old_rpc.reads(), new_rpc.reads(), follower_rpc.reads()]
-            )
-        })?;
+        wait_processed(fixture, 2, label).await.wrap_err_with(reads)?;
     }
 
     let outcome = new.expect_event_on(0).timeout(PHASE_TIMEOUT).block_sequenced(4).await;
-    let reads = [old_rpc.reads(), new_rpc.reads(), follower_rpc.reads()];
     let progress = [processed(&old).await?, processed(&new).await?, processed(&follower).await?];
     let block = outcome.wrap_err_with(|| {
         format!(
             "new signer did not sequence after L1 rotation; L1 processed [old, standby, follower]=\
-         {progress:?}; storage reads={reads:?}; old={old_address}, new={new_address}"
+         {progress:?}; {}",
+            reads()
         )
     })?;
     ensure!(block.header.parent_hash == common_parent, "standby did not extend common parent");

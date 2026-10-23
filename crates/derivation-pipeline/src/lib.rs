@@ -27,7 +27,12 @@ mod metrics;
 pub use metrics::DerivationPipelineMetrics;
 
 use crate::data_source::CodecDataSource;
-use std::{boxed::Box, sync::Arc, time::Instant, vec::Vec};
+use std::{
+    boxed::Box,
+    sync::Arc,
+    time::{Duration, Instant},
+    vec::Vec,
+};
 
 /// The derivation pipeline that derives [`BatchDerivationResult`] from [`BatchInfo`].
 ///
@@ -48,6 +53,7 @@ pub struct DerivationPipeline {
 impl DerivationPipeline {
     /// Returns a new instance of the [`DerivationPipeline`].
     pub async fn new<P>(
+        task_executor: &reth_tasks::TaskExecutor,
         l1_provider: P,
         database: Arc<Database>,
         l1_v2_message_queue_start_index: u64,
@@ -55,9 +61,13 @@ impl DerivationPipeline {
     where
         P: L1Provider + Clone + Send + Sync + 'static,
     {
-        let (batch_sender, result_receiver) =
-            DerivationPipelineWorker::spawn(l1_provider, database, l1_v2_message_queue_start_index)
-                .await;
+        let (batch_sender, result_receiver) = DerivationPipelineWorker::spawn(
+            task_executor,
+            l1_provider,
+            database,
+            l1_v2_message_queue_start_index,
+        )
+        .await;
         Self { batch_sender, result_receiver, len: 0 }
     }
 
@@ -101,6 +111,28 @@ impl Stream for DerivationPipeline {
 /// The maximum number of concurrent batch derivation futures.
 const DERIVATION_PIPELINE_WORKER_CONCURRENCY: usize = 3;
 
+/// The delay before the first derivation retry.
+const DERIVATION_RETRY_INITIAL_DELAY: Duration = Duration::from_secs(1);
+/// The longest delay between derivation retries.
+const DERIVATION_RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
+
+/// The wait before retrying a batch that failed to derive: doubles after each failure, up to the
+/// cap.
+#[derive(Debug)]
+struct RetryDelay(Duration);
+
+impl RetryDelay {
+    fn next(&mut self) -> Duration {
+        let delay = self.0;
+        self.0 = (delay * 2).min(DERIVATION_RETRY_MAX_DELAY);
+        delay
+    }
+
+    const fn reset(&mut self) {
+        self.0 = DERIVATION_RETRY_INITIAL_DELAY;
+    }
+}
+
 /// A structure holding the current unresolved futures for the derivation pipeline.
 #[derive(Debug)]
 pub struct DerivationPipelineWorker<P> {
@@ -110,6 +142,8 @@ pub struct DerivationPipelineWorker<P> {
     result_sender: UnboundedSender<BatchDerivationResult>,
     /// The active batch derivation futures.
     futures: FuturesOrdered<DerivationPipelineFuture>,
+    /// The delay before the next derivation retry.
+    retry_delay: RetryDelay,
     /// A reference to the database.
     database: Arc<Database>,
     /// A cache for pre-fetching derivation pipeline data from the database.
@@ -138,6 +172,7 @@ impl<P> DerivationPipelineWorker<P> {
             batch_receiver,
             result_sender,
             futures: FuturesOrdered::new(),
+            retry_delay: RetryDelay(DERIVATION_RETRY_INITIAL_DELAY),
             database,
             cache,
             l1_provider,
@@ -153,6 +188,7 @@ where
 {
     /// Spawns a new instance of the [`DerivationPipelineWorker`] in a separate task.
     pub async fn spawn(
+        task_executor: &reth_tasks::TaskExecutor,
         l1_provider: P,
         database: Arc<Database>,
         l1_v2_message_queue_start_index: u64,
@@ -161,7 +197,7 @@ where
         let (batch_sender, batch_receiver) = tokio::sync::mpsc::unbounded_channel();
         let (result_sender, result_receiver) = tokio::sync::mpsc::unbounded_channel();
 
-        tokio::task::spawn(async move {
+        task_executor.spawn_critical_task("derivation_pipeline_worker", async move {
             let worker = Self::new(
                 l1_provider,
                 database,
@@ -202,14 +238,20 @@ where
                 Some(result) = self.futures.next() => {
                     match result {
                         Ok(res) => {
+                            self.retry_delay.reset();
                             if self.result_sender.send(res).is_err() {
                                 tracing::info!(target: "scroll::derivation_pipeline", "Result channel closed, shutting down derivation pipeline worker");
                                 break;
                             }
                         }
                         Err((batch_info, err)) => {
-                            tracing::error!(target: "scroll::derivation_pipeline", ?batch_info, ?err, "Failed to derive payload attributes");
-                            self.futures.push_front(self.derivation_future(batch_info));
+                            let retry_in = self.retry_delay.next();
+                            tracing::error!(target: "scroll::derivation_pipeline", ?batch_info, ?err, ?retry_in, "Failed to derive payload attributes");
+                            let fut = self.derivation_future(batch_info);
+                            self.futures.push_front(Box::pin(async move {
+                                tokio::time::sleep(retry_in).await;
+                                fut.await
+                            }));
                         }
                     }
                 }
@@ -517,6 +559,15 @@ mod tests {
     };
 
     #[test]
+    fn test_retry_delay() {
+        let mut delay = RetryDelay(DERIVATION_RETRY_INITIAL_DELAY);
+        let delays: Vec<_> = (0..7).map(|_| delay.next().as_secs()).collect();
+        assert_eq!(delays, [1, 2, 4, 8, 16, 30, 30]);
+        delay.reset();
+        assert_eq!(delay.next(), Duration::from_secs(1));
+    }
+
+    #[test]
     fn test_should_reject_l1_message_transaction_from_batch_data() {
         let transactions = vec![Bytes::from_static(&[L1_MESSAGE_TX_TYPE_ID, 0xc0])];
 
@@ -549,7 +600,13 @@ mod tests {
 
         // construct the pipeline.
         let mock_l1_provider = MockL1Provider { db: db.clone(), blobs: HashMap::new() };
-        let mut pipeline = DerivationPipeline::new(mock_l1_provider, db.clone(), u64::MAX).await;
+        let mut pipeline = DerivationPipeline::new(
+            &reth_tasks::TaskExecutor::test(),
+            mock_l1_provider,
+            db.clone(),
+            u64::MAX,
+        )
+        .await;
 
         // as long as we don't call `push_batch`, pipeline should not return attributes.
         pipeline
@@ -623,7 +680,13 @@ mod tests {
 
         // construct the pipeline.
         let mock_l1_provider = MockL1Provider { db: db.clone(), blobs: HashMap::new() };
-        let mut pipeline = DerivationPipeline::new(mock_l1_provider, db, u64::MAX).await;
+        let mut pipeline = DerivationPipeline::new(
+            &reth_tasks::TaskExecutor::test(),
+            mock_l1_provider,
+            db,
+            u64::MAX,
+        )
+        .await;
 
         // as long as we don't call `push_batch`, pipeline should not return attributes.
         pipeline

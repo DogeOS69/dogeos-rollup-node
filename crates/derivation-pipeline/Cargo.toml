@@ -19,6 +19,9 @@ alloy-rpc-types-engine = { workspace = true, default-features = false }
 dogeos-protocol-types = { workspace = true, default-features = false }
 dogeos-reth-engine.workspace = true
 
+# reth
+reth-tasks.workspace = true
+
 # rollup node
 rollup-node-primitives.workspace = true
 rollup-node-providers.workspace = true

@@ -623,6 +623,7 @@ async fn rg41_restart_from_finalized_block_number_does_not_detect_replacement() 
 
     // The database's highest stored message is the old block 3's: the node restarts from 3.
     let (_tx, mut handle) = L1Watcher::spawn(
+        &reth_tasks::TaskExecutor::test(),
         l1.clone(),
         L1BlockStartupInfo::FinalizedBlockNumber(3),
         Arc::new(config),
@@ -655,6 +656,93 @@ async fn rg41_restart_from_finalized_block_number_does_not_detect_replacement() 
     // Stop the spawned watcher. `L1Watcher::spawn` does not return its task handle; dropping the
     // notification receiver makes the watcher's next send fail, which ends its run loop.
     drop(handle);
+}
+
+/// Startup waits for missing L1 blocks and resumes when they are available.
+#[tokio::test]
+async fn startup_waits_for_missing_blocks() {
+    let f = Fixture::new();
+    let executor = reth_tasks::TaskExecutor::test();
+    for (chain, startup_info, head) in [
+        (vec![], L1BlockStartupInfo::None, &f.b3),
+        (
+            vec![f.b0.clone(), f.b1.clone()],
+            L1BlockStartupInfo::UnsafeBlocks(vec![(&f.b3).into()]),
+            &f.b1,
+        ),
+    ] {
+        let l1 = SyntheticL1::new(chain, vec![]);
+        let provider = l1.clone();
+        let task_executor = executor.clone();
+        let config = NodeConfig { start_l1_block: 1, ..NodeConfig::mainnet() };
+        let task = tokio::spawn(async move {
+            L1Watcher::spawn(
+                &task_executor,
+                provider,
+                startup_info,
+                Arc::new(config),
+                500,
+                60,
+                12,
+                #[cfg(feature = "test-utils")]
+                false,
+            )
+            .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!task.is_finished(), "startup waits for the missing block");
+
+        l1.serve(f.chain(), vec![]);
+        let (_tx, mut handle) = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("startup resumes when blocks are available")
+            .expect("startup does not panic");
+        let notifications = drain(&mut handle);
+        assert_eq!(notifications.first(), Some(&L1Notification::Finalized(head.number)));
+        assert_eq!(notifications.get(1), Some(&L1Notification::NewBlock(head.into())));
+    }
+}
+
+/// A watcher panic reaches Reth's task manager, which ends the node.
+#[tokio::test]
+async fn watcher_panic_reaches_task_manager() {
+    let executor = reth_tasks::TaskExecutor::test();
+    let task_manager = executor.take_task_manager_handle().expect("handle");
+    let f = Fixture::new();
+    let l1 = SyntheticL1::new(f.chain(), vec![]);
+    let config = NodeConfig { start_l1_block: 1, ..NodeConfig::mainnet() };
+    let (_tx, mut handle) = L1Watcher::spawn(
+        &executor,
+        l1.clone(),
+        L1BlockStartupInfo::FinalizedBlockNumber(3),
+        Arc::new(config),
+        500,
+        60,
+        12,
+        #[cfg(feature = "test-utils")]
+        false,
+    )
+    .await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    for expected in [L1Notification::Finalized(3), L1Notification::NewBlock((&f.b3).into())] {
+        let notification =
+            tokio::time::timeout_at(deadline, handle.l1_notification_receiver().recv())
+                .await
+                .expect("startup notification arrives")
+                .expect("channel open");
+        assert_eq!(*notification, expected);
+    }
+
+    // An L1 serving no blocks makes the watcher's run loop panic.
+    l1.state().chain.clear();
+    let err = tokio::time::timeout(Duration::from_secs(5), task_manager)
+        .await
+        .expect("task manager observes the panic")
+        .expect("task manager task completes")
+        .expect_err("watcher panic ends the node");
+    assert!(err.to_string().contains("l1_watcher"), "unexpected error: {err}");
 }
 
 /// The runtime signer refresh never fires. `handle_latest_block` sets

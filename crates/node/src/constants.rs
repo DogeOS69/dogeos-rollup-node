@@ -2,6 +2,14 @@
 
 use alloy_primitives::{address, Address, U128};
 
+/// Exit code for a safety stop: the node stopped because its own state may be wrong (see
+/// `rollup_node_chain_orchestrator::ChainOrchestratorError::is_safety_stop`), so a restart alone
+/// will not fix it. Exit codes once the node has started: 0 for SIGTERM/SIGINT, 1 for other
+/// errors, 70 for a signer rotation ([`crate::signer_rotation::EXIT_CODE_SIGNER_ROTATION`]) and 78
+/// for a safety stop. Invalid command-line arguments exit 2 before the node starts, and a panic
+/// outside a Reth task (for example during start-up) exits 101.
+pub const EXIT_CODE_SAFETY_STOP: i32 = 78;
+
 /// The max retries for the L1 provider.
 pub(crate) const L1_PROVIDER_MAX_RETRIES: u32 = 10;
 

@@ -209,7 +209,10 @@ where
 {
     /// Spawn a new [`L1Watcher`], starting at `start_block`. The watcher will iterate the L1,
     /// returning [`L1Notification`] in the returned channel.
+    /// Runs as a critical task, so a panic shuts down the node.
+    #[allow(clippy::too_many_arguments)]
     pub async fn spawn(
+        task_executor: &reth_tasks::TaskExecutor,
         execution_provider: EP,
         l1_block_startup_info: L1BlockStartupInfo,
         config: Arc<NodeConfig>,
@@ -228,11 +231,14 @@ where
             let block = loop {
                 match execution_provider.get_block(tag.into()).await {
                     Err(err) => {
-                        tracing::error!(target: "scroll::watcher", ?err, "failed to fetch {tag} block")
+                        tracing::error!(target: "scroll::watcher", ?err, delay = ?SLOW_SYNC_INTERVAL, "failed to fetch {tag} block")
                     }
                     Ok(Some(block)) => break block,
-                    _ => unreachable!("should always be a {tag} block"),
+                    Ok(None) => {
+                        tracing::warn!(target: "scroll::watcher", %tag, delay = ?SLOW_SYNC_INTERVAL, "L1 endpoint has no {tag} block yet; watcher will retry")
+                    }
                 }
+                tokio::time::sleep(SLOW_SYNC_INTERVAL).await;
             };
             BlockInfo { number: block.header.number, hash: block.header.hash }
         };
@@ -303,7 +309,7 @@ where
             .await
             .expect("channel is open in this context");
 
-        tokio::spawn(watcher.run());
+        task_executor.spawn_critical_task("l1_watcher", watcher.run());
 
         (notification_tx, handle)
     }

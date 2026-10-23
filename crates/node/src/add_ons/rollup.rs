@@ -11,7 +11,15 @@ use reth_rpc_eth_api::EthApiTypes;
 use rollup_node_chain_orchestrator::ChainOrchestratorHandle;
 use scroll_network::{DogeosNetworkPrimitives, EthWireBlockWithPeer};
 use scroll_wire::ScrollWireEvent;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::mpsc::{Receiver, UnboundedReceiver};
+
+static SAFETY_STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Returns whether the chain orchestrator requested a safety stop.
+pub fn safety_stop_requested() -> bool {
+    SAFETY_STOP_REQUESTED.load(Ordering::SeqCst)
+}
 
 /// Implementing the trait allows the type to return whether it is configured for dev chain.
 #[auto_impl::auto_impl(Arc)]
@@ -78,6 +86,9 @@ impl RollupManagerAddOn {
                 if let Err(error) =
                     chain_orchestrator.run_until_shutdown(shutdown.ignore_guard()).await
                 {
+                    if error.is_safety_stop() {
+                        SAFETY_STOP_REQUESTED.store(true, Ordering::SeqCst);
+                    }
                     panic!("fatal chain orchestrator error: {error}");
                 }
             },

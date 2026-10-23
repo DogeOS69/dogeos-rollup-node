@@ -179,11 +179,91 @@ pub enum ChainOrchestratorError {
     RollupNodePrimitiveError(rollup_node_primitives::RollupNodePrimitiveError),
 }
 
+impl ChainOrchestratorError {
+    /// The node stopped because its state may be wrong; restarting alone will not help.
+    pub const fn is_safety_stop(&self) -> bool {
+        matches!(
+            self,
+            Self::InvalidDerivedPayload { .. }
+                | Self::DerivedPayloadMismatch { .. }
+                | Self::SafeFrontierMismatch { .. }
+                | Self::UnwindForkchoiceUpdateFailed { .. }
+        )
+    }
+}
+
 impl CanRetry for ChainOrchestratorError {
     fn can_retry(&self) -> bool {
         match &self {
             Self::DatabaseError(err) => err.can_retry(),
             _ => false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classifies_safety_stops() {
+        let cases = [
+            (
+                ChainOrchestratorError::InvalidDerivedPayload {
+                    batch_info: Default::default(),
+                    method: "newPayload",
+                    block_number: Some(1),
+                    latest_valid_hash: None,
+                    validation_error: "invalid block".into(),
+                },
+                true,
+            ),
+            (
+                ChainOrchestratorError::DerivedPayloadMismatch {
+                    batch_info: Default::default(),
+                    block_number: 1,
+                    reason: "block hash differs".into(),
+                },
+                true,
+            ),
+            (
+                ChainOrchestratorError::SafeFrontierMismatch {
+                    batch_info: Default::default(),
+                    engine_safe: Default::default(),
+                    db_safe: Default::default(),
+                    reth_canonical: None,
+                },
+                true,
+            ),
+            (
+                ChainOrchestratorError::UnwindForkchoiceUpdateFailed {
+                    operation: "L1 reorg",
+                    db_safe: None,
+                    engine_safe: Default::default(),
+                    reason: "forkchoice rejected".into(),
+                },
+                true,
+            ),
+            (
+                ChainOrchestratorError::DatabaseError(DatabaseError::L1MessageNotFound(
+                    L1MessageKey::QueueIndex(1),
+                )),
+                false,
+            ),
+            (ChainOrchestratorError::EngineError(EngineError::fcs_no_update_provided()), false),
+            (ChainOrchestratorError::L2BlockNotFoundInL2Client(1), false),
+            (
+                ChainOrchestratorError::InvalidBatchReorg {
+                    batch_info: Default::default(),
+                    safe_block_number: 1,
+                    derived_block_number: 3,
+                },
+                false,
+            ),
+        ];
+
+        for (error, expected) in cases {
+            assert_eq!(error.is_safety_stop(), expected, "{error:?}");
         }
     }
 }

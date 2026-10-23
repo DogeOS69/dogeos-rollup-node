@@ -2,6 +2,11 @@
 
 use alloy_primitives::{address, Address, U128};
 
+/// Node exit codes: 0 for SIGTERM/SIGINT, 1 for other errors,
+/// 70 for signer rotation ([`crate::signer_rotation::EXIT_CODE_SIGNER_ROTATION`]),
+/// and 78 for a safety stop.
+pub const EXIT_CODE_SAFETY_STOP: i32 = 78;
+
 /// The max retries for the L1 provider.
 pub(crate) const L1_PROVIDER_MAX_RETRIES: u32 = 10;
 

@@ -11,9 +11,10 @@
 //! compares against it, so the standby never sequences block 4. Passing needs two watcher
 //! changes: re-read the signer on every new L1 head, and deliver that update even when the
 //! L1 block has no logs. Today a signer update with no logs fails the watcher's
-//! notification-count check, so with only the first change the test fails earlier, at
-//! "did not process L1 2". Remove the `#[ignore]` once both are fixed. Until then, followers
-//! pick up a rotation by exiting and restarting (`--consensus.exit-on-signer-rotation`).
+//! notification-count check, so a fix that only adds the re-read still fails: either at
+//! "did not process L1 2", or at block 4 with the new signer already in the storage reads.
+//! Remove the `#[ignore]` once both are fixed. Until then, followers pick up a rotation by
+//! exiting and restarting (`--consensus.exit-on-signer-rotation`).
 
 use alloy_primitives::{Address, B256, U256};
 use alloy_rpc_types_eth::Block;

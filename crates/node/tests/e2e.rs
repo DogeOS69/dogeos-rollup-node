@@ -2003,8 +2003,9 @@ async fn eth_wire_gossip_follows_a_signer_rotation() -> eyre::Result<()> {
     fixture.l1().sync().await?;
     fixture.expect_event_on_all_nodes().l1_synced().await?;
 
-    // L1 rotates the signer to the sequencer's key. A node handles L1 notifications in order, so
-    // once it reports the next L1 block it has applied the rotation.
+    // L1 rotates the signer to the sequencer's key. The test sends the rotation before the next L1
+    // block, and a node handles L1 notifications in order, so once it reports that block it has
+    // applied the rotation.
     fixture.l1().signer_update(signer.address()).await?;
     fixture.l1().new_block(1).await?;
     fixture.expect_event_on_all_nodes().new_l1_block().await?;

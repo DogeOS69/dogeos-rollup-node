@@ -151,8 +151,8 @@ impl ScrollRollupNodeConfig {
             }
             if self.consensus_args.authorized_signer.is_some() {
                 return Err("--consensus.exit-on-signer-rotation cannot be used with \
-                     --consensus.authorized-signer because a restart applies the pinned signer \
-                     again until the next L1 head"
+                     --consensus.authorized-signer because every restart would apply the pinned \
+                     signer again until the L1 watcher first reports the signer"
                     .to_string());
             }
             if self.consensus_args.algorithm != ConsensusAlgorithm::SystemContract {
@@ -1163,8 +1163,8 @@ mod tests {
         assert_eq!(
             config.validate().unwrap_err(),
             "--consensus.exit-on-signer-rotation cannot be used with \
-             --consensus.authorized-signer because a restart applies the pinned signer \
-             again until the next L1 head"
+             --consensus.authorized-signer because every restart would apply the pinned \
+             signer again until the L1 watcher first reports the signer"
         );
     }
 

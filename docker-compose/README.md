@@ -98,7 +98,7 @@ can restart it. Configure a restart policy such as Docker Compose `restart: unle
 Kubernetes, or systemd `Restart=on-failure` before enabling the flag.
 
 Do not enable this on sequencer nodes or combine it with `--consensus.authorized-signer`; a
-restart would apply the pinned signer again until the next L1 head.
+restart would apply the pinned signer again until the L1 watcher first reports the signer.
 
 ---
 

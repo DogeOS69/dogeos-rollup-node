@@ -163,7 +163,7 @@ test: true  // in ScrollRollupNodeConfig
 ### 2. Consensus Modes
 - **Noop**: No consensus validation (test mode)
 - **SystemContract**: Validates against authorized signer from L1 contract
-  - **PoA**: without an L1 URL, `consensus.authorized-signer` stays constant; with one, it is only the startup signer and each new L1 head replaces it with the L1 signer
+  - **PoA**: without an L1 URL, `consensus.authorized-signer` stays constant; with one, it applies only until the L1 watcher first reports the signer after startup, and the node follows the L1 signer from then on
 
 ## Debugging & Troubleshooting
 

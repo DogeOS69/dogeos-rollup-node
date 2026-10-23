@@ -230,11 +230,14 @@ where
             let block = loop {
                 match execution_provider.get_block(tag.into()).await {
                     Err(err) => {
-                        tracing::error!(target: "scroll::watcher", ?err, "failed to fetch {tag} block")
+                        tracing::error!(target: "scroll::watcher", ?err, delay = ?SLOW_SYNC_INTERVAL, "failed to fetch {tag} block")
                     }
                     Ok(Some(block)) => break block,
-                    _ => unreachable!("should always be a {tag} block"),
+                    Ok(None) => {
+                        tracing::warn!(target: "scroll::watcher", %tag, delay = ?SLOW_SYNC_INTERVAL, "L1 endpoint has no {tag} block yet; watcher will retry")
+                    }
                 }
+                tokio::time::sleep(SLOW_SYNC_INTERVAL).await;
             };
             BlockInfo { number: block.header.number, hash: block.header.hash }
         };

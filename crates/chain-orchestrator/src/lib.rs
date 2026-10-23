@@ -2,7 +2,7 @@
 //! L2 p2p network.
 
 use alloy_eips::Encodable2718;
-use alloy_primitives::{b256, bytes::Bytes, keccak256, B256};
+use alloy_primitives::{bytes::Bytes, keccak256, B256};
 use alloy_provider::Provider;
 use alloy_rpc_types_engine::{ExecutionPayloadV1, PayloadStatusEnum};
 use dogeos_hardforks::DogeosHardforks;
@@ -76,10 +76,6 @@ macro_rules! metered {
         }
     };
 }
-
-/// The mask used to mask the L1 message queue hash.
-const L1_MESSAGE_QUEUE_HASH_MASK: B256 =
-    b256!("ffffffffffffffffffffffffffffffffffffffffffffffffffffffff00000000");
 
 /// The number of headers to fetch in each request when fetching headers from peers.
 const HEADER_FETCH_COUNT: u64 = 100;
@@ -1722,35 +1718,33 @@ const fn supersedes_blocked_import(
         )
 }
 
-/// Computes the queue hash by taking the previous queue hash and performing a 2-to-1 hash with the
-/// current transaction hash using keccak. It then applies a mask to the last 32 bits as these bits
-/// are used to store the timestamp at which the message was enqueued in the contract. For the first
-/// message in the queue, the previous queue hash is zero. If the L1 message queue index is before
-/// migration to `L1MessageQueueV2`, the queue hash will be None.
-///
-/// The solidity contract (`L1MessageQueueV2.sol`) implementation is defined here: <https://github.com/scroll-tech/scroll-contracts/blob/67c1bde19c1d3462abf8c175916a2bb3c89530e4/src/L1/rollup/L1MessageQueueV2.sol#L379-L403>
+/// Fold a transaction hash into the full 256-bit `DogeOS` message queue commitment.
+fn hash_msg_queue(rolling_hash: B256, tx_hash: B256) -> B256 {
+    let mut input = [0u8; 64];
+    input[..32].copy_from_slice(rolling_hash.as_slice());
+    input[32..].copy_from_slice(tx_hash.as_slice());
+    keccak256(input)
+}
+
+/// Compute the queue hash, preserving all 256 bits at every step.
+/// The first V2 message starts from zero; earlier messages have no queue hash.
 async fn compute_l1_message_queue_hash(
     database: &Arc<Database>,
     l1_message: &TxL1Message,
     l1_v2_message_queue_start_index: u64,
 ) -> Result<Option<alloy_primitives::FixedBytes<32>>, ChainOrchestratorError> {
     let queue_hash = if l1_message.queue_index == l1_v2_message_queue_start_index {
-        let mut input = B256::default().to_vec();
-        input.append(&mut l1_message.tx_hash().to_vec());
-        Some(keccak256(input) & L1_MESSAGE_QUEUE_HASH_MASK)
+        Some(hash_msg_queue(B256::ZERO, l1_message.tx_hash()))
     } else if l1_message.queue_index > l1_v2_message_queue_start_index {
         let index = l1_message.queue_index - 1;
-        let mut input = database
+        let previous = database
             .get_n_l1_messages(Some(L1MessageKey::from_queue_index(index)), 1)
             .await?
             .first()
             .map(|m| m.queue_hash)
             .ok_or(DatabaseError::L1MessageNotFound(L1MessageKey::QueueIndex(index)))?
-            .unwrap_or_default()
-            .to_vec();
-
-        input.append(&mut l1_message.tx_hash().to_vec());
-        Some(keccak256(input) & L1_MESSAGE_QUEUE_HASH_MASK)
+            .unwrap_or_default();
+        Some(hash_msg_queue(previous, l1_message.tx_hash()))
     } else {
         None
     };

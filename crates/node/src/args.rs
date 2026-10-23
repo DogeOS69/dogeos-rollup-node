@@ -118,13 +118,6 @@ pub struct ScrollRollupNodeConfig {
     /// The database connection (not parsed via CLI but hydrated after validation).
     #[arg(skip)]
     pub database: Option<Arc<Database>>,
-    /// Require an additional L1 data fee buffer in the account balance checks for transactions.
-    #[arg(
-        long = "require-l1-data-fee-buffer",
-        value_name = "REQUIRE_L1_DATA_FEE_BUFFER",
-        default_value = "false"
-    )]
-    pub require_l1_data_fee_buffer: bool,
 }
 
 impl ScrollRollupNodeConfig {
@@ -1365,6 +1358,13 @@ mod tests {
     }
 
     #[test]
+    fn retired_l1_fee_buffer_flag_is_unknown() {
+        let error =
+            RollupCli::try_parse_from(["rollup-node", "--require-l1-data-fee-buffer"]).unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
+
+    #[test]
     fn shared_code_witness_arguments_parse_in_rollup_node() {
         let cli = RollupCli::try_parse_from([
             "rollup-node",
@@ -1418,7 +1418,6 @@ mod tests {
             pprof_args: PprofArgs::default(),
             remote_block_source_args: RemoteBlockSourceArgs::default(),
             database: None,
-            require_l1_data_fee_buffer: false,
         }
     }
 
@@ -1789,7 +1788,6 @@ mod tests {
             rpc_args: RpcArgs::default(),
             pprof_args: PprofArgs::default(),
             remote_block_source_args: RemoteBlockSourceArgs::default(),
-            require_l1_data_fee_buffer: false,
         };
 
         // The message names only the two sources a CLI user can select;
@@ -1824,7 +1822,6 @@ mod tests {
                 poll_interval_ms: 100,
                 build: false,
             },
-            require_l1_data_fee_buffer: false,
         };
 
         let result = config.validate();
@@ -1861,7 +1858,6 @@ mod tests {
             rpc_args: RpcArgs::default(),
             pprof_args: PprofArgs::default(),
             remote_block_source_args: RemoteBlockSourceArgs::default(),
-            require_l1_data_fee_buffer: false,
         };
 
         let result = config.validate();
@@ -1892,7 +1888,6 @@ mod tests {
             rpc_args: RpcArgs::default(),
             pprof_args: PprofArgs::default(),
             remote_block_source_args: RemoteBlockSourceArgs::default(),
-            require_l1_data_fee_buffer: false,
         };
 
         assert!(config.validate().is_ok());
@@ -1921,7 +1916,6 @@ mod tests {
             rpc_args: RpcArgs::default(),
             pprof_args: PprofArgs::default(),
             remote_block_source_args: RemoteBlockSourceArgs::default(),
-            require_l1_data_fee_buffer: false,
         };
 
         assert!(config.validate().is_ok());
@@ -1946,7 +1940,6 @@ mod tests {
             rpc_args: RpcArgs::default(),
             pprof_args: PprofArgs::default(),
             remote_block_source_args: RemoteBlockSourceArgs::default(),
-            require_l1_data_fee_buffer: false,
         };
 
         assert!(config.validate().is_ok());

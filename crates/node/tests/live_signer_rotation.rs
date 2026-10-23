@@ -9,10 +9,11 @@
 //! run it with `--ignored`. A running watcher never re-reads the signer slot:
 //! `handle_latest_block` stores the new L1 head before `handle_system_contract_update`
 //! compares against it, so the standby never sequences block 4. Passing needs two watcher
-//! changes: re-read the signer on every new L1 head, and keep that update out of the
-//! watcher's log-based notification-count check, which would reject it. Either change
-//! alone still fails. Remove the `#[ignore]` once both are fixed. Until then,
-//! followers pick up a rotation by exiting and restarting
+//! changes: re-read the signer on every new L1 head, and deliver that update without counting
+//! it in the watcher's log-based notification-count check, which would reject it. Either
+//! change alone still fails. When both are fixed, remove the `#[ignore]` and update
+//! `rg52_runtime_signer_refresh_never_reads_the_system_contract` in the watcher tests. Until
+//! then, followers pick up a rotation by exiting and restarting
 //! (`--consensus.exit-on-signer-rotation`).
 
 use alloy_primitives::{Address, B256, U256};
@@ -193,10 +194,8 @@ async fn expect_import(
         "received block {height} was not signed by {signer}: {signatures:?}"
     );
     fixture.expect_event_on(0).timeout(PHASE_TIMEOUT).chain_extended(height).await?;
-    ensure!(
-        canonical_hash(fixture, height).await? == hash,
-        "node imported a different block at {height}, expected {hash}"
-    );
+    let imported = canonical_hash(fixture, height).await?;
+    ensure!(imported == hash, "node imported {imported} at {height}, expected {hash}");
     Ok(())
 }
 
@@ -300,7 +299,11 @@ async fn rotation() -> eyre::Result<()> {
             reads()
         )
     })?;
-    ensure!(block.header.parent_hash == common_parent, "standby did not extend common parent");
+    ensure!(
+        block.header.parent_hash == common_parent,
+        "standby built block 4 on {}, expected common parent {common_parent}",
+        block.header.parent_hash
+    );
     for (label, rpc) in [("old", &old_rpc), ("standby", &new_rpc), ("follower", &follower_rpc)] {
         ensure!(
             rpc.reads().contains(&new_address),
@@ -311,9 +314,11 @@ async fn rotation() -> eyre::Result<()> {
     expect_import(&mut follower, 4, block.hash_slow(), new_address)
         .await
         .wrap_err("prestarted follower did not adopt new signer")?;
+    let (standby_hash, follower_hash) =
+        (canonical_hash(&new, 4).await?, canonical_hash(&follower, 4).await?);
     ensure!(
-        canonical_hash(&new, 4).await? == canonical_hash(&follower, 4).await?,
-        "new sequencer and continuously running follower disagree"
+        standby_hash == follower_hash,
+        "block 4 differs: standby {standby_hash}, continuously running follower {follower_hash}"
     );
     Ok(())
 }

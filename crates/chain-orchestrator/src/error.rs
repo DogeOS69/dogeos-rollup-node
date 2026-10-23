@@ -184,10 +184,10 @@ impl ChainOrchestratorError {
     pub const fn is_safety_stop(&self) -> bool {
         matches!(
             self,
-            Self::InvalidDerivedPayload { .. }
-                | Self::DerivedPayloadMismatch { .. }
-                | Self::SafeFrontierMismatch { .. }
-                | Self::UnwindForkchoiceUpdateFailed { .. }
+            Self::InvalidDerivedPayload { .. } |
+                Self::DerivedPayloadMismatch { .. } |
+                Self::SafeFrontierMismatch { .. } |
+                Self::UnwindForkchoiceUpdateFailed { .. }
         )
     }
 }

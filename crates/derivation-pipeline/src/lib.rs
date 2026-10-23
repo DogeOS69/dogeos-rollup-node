@@ -680,9 +680,13 @@ mod tests {
 
         // construct the pipeline.
         let mock_l1_provider = MockL1Provider { db: db.clone(), blobs: HashMap::new() };
-        let mut pipeline =
-            DerivationPipeline::new(&reth_tasks::TaskExecutor::test(), mock_l1_provider, db, u64::MAX)
-                .await;
+        let mut pipeline = DerivationPipeline::new(
+            &reth_tasks::TaskExecutor::test(),
+            mock_l1_provider,
+            db,
+            u64::MAX,
+        )
+        .await;
 
         // as long as we don't call `push_batch`, pipeline should not return attributes.
         pipeline

@@ -26,6 +26,7 @@ fn main() {
     use reth_node_builder::EngineNodeLauncher;
     use reth_node_core::args::DefaultEngineValues;
     use rollup_node::{
+        constants::EXIT_CODE_SAFETY_STOP, safety_stop_requested,
         signer_rotation::EXIT_CODE_SIGNER_ROTATION, DogeosChainSpecParser, ScrollRollupNode,
         ScrollRollupNodeConfig,
     };
@@ -123,6 +124,13 @@ fn main() {
             eprintln!("Error during signer-rotation shutdown: {err:?}");
         }
         std::process::exit(EXIT_CODE_SIGNER_ROTATION);
+    }
+
+    if safety_stop_requested() {
+        if let Err(err) = &result {
+            eprintln!("Error: {err:?}");
+        }
+        std::process::exit(EXIT_CODE_SAFETY_STOP);
     }
 
     if let Err(err) = result {

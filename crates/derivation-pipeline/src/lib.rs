@@ -53,6 +53,7 @@ pub struct DerivationPipeline {
 impl DerivationPipeline {
     /// Returns a new instance of the [`DerivationPipeline`].
     pub async fn new<P>(
+        task_executor: &reth_tasks::TaskExecutor,
         l1_provider: P,
         database: Arc<Database>,
         l1_v2_message_queue_start_index: u64,
@@ -60,9 +61,13 @@ impl DerivationPipeline {
     where
         P: L1Provider + Clone + Send + Sync + 'static,
     {
-        let (batch_sender, result_receiver) =
-            DerivationPipelineWorker::spawn(l1_provider, database, l1_v2_message_queue_start_index)
-                .await;
+        let (batch_sender, result_receiver) = DerivationPipelineWorker::spawn(
+            task_executor,
+            l1_provider,
+            database,
+            l1_v2_message_queue_start_index,
+        )
+        .await;
         Self { batch_sender, result_receiver, len: 0 }
     }
 
@@ -183,6 +188,7 @@ where
 {
     /// Spawns a new instance of the [`DerivationPipelineWorker`] in a separate task.
     pub async fn spawn(
+        task_executor: &reth_tasks::TaskExecutor,
         l1_provider: P,
         database: Arc<Database>,
         l1_v2_message_queue_start_index: u64,
@@ -191,7 +197,7 @@ where
         let (batch_sender, batch_receiver) = tokio::sync::mpsc::unbounded_channel();
         let (result_sender, result_receiver) = tokio::sync::mpsc::unbounded_channel();
 
-        tokio::task::spawn(async move {
+        task_executor.spawn_critical_task("derivation_pipeline_worker", async move {
             let worker = Self::new(
                 l1_provider,
                 database,
@@ -594,7 +600,13 @@ mod tests {
 
         // construct the pipeline.
         let mock_l1_provider = MockL1Provider { db: db.clone(), blobs: HashMap::new() };
-        let mut pipeline = DerivationPipeline::new(mock_l1_provider, db.clone(), u64::MAX).await;
+        let mut pipeline = DerivationPipeline::new(
+            &reth_tasks::TaskExecutor::test(),
+            mock_l1_provider,
+            db.clone(),
+            u64::MAX,
+        )
+        .await;
 
         // as long as we don't call `push_batch`, pipeline should not return attributes.
         pipeline
@@ -668,7 +680,9 @@ mod tests {
 
         // construct the pipeline.
         let mock_l1_provider = MockL1Provider { db: db.clone(), blobs: HashMap::new() };
-        let mut pipeline = DerivationPipeline::new(mock_l1_provider, db, u64::MAX).await;
+        let mut pipeline =
+            DerivationPipeline::new(&reth_tasks::TaskExecutor::test(), mock_l1_provider, db, u64::MAX)
+                .await;
 
         // as long as we don't call `push_batch`, pipeline should not return attributes.
         pipeline

@@ -242,7 +242,7 @@ impl DerivationDriver {
                     return Ok::<_, ChainOrchestratorError>((
                         unwind_result,
                         HeldReorgOutcome::NoHeldBatch,
-                    ))
+                    ));
                 };
 
                 let stored = tx.get_batch_by_index(held.batch_info.index).await?;
@@ -743,7 +743,8 @@ mod tests {
             gas_used: 0,
             timestamp: 0,
             extra_data: Bytes::new(),
-            base_fee_per_gas: U256::ZERO,
+            // What `batch()` derives, so a rebuilt payload matches unless a test says otherwise.
+            base_fee_per_gas: U256::from(DERIVED_BASE_FEE),
             block_hash: B256::repeat_byte(0x22),
             transactions: vec![],
         }
@@ -758,7 +759,7 @@ mod tests {
         BatchDerivationResult {
             attributes: vec![DerivedAttributes {
                 block_number: SAFE + 1,
-                base_fee: U256::ZERO,
+                base_fee: U256::from(DERIVED_BASE_FEE),
                 attributes: ScrollPayloadAttributes {
                     transactions: Some(vec![]),
                     ..Default::default()
@@ -807,12 +808,11 @@ mod tests {
         asserter.push_success(&Some(RpcBlock::<ScrollRpcTransaction, _>::empty(rpc_header)));
     }
 
-    fn push_matching_empty_block(
-        asserter: &Asserter,
-        attributes: &ScrollPayloadAttributes,
-    ) -> BlockInfo {
+    fn push_matching_empty_block(asserter: &Asserter, derived: &DerivedAttributes) -> BlockInfo {
+        let attributes = &derived.attributes;
         let header = ConsensusHeader {
             number: SAFE + 1,
+            base_fee_per_gas: Some(derived.base_fee.to()),
             timestamp: attributes.payload_attributes.timestamp,
             mix_hash: attributes.payload_attributes.prev_randao,
             beneficiary: attributes.block_data_hint.coinbase.unwrap_or_default(),
@@ -952,7 +952,7 @@ mod tests {
             timestamp: 1_700_000_001,
             gas_limit: 30_000_000,
             difficulty: U256::ONE,
-            base_fee_per_gas: Some(0),
+            base_fee_per_gas: Some(DERIVED_BASE_FEE),
             ..Default::default()
         };
         let rebuilt_header =
@@ -1044,7 +1044,7 @@ mod tests {
         derived.attributes[0].attributes.transactions = Some(vec![]);
         let asserter = Asserter::new();
         push_absent_block(&asserter);
-        let canonical = push_matching_empty_block(&asserter, &derived.attributes[0].attributes);
+        let canonical = push_matching_empty_block(&asserter, &derived.attributes[0]);
         let provider = absent_block_provider(asserter);
         let mut driver = DerivationDriver::default();
         driver.hold_batch(derived);
@@ -1097,7 +1097,7 @@ mod tests {
 
         let asserter = Asserter::new();
         push_absent_block(&asserter);
-        let canonical = push_matching_empty_block(&asserter, &derived.attributes[0].attributes);
+        let canonical = push_matching_empty_block(&asserter, &derived.attributes[0]);
         let provider = absent_block_provider(asserter);
 
         let client = Arc::new(ScriptedEngineClient::new());
@@ -1449,7 +1449,7 @@ mod tests {
         derived.attributes.push(second);
 
         let asserter = Asserter::new();
-        let child_of_b = push_matching_empty_block(&asserter, &derived.attributes[0].attributes);
+        let child_of_b = push_matching_empty_block(&asserter, &derived.attributes[0]);
         push_absent_block(&asserter);
         let provider = absent_block_provider(asserter);
         let client = Arc::new(ScriptedEngineClient::new());
@@ -1488,7 +1488,7 @@ mod tests {
         derived.attributes.push(second);
         let asserter = Asserter::new();
         push_canonical_block(&asserter, canonical);
-        let child = push_matching_empty_block(&asserter, &derived.attributes[0].attributes);
+        let child = push_matching_empty_block(&asserter, &derived.attributes[0]);
         push_absent_block(&asserter);
         let client = Arc::new(ScriptedEngineClient::new());
         client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Valid, None)));
@@ -1627,7 +1627,7 @@ mod tests {
         let derived = batch(2, BatchStatus::Consolidated);
         let asserter = Asserter::new();
         push_canonical_block(&asserter, info(SAFE, 0x11));
-        let canonical = push_matching_empty_block(&asserter, &derived.attributes[0].attributes);
+        let canonical = push_matching_empty_block(&asserter, &derived.attributes[0]);
         let provider = absent_block_provider(asserter);
         let client = Arc::new(ScriptedEngineClient::new());
         client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Valid, None)));

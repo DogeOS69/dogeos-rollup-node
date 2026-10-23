@@ -355,9 +355,7 @@ impl ScrollRollupNodeConfig {
         // Reconcile the height-0 rows with the chain genesis. The rationale
         // (the migration seed is not the chain genesis, and why that is still
         // reconcilable) is on `DatabaseWriteOperations::reconcile_genesis_block`.
-        // The SAME genesis source the forkchoice state uses; the fallback is the
-        // sealed `genesis_hash()`, not a recomputed header hash — see
-        // `genesis_hash_from_chain_spec` for why that matters on chikyu.
+        // Use the same genesis source as forkchoice so the database and execution layer agree.
         let genesis_hash = genesis_hash_from_chain_spec(chain_spec.clone())
             .unwrap_or_else(|| chain_spec.genesis_hash());
         // The genesis the static migration above seeded; NOT always `genesis_hash`.
@@ -1273,7 +1271,7 @@ mod tests {
     /// `ScrollDevMigrationInfo` today. Naming mainnet or chikyu later would
     /// route it onto a different seed, and this test is what should fail then.
     /// It also pins two facts that mapping silently depends on: chikyu's
-    /// sealed genesis differs from its recomputed header hash, and `--test`
+    /// genesis matches its recomputed header hash, and `--test`
     /// mode's mainnet migration seeds the same genesis as the production one.
     #[test]
     fn genesis_seed_pairing_holds_for_shipped_chain_specs() {
@@ -1302,16 +1300,12 @@ mod tests {
                 ScrollDevMigrationInfo::genesis_hash(),
                 "{name} is expected to be seeded by the dev migration"
             );
-            // THE load-bearing assertion: `genesis_hash()` returns the sealed
-            // value when a spec carries one, and that is what the EL stores at
-            // block 0, so the reconciliation must agree with it. A recomputed
-            // header hash is MAINNET's genesis for chikyu — unequal to the seed
-            // but also unequal to chikyu's own sealed genesis.
+            // Reconciliation and forkchoice must use the genesis the execution layer stores
+            // at block 0, independently of which static migration supplied the initial seed.
             assert_eq!(
                 genesis_hash_from_chain_spec(chain_spec.clone()),
                 Some(chain_spec.genesis_hash()),
-                "{name}'s forkchoice genesis must be the chain spec's own genesis; a recomputed \
-                 header hash diverges from the sealed one and bricks the chain at startup"
+                "{name}'s forkchoice genesis must be the chain spec's own genesis"
             );
             assert_ne!(
                 genesis_hash_from_chain_spec(chain_spec.clone()),
@@ -1322,17 +1316,12 @@ mod tests {
             );
         }
 
-        // The chikyu regression itself, pinned directly so the assertion above
-        // cannot go vacuous: chikyu's genesis document is byte-identical to
-        // mainnet's in every header field, so a recomputed header hash is
-        // MAINNET's genesis, not the sealed chikyu one. Should upstream reseal
-        // chikyu so the two agree, the source-of-genesis assertion above would
-        // pass with `hash_slow()` too and stop guarding anything.
-        assert_ne!(
+        // Chikyu derives its identity from the network document. A pre-sealed override must
+        // never make the chain spec disagree with the actual genesis header again.
+        assert_eq!(
             DOGEOS_CHIKYU.genesis_hash(),
             DOGEOS_CHIKYU.genesis_header().hash_slow(),
-            "chikyu's sealed genesis now equals its recomputed header hash; the genesis-source \
-             assertion above no longer distinguishes genesis_hash() from hash_slow()"
+            "chikyu's genesis must match its recomputed header hash"
         );
         // `--test` migrates mainnet through ScrollMainnetTestMigrationInfo,
         // which the seed mapping above never names: it is only correct while

@@ -49,8 +49,8 @@ struct MaterializedL1 {
 impl MaterializedL1 {
     fn new(signer: Address) -> Self {
         let mut state = Self { blocks: Vec::new(), signers: Vec::new() };
-        // Serve blocks 0 and 1: the watcher starts at L1 block 0 and reports a block as
-        // processed only once the head is above it.
+        // Serve blocks 0 and 1: the watcher's cursor starts at L1 block 0, and it indexes
+        // and reports a block processed only after the head moves past the cursor.
         state.advance(signer);
         state.advance(signer);
         state
@@ -154,7 +154,7 @@ async fn processed(fixture: &TestFixture) -> eyre::Result<u64> {
 }
 
 async fn wait_processed(fixture: &TestFixture, height: u64, label: &str) -> eyre::Result<()> {
-    timeout(PHASE_TIMEOUT, async {
+    let waited = timeout(PHASE_TIMEOUT, async {
         loop {
             if processed(fixture).await? >= height {
                 return Ok::<_, eyre::Report>(());
@@ -162,8 +162,14 @@ async fn wait_processed(fixture: &TestFixture, height: u64, label: &str) -> eyre
             sleep(Duration::from_millis(20)).await;
         }
     })
-    .await
-    .wrap_err_with(|| format!("{label}: production watcher did not process L1 {height}"))?
+    .await;
+    match waited {
+        Ok(result) => result,
+        Err(_) => eyre::bail!(
+            "{label}: production watcher did not process L1 {height}; processed {}",
+            processed(fixture).await?
+        ),
+    }
 }
 
 async fn expect_import(
@@ -188,12 +194,18 @@ async fn expect_import(
             }
             None
         })
-        .await?;
+        .await
+        .wrap_err_with(|| format!("block {height} ({hash}) was not received"))?;
     ensure!(
         signatures[0].as_ref().is_ok_and(|address| *address == signer),
         "received block {height} was not signed by {signer}: {signatures:?}"
     );
-    fixture.expect_event_on(0).timeout(PHASE_TIMEOUT).chain_extended(height).await?;
+    fixture
+        .expect_event_on(0)
+        .timeout(PHASE_TIMEOUT)
+        .chain_extended(height)
+        .await
+        .wrap_err_with(|| format!("block {height} ({hash}) was received but not imported"))?;
     let imported = canonical_hash(fixture, height).await?;
     ensure!(imported == hash, "node imported {imported} at {height}, expected {hash}");
     Ok(())

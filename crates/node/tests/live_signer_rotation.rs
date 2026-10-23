@@ -343,6 +343,15 @@ async fn rotation() -> eyre::Result<()> {
         .await
         .wrap_err("retired sequencer did not adopt new signer")?;
 
+    // Stop the standby first. Its blocks are empty too, so a standby block built in the same
+    // second on the same parent would have the same hash as the old-signer block below, and peers
+    // would skip that block as already seen. Disabling sequencing cancels any block in progress,
+    // so after a one-second wait every standby block has an earlier timestamp.
+    let disabled =
+        new.nodes[0].as_ref().unwrap().rollup_manager_handle.disable_automatic_sequencing().await?;
+    ensure!(disabled, "standby did not disable automatic sequencing");
+    sleep(Duration::from_secs(1)).await;
+
     // Manual builds skip the sequencing check, so the retired sequencer can still sign a block
     // with the old key. The follower must refuse it.
     let stale = old.build_block().build_and_await_block().await?;

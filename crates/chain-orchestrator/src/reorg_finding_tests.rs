@@ -3,9 +3,11 @@
 //! client that either panics if called or answers from a script.
 //!
 //! Tracker rows (Reorg Issue Tracker, Private Mainnet): RG-43 (message sync stops on a queue gap),
-//! RG-46 (L2 finalized at zero synthetic depth cannot be undone) and RG-49 (unwind robustness:
+//! RG-46 (L2 finalized at zero synthetic depth cannot be undone), RG-49 (unwind robustness:
 //! a signed block requested before an unwind is still persisted and announced after it, an
-//! administrative revert that stops half way, and forkchoice answers that are not checked).
+//! administrative revert that stops half way, and forkchoice answers that are not checked) and
+//! RG-52 (an L1 signer update reaches the network's eth-wire gossip check only under
+//! system-contract consensus).
 //! Each test name starts with the RG key of the row it pins.
 //!
 //! Tests that pass today document behaviour that is not fixed; when a row is fixed, change the
@@ -21,6 +23,7 @@ use dogeos_reth_consensus::DogeosConsensus;
 use futures::FutureExt;
 use reth_network_api::noop::NoopNetwork;
 use reth_network_p2p::NoopFullBlockClient;
+use rollup_node_primitives::ConsensusUpdate;
 use rollup_node_providers::{test_utils::MockL1Provider, ScrollRootProvider};
 use rollup_node_watcher::L1WatcherCommand;
 use scroll_db::test_utils::setup_test_db;
@@ -40,9 +43,10 @@ fn info(number: u64, tag: u8) -> BlockInfo {
 }
 
 /// A network handle backed by a no-op network. Every block announcement is forwarded to
-/// `announced` when given.
+/// `announced` and every signer handed to the network to `signers`, when given.
 async fn test_scroll_network(
     announced: Option<mpsc::UnboundedSender<(DogeosBlock, alloy_primitives::Signature)>>,
+    signers: Option<mpsc::UnboundedSender<Address>>,
 ) -> ScrollNetwork<TestNetwork> {
     let (to_manager_tx, mut from_handle_rx) = mpsc::unbounded_channel();
     let handle =
@@ -59,6 +63,11 @@ async fn test_scroll_network(
                         let _ = announced.send((block, signature));
                     }
                 }
+                NetworkHandleMessage::UpdateAuthorizedSigner(signer) => {
+                    if let Some(signers) = &signers {
+                        let _ = signers.send(signer);
+                    }
+                }
                 _ => {}
             }
         }
@@ -71,6 +80,8 @@ async fn test_scroll_network(
 struct Probes {
     /// Receives every block the orchestrator announces to the network.
     announced: Option<mpsc::UnboundedSender<(DogeosBlock, alloy_primitives::Signature)>>,
+    /// Receives every signer the orchestrator hands to the network.
+    signers: Option<mpsc::UnboundedSender<Address>>,
     /// Receives every command the orchestrator sends to the L1 watcher.
     watcher_commands: Option<mpsc::UnboundedSender<L1WatcherCommand>>,
 }
@@ -124,7 +135,7 @@ async fn orchestrator_with_engine<EC: ScrollEngineApi + Unpin + Send + Sync + 's
         block_client,
         l2_provider,
         l1_watcher,
-        test_scroll_network(probes.announced).await,
+        test_scroll_network(probes.announced, probes.signers).await,
         Box::new(NoopConsensus),
         engine,
         None::<Sequencer<TestL1Provider, DogeosChainSpec>>,
@@ -597,5 +608,38 @@ async fn rg49_update_fcs_head_replies_success_only_if_the_engine_accepted_the_he
             "the admin caller is told the head moved to 8 (database head {}), but the Engine kept head 5",
             database.get_l2_head_block_number().await.unwrap()
         );
+    }
+}
+
+/// RG-52: after an L1 signer update, the orchestrator hands the consensus signer to the network,
+/// which checks it before gossiping a block over eth-wire. No-op consensus checks no signer, so
+/// it hands over nothing and a network signer set at startup stays as it was.
+#[tokio::test]
+async fn rg52_signer_update_reaches_the_network_only_under_system_contract_consensus() {
+    let new_signer = Address::repeat_byte(0xbb);
+    let cases: [(Box<dyn Consensus>, Vec<Address>); 2] = [
+        (Box::new(NoopConsensus), vec![]),
+        (Box::new(SystemContractConsensus::new(Address::repeat_byte(0xaa))), vec![new_signer]),
+    ];
+    for (consensus, expected) in cases {
+        let (signers_tx, mut signers_rx) = mpsc::unbounded_channel();
+        let probes = Probes { signers: Some(signers_tx), ..Default::default() };
+        let database = Arc::new(setup_test_db().await);
+        let mut orchestrator =
+            orchestrator_probed(database, ForkchoiceState::from_genesis(B256::ZERO), 0, probes)
+                .await;
+        orchestrator.consensus = consensus;
+
+        let update = L1Notification::Consensus(ConsensusUpdate::AuthorizedSigner(new_signer));
+        orchestrator.handle_l1_notification(Arc::new(update)).await.unwrap();
+        // The network task handles messages in order, so once it answers this request it has
+        // forwarded any signer sent before it.
+        let _ = orchestrator.network.handle().event_listener().await;
+
+        let mut handed = Vec::new();
+        while let Ok(signer) = signers_rx.try_recv() {
+            handed.push(signer);
+        }
+        assert_eq!(handed, expected);
     }
 }

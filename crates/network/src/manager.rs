@@ -58,8 +58,10 @@ pub struct ScrollNetworkManager<N, CS> {
     peer_state: HashMap<PeerId, LruCache<B256>>,
     /// The constant value that must be added to the block number to get the total difficulty.
     td_constant: U128,
-    /// The signer whose blocks are gossiped over eth-wire; `None` gossips every block. The chain
-    /// orchestrator keeps it on the consensus signer.
+    /// The signer whose blocks are gossiped over eth-wire; `None` gossips every block. With
+    /// system-contract consensus, the chain orchestrator replaces a configured signer with the
+    /// consensus signer after each L1 signer update. `None` stays `None`, and no-op consensus
+    /// leaves the signer unchanged.
     authorized_signer: Option<Address>,
     /// Whether to gossip blocks to peers.
     #[cfg(feature = "test-utils")]
@@ -467,4 +469,40 @@ impl<
 /// Compute totally difficulty for a given block number.
 fn compute_td(td_constant: U128, block_number: u64) -> U128 {
     td_constant.saturating_add(U128::from(block_number))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reth_network_api::noop::NoopNetwork;
+
+    impl EthWirePeerSender for NoopNetwork<DogeosNetworkPrimitives> {
+        fn eth_wire_announce_block_to_peer(
+            &self,
+            _peer_id: PeerId,
+            _block: EthWireNewBlock<dogeos_reth_primitives::DogeosBlock>,
+            _hash: B256,
+        ) {
+        }
+    }
+
+    /// A node started without a network signer gossips every block over eth-wire, and an L1
+    /// signer update does not change that.
+    #[tokio::test]
+    async fn signer_update_keeps_an_unset_signer_unset() {
+        let (_events_tx, events) = mpsc::unbounded_channel();
+        let (mut manager, _handle) = ScrollNetworkManager::from_parts(
+            dogeos_chainspec::DOGEOS_DEV.clone(),
+            NoopNetwork::<DogeosNetworkPrimitives>::new(),
+            events,
+            None,
+            U128::ZERO,
+            None,
+        );
+        let signer = Address::repeat_byte(1);
+        manager.on_handle_message(NetworkHandleMessage::UpdateAuthorizedSigner(signer)).await;
+
+        let unsigned = NewBlock { signature: Default::default(), block: Default::default() };
+        assert!(manager.verify_block_signature(&unsigned), "every block is still gossiped");
+    }
 }

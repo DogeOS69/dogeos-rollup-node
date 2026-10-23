@@ -75,6 +75,7 @@ async fn test_should_detect_reorg() -> eyre::Result<()> {
 
     // spawn the watcher and verify received notifications are consistent.
     let (_, mut l1_watcher) = L1Watcher::spawn(
+        &reth_tasks::TaskExecutor::test(),
         mock_provider,
         L1BlockStartupInfo::None,
         Arc::new(config),
@@ -185,6 +186,7 @@ async fn test_should_fetch_gap_in_unfinalized_blocks() -> eyre::Result<()> {
 
     // spawn the watcher and verify received notifications are consistent.
     let (_, mut l1_watcher) = L1Watcher::spawn(
+        &reth_tasks::TaskExecutor::test(),
         mock_provider,
         L1BlockStartupInfo::None,
         Arc::new(config),

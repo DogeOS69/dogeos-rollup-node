@@ -209,7 +209,9 @@ where
 {
     /// Spawn a new [`L1Watcher`], starting at `start_block`. The watcher will iterate the L1,
     /// returning [`L1Notification`] in the returned channel.
+    /// Runs as a critical task, so a panic shuts down the node.
     pub async fn spawn(
+        task_executor: &reth_tasks::TaskExecutor,
         execution_provider: EP,
         l1_block_startup_info: L1BlockStartupInfo,
         config: Arc<NodeConfig>,
@@ -303,7 +305,7 @@ where
             .await
             .expect("channel is open in this context");
 
-        tokio::spawn(watcher.run());
+        task_executor.spawn_critical_task("l1_watcher", watcher.run());
 
         (notification_tx, handle)
     }

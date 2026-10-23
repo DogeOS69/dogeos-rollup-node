@@ -1866,8 +1866,13 @@ mod run_loop_policy_tests {
         let l2_provider =
             ProviderBuilder::<_, _, Scroll>::default().connect_mocked_client(asserter);
         let l1_provider = MockL1Provider { db: database.clone(), blobs: Default::default() };
-        let derivation_pipeline =
-            DerivationPipeline::new(l1_provider.clone(), database.clone(), 0).await;
+        let derivation_pipeline = DerivationPipeline::new(
+            &reth_tasks::TaskExecutor::test(),
+            l1_provider.clone(),
+            database.clone(),
+            0,
+        )
+        .await;
 
         let (watcher_command_tx, _watcher_command_rx) = mpsc::unbounded_channel();
         let (notification_tx, notification_rx) = mpsc::channel(TEST_L1_NOTIFICATION_CAPACITY);

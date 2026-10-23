@@ -623,6 +623,7 @@ async fn rg41_restart_from_finalized_block_number_does_not_detect_replacement() 
 
     // The database's highest stored message is the old block 3's: the node restarts from 3.
     let (_tx, mut handle) = L1Watcher::spawn(
+        &reth_tasks::TaskExecutor::test(),
         l1.clone(),
         L1BlockStartupInfo::FinalizedBlockNumber(3),
         Arc::new(config),
@@ -655,6 +656,47 @@ async fn rg41_restart_from_finalized_block_number_does_not_detect_replacement() 
     // Stop the spawned watcher. `L1Watcher::spawn` does not return its task handle; dropping the
     // notification receiver makes the watcher's next send fail, which ends its run loop.
     drop(handle);
+}
+
+/// A watcher panic reaches Reth's task manager, which ends the node.
+#[tokio::test]
+async fn watcher_panic_reaches_task_manager() {
+    let executor = reth_tasks::TaskExecutor::test();
+    let task_manager = executor.take_task_manager_handle().expect("handle");
+    let f = Fixture::new();
+    let l1 = SyntheticL1::new(f.chain(), vec![]);
+    let config = NodeConfig { start_l1_block: 1, ..NodeConfig::mainnet() };
+    let (_tx, mut handle) = L1Watcher::spawn(
+        &executor,
+        l1.clone(),
+        L1BlockStartupInfo::FinalizedBlockNumber(3),
+        Arc::new(config),
+        500,
+        60,
+        12,
+        #[cfg(feature = "test-utils")]
+        false,
+    )
+    .await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    for expected in [L1Notification::Finalized(3), L1Notification::NewBlock((&f.b3).into())] {
+        let notification =
+            tokio::time::timeout_at(deadline, handle.l1_notification_receiver().recv())
+                .await
+                .expect("startup notification arrives")
+                .expect("channel open");
+        assert_eq!(*notification, expected);
+    }
+
+    // An L1 serving no blocks makes the watcher's run loop panic.
+    l1.state().chain.clear();
+    let err = tokio::time::timeout(Duration::from_secs(5), task_manager)
+        .await
+        .expect("task manager observes the panic")
+        .expect("task manager task completes")
+        .expect_err("watcher panic ends the node");
+    assert!(err.to_string().contains("l1_watcher"), "unexpected error: {err}");
 }
 
 /// The runtime signer refresh never fires. `handle_latest_block` sets

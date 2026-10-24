@@ -657,7 +657,26 @@ impl<
                 self.handle_l1_reorg_and_revalidate(*block_number).await
             }
             L1Notification::Consensus(update) => {
+                let local_signer = self.signer.as_ref().map(|signer| signer.address);
+                let authorized =
+                    |c: &dyn Consensus| local_signer.is_some_and(|s| c.should_sequence_block(&s));
+                let was_authorized = authorized(&*self.consensus);
                 self.consensus.update_config(update);
+                // Peers would reject a block this node started before losing authorization.
+                if was_authorized && !authorized(&*self.consensus) {
+                    tracing::warn!(
+                        target: "scroll::chain_orchestrator",
+                        ?local_signer,
+                        "This node's signer is no longer authorized; dropping any block in progress"
+                    );
+                    if let Some(sequencer) = self.sequencer.as_mut() {
+                        sequencer.cancel_payload_building_job();
+                    }
+                }
+                // The network checks the signer before gossiping a block over eth-wire.
+                if let Some(signer) = self.consensus.authorized_signer() {
+                    self.network.handle().update_authorized_signer(signer);
+                }
                 Ok(None)
             }
             L1Notification::NewBlock(block_info) => self.handle_l1_new_block(*block_info).await,
@@ -1792,6 +1811,92 @@ mod run_loop_policy_tests {
                     "obsolete job must stay cancelled"
                 );
             }
+        }
+    }
+
+    /// RG-52: a block this node started while it was the authorized signer is dropped when an L1
+    /// signer update takes that authorization away, because peers would reject it. An update that
+    /// keeps this node authorized leaves the block alone.
+    #[tokio::test]
+    async fn signer_update_cancels_the_block_in_progress_only_when_authorization_is_lost() {
+        use rollup_node_primitives::ConsensusUpdate;
+        use rollup_node_sequencer::{
+            L1MessageInclusionMode, PayloadBuildingConfig, SequencerConfig,
+        };
+        use tokio_stream::wrappers::UnboundedReceiverStream;
+
+        for (new_signer, expected) in
+            [(Address::repeat_byte(0xaa), true), (Address::repeat_byte(0xbb), false)]
+        {
+            let local = Address::repeat_byte(0xaa);
+            let database = Arc::new(setup_test_db().await);
+            let client = Arc::new(ScriptedEngineClient::new());
+            let (mut orchestrator, _handle, _notifications) = test_orchestrator(
+                database.clone(),
+                client.clone(),
+                Asserter::new(),
+                BatchDerivationResult {
+                    attributes: vec![],
+                    batch_info: BatchInfo::new(1, B256::repeat_byte(1)),
+                    skipped_l1_messages: vec![],
+                    target_status: BatchStatus::Consolidated,
+                },
+            )
+            .await;
+            orchestrator.consensus = Box::new(SystemContractConsensus::new(local));
+            let (request_tx, _request_rx) = mpsc::unbounded_channel();
+            let (_event_tx, event_rx) = mpsc::unbounded_channel();
+            orchestrator.signer =
+                Some(SignerHandle::new(request_tx, UnboundedReceiverStream::new(event_rx), local));
+            let old_parent = info(SAFE + 1, 0x11);
+            orchestrator.engine = Engine::new(
+                client.clone(),
+                ForkchoiceState::new(old_parent, info(SAFE, 0x10), info(0, 0)),
+            );
+            orchestrator.sync_state.l2_mut().set_synced();
+            orchestrator.sequencer = Some(Sequencer::new(
+                Arc::new(MockL1Provider { db: database, blobs: Default::default() }),
+                SequencerConfig {
+                    chain_spec: DOGEOS_DEV.clone(),
+                    fee_recipient: Address::ZERO,
+                    auto_start: true,
+                    block_time: 100,
+                    payload_building_duration: 0,
+                    allow_empty_blocks: true,
+                    payload_building_config: PayloadBuildingConfig {
+                        block_gas_limit: 30_000_000,
+                        max_l1_messages_per_block: 10,
+                        l1_message_inclusion_mode: L1MessageInclusionMode::BlockDepth(0),
+                    },
+                },
+            ));
+
+            client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(
+                PayloadStatusEnum::Valid,
+                Some(PayloadId::new([1; 8])),
+            )));
+            // Install the job using the same operation as an automatic NewSlot, without sleeps.
+            orchestrator
+                .sequencer
+                .as_mut()
+                .unwrap()
+                .start_payload_building(&mut orchestrator.engine)
+                .await
+                .unwrap();
+            assert!(orchestrator.sequencer.as_ref().unwrap().payload_building_job().is_some());
+
+            orchestrator
+                .handle_l1_notification(Arc::new(L1Notification::Consensus(
+                    ConsensusUpdate::AuthorizedSigner(new_signer),
+                )))
+                .await
+                .unwrap();
+
+            assert_eq!(
+                orchestrator.sequencer.as_ref().unwrap().payload_building_job().is_some(),
+                expected,
+                "new signer {new_signer}"
+            );
         }
     }
 

@@ -1977,6 +1977,46 @@ async fn can_gossip_over_eth_wire() -> eyre::Result<()> {
     Ok(())
 }
 
+/// A node gossips over eth-wire only blocks from its network signer. When L1 rotates the signer,
+/// the network must follow consensus to the new one, or the new sequencer's blocks stop there.
+#[tokio::test]
+async fn eth_wire_gossip_follows_a_signer_rotation() -> eyre::Result<()> {
+    reth_tracing::init_test_tracing();
+
+    let signer = PrivateKeySigner::random();
+    let retired = Address::random();
+
+    // Scroll-wire is off, so blocks reach the follower only over eth-wire. Both nodes start with
+    // the retired signer in consensus and in the network.
+    let mut fixture = TestFixture::builder()
+        .sequencer()
+        .followers(1)
+        .block_time(0)
+        .allow_empty_blocks(true)
+        .with_scroll_wire(false)
+        .with_consensus_system_contract(Some(retired))
+        .with_network_valid_signer(Some(retired))
+        .with_signer(signer.clone())
+        .payload_building_duration(1000)
+        .build()
+        .await?;
+    fixture.l1().sync().await?;
+    fixture.expect_event_on_all_nodes().l1_synced().await?;
+
+    // L1 rotates the signer to the sequencer's key. The test sends the rotation before the next L1
+    // block, and a node handles L1 notifications in order, so once it reports that block it has
+    // applied the rotation.
+    fixture.l1().signer_update(signer.address()).await?;
+    fixture.l1().new_block(1).await?;
+    fixture.expect_event_on_all_nodes().new_l1_block().await?;
+
+    let block = fixture.build_block().build_and_await_block().await?;
+    fixture.expect_event_on(1).chain_extended(block.header.number).await?;
+    assert_eq!(fixture.get_block(1).await?.header.hash_slow(), block.header.hash_slow());
+
+    Ok(())
+}
+
 #[allow(clippy::large_stack_frames)]
 #[tokio::test]
 async fn signer_rotation() -> eyre::Result<()> {

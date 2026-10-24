@@ -1,6 +1,6 @@
 use super::ScrollNetwork;
 use crate::ScrollNetworkManagerEvent;
-use alloy_primitives::Signature;
+use alloy_primitives::{Address, Signature};
 use dogeos_reth_primitives::DogeosBlock;
 use reth_network_api::FullNetwork;
 use reth_tokio_util::EventStream;
@@ -60,6 +60,12 @@ impl<N: FullNetwork> ScrollNetworkHandle<N> {
         self.send_message(NetworkHandleMessage::AnnounceBlock { block, signature });
     }
 
+    /// Replaces the signer whose blocks the network gossips over eth-wire, if one is set. A
+    /// network started without one keeps gossiping every block.
+    pub fn update_authorized_signer(&self, signer: Address) {
+        self.send_message(NetworkHandleMessage::UpdateAuthorizedSigner(signer));
+    }
+
     /// Shuts down the network handle.
     pub async fn shutdown(&self) -> Result<(), oneshot::error::RecvError> {
         let (tx, rx) = oneshot::channel();
@@ -94,6 +100,7 @@ pub enum NetworkHandleMessage {
         signature: Signature,
     },
     BlockImportOutcome(super::BlockImportOutcome),
+    UpdateAuthorizedSigner(Address),
     Shutdown(oneshot::Sender<()>),
     EventListener(oneshot::Sender<EventStream<ScrollNetworkManagerEvent>>),
     #[cfg(feature = "test-utils")]

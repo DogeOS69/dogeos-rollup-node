@@ -6,15 +6,9 @@
 //! the same block. It does not run the rotation transaction itself. No notification is injected,
 //! and no node is restarted or reconfigured during the test.
 //!
-//! The test asserts the intended behaviour and fails today, so it is `#[ignore]`d (RG-52); run it
-//! with `--ignored`. A running watcher never re-reads the signer slot: `handle_latest_block`
-//! stores the new L1 head before `handle_system_contract_update` compares against it, so the
-//! standby never sequences block 4. Passing needs two watcher changes: re-read the signer on every
-//! new L1 head, and keep that update out of the watcher's log-based notification-count check,
-//! which would otherwise reject it. Either change alone still fails. With both, remove the
-//! `#[ignore]` and update `rg52_runtime_signer_refresh_never_reads_the_system_contract` in the
-//! watcher tests. Until then, only a follower started with `--consensus.exit-on-signer-rotation`
-//! picks up a rotation, by exiting so that its supervisor restarts it.
+//! Each watcher re-reads the signer slot on every new L1 head and passes it to consensus outside
+//! its log-based notification-count check (RG-52), so the standby sequences block 4 and the other
+//! nodes accept it without a restart.
 
 use alloy_primitives::{Address, B256, U256};
 use alloy_rpc_types_eth::Block;
@@ -228,7 +222,6 @@ async fn canonical_hash(fixture: &TestFixture, height: u64) -> eyre::Result<B256
 }
 
 #[tokio::test]
-#[ignore = "RG-52: a running L1 watcher never re-reads the SystemConfig signer, so the standby never sequences"]
 async fn running_nodes_discover_materialized_signer_rotation() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
     timeout(HANG_TIMEOUT, rotation())
@@ -303,6 +296,14 @@ async fn rotation() -> eyre::Result<()> {
     for (fixture, label) in [(&old, "old"), (&new, "standby"), (&follower, "follower")] {
         wait_processed(fixture, 2, label).await.wrap_err_with(reads)?;
     }
+    // A watcher reads the signer before it reports the new head processed.
+    for (label, rpc) in [("old", &old_rpc), ("standby", &new_rpc), ("follower", &follower_rpc)] {
+        ensure!(
+            rpc.reads().contains(&new_address),
+            "{label}: watcher did not refresh signer; {}",
+            reads()
+        );
+    }
 
     let outcome = new.expect_event_on(0).timeout(PHASE_TIMEOUT).block_sequenced(4).await;
     let progress = [processed(&old).await?, processed(&new).await?, processed(&follower).await?];
@@ -318,13 +319,6 @@ async fn rotation() -> eyre::Result<()> {
         "standby built block 4 on {}, expected common parent {common_parent}",
         block.header.parent_hash
     );
-    for (label, rpc) in [("old", &old_rpc), ("standby", &new_rpc), ("follower", &follower_rpc)] {
-        ensure!(
-            rpc.reads().contains(&new_address),
-            "{label}: watcher did not refresh signer; {}",
-            reads()
-        );
-    }
     expect_import(&mut follower, 4, block.hash_slow(), new_address)
         .await
         .wrap_err("follower did not adopt new signer")?;

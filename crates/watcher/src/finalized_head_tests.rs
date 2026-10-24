@@ -8,11 +8,12 @@
 //!
 //! Tracker rows (Reorg Issue Tracker, Private Mainnet): RG-41 (finalized = head misleads the
 //! watcher's replacement detection), RG-45 (the finalized/latest race), RG-52 (the runtime
-//! signer refresh never fires) and RG-49 (a reset queued while the watcher is blocked sending is
+//! signer refresh, fixed) and RG-49 (a reset queued while the watcher is blocked sending is
 //! lost, rollup-node #29). Each test name starts with the RG key of the row it pins.
 //!
-//! The RG-41, RG-45 and RG-52 tests pass today and document behaviour that is not fixed; when a
-//! row is fixed in the watcher, change the matching assertion instead of deleting the test.
+//! The RG-41 and RG-45 tests pass today and document behaviour that is not fixed; when a row is
+//! fixed in the watcher, change the matching assertion instead of deleting the test. The RG-52
+//! tests pin the fix.
 //!
 //! The RG-41 tests document the watcher under a CONDITION: the provider always serves
 //! `finalized` = head. The fix accepted for RG-41 is a lagging finalized tag in dogeos-core's
@@ -56,6 +57,10 @@ struct Served {
     by_hash_lookups: u64,
     signer: Address,
     storage_reads: u64,
+    /// How many of the next `get_logs` calls fail.
+    failing_log_queries: u64,
+    /// How many of the next storage reads fail.
+    failing_storage_reads: u64,
 }
 
 /// A synthetic L1 provider: `finalized` and `latest` both return the served head.
@@ -145,7 +150,13 @@ impl Provider for SyntheticL1 {
     }
 
     async fn get_logs(&self, filter: &Filter) -> TransportResult<Vec<Log>> {
-        let s = self.0.lock().unwrap();
+        let mut s = self.0.lock().unwrap();
+        if s.failing_log_queries > 0 {
+            s.failing_log_queries -= 1;
+            return Err(alloy_transport::TransportErrorKind::custom_str(
+                "injected log query failure",
+            ));
+        }
         let from = filter.get_from_block().unwrap_or(0);
         let to = filter.get_to_block().unwrap_or(u64::MAX);
         // A range that starts above the served head is answered with an empty list, as
@@ -164,10 +175,19 @@ impl Provider for SyntheticL1 {
     ) -> RpcWithBlock<(Address, U256), StorageValue> {
         let value = {
             let mut s = self.0.lock().unwrap();
-            s.storage_reads += 1;
-            U256::from_be_slice(s.signer.as_slice())
+            if s.failing_storage_reads > 0 {
+                s.failing_storage_reads -= 1;
+                None
+            } else {
+                s.storage_reads += 1;
+                Some(U256::from_be_slice(s.signer.as_slice()))
+            }
         };
-        RpcWithBlock::new_provider(move |_| ProviderCall::Ready(Some(Ok(value))))
+        RpcWithBlock::new_provider(move |_| {
+            ProviderCall::Ready(Some(value.ok_or_else(|| {
+                alloy_transport::TransportErrorKind::custom_str("injected storage read failure")
+            })))
+        })
     }
 
     fn get_transaction_by_hash(
@@ -274,8 +294,8 @@ fn drain(handle: &mut L1WatcherHandle) -> Vec<L1Notification> {
 }
 
 /// Like [`drain`], without the signer-update (`Consensus`) notifications. Tests that compare a
-/// whole notification list use this, so they keep pinning the chain events once the RG-52 signer
-/// refresh starts sending `Consensus` notifications.
+/// whole notification list use this, so the signer update sent with every new head (RG-52) does
+/// not change them.
 fn drain_chain(handle: &mut L1WatcherHandle) -> Vec<L1Notification> {
     drain(handle).into_iter().filter(|n| !matches!(n, L1Notification::Consensus(_))).collect()
 }
@@ -288,6 +308,17 @@ fn messages(notifications: &[L1Notification]) -> Vec<(u64, u64, U256)> {
             L1Notification::L1Message { message, block_info, .. } => {
                 Some((message.queue_index, block_info.number, message.value))
             }
+            _ => None,
+        })
+        .collect()
+}
+
+/// The signer of every `AuthorizedSigner` notification.
+fn signers(notifications: &[L1Notification]) -> Vec<Address> {
+    notifications
+        .iter()
+        .filter_map(|n| match n {
+            L1Notification::Consensus(ConsensusUpdate::AuthorizedSigner(signer)) => Some(*signer),
             _ => None,
         })
         .collect()
@@ -657,21 +688,21 @@ async fn rg41_restart_from_finalized_block_number_does_not_detect_replacement() 
     drop(handle);
 }
 
-/// The runtime signer refresh never fires. `handle_latest_block` sets
-/// `l1_state.head = latest.number` before `handle_system_contract_update` compares
-/// `latest.number != l1_state.head`, so the system contract is never read.
+/// The watcher re-reads the signer from the system contract on every new head: one with a log,
+/// one without logs and one replaced at the same height. The update comes from storage, not from
+/// a log, so a head without logs does not fail the log-based notification-count check. An
+/// unchanged head is not re-read.
 #[tokio::test]
-async fn rg52_runtime_signer_refresh_never_reads_the_system_contract() {
+async fn rg52_runtime_signer_refresh_reads_the_system_contract_on_every_new_head() {
     let old_signer = Address::repeat_byte(0xaa);
     let new_signer = Address::repeat_byte(0xbb);
     let f = Fixture::new();
     let l1 = SyntheticL1::new(f.chain(), f.logs());
     l1.state().signer = old_signer;
     let (mut w, mut h) = watcher(l1.clone());
-    let mut all = Vec::new();
 
     w.step().await.expect("poll at head 3");
-    all.extend(drain(&mut h));
+    assert_eq!(signers(&drain(&mut h)), vec![old_signer]);
 
     // The signer rotates; the chain extends by a block that carries a log, then by an empty
     // block, then block 5 is replaced at the same height.
@@ -681,39 +712,76 @@ async fn rg52_runtime_signer_refresh_never_reads_the_system_contract() {
     chain.push(b4.clone());
     l1.serve(chain.clone(), vec![deposit(&b4, 3, 0)]);
     w.step().await.expect("poll at head 4 (with a log)");
-    all.extend(drain(&mut h));
+    assert_eq!(signers(&drain(&mut h)), vec![new_signer]);
 
     let b5 = header(5, 0, &b4);
     chain.push(b5.clone());
     l1.serve(chain.clone(), vec![]);
-    w.step().await.expect("poll at head 5 (no logs): no InvalidNotificationCount either");
-    all.extend(drain(&mut h));
+    w.step().await.expect("poll at head 5 (no logs): no InvalidNotificationCount");
+    assert_eq!(signers(&drain(&mut h)), vec![new_signer]);
+
+    w.step().await.expect("poll at unchanged head 5");
+    assert!(signers(&drain(&mut h)).is_empty(), "an unchanged head is not re-read");
 
     let b5r = header(5, 1, &b4);
     chain.pop();
-    chain.push(b5r.clone());
-    l1.serve(chain.clone(), vec![]);
+    chain.push(b5r);
+    l1.serve(chain, vec![]);
     w.step().await.expect("poll at replaced head 5");
     let replaced = drain(&mut h);
     assert_eq!(reorgs(&replaced), vec![4]);
-    all.extend(replaced);
-
-    assert!(
-        !all.iter().any(|n| matches!(n, L1Notification::Consensus(_))),
-        "no AuthorizedSigner notification after the rotation: {all:?}"
-    );
-    assert_eq!(l1.state().storage_reads, 0, "slot 0x67 was never read");
+    assert_eq!(signers(&replaced), vec![new_signer]);
+    assert_eq!(l1.state().storage_reads, 4, "one read per new head");
     assert_eq!(w.l1_state.head, 5);
+}
 
-    // Control: the refresh itself works when the head comparison sees an older head.
-    let b6 = header(6, 0, &b5r);
-    let notification =
-        w.handle_system_contract_update(&block(b6)).await.expect("storage read succeeds");
-    assert_eq!(
-        notification,
-        Some(L1Notification::Consensus(ConsensusUpdate::AuthorizedSigner(new_signer)))
-    );
-    assert_eq!(l1.state().storage_reads, 1);
+/// A step that fails after storing a new head (log query or signer read) does not lose the
+/// rotation: the next step at the same head reads the signer again and sends it before it
+/// reports the head processed.
+#[tokio::test]
+async fn rg52_signer_refresh_is_retried_at_the_same_head_after_a_failed_step() {
+    for fail_logs in [true, false] {
+        let f = Fixture::new();
+        let l1 = SyntheticL1::new(f.chain(), f.logs());
+        l1.state().signer = Address::repeat_byte(0xaa);
+        let (mut w, mut h) = watcher(l1.clone());
+
+        w.step().await.expect("poll at head 3");
+        drain(&mut h);
+
+        // Rotate the signer and extend the chain by one block that carries a deposit.
+        let new_signer = Address::repeat_byte(0xbb);
+        l1.state().signer = new_signer;
+        let b4 = header(4, 0, &f.b3);
+        let mut chain = f.chain();
+        chain.push(b4.clone());
+        l1.serve(chain, vec![deposit(&b4, 3, 0)]);
+
+        // One of the two queries the step makes at the new head fails.
+        if fail_logs {
+            l1.state().failing_log_queries = 1;
+        } else {
+            l1.state().failing_storage_reads = 1;
+        }
+
+        assert!(w.step().await.is_err(), "the injected failure fails the step");
+        let failed = drain(&mut h);
+        assert!(signers(&failed).is_empty(), "{failed:?}");
+        assert!(!failed.contains(&L1Notification::Processed(4)), "{failed:?}");
+
+        w.step().await.expect("retry at the same head");
+        let retried = drain(&mut h);
+
+        assert_eq!(signers(&retried), vec![new_signer], "fail_logs={fail_logs}");
+
+        let signer_at =
+            retried.iter().position(|n| matches!(n, L1Notification::Consensus(_))).unwrap();
+        let processed_at = retried
+            .iter()
+            .position(|n| *n == L1Notification::Processed(4))
+            .expect("head 4 processed");
+        assert!(signer_at < processed_at, "{retried:?}");
+    }
 }
 
 /// RG-49 (rollup-node issue #29): a reset queued while the watcher is blocked sending on the old

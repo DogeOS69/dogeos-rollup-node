@@ -421,12 +421,6 @@ where
                 notifications.extend(group_notifications);
             }
 
-            if let Some(system_contract_update) =
-                self.handle_system_contract_update(&latest).await?
-            {
-                notifications.push(system_contract_update);
-            }
-
             // Check that we haven't generated more notifications than logs
             // Note: notifications.len() may be less than logs.len() because genesis batch
             // (batch_index=0) is intentionally skipped
@@ -436,6 +430,9 @@ where
                     notifications.len(),
                 )))
             }
+
+            // The signer comes from storage, not from a log, so it is added after the check.
+            notifications.push(self.handle_system_contract_update().await?);
 
             // send all notifications on the channel.
             self.notify_all(notifications).await?;
@@ -757,22 +754,15 @@ where
         Ok(notifications)
     }
 
-    /// Handles the system contract update events.
+    /// Reads the authorized signer from the system contract. Called on every step that indexes
+    /// new blocks, so a step that fails before it finishes reads the signer again on retry.
     /// TODO(greg): update with logs once system contract emits logs.
-    async fn handle_system_contract_update(
-        &self,
-        latest_block: &Block,
-    ) -> L1WatcherResult<Option<L1Notification>> {
-        // refresh the signer every new block.
-        if latest_block.header.number != self.l1_state.head {
-            let signer = self
-                .execution_provider
-                .authorized_signer(self.config.address_book.system_contract_address)
-                .await?;
-            return Ok(Some(L1Notification::Consensus(ConsensusUpdate::AuthorizedSigner(signer))));
-        }
-
-        Ok(None)
+    async fn handle_system_contract_update(&self) -> L1WatcherResult<L1Notification> {
+        let signer = self
+            .execution_provider
+            .authorized_signer(self.config.address_book.system_contract_address)
+            .await?;
+        Ok(L1Notification::Consensus(ConsensusUpdate::AuthorizedSigner(signer)))
     }
 
     /// Fetches the chain of unfinalized blocks up to and including the latest block, ensuring no

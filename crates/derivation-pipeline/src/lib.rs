@@ -111,6 +111,8 @@ const DERIVATION_RETRY_INITIAL_DELAY: Duration = Duration::from_secs(1);
 /// The longest delay between derivation retries.
 const DERIVATION_RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
 
+/// The wait before retrying a batch that failed to derive: doubles after each failure, up to the
+/// cap.
 #[derive(Debug)]
 struct RetryDelay(Duration);
 
@@ -121,7 +123,7 @@ impl RetryDelay {
         delay
     }
 
-    fn reset(&mut self) {
+    const fn reset(&mut self) {
         self.0 = DERIVATION_RETRY_INITIAL_DELAY;
     }
 }

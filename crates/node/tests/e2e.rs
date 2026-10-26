@@ -546,22 +546,44 @@ async fn can_sequence_and_gossip_transactions() -> eyre::Result<()> {
 
 /// We test the bridge from the eth-wire protocol to the scroll-wire protocol.
 ///
-/// This test will launch three nodes:
+/// The network has three participants:
 /// - Node 1: The bridge node that will bridge messages from the eth-wire protocol to the
 ///   scroll-wire protocol.
 /// - Node 2: A scroll-wire node that will receive the bridged messages.
 /// - Node 3: A standard node that will send messages to the bridge node on the eth-wire protocol.
 ///
-/// The test will send messages from Node 3 to Node 1, which will bridge the messages to Node
-/// Node 2 will then receive the messages and verify that they are correct.
+/// An isolated sequencer fixture builds a valid block under the same chain rules. Node 3 sends
+/// it to Node 1, which imports it before forwarding it to Node 2 for verification.
 #[tokio::test]
 async fn can_bridge_blocks() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    // Signed legacy fixture is pre-Tsuki; retain DOGEOS_DEV genesis and Galileo rules.
+    // Keep coverage of the legacy eth-wire bridge under Galileo rules.
     let mut chain_spec = (**DOGEOS_DEV).clone();
     chain_spec.inner.hardforks.insert(DogeosHardfork::Tsuki, ForkCondition::Never);
     let chain_spec = Arc::new(chain_spec);
+
+    // A frozen legacy block can become invalid as execution rules change (for example, its
+    // base fee). The bridge only forwards valid imports, so build and sign a fresh block.
+    let signer = PrivateKeySigner::random();
+    let mut producer = TestFixture::builder()
+        .sequencer()
+        .with_chain_spec(chain_spec.clone())
+        .with_signer(signer.clone())
+        .block_time(0)
+        .allow_empty_blocks(true)
+        .build()
+        .await?;
+    producer.l1().sync().await?;
+    let mut block_1 = producer
+        .build_block()
+        .expect_block_number(1)
+        .expect_tx_count(0)
+        .build_and_await_block()
+        .await?;
+    let block_1_hash = block_1.hash_slow();
+    let expected_signature = signer.sign_hash(&sig_encode_hash(&block_1)).await?;
+    block_1.header.extra_data = expected_signature.as_bytes().into();
 
     // Setup the bridge node and a standard node.
     let (mut nodes, _dbs, _wallet) = setup_engine(
@@ -605,7 +627,9 @@ async fn can_bridge_blocks() -> eyre::Result<()> {
 
     // Connect the scroll-wire node to the scroll NetworkManager.
     bridge_node.network.add_peer(scroll_network_handle.local_node_record()).await;
-    bridge_node.network.next_session_established().await;
+    time::timeout(Duration::from_secs(20), bridge_node.network.next_session_established())
+        .await
+        .map_err(|_| eyre::eyre!("timed out connecting the scroll-wire peer"))?;
 
     // Create a standard NetworkManager to send blocks to the bridge node.
     let network_config = NetworkConfigBuilder::<DogeosNetworkPrimitives>::with_rng_secret_key(
@@ -628,20 +652,14 @@ async fn can_bridge_blocks() -> eyre::Result<()> {
 
     // Connect the standard NetworkManager to the bridge node.
     bridge_node.network.add_peer(network_handle.local_node_record()).await;
-    bridge_node.network.next_session_established().await;
-    let _ = network_events.next().await;
+    time::timeout(Duration::from_secs(20), bridge_node.network.next_session_established())
+        .await
+        .map_err(|_| eyre::eyre!("timed out connecting the eth-wire peer"))?;
+    time::timeout(Duration::from_secs(20), network_events.next())
+        .await
+        .map_err(|_| eyre::eyre!("timed out waiting for the eth-wire session event"))?;
 
-    // Send a block from the standard NetworkManager to the bridge node.
-    let mut block_1: dogeos_reth_primitives::DogeosBlock =
-        serde_json::from_str(include_str!("../assets/block.json")).unwrap();
-
-    // Compute the block hash while masking the extra data which isn't used in block hash
-    // computation.
-    let extra_data = block_1.extra_data.clone();
-    block_1.header.extra_data = Default::default();
-    let block_1_hash = block_1.hash_slow();
-    block_1.header.extra_data = extra_data.clone();
-
+    // Send the valid signed block from the eth-wire peer to the bridge node.
     let new_block_1 = reth_eth_wire_types::NewBlock { block: block_1, ..Default::default() };
 
     trace!("Announcing block to eth-wire network");
@@ -652,14 +670,13 @@ async fn can_bridge_blocks() -> eyre::Result<()> {
         peer_id,
         block,
         signature,
-    })) = scroll_network_events.next().await
+    })) = time::timeout(Duration::from_secs(20), scroll_network_events.next())
+        .await
+        .map_err(|_| eyre::eyre!("timed out receiving the bridged block"))?
     {
         assert_eq!(peer_id, bridge_peer_id);
         assert_eq!(block.hash_slow(), block_1_hash);
-        assert_eq!(
-            TryInto::<Signature>::try_into(extra_data.as_ref().windows(65).last().unwrap())?,
-            signature
-        )
+        assert_eq!(signature, expected_signature);
     } else {
         panic!("Failed to receive block from scroll-wire network");
     }

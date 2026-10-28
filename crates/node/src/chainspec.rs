@@ -46,5 +46,17 @@ mod tests {
         assert_eq!(builtin.config.l1_config.l1_chain_id, 111_111);
         assert!(!builtin.is_tsuki_active_at_timestamp(1_790_030_899));
         assert!(builtin.is_tsuki_active_at_timestamp(1_790_030_900));
+        // TsukiV2 sits at the placeholder 2027-01-01T00:00:00Z until ops sets the real time.
+        assert!(!builtin.is_tsuki_v2_active_at_timestamp(1_798_761_599));
+        assert!(builtin.is_tsuki_v2_active_at_timestamp(1_798_761_600));
+    }
+
+    #[test]
+    fn mainnet_and_dev_activate_tsuki_v2_at_genesis() {
+        for chain in ["dogeos-mainnet", "dev"] {
+            let spec = DogeosChainSpecParser::parse(chain).unwrap();
+            assert!(spec.is_tsuki_active_at_timestamp(0), "{chain}");
+            assert!(spec.is_tsuki_v2_active_at_timestamp(0), "{chain}");
+        }
     }
 }

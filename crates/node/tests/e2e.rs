@@ -561,6 +561,7 @@ async fn can_bridge_blocks() -> eyre::Result<()> {
     // Keep coverage of the legacy eth-wire bridge under Galileo rules.
     let mut chain_spec = (**DOGEOS_DEV).clone();
     chain_spec.inner.hardforks.insert(DogeosHardfork::Tsuki, ForkCondition::Never);
+    chain_spec.inner.hardforks.insert(DogeosHardfork::TsukiV2, ForkCondition::Never);
     let chain_spec = Arc::new(chain_spec);
 
     // A frozen legacy block can become invalid as execution rules change (for example, its

@@ -11469,6 +11469,7 @@ dependencies = [
  "alloy-primitives",
  "alloy-signer",
  "alloy-signer-local",
+ "async-trait",
  "dogeos-reth-primitives",
  "futures",
  "metrics",

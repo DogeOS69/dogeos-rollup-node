@@ -149,7 +149,7 @@ impl BlobProviders {
                     debug!(target: "scroll::providers", ?hash, ?block_timestamp, ?provider_index, provider_type, "provider does not have the blob");
                 }
                 Err(err) => {
-                    warn!(target: "scroll::providers", ?hash, ?block_timestamp, ?provider_index, ?err, provider_type, "provider failed to fetch blob");
+                    debug!(target: "scroll::providers", ?hash, ?block_timestamp, ?provider_index, ?err, provider_type, "provider failed to fetch blob");
                 }
             }
         }

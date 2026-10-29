@@ -180,24 +180,33 @@ async fn s3_rejects_invalid_field_elements() {
 }
 
 #[tokio::test]
-async fn providers_fall_back_to_s3_when_beacon_misses_or_fails() {
+async fn providers_fall_back_to_the_next_source_when_one_misses_or_fails() {
     let item = sidecar(b"original");
     let hash = B256::from(item.to_kzg_versioned_hash());
     let mut tampered = item.clone();
     tampered.blob[63] ^= 1;
 
-    // The beacon node either has no sidecar for the slot or serves one that fails verification.
-    for beacon_sidecars in [vec![], vec![tampered]] {
-        let (beacon, beacon_server) = beacon(beacon_sidecars).await;
-        let (url, s3_server) = serve(vec![(format!("/{hash}"), item.blob.to_vec())]).await;
-        let providers = BlobProviders::new(
-            vec![Arc::new(beacon) as Arc<dyn BlobProvider>],
-            vec![Arc::new(S3BlobProvider::new_http(url)) as Arc<dyn BlobProvider>],
-        );
+    // The first beacon node has no sidecar for the slot, or serves one that fails verification.
+    // The blob then comes from S3, or from a second beacon node.
+    for (first_sidecars, from_second_beacon) in
+        [(vec![], false), (vec![tampered], false), (vec![], true)]
+    {
+        let (first, first_server) = beacon(first_sidecars).await;
+        let mut beacons = vec![Arc::new(first) as Arc<dyn BlobProvider>];
+        let mut backups = Vec::new();
+        let second_server = if from_second_beacon {
+            let (second, server) = beacon(vec![item.clone()]).await;
+            beacons.push(Arc::new(second));
+            server
+        } else {
+            let (url, server) = serve(vec![(format!("/{hash}"), item.blob.to_vec())]).await;
+            backups.push(Arc::new(S3BlobProvider::new_http(url)) as Arc<dyn BlobProvider>);
+            server
+        };
 
-        let fetched = providers.blob(12, hash).await.unwrap().unwrap();
+        let fetched = BlobProviders::new(beacons, backups).blob(12, hash).await.unwrap().unwrap();
         assert_eq!(fetched.as_ref(), item.blob.as_ref());
-        beacon_server.await.unwrap();
-        s3_server.await.unwrap();
+        first_server.await.unwrap();
+        second_server.await.unwrap();
     }
 }

@@ -114,6 +114,8 @@ The node requires access to blob data for derivation. Configure one or more blob
 - `--blob.s3_url <URL>`: S3-compatible storage URL for blob data
 - `--blob.anvil_url <URL>`: Anvil blob provider URL (for testing)
 
+When several sources are set, the node asks the beacon nodes first, then S3 and Anvil, and moves on to the next source when one does not have the blob or fails.
+
 **Scroll-Provided S3 Blob Storage:**
 
 Scroll provides public S3 blob storage endpoints for both networks:

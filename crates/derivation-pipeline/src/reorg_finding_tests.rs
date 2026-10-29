@@ -55,7 +55,13 @@ async fn rg43_missing_messages_then_unwind_leave_the_pipeline_stuck() -> eyre::R
     db.insert_batch(batch_data.clone()).await?;
 
     let provider = MockL1Provider { db: db.clone(), blobs: HashMap::new() };
-    let mut pipeline = DerivationPipeline::new(provider.clone(), db.clone(), u64::MAX).await;
+    let mut pipeline = DerivationPipeline::new(
+        &reth_tasks::TaskExecutor::test(),
+        provider.clone(),
+        db.clone(),
+        u64::MAX,
+    )
+    .await;
     pipeline
         .push_batch(BatchInfo { index: 12, hash: batch_data.hash }, BatchStatus::Consolidated)
         .await;

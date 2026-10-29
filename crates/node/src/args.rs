@@ -456,7 +456,8 @@ impl ScrollRollupNodeConfig {
             td_constant(chain_spec.chain().named()),
             authorized_signer,
         );
-        ctx.task_executor.spawn_task(scroll_network_manager.run());
+        ctx.task_executor
+            .spawn_critical_task("scroll_network_manager", scroll_network_manager.run());
 
         tracing::info!(target: "scroll::node::args", fcs = ?fcs, payload_building_duration = ?self.sequencer_args.payload_building_duration, "Starting engine driver");
         let engine = Engine::new(Arc::new(engine_api), fcs);
@@ -483,6 +484,7 @@ impl ScrollRollupNodeConfig {
             tracing::info!(target: "scroll::node::args", ?l1_block_startup_info, "Starting L1 watcher");
 
             let (notification_tx, handle) = L1Watcher::spawn(
+                &ctx.task_executor,
                 provider,
                 l1_block_startup_info,
                 node_config,
@@ -578,6 +580,7 @@ impl ScrollRollupNodeConfig {
 
         // Instantiate the derivation pipeline
         let derivation_pipeline = DerivationPipeline::new(
+            &ctx.task_executor,
             l1_provider.clone(),
             db.clone(),
             l1_v2_message_queue_start_index,

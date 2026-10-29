@@ -11928,6 +11928,7 @@ dependencies = [
  "metrics-derive",
  "moka",
  "reqwest 0.12.28",
+ "reth-tasks",
  "reth-tracing",
  "rollup-node-primitives",
  "rollup-node-providers",

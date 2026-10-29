@@ -6,7 +6,10 @@ use alloy_eips::eip4844::{
 };
 use alloy_primitives::B256;
 use alloy_rpc_types_beacon::sidecar::{BeaconBlobBundle, BlobData};
-use rollup_node_providers::{BeaconClientProvider, BlobProvider, L1ProviderError, S3BlobProvider};
+use rollup_node_providers::{
+    BeaconClientProvider, BlobProvider, BlobProviders, L1ProviderError, S3BlobProvider,
+};
+use std::sync::Arc;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
@@ -174,4 +177,27 @@ async fn s3_rejects_invalid_field_elements() {
         Err(L1ProviderError::BlobValidation(BlobTransactionValidationError::KZGError(_)))
     ));
     server.await.unwrap();
+}
+
+#[tokio::test]
+async fn providers_fall_back_to_s3_when_beacon_misses_or_fails() {
+    let item = sidecar(b"original");
+    let hash = B256::from(item.to_kzg_versioned_hash());
+    let mut tampered = item.clone();
+    tampered.blob[63] ^= 1;
+
+    // The beacon node either has no sidecar for the slot or serves one that fails verification.
+    for beacon_sidecars in [vec![], vec![tampered]] {
+        let (beacon, beacon_server) = beacon(beacon_sidecars).await;
+        let (url, s3_server) = serve(vec![(format!("/{hash}"), item.blob.to_vec())]).await;
+        let providers = BlobProviders::new(
+            vec![Arc::new(beacon) as Arc<dyn BlobProvider>],
+            vec![Arc::new(S3BlobProvider::new_http(url)) as Arc<dyn BlobProvider>],
+        );
+
+        let fetched = providers.blob(12, hash).await.unwrap().unwrap();
+        assert_eq!(fetched.as_ref(), item.blob.as_ref());
+        beacon_server.await.unwrap();
+        s3_server.await.unwrap();
+    }
 }

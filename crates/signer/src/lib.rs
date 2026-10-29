@@ -102,6 +102,12 @@ impl Signer {
                         break;
                     }
                 }
+                // Signing retries until it succeeds, so stop as soon as nobody is listening
+                // instead of waiting for pending blocks to be signed.
+                _ = self.sender.closed() => {
+                    tracing::info!(target: "scroll::signer", "The event channel has been closed - shutting down.");
+                    break;
+                }
                 else => {
                     // The request channel is closed, exit the loop.
                     tracing::info!(target: "scroll::signer", "Signer request channel has been closed - shutting down.");
@@ -132,7 +138,7 @@ mod tests {
     use dogeos_reth_primitives::DogeosBlock;
     use rollup_node_primitives::sig_encode_hash;
     use std::{
-        sync::atomic::{AtomicBool, Ordering},
+        sync::atomic::{AtomicUsize, Ordering},
         time::Duration,
     };
 
@@ -158,18 +164,32 @@ mod tests {
         assert_eq!(recovered_address, signer.address());
     }
 
-    /// A signer whose first call for one hash never returns. Every other call signs normally.
-    struct HangsOnce {
+    /// A signer whose first `failures` calls for one hash fail: the first call never returns and
+    /// the later ones return an error. Every other call signs normally.
+    struct FailsFirst {
         key: PrivateKeySigner,
         hash: B256,
-        hung: AtomicBool,
+        failures: usize,
+        calls: AtomicUsize,
+    }
+
+    impl FailsFirst {
+        fn new(key: PrivateKeySigner, block: &DogeosBlock, failures: usize) -> Self {
+            Self { key, hash: sig_encode_hash(block), failures, calls: AtomicUsize::new(0) }
+        }
     }
 
     #[async_trait::async_trait]
-    impl alloy_signer::Signer for HangsOnce {
+    impl alloy_signer::Signer for FailsFirst {
         async fn sign_hash(&self, hash: &B256) -> alloy_signer::Result<Signature> {
-            if *hash == self.hash && !self.hung.swap(true, Ordering::SeqCst) {
-                std::future::pending::<()>().await;
+            if *hash == self.hash {
+                let call = self.calls.fetch_add(1, Ordering::SeqCst);
+                if call == 0 && self.failures > 0 {
+                    std::future::pending::<()>().await;
+                }
+                if call < self.failures {
+                    return Err(alloy_signer::Error::other("signer unavailable"));
+                }
             }
             self.key.sign_hash_sync(hash)
         }
@@ -193,18 +213,13 @@ mod tests {
         second.header.number = 2;
 
         let key = PrivateKeySigner::random();
-        let stub = HangsOnce {
-            key: key.clone(),
-            hash: sig_encode_hash(&first),
-            hung: AtomicBool::new(false),
-        };
-        let mut handle = Signer::spawn(stub);
+        let mut handle = Signer::spawn(FailsFirst::new(key.clone(), &first, 2));
         let start = tokio::time::Instant::now();
         handle.sign_block(first.clone()).unwrap();
         handle.sign_block(second.clone()).unwrap();
 
-        // The second block signs at once but must not overtake the first, which is
-        // signed only by the retry after its first call times out.
+        // The second block signs at once but must not overtake the first. The first call for
+        // the first block times out, the retry returns an error, and the next retry signs it.
         for expected in [first, second] {
             let event = tokio::time::timeout(Duration::from_secs(60), handle.next())
                 .await
@@ -216,6 +231,22 @@ mod tests {
             assert_eq!(signature.recover_address_from_prehash(&hash).unwrap(), key.address());
         }
         assert!(start.elapsed() >= future::ATTEMPT_TIMEOUT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_drop_signer_handle_while_retrying() {
+        let block = DogeosBlock::default();
+        let key = PrivateKeySigner::random();
+        let (signer, handle) = Signer::new(FailsFirst::new(key, &block, usize::MAX));
+        let task = tokio::spawn(signer.run());
+        handle.sign_block(block).unwrap();
+        drop(handle);
+
+        // The block can never be signed, so the task must stop because nobody is listening.
+        tokio::time::timeout(Duration::from_secs(60), task)
+            .await
+            .expect("signer task kept retrying after its handle was dropped")
+            .expect("signer task panicked");
     }
 
     // The following tests do not have any assertions, they are just to ensure that the

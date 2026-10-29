@@ -13,14 +13,20 @@ mod s3;
 pub use s3::S3BlobProvider;
 
 use crate::L1ProviderError;
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Arc,
+use std::{
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    time::Duration,
 };
 
 use alloy_eips::eip4844::Blob;
 use alloy_primitives::B256;
 use tracing::{debug, info, warn};
+
+/// How long one blob source may take to answer before the next one is asked.
+const BLOB_SOURCE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// An instance of the trait can be used to fetch L1 blob data.
 #[async_trait::async_trait]
@@ -125,7 +131,7 @@ impl BlobProviders {
     }
 
     /// Asks each provider once, starting at the round-robin index, and returns the first blob
-    /// found. A provider that does not have the blob or fails to answer is skipped.
+    /// found. A provider that does not have the blob, fails, or does not answer in time is skipped.
     async fn try_providers(
         &self,
         providers: &[Arc<dyn BlobProvider>],
@@ -143,7 +149,11 @@ impl BlobProviders {
             // update the counter to the next provider round-robin index.
             counter.store(provider_index + 1, Ordering::Relaxed);
 
-            match provider.blob(block_timestamp, hash).await {
+            let result =
+                tokio::time::timeout(BLOB_SOURCE_TIMEOUT, provider.blob(block_timestamp, hash))
+                    .await
+                    .unwrap_or(Err(L1ProviderError::Other("blob source did not answer in time")));
+            match result {
                 Ok(Some(blob)) => return Some(blob),
                 Ok(None) => {
                     debug!(target: "scroll::providers", ?hash, ?block_timestamp, ?provider_index, provider_type, "provider does not have the blob");

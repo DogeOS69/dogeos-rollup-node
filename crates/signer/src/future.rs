@@ -6,8 +6,9 @@ use rollup_node_primitives::sig_encode_hash;
 
 /// How long one signing attempt may take before it is abandoned and retried.
 pub(crate) const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
-/// The wait before the first retry. It doubles after each failed attempt.
-const FIRST_RETRY_DELAY: Duration = Duration::from_secs(1);
+/// The wait before the first retry. It doubles after each failed attempt, up to
+/// `MAX_RETRY_DELAY`.
+pub(crate) const FIRST_RETRY_DELAY: Duration = Duration::from_secs(1);
 /// The longest wait between retries.
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 
@@ -19,7 +20,8 @@ pub type SignerFuture = Pin<Box<dyn Future<Output = SignerEvent> + Send>>;
 /// Signatures are handed out in block order, so a remote signer (such as AWS KMS) call that
 /// never answers would hold back every later block. Each attempt is therefore cut off after 10
 /// seconds, and a failed or timed-out attempt is retried after a delay that starts at 1 second
-/// and doubles up to 30 seconds, until the block is signed.
+/// and doubles up to 30 seconds, until the block is signed. The future never gives up; drop it to
+/// cancel.
 pub fn sign_block(
     block: DogeosBlock,
     signer: Arc<dyn alloy_signer::Signer + Send + Sync>,

@@ -104,8 +104,8 @@ impl Signer {
                 }
                 // Signing retries until it succeeds, so stop as soon as nobody is listening
                 // instead of waiting for pending blocks to be signed.
-                _ = self.sender.closed() => {
-                    tracing::info!(target: "scroll::signer", "The event channel has been closed - shutting down.");
+                _ = self.sender.closed(), if !self.in_progress.is_empty() => {
+                    tracing::info!(target: "scroll::signer", pending = self.in_progress.len(), "Nobody is listening for signed blocks - shutting down.");
                     break;
                 }
                 else => {
@@ -164,8 +164,9 @@ mod tests {
         assert_eq!(recovered_address, signer.address());
     }
 
-    /// A signer whose first `failures` calls for one hash fail: the first call never returns and
-    /// the later ones return an error. Every other call signs normally.
+    /// A signer that fails its first `failures` calls for one hash: call 1 never returns and calls
+    /// 2 to `failures` return an error. All further calls, and calls for any other hash, sign
+    /// normally.
     struct FailsFirst {
         key: PrivateKeySigner,
         hash: B256,
@@ -230,7 +231,8 @@ mod tests {
             let hash = sig_encode_hash(&block);
             assert_eq!(signature.recover_address_from_prehash(&hash).unwrap(), key.address());
         }
-        assert!(start.elapsed() >= future::ATTEMPT_TIMEOUT);
+        // The timeout, then the 1 s and 2 s retry delays.
+        assert!(start.elapsed() >= future::ATTEMPT_TIMEOUT + future::FIRST_RETRY_DELAY * 3);
     }
 
     #[tokio::test(start_paused = true)]
@@ -240,10 +242,13 @@ mod tests {
         let (signer, handle) = Signer::new(FailsFirst::new(key, &block, usize::MAX));
         let task = tokio::spawn(signer.run());
         handle.sign_block(block).unwrap();
+
+        // Let the first attempt time out and the retries start, then stop listening.
+        tokio::time::sleep(future::ATTEMPT_TIMEOUT + Duration::from_secs(5)).await;
         drop(handle);
 
         // The block can never be signed, so the task must stop because nobody is listening.
-        tokio::time::timeout(Duration::from_secs(60), task)
+        tokio::time::timeout(Duration::from_secs(1), task)
             .await
             .expect("signer task kept retrying after its handle was dropped")
             .expect("signer task panicked");

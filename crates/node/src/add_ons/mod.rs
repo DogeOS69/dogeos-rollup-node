@@ -43,8 +43,8 @@ pub(crate) type RollupManagerHandle = rollup_node_chain_orchestrator::ChainOrche
     reth_network::NetworkHandle<DogeosNetworkPrimitives>,
 >;
 
-/// `eth` methods that `DogeOS` does not use and that run unbounded work on the blocking pool
-/// without a permit: the EIP-7928 block access list methods re-execute a whole block, and
+/// `eth` methods that `DogeOS` does not use, so they are not served. They also run on the blocking
+/// pool without a permit: the EIP-7928 block access list methods re-execute a whole block, and
 /// `eth_callBundle` executes any number of signed transactions.
 const UNUSED_ETH_METHODS: [&str; 4] = [
     "eth_getBlockAccessListByBlockHash",
@@ -55,8 +55,11 @@ const UNUSED_ETH_METHODS: [&str; 4] = [
 
 /// Removes the [`UNUSED_ETH_METHODS`] from all configured transports.
 fn remove_unused_eth_methods(modules: &mut TransportRpcModules) {
+    let eth_configured = modules.module_config().contains_any(&RethRpcModule::Eth);
     for method in UNUSED_ETH_METHODS {
-        modules.remove_method_from_configured(method);
+        if !modules.remove_method_from_configured(method) && eth_configured {
+            tracing::debug!(target: "scroll::node::rpc", method, "Unused eth method was not registered");
+        }
     }
 }
 
@@ -300,6 +303,7 @@ mod tests {
 
     fn eth_module() -> RpcModule<()> {
         let mut module = RpcModule::new(());
+        // Written out on purpose: dropping a name from `UNUSED_ETH_METHODS` must fail the test.
         for method in [
             "eth_getBlockAccessListByBlockHash",
             "eth_getBlockAccessListByBlockNumber",

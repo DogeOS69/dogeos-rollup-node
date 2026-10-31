@@ -19,7 +19,7 @@ use reth_node_builder::{
 };
 use reth_node_types::NodeTypes;
 use reth_revm::context::{BlockEnv, TxEnv};
-use reth_rpc_builder::RethRpcModule;
+use reth_rpc_builder::{RethRpcModule, TransportRpcModules};
 use reth_rpc_eth_types::{error::FromEvmError, EthApiError};
 use scroll_wire::ScrollWireEvent;
 use std::sync::{Arc, OnceLock};
@@ -42,6 +42,23 @@ use tokio::sync::mpsc::{Receiver, UnboundedReceiver};
 pub(crate) type RollupManagerHandle = rollup_node_chain_orchestrator::ChainOrchestratorHandle<
     reth_network::NetworkHandle<DogeosNetworkPrimitives>,
 >;
+
+/// `eth` methods that `DogeOS` does not use and that run unbounded work on the blocking pool
+/// without a permit: the EIP-7928 block access list methods re-execute a whole block, and
+/// `eth_callBundle` executes any number of signed transactions.
+const UNUSED_ETH_METHODS: [&str; 4] = [
+    "eth_getBlockAccessListByBlockHash",
+    "eth_getBlockAccessListByBlockNumber",
+    "eth_getBlockAccessListRaw",
+    "eth_callBundle",
+];
+
+/// Removes the [`UNUSED_ETH_METHODS`] from all configured transports.
+fn remove_unused_eth_methods(modules: &mut TransportRpcModules) {
+    for method in UNUSED_ETH_METHODS {
+        modules.remove_method_from_configured(method);
+    }
+}
 
 /// Add-ons for the Scroll follower node.
 #[derive(Debug)]
@@ -145,6 +162,8 @@ where
         let rollup_node_rpc_ext = Arc::new(RollupNodeRpcExt::<N::Network>::new(rx));
 
         rpc_add_ons = rpc_add_ons.extend_rpc_modules(move |ctx| {
+            remove_unused_eth_methods(ctx.modules);
+
             let priority_fee_api = dogeos_reth_rpc::DogeosPriorityFeeApi::new(
                 ctx.registry.eth_api().clone(),
                 ctx.registry.eth_api().gas_oracle().config().max_price,
@@ -271,5 +290,44 @@ where
 
     fn engine_validator_builder(&self) -> Self::ValidatorBuilder {
         EngineValidatorAddOn::engine_validator_builder(&self.rpc_add_ons)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use jsonrpsee::RpcModule;
+
+    fn eth_module() -> RpcModule<()> {
+        let mut module = RpcModule::new(());
+        for method in [
+            "eth_getBlockAccessListByBlockHash",
+            "eth_getBlockAccessListByBlockNumber",
+            "eth_getBlockAccessListRaw",
+            "eth_callBundle",
+            "eth_chainId",
+        ] {
+            module.register_method(method, |_, _, _| "0x1").unwrap();
+        }
+        module
+    }
+
+    #[test]
+    fn removes_unused_eth_methods_from_all_transports() {
+        let mut modules = TransportRpcModules::default()
+            .with_http(eth_module())
+            .with_ws(eth_module())
+            .with_ipc(eth_module());
+
+        remove_unused_eth_methods(&mut modules);
+
+        for methods in [
+            modules.http_methods(|_| true),
+            modules.ws_methods(|_| true),
+            modules.ipc_methods(|_| true),
+        ] {
+            let names: Vec<_> = methods.unwrap().method_names().collect();
+            assert_eq!(names, ["eth_chainId"]);
+        }
     }
 }

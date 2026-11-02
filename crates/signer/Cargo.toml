@@ -31,7 +31,9 @@ tracing.workspace = true
 
 [dev-dependencies]
 alloy-signer-local.workspace = true
+async-trait.workspace = true
 reth-tracing.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 
 [features]
 default = []

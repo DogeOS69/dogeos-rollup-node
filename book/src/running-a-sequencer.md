@@ -373,7 +373,9 @@ Monitor L1 message detection and inclusion.
 
 ### Block Signing Failed
 
-**Symptoms:** Logs show "failed to sign"
+**Symptoms:** Logs show "Failed to sign block, retrying" or "Signing the block timed out, retrying"
+
+The signer retries a block until it is signed, and later blocks are not gossiped until it is.
 
 **Solutions:**
 1. Check signer configuration is correct

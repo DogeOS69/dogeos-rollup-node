@@ -5,6 +5,7 @@ use metrics_derive::Metrics;
 #[derive(Metrics, Clone)]
 #[metrics(scope = "signer")]
 pub struct SignerMetrics {
-    /// The signing duration.
+    /// Time from a block's signing request to its signature, including timed-out attempts and
+    /// retry delays.
     pub signing_duration: Histogram,
 }

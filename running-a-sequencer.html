@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-b592836f.js";
+            window.path_to_searchindex_js = "searchindex-fc602875.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-e2c7dee6.js"></script>
@@ -474,7 +474,8 @@ curl -X POST http://localhost:8545 \
 <li>Review AWS CloudTrail logs for KMS denials</li>
 </ul>
 <h3 id="block-signing-failed"><a class="header" href="#block-signing-failed">Block Signing Failed</a></h3>
-<p><strong>Symptoms:</strong> Logs show “failed to sign”</p>
+<p><strong>Symptoms:</strong> Logs show “Failed to sign block, retrying” or “Signing the block timed out, retrying”</p>
+<p>The signer retries a block until it is signed, and later blocks are not gossiped until it is.</p>
 <p><strong>Solutions:</strong></p>
 <ol>
 <li>Check signer configuration is correct</li>

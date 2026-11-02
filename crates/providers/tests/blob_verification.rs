@@ -6,7 +6,10 @@ use alloy_eips::eip4844::{
 };
 use alloy_primitives::B256;
 use alloy_rpc_types_beacon::sidecar::{BeaconBlobBundle, BlobData};
-use rollup_node_providers::{BeaconClientProvider, BlobProvider, L1ProviderError, S3BlobProvider};
+use rollup_node_providers::{
+    BeaconClientProvider, BlobProvider, BlobProviders, L1ProviderError, S3BlobProvider,
+};
+use std::sync::Arc;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
@@ -174,4 +177,36 @@ async fn s3_rejects_invalid_field_elements() {
         Err(L1ProviderError::BlobValidation(BlobTransactionValidationError::KZGError(_)))
     ));
     server.await.unwrap();
+}
+
+#[tokio::test]
+async fn providers_fall_back_to_the_next_source_when_one_misses_or_fails() {
+    let item = sidecar(b"original");
+    let hash = B256::from(item.to_kzg_versioned_hash());
+    let mut tampered = item.clone();
+    tampered.blob[63] ^= 1;
+
+    // The first beacon node has no sidecar for the slot, or serves one that fails verification.
+    // The blob then comes from S3, or from a second beacon node.
+    for (first_sidecars, from_second_beacon) in
+        [(vec![], false), (vec![tampered], false), (vec![], true)]
+    {
+        let (first, first_server) = beacon(first_sidecars).await;
+        let mut beacons = vec![Arc::new(first) as Arc<dyn BlobProvider>];
+        let mut backups = Vec::new();
+        let second_server = if from_second_beacon {
+            let (second, server) = beacon(vec![item.clone()]).await;
+            beacons.push(Arc::new(second));
+            server
+        } else {
+            let (url, server) = serve(vec![(format!("/{hash}"), item.blob.to_vec())]).await;
+            backups.push(Arc::new(S3BlobProvider::new_http(url)) as Arc<dyn BlobProvider>);
+            server
+        };
+
+        let fetched = BlobProviders::new(beacons, backups).blob(12, hash).await.unwrap().unwrap();
+        assert_eq!(fetched.as_ref(), item.blob.as_ref());
+        first_server.await.unwrap();
+        second_server.await.unwrap();
+    }
 }

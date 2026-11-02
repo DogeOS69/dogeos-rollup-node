@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-b8775153.js";
+            window.path_to_searchindex_js = "searchindex-b592836f.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-e2c7dee6.js"></script>
@@ -254,6 +254,7 @@ a follower node.</p>
 <li><code>--blob.s3_url &lt;URL&gt;</code>: S3-compatible storage URL for blob data</li>
 <li><code>--blob.anvil_url &lt;URL&gt;</code>: Anvil blob provider URL (for testing)</li>
 </ul>
+<p>When several sources are set, the node asks the beacon nodes first, then S3 and Anvil, and moves on to the next source when one does not have the blob or fails.</p>
 <p><strong>Scroll-Provided S3 Blob Storage:</strong></p>
 <p>Scroll provides public S3 blob storage endpoints for both networks:</p>
 <ul>

@@ -107,8 +107,13 @@ async fn orchestrator_with_engine<EC: ScrollEngineApi + Unpin + Send + Sync + 's
     let l2_provider =
         ProviderBuilder::<_, _, Scroll>::default().connect_mocked_client(Asserter::new());
     let l1_provider = MockL1Provider { db: database.clone(), blobs: Default::default() };
-    let derivation_pipeline =
-        DerivationPipeline::new(l1_provider.clone(), database.clone(), v2_start).await;
+    let derivation_pipeline = DerivationPipeline::new(
+        &reth_tasks::TaskExecutor::test(),
+        l1_provider.clone(),
+        database.clone(),
+        v2_start,
+    )
+    .await;
     let (watcher_command_tx, _watcher_command_rx) = mpsc::unbounded_channel();
     let watcher_command_tx = probes.watcher_commands.unwrap_or(watcher_command_tx);
     let (_notification_tx, notification_rx) = mpsc::channel(16);

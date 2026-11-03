@@ -26,6 +26,7 @@ fn main() {
     use reth_node_builder::EngineNodeLauncher;
     use reth_node_core::args::DefaultEngineValues;
     use rollup_node::{
+        constants::EXIT_CODE_SAFETY_STOP, safety_stop_requested,
         signer_rotation::EXIT_CODE_SIGNER_ROTATION, DogeosChainSpecParser, ScrollRollupNode,
         ScrollRollupNodeConfig,
     };
@@ -127,7 +128,11 @@ fn main() {
 
     if let Err(err) = result {
         eprintln!("Error: {err:?}");
-        std::process::exit(1);
+        // Only a safety stop that ended the run gets its own code. One raised while a signal
+        // shutdown is already under way (for example because the Engine stopped first) leaves
+        // the run's result `Ok`, so that shutdown still exits 0.
+        let code = if safety_stop_requested() { EXIT_CODE_SAFETY_STOP } else { 1 };
+        std::process::exit(code);
     }
 }
 

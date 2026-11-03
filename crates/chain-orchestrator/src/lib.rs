@@ -19,7 +19,7 @@ use rollup_node_primitives::{
     L2BlockInfoWithL1Messages,
 };
 use rollup_node_providers::L1MessageProvider;
-use rollup_node_sequencer::{Sequencer, SequencerEvent};
+use rollup_node_sequencer::{Sequencer, SequencerError, SequencerEvent};
 use rollup_node_signer::{SignatureAsBytes, SignerEvent, SignerHandle};
 use rollup_node_watcher::{L1Notification, L1WatcherHandle};
 use scroll_db::{
@@ -204,7 +204,8 @@ impl<
         ))
     }
 
-    /// Drives the [`ChainOrchestrator`] until shutdown or any held-derivation fail-stop boundary.
+    /// Drives the [`ChainOrchestrator`] until shutdown, a held-derivation fail-stop boundary, or
+    /// an Engine rejection of a sequenced payload.
     pub async fn run_until_shutdown(
         mut self,
         mut shutdown: impl std::future::Future<Output = ()> + Unpin,
@@ -290,8 +291,15 @@ impl<
                         unreachable!()
                     }
                 }, if self.sequencer.is_some() && self.sync_state.is_synced() && !self.has_pending_derivation_work() => {
-                    let res = self.handle_sequencer_event(event).await;
-                    self.handle_outcome(res);
+                    match self.handle_sequencer_event(event).await {
+                        Err(error @ ChainOrchestratorError::SequencerError(
+                            SequencerError::InvalidPayload { .. },
+                        )) => {
+                            tracing::error!(target: "scroll::chain_orchestrator", %error, "Engine rejected sequenced payload; stopping node");
+                            return Err(error)
+                        }
+                        outcome => self.handle_outcome(outcome),
+                    }
                 }
                 Some(batch) = self.derivation_pipeline.next(), if self.derivation_driver.can_accept_batch() => {
                     self.derivation_driver.hold_batch(batch);
@@ -431,6 +439,10 @@ impl<
                     .await
                 {
                     Ok(block) => block,
+                    Err(err @ SequencerError::InvalidPayload { .. }) => {
+                        self.metric_handler.finish_block_building_recording(None);
+                        return Err(err.into());
+                    }
                     Err(err) => {
                         // Terminal for this slot: the sequencer commits, signs and
                         // announces nothing on failure, so there is no block to wait
@@ -2009,6 +2021,138 @@ mod run_loop_policy_tests {
                 allow_empty_blocks: true,
             },
         )
+    }
+
+    #[tokio::test]
+    async fn sequencer_forkchoice_rejection_stops_or_skips_without_side_effects() {
+        for status in [
+            PayloadStatusEnum::Invalid { validation_error: "scripted invalid candidate".into() },
+            PayloadStatusEnum::Syncing,
+            PayloadStatusEnum::Accepted,
+        ] {
+            let database = Arc::new(setup_test_db().await);
+            database.insert_genesis_block(B256::ZERO).await.unwrap();
+            database.set_l2_head_block_number(SAFE).await.unwrap();
+            let message = L1MessageEnvelope::new(
+                TxL1Message { queue_index: 0, gas_limit: 21_000, ..Default::default() },
+                0,
+                None,
+                Some(B256::repeat_byte(0x33)),
+            );
+            database.insert_l1_message(message.clone()).await.unwrap();
+
+            // A decodable, hash-consistent candidate ensures the INVALID test would reach L1
+            // accounting and signing if the final forkchoice response were ignored.
+            let mut candidate_payload = payload(SAFE + 1);
+            candidate_payload.parent_hash = info(SAFE, 0x11).hash;
+            candidate_payload.gas_limit = 30_000_000;
+            candidate_payload.transactions = vec![message.transaction.encoded_2718().into()];
+            let mut block: DogeosBlock = candidate_payload
+                .clone()
+                .try_into_block::<dogeos_reth_primitives::ScrollTransactionSigned>()
+                .unwrap();
+            block.header.difficulty = U256::ONE;
+            candidate_payload.block_hash = block.hash_slow();
+            let candidate = BlockInfo::from(&block);
+
+            let client = Arc::new(ScriptedEngineClient::new());
+            client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(
+                PayloadStatusEnum::Valid,
+                Some(PayloadId::new([9; 8])),
+            )));
+            client.push_get_payload(ScriptedResponse::Ok(candidate_payload));
+            client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(status.clone(), None)));
+            let (mut orchestrator, _handle, _notifications) = test_orchestrator(
+                database.clone(),
+                client.clone(),
+                Asserter::new(),
+                BatchDerivationResult {
+                    attributes: vec![],
+                    batch_info: BatchInfo::new(1, B256::repeat_byte(1)),
+                    skipped_l1_messages: vec![],
+                    target_status: BatchStatus::Consolidated,
+                },
+            )
+            .await;
+            orchestrator.derivation_driver = DerivationDriver::default();
+            orchestrator.sync_state.l2_mut().set_synced();
+            orchestrator.sequencer = Some(test_sequencer(database.clone()));
+            let (request_tx, mut signer_requests) = mpsc::unbounded_channel();
+            let (_signer_events, event_rx) = mpsc::unbounded_channel();
+            orchestrator.signer =
+                Some(SignerHandle::new(request_tx, event_rx.into(), Address::ZERO));
+
+            let (network_tx, mut network_rx) = mpsc::unbounded_channel();
+            let (announcement_tx, mut announcements) = mpsc::unbounded_channel();
+            tokio::spawn(async move {
+                let events = EventSender::new(16);
+                while let Some(message) = network_rx.recv().await {
+                    match message {
+                        NetworkHandleMessage::EventListener(response) => {
+                            let _ = response.send(events.new_listener());
+                        }
+                        NetworkHandleMessage::AnnounceBlock { block, .. } => {
+                            let _ = announcement_tx.send(block);
+                        }
+                        _ => {}
+                    }
+                }
+            });
+            orchestrator.network = ScrollNetworkHandle::new(network_tx, TestNetwork::new())
+                .into_scroll_network()
+                .await;
+
+            orchestrator.handle_sequencer_event(SequencerEvent::NewSlot).await.unwrap();
+            if matches!(status, PayloadStatusEnum::Invalid { .. }) {
+                // Exercise both propagation boundaries: finalization handler and run loop.
+                let result = time::timeout(
+                    Duration::from_secs(2),
+                    orchestrator.run_until_shutdown(std::future::pending()),
+                )
+                .await
+                .expect("INVALID must terminate without an external shutdown signal");
+                assert!(matches!(
+                    result,
+                    Err(ChainOrchestratorError::SequencerError(SequencerError::InvalidPayload {
+                        block_info,
+                        latest_valid_hash: None,
+                        validation_error,
+                    })) if block_info == candidate && validation_error == "scripted invalid candidate"
+                ));
+            } else {
+                let event = time::timeout(
+                    Duration::from_secs(2),
+                    orchestrator.sequencer.as_mut().unwrap().next(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert!(matches!(
+                    orchestrator.handle_sequencer_event(event).await,
+                    Ok(Some(ChainOrchestratorEvent::BlockBuildingSkipped))
+                ));
+                drop(orchestrator);
+            }
+            assert_eq!(client.fork_choice_updated_calls(), 2, "do not retry the candidate");
+            assert_eq!(database.get_l2_head_block_number().await.unwrap(), SAFE);
+            assert!(database.get_signature(candidate.hash).await.unwrap().is_none());
+            assert_eq!(
+                database
+                    .get_n_l1_messages(Some(L1MessageKey::from_queue_index(0)), 1)
+                    .await
+                    .unwrap(),
+                vec![message],
+                "the unconfirmed block must not consume the queued L1 message"
+            );
+            assert!(signer_requests.try_recv().is_err(), "no signing request may escape");
+            assert!(
+                time::timeout(Duration::from_secs(2), announcements.recv())
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "no unconfirmed block may be announced"
+            );
+        }
     }
 
     #[test]

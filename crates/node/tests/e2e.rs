@@ -544,6 +544,78 @@ async fn can_sequence_and_gossip_transactions() -> eyre::Result<()> {
     Ok(())
 }
 
+/// An EIP-7702 transaction sent to the sequencer over `eth_sendRawTransaction` is admitted,
+/// sequenced with its authorization applied and imported by a follower. The delegated account can
+/// then still send transactions.
+#[allow(clippy::large_stack_frames)]
+#[tokio::test]
+async fn can_sequence_eip7702_transaction_from_rpc() -> eyre::Result<()> {
+    use alloy_consensus::{SignableTransaction, TxEip7702, TxEnvelope};
+    use alloy_eips::{eip2718::Encodable2718, eip7702::Authorization};
+    use alloy_signer::SignerSync;
+    use jsonrpsee::{core::client::ClientT, rpc_params};
+
+    reth_tracing::init_test_tracing();
+
+    let mut fixture = TestFixture::builder()
+        .sequencer()
+        .followers(1)
+        .block_time(0)
+        .allow_empty_blocks(true)
+        .build()
+        .await?;
+    fixture.l1().for_node(0).sync().await?;
+    fixture.expect_event_on(0).l1_synced().await?;
+
+    let (signer, chain_id, nonce) = {
+        let wallet = fixture.wallet.lock().await;
+        (wallet.inner.clone(), wallet.chain_id, wallet.inner_nonce)
+    };
+    let sender = signer.address();
+    let delegate = Address::repeat_byte(0xde);
+
+    // Self-sponsored: the authorization nonce follows the transaction's own nonce.
+    let authorization =
+        Authorization { chain_id: U256::from(chain_id), address: delegate, nonce: nonce + 1 };
+    let authorization_signature = signer.sign_hash_sync(&authorization.signature_hash())?;
+    let tx = TxEip7702 {
+        chain_id,
+        nonce,
+        gas_limit: 100_000,
+        max_fee_per_gas: 1000e9 as u128,
+        max_priority_fee_per_gas: 1e9 as u128,
+        to: sender,
+        authorization_list: vec![authorization.into_signed(authorization_signature)],
+        ..Default::default()
+    };
+    let signature = signer.sign_hash_sync(&tx.signature_hash())?;
+    let raw: Bytes = TxEnvelope::Eip7702(tx.into_signed(signature)).encoded_2718().into();
+    fixture.wallet.lock().await.inner_nonce += 2;
+
+    let client = fixture.sequencer().node.rpc_client().expect("sequencer serves HTTP RPC");
+    let hash: B256 = client.request("eth_sendRawTransaction", rpc_params![raw]).await?;
+    fixture.build_block().expect_tx(hash).expect_tx_count(1).build_and_await_block().await?;
+    fixture.expect_event_on(1).chain_extended(1).await?;
+
+    let receipt: serde_json::Value =
+        client.request("eth_getTransactionReceipt", rpc_params![hash]).await?;
+    assert_eq!(receipt["type"], "0x4", "{receipt}");
+    assert_eq!(receipt["status"], "0x1", "{receipt}");
+    let code: Bytes = client.request("eth_getCode", rpc_params![sender, "latest"]).await?;
+    assert_eq!(code, Bytes::from([&[0xef, 0x01, 0x00][..], delegate.as_slice()].concat()));
+
+    // The pool's EIP-3607 check allows senders whose code is a delegation.
+    let raw = fixture.tx().transfer().build().await?;
+    let hash: B256 = client.request("eth_sendRawTransaction", rpc_params![raw]).await?;
+    fixture.build_block().expect_tx(hash).expect_tx_count(1).build_and_await_block().await?;
+    fixture.expect_event_on(1).chain_extended(2).await?;
+    let next_nonce: U256 =
+        client.request("eth_getTransactionCount", rpc_params![sender, "latest"]).await?;
+    assert_eq!(next_nonce, U256::from(nonce + 3));
+
+    Ok(())
+}
+
 /// We test the bridge from the eth-wire protocol to the scroll-wire protocol.
 ///
 /// The network has three participants:

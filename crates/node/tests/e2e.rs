@@ -601,8 +601,13 @@ async fn can_sequence_eip7702_transaction_from_rpc() -> eyre::Result<()> {
         client.request("eth_getTransactionReceipt", rpc_params![hash]).await?;
     assert_eq!(receipt["type"], "0x4", "{receipt}");
     assert_eq!(receipt["status"], "0x1", "{receipt}");
+    let delegation = Bytes::from([&[0xef, 0x01, 0x00][..], delegate.as_slice()].concat());
     let code: Bytes = client.request("eth_getCode", rpc_params![sender, "latest"]).await?;
-    assert_eq!(code, Bytes::from([&[0xef, 0x01, 0x00][..], delegate.as_slice()].concat()));
+    assert_eq!(code, delegation);
+    // The follower applied the same authorization when it executed the imported block.
+    let follower = fixture.follower(0).node.rpc_client().expect("follower serves HTTP RPC");
+    let code: Bytes = follower.request("eth_getCode", rpc_params![sender, "latest"]).await?;
+    assert_eq!(code, delegation);
 
     // The pool's EIP-3607 check allows senders whose code is a delegation.
     let raw = fixture.tx().transfer().build().await?;

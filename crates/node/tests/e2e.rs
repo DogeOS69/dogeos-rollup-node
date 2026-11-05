@@ -623,8 +623,8 @@ async fn can_sequence_eip7702_transaction_from_rpc() -> eyre::Result<()> {
 
 /// `dogeos_estimateFee` quotes, at the block a transaction is sent on, the L1 data fee its receipt
 /// is charged and a total that covers what the transaction pays. `scroll_estimateL1DataFee` quotes
-/// the same L1 fee. Covers legacy and EIP-1559 sends, a deploy, a call and EIP-7702, and a
-/// failing transaction.
+/// the same L1 fee without executing the transaction. Covers legacy and EIP-1559 sends, a deploy, a
+/// call and EIP-7702, and a failing transaction.
 #[allow(clippy::large_stack_frames)]
 #[tokio::test]
 async fn estimate_fee_quotes_the_receipt_l1_fee() -> eyre::Result<()> {
@@ -687,11 +687,22 @@ async fn estimate_fee_quotes_the_receipt_l1_fee() -> eyre::Result<()> {
         };
         let estimate: Value =
             client.request("dogeos_estimateFee", rpc_params![request.clone(), "latest"]).await?;
-        let alias: U256 = client
-            .request("scroll_estimateL1DataFee", rpc_params![request.clone(), "latest"])
-            .await?;
         let quantity = |key: &str| estimate[key].as_str().unwrap().parse::<U256>().unwrap();
+        // The same quote by block number.
+        let head: U256 = client.request("eth_blockNumber", rpc_params![]).await?;
+        let by_number: Value =
+            client.request("dogeos_estimateFee", rpc_params![request.clone(), head]).await?;
+        assert_eq!(by_number, estimate, "{name}");
+        // The Scroll method does not estimate gas: given the same gas it quotes the same fee, and
+        // by default (pending block, RPC gas cap) a longer gas field costs no less.
+        let mut with_gas = request.clone();
+        with_gas["gas"] = estimate["gasLimit"].clone();
+        let alias: U256 =
+            client.request("scroll_estimateL1DataFee", rpc_params![with_gas, "latest"]).await?;
         assert_eq!(alias, quantity("l1DataFee"), "{name}");
+        let alias: U256 =
+            client.request("scroll_estimateL1DataFee", rpc_params![request.clone()]).await?;
+        assert!(alias >= quantity("l1DataFee"), "{name}: {alias} vs {estimate}");
 
         // Sign the transaction a wallet builds from the estimate.
         let mut filled = request;
@@ -728,11 +739,14 @@ async fn estimate_fee_quotes_the_receipt_l1_fee() -> eyre::Result<()> {
         assert!(paid <= quantity("totalFee"), "{name}: paid {paid} vs {estimate}");
     }
 
-    // Like `eth_estimateGas`, a transaction that fails returns an error.
+    // Like `eth_estimateGas`, a transaction that fails returns an error. The Scroll method, which
+    // does not execute it, still quotes its L1 fee.
     let failing = json!({"from": sender, "data": "0xfe"});
     let estimate: Result<Value, _> =
-        client.request("dogeos_estimateFee", rpc_params![failing, "latest"]).await;
+        client.request("dogeos_estimateFee", rpc_params![failing.clone(), "latest"]).await;
     assert!(estimate.is_err(), "{estimate:?}");
+    let alias: U256 = client.request("scroll_estimateL1DataFee", rpc_params![failing]).await?;
+    assert!(alias > U256::ZERO);
 
     Ok(())
 }

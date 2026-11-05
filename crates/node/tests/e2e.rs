@@ -654,6 +654,8 @@ async fn estimate_fee_quotes_the_receipt_l1_fee() -> eyre::Result<()> {
         [&alloy_primitives::hex!("6001600c60003960016000f300")[..], &[0xab; 2_000]].concat(),
     );
     let contract = sender.create(fixture.wallet.lock().await.inner_nonce + 2);
+    // `approve` calldata, sent to the STOP contract: it checks the calldata's pricing, not ERC-20
+    // execution.
     let approve = Bytes::from(
         [&alloy_primitives::hex!("095ea7b3")[..], &[0; 12], sender.as_slice(), &[0xff; 32]]
             .concat(),
@@ -688,11 +690,14 @@ async fn estimate_fee_quotes_the_receipt_l1_fee() -> eyre::Result<()> {
         let estimate: Value =
             client.request("dogeos_estimateFee", rpc_params![request.clone(), "latest"]).await?;
         let quantity = |key: &str| estimate[key].as_str().unwrap().parse::<U256>().unwrap();
-        // The same quote by block number.
+        // The same quote by block number, and by default (latest).
         let head: U256 = client.request("eth_blockNumber", rpc_params![]).await?;
         let by_number: Value =
             client.request("dogeos_estimateFee", rpc_params![request.clone(), head]).await?;
         assert_eq!(by_number, estimate, "{name}");
+        let by_default: Value =
+            client.request("dogeos_estimateFee", rpc_params![request.clone()]).await?;
+        assert_eq!(by_default, estimate, "{name}");
         // The Scroll method does not estimate gas: given the same gas it quotes the same fee, and
         // by default (pending block, RPC gas cap) a longer gas field costs no less.
         let mut with_gas = request.clone();
@@ -732,9 +737,16 @@ async fn estimate_fee_quotes_the_receipt_l1_fee() -> eyre::Result<()> {
         let l1_fee = receipt_quantity("l1Fee");
         let l1_data_fee = quantity("l1DataFee");
         assert!(l1_fee > U256::ZERO, "{name}: {receipt}");
-        // The placeholder signature can compress up to a byte worse than a real one; for these
-        // transactions and the fixture's deterministic signer they compress the same.
-        assert_eq!(l1_data_fee, l1_fee, "{name}: {receipt}");
+        // Never below the receipt. The placeholder signature can encode and compress up to a byte
+        // longer than a real one (with these fixtures the two are equal).
+        assert!(
+            l1_fee <= l1_data_fee && l1_data_fee - l1_fee <= l1_fee / U256::from(50),
+            "{name}: receipt {l1_fee} vs estimate {l1_data_fee}"
+        );
+        let block: Value = client
+            .request("eth_getBlockByHash", rpc_params![receipt["blockHash"].clone(), false])
+            .await?;
+        assert_eq!(block["baseFeePerGas"], estimate["baseFeePerGas"], "{name}");
         let paid = receipt_quantity("gasUsed") * receipt_quantity("effectiveGasPrice") + l1_fee;
         assert!(paid <= quantity("totalFee"), "{name}: paid {paid} vs {estimate}");
     }

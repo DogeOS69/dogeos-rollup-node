@@ -624,7 +624,7 @@ async fn can_sequence_eip7702_transaction_from_rpc() -> eyre::Result<()> {
 /// `dogeos_estimateFee` quotes, at the block a transaction is sent on, the L1 data fee its receipt
 /// is charged and a total that covers what the transaction pays. `scroll_estimateL1DataFee` quotes
 /// the same L1 fee without executing the transaction. Covers legacy and EIP-1559 sends, a deploy, a
-/// call and EIP-7702, and a failing transaction.
+/// call and EIP-7702, a failing transaction and a sender who cannot afford the fees.
 #[allow(clippy::large_stack_frames)]
 #[tokio::test]
 async fn estimate_fee_quotes_the_receipt_l1_fee() -> eyre::Result<()> {
@@ -737,8 +737,8 @@ async fn estimate_fee_quotes_the_receipt_l1_fee() -> eyre::Result<()> {
         let l1_fee = receipt_quantity("l1Fee");
         let l1_data_fee = quantity("l1DataFee");
         assert!(l1_fee > U256::ZERO, "{name}: {receipt}");
-        // Never below the receipt. The placeholder signature can encode and compress up to a byte
-        // longer than a real one (with these fixtures the two are equal).
+        // Never below the receipt, and close to it: the placeholder signature compresses at most a
+        // byte worse than a real one, well within 2% (with these fixtures the two are equal).
         assert!(
             l1_fee <= l1_data_fee && l1_data_fee - l1_fee <= l1_fee / U256::from(50),
             "{name}: receipt {l1_fee} vs estimate {l1_data_fee}"
@@ -759,6 +759,20 @@ async fn estimate_fee_quotes_the_receipt_l1_fee() -> eyre::Result<()> {
     assert!(estimate.is_err(), "{estimate:?}");
     let alias: U256 = client.request("scroll_estimateL1DataFee", rpc_params![failing]).await?;
     assert!(alias > U256::ZERO);
+
+    // A sender who cannot afford the fees still gets a quote, whichever fee fields it sets.
+    for fees in [
+        json!({}),
+        json!({"gasPrice": "0x3b9aca00"}),
+        json!({"maxFeePerGas": "0x3b9aca00", "maxPriorityFeePerGas": "0x1"}),
+    ] {
+        let mut unfunded =
+            json!({"from": Address::repeat_byte(0x99), "to": Address::repeat_byte(0x11)});
+        unfunded.as_object_mut().unwrap().extend(fees.as_object().unwrap().clone());
+        let estimate: Value =
+            client.request("dogeos_estimateFee", rpc_params![unfunded.clone(), "latest"]).await?;
+        assert_eq!(estimate["gasLimit"], "0x5208", "{unfunded}: {estimate}");
+    }
 
     Ok(())
 }

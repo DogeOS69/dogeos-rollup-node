@@ -621,6 +621,122 @@ async fn can_sequence_eip7702_transaction_from_rpc() -> eyre::Result<()> {
     Ok(())
 }
 
+/// `dogeos_estimateFee` quotes, at the block a transaction is sent on, the L1 data fee its receipt
+/// is charged and a total that covers what the transaction pays. `scroll_estimateL1DataFee` quotes
+/// the same L1 fee. Covers legacy and EIP-1559 sends, a deploy, a call and EIP-7702, and a
+/// failing transaction.
+#[allow(clippy::large_stack_frames)]
+#[tokio::test]
+async fn estimate_fee_quotes_the_receipt_l1_fee() -> eyre::Result<()> {
+    use alloy_consensus::SignableTransaction;
+    use alloy_eips::{eip2718::Encodable2718, eip7702::Authorization};
+    use alloy_rpc_types_eth::TransactionRequest;
+    use alloy_signer::SignerSync;
+    use jsonrpsee::{core::client::ClientT, rpc_params};
+    use serde_json::{json, Value};
+
+    reth_tracing::init_test_tracing();
+
+    let mut fixture =
+        TestFixture::builder().sequencer().block_time(0).allow_empty_blocks(true).build().await?;
+    fixture.l1().for_node(0).sync().await?;
+    fixture.expect_event_on(0).l1_synced().await?;
+
+    let (signer, chain_id) = {
+        let wallet = fixture.wallet.lock().await;
+        (wallet.inner.clone(), wallet.chain_id)
+    };
+    let sender = signer.address();
+    let client = fixture.sequencer().node.rpc_client().expect("sequencer serves HTTP RPC");
+
+    // Init code that deploys a contract whose code is STOP, followed by data it does not copy.
+    let init_code = Bytes::from(
+        [&alloy_primitives::hex!("6001600c60003960016000f300")[..], &[0xab; 2_000]].concat(),
+    );
+    let contract = sender.create(fixture.wallet.lock().await.inner_nonce + 2);
+    let approve = Bytes::from(
+        [&alloy_primitives::hex!("095ea7b3")[..], &[0; 12], sender.as_slice(), &[0xff; 32]]
+            .concat(),
+    );
+    let authorization = |nonce: u64| {
+        let authorization = Authorization {
+            chain_id: U256::from(chain_id),
+            address: Address::repeat_byte(0xde),
+            nonce,
+        };
+        let signature = signer.sign_hash_sync(&authorization.signature_hash()).unwrap();
+        authorization.into_signed(signature)
+    };
+
+    for (name, request) in [
+        (
+            "legacy send",
+            json!({"from": sender, "to": Address::repeat_byte(0x11), "value": "0x1", "type": "0x0"}),
+        ),
+        ("send", json!({"from": sender, "to": Address::repeat_byte(0x11), "value": "0x1"})),
+        ("deploy", json!({"from": sender, "data": init_code})),
+        ("approve", json!({"from": sender, "to": contract, "data": approve})),
+        ("eip-7702", Value::Null),
+    ] {
+        let nonce = fixture.wallet.lock().await.inner_nonce;
+        // Self-sponsored: the authorization nonce follows the transaction's own nonce.
+        let request = if request.is_null() {
+            json!({"from": sender, "to": sender, "authorizationList": [authorization(nonce + 1)]})
+        } else {
+            request
+        };
+        let estimate: Value =
+            client.request("dogeos_estimateFee", rpc_params![request.clone(), "latest"]).await?;
+        let alias: U256 = client
+            .request("scroll_estimateL1DataFee", rpc_params![request.clone(), "latest"])
+            .await?;
+        let quantity = |key: &str| estimate[key].as_str().unwrap().parse::<U256>().unwrap();
+        assert_eq!(alias, quantity("l1DataFee"), "{name}");
+
+        // Sign the transaction a wallet builds from the estimate.
+        let mut filled = request;
+        filled["nonce"] = json!(nonce);
+        filled["chainId"] = json!(chain_id);
+        filled["gas"] = estimate["gasLimit"].clone();
+        if filled["type"] == "0x0" {
+            filled["gasPrice"] = estimate["maxFeePerGas"].clone();
+        } else {
+            filled["maxFeePerGas"] = estimate["maxFeePerGas"].clone();
+            filled["maxPriorityFeePerGas"] = estimate["maxPriorityFeePerGas"].clone();
+        }
+        let mut transaction = serde_json::from_value::<TransactionRequest>(filled)?;
+        transaction.to.get_or_insert(alloy_primitives::TxKind::Create);
+        let transaction = transaction
+            .build_typed_tx()
+            .map_err(|request| eyre::eyre!("{name}: incomplete request {request:?}"))?;
+        let signature = signer.sign_hash_sync(&transaction.signature_hash())?;
+        let raw: Bytes = transaction.into_envelope(signature).encoded_2718().into();
+        fixture.wallet.lock().await.inner_nonce += if name == "eip-7702" { 2 } else { 1 };
+
+        let hash: B256 = client.request("eth_sendRawTransaction", rpc_params![raw]).await?;
+        fixture.build_block().expect_tx(hash).expect_tx_count(1).build_and_await_block().await?;
+        let receipt: Value = client.request("eth_getTransactionReceipt", rpc_params![hash]).await?;
+        assert_eq!(receipt["status"], "0x1", "{name}: {receipt}");
+        let receipt_quantity = |key: &str| receipt[key].as_str().unwrap().parse::<U256>().unwrap();
+        let l1_fee = receipt_quantity("l1Fee");
+        let l1_data_fee = quantity("l1DataFee");
+        assert!(l1_fee > U256::ZERO, "{name}: {receipt}");
+        // The placeholder signature can compress up to a byte worse than a real one; for these
+        // transactions and the fixture's deterministic signer they compress the same.
+        assert_eq!(l1_data_fee, l1_fee, "{name}: {receipt}");
+        let paid = receipt_quantity("gasUsed") * receipt_quantity("effectiveGasPrice") + l1_fee;
+        assert!(paid <= quantity("totalFee"), "{name}: paid {paid} vs {estimate}");
+    }
+
+    // Like `eth_estimateGas`, a transaction that fails returns an error.
+    let failing = json!({"from": sender, "data": "0xfe"});
+    let estimate: Result<Value, _> =
+        client.request("dogeos_estimateFee", rpc_params![failing, "latest"]).await;
+    assert!(estimate.is_err(), "{estimate:?}");
+
+    Ok(())
+}
+
 /// We test the bridge from the eth-wire protocol to the scroll-wire protocol.
 ///
 /// The network has three participants:

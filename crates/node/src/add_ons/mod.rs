@@ -175,6 +175,10 @@ where
             );
             ctx.modules.add_or_replace_if_module_configured(
                 RethRpcModule::Eth,
+                dogeos_reth_rpc::DogeosEstimateFeeApi::new(priority_fee_api.clone()).into_rpc()?,
+            )?;
+            ctx.modules.add_or_replace_if_module_configured(
+                RethRpcModule::Eth,
                 priority_fee_api.into_rpc()?,
             )?;
 

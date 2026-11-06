@@ -392,6 +392,8 @@ impl<
 
     /// Handles the outcome of an operation, logging errors and notifying event listeners as
     /// appropriate.
+    /// The error is returned once, when the run loop stops, so it is not boxed.
+    #[allow(clippy::result_large_err)]
     fn handle_outcome(
         &self,
         outcome: Result<Option<ChainOrchestratorEvent>, ChainOrchestratorError>,

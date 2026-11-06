@@ -212,16 +212,15 @@ where
                 observed: observed.finalized,
             })
         }
-        if observed.safe != safe {
-            if !explained_by_acknowledged_move(provider, database, observed.safe, safe).await? &&
-                !canonical_ancestor(provider, observed.safe, safe).await?
-            {
-                return Err(ChainOrchestratorError::FrontierConflict {
-                    tag: "safe",
-                    target: safe,
-                    observed: observed.safe,
-                })
-            }
+        if observed.safe != safe &&
+            !explained_by_acknowledged_move(provider, database, observed.safe, safe).await? &&
+            !canonical_ancestor(provider, observed.safe, safe).await?
+        {
+            return Err(ChainOrchestratorError::FrontierConflict {
+                tag: "safe",
+                target: safe,
+                observed: observed.safe,
+            })
         }
 
         // Select the persisted unsafe head only after resolving a possible safe rewind. If the

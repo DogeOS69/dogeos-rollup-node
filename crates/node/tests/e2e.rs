@@ -779,14 +779,14 @@ async fn estimate_fee_quotes_the_receipt_l1_fee() -> eyre::Result<()> {
             chain_id,
             nonce,
             gas_limit: 21_000,
-            max_fee_per_gas: 1e10 as u128,
+            max_fee_per_gas: 10_000_000_000,
             to: alloy_primitives::TxKind::Call(to),
             value,
             ..Default::default()
         })
     };
     let nonce = fixture.wallet.lock().await.inner_nonce;
-    let funding = sign(&signer, transfer(nonce, other.address(), U256::from(1e18 as u128)));
+    let funding = sign(&signer, transfer(nonce, other.address(), U256::from(10u128.pow(18))));
     fixture.wallet.lock().await.inner_nonce += 1;
     let funding: B256 = client.request("eth_sendRawTransaction", rpc_params![funding]).await?;
     fixture.build_block().expect_tx(funding).expect_tx_count(1).build_and_await_block().await?;

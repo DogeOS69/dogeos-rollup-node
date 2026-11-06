@@ -762,6 +762,124 @@ async fn can_bridge_blocks() -> eyre::Result<()> {
     Ok(())
 }
 
+/// Restart both a sequencer and a follower with a fresh Engine and `SQLite` connection at each
+/// durable finalization checkpoint. No new block is built after FCU, so tag persistence may lag.
+/// Checkpoint 3 has no saved transition (a database written by an older release) and a database
+/// head two blocks past Reth's, as after Reth lost unsaved blocks and its safe-tag write.
+#[tokio::test]
+async fn restart_recovers_frontier_checkpoints_on_sequencer_and_follower() -> eyre::Result<()> {
+    use scroll_db::{DatabaseConnectionProvider, PendingFrontierTransition, StoredForkchoiceState};
+    use scroll_engine::{ScrollAuthApiEngineClient, ScrollEngineApi};
+
+    for checkpoint in 0..4 {
+        let mut fixture = TestFixture::builder()
+            .sequencer()
+            .followers(1)
+            .allow_empty_blocks(true)
+            .build()
+            .await?;
+        fixture.l1().sync().await?;
+        let block = fixture.build_block().expect_block_number(1).build_and_await_block().await?;
+        fixture.expect_event_on(1).chain_extended(1).await?;
+        let tip = BlockInfo::from(&block);
+        let genesis = BlockInfo::new(0, fixture.chain_spec.genesis_hash());
+        let expected = StoredForkchoiceState { head: tip, safe: genesis, finalized: genesis };
+        let target = StoredForkchoiceState { head: tip, safe: tip, finalized: tip };
+        let mut databases = Vec::new();
+        for node in fixture.nodes.iter().flatten() {
+            let database = node.rollup_manager_handle.get_database_handle().await?;
+            let batch = BatchCommitData {
+                hash: B256::repeat_byte(0xb1),
+                index: 1,
+                block_number: 1,
+                block_timestamp: 1,
+                calldata: Arc::new(Bytes::new()),
+                blob_versioned_hash: None,
+                finalized_block_number: Some(1),
+                reverted_block_number: None,
+            };
+            database
+                .tx_mut(move |tx| {
+                    let batch = batch.clone();
+                    async move {
+                        tx.insert_batch(batch.clone()).await?;
+                        tx.insert_blocks(vec![tip], (&batch).into()).await?;
+                        tx.update_batch_status(batch.hash, BatchStatus::Finalized).await?;
+                        if checkpoint == 3 {
+                            return tx.set_l2_head_block_number(tip.number + 2).await
+                        }
+                        tx.set_l2_head_block_number(tip.number).await?;
+                        tx.set_pending_frontier_transition(PendingFrontierTransition {
+                            expected,
+                            target,
+                        })
+                        .await
+                    }
+                })
+                .await?;
+            if (1..3).contains(&checkpoint) {
+                let client = ScrollAuthApiEngineClient::new(
+                    node.node.inner.add_ons_handle.rpc_server_handles.auth.http_client(),
+                );
+                let response = client
+                    .fork_choice_updated_v1(
+                        alloy_rpc_types_engine::ForkchoiceState {
+                            head_block_hash: tip.hash,
+                            safe_block_hash: tip.hash,
+                            finalized_block_hash: tip.hash,
+                        },
+                        None,
+                    )
+                    .await?;
+                assert!(matches!(
+                    response.payload_status.status,
+                    alloy_rpc_types_engine::PayloadStatusEnum::Valid
+                ));
+            }
+            if checkpoint == 2 {
+                database.clear_pending_frontier_transition().await?;
+            }
+            databases.push(database);
+        }
+        for (node_index, database) in databases.iter().enumerate() {
+            fixture.shutdown_node(node_index).await?;
+            database.inner().get_connection().clone().close().await?;
+        }
+        drop(databases);
+        for node_index in 0..2 {
+            fixture.start_node(node_index).await?;
+            let node = fixture.nodes[node_index].as_ref().unwrap();
+            let database = node.rollup_manager_handle.get_database_handle().await?;
+            assert_eq!(database.get_pending_frontier_transition().await?, None);
+            assert_eq!(database.get_latest_finalized_l2_info().await?, tip);
+            assert_eq!(
+                database.get_l2_head_block_number().await?,
+                tip.number,
+                "checkpoint {checkpoint}"
+            );
+            for tag in
+                [BlockNumberOrTag::Latest, BlockNumberOrTag::Safe, BlockNumberOrTag::Finalized]
+            {
+                let block =
+                    node.node.rpc.inner.eth_api().block_by_number(tag, false).await?.unwrap();
+                assert_eq!(
+                    BlockInfo::from(&block.header),
+                    tip,
+                    "checkpoint {checkpoint}, node {node_index}, tag {tag}"
+                );
+            }
+        }
+        // No manual step: the sequencer builds on the recovered head.
+        fixture.l1().sync().await?;
+        fixture.build_block().expect_block_number(tip.number + 1).build_and_await_block().await?;
+        // Shut down while the fixture still owns its files.
+        for node_index in 0..2 {
+            fixture.shutdown_node(node_index).await?;
+        }
+    }
+    Ok(())
+}
+
 /// Test that when the rollup node manager is shutdown, it consolidates the most recent batch
 /// on startup.
 #[allow(clippy::large_stack_frames)]
@@ -1043,10 +1161,11 @@ async fn shutdown_consolidates_most_recent_batch_on_startup() -> eyre::Result<()
     .expect("restart recovery must consolidate batch 2");
 
     assert!(processing_observer.await?, "startup catch-up must mark the batch Processing");
+    // Startup moves Reth back to the database head (block 4), so the whole batch is rebuilt.
     assert_eq!(
         recovered_blocks,
-        (partial_head..=57).collect::<Vec<_>>(),
-        "the matching partial head must be reused before building only the missing suffix"
+        (5..=57).collect::<Vec<_>>(),
+        "partial head {partial_head} must be rebuilt from the database head"
     );
     assert_eq!(recovered_outcome.blocks.len(), 53);
     assert_eq!(recovered_outcome.target_status, BatchStatus::Consolidated);

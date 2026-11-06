@@ -1,5 +1,8 @@
-use super::{models, DatabaseError};
-use crate::{ReadConnectionProvider, WriteConnectionProvider};
+use super::{models, DatabaseError, PendingFrontierTransition};
+use crate::{
+    frontier_transition_types::{CONFIRMED_FRONTIER_KEY, FRONTIER_TRANSITION_KEY},
+    ReadConnectionProvider, WriteConnectionProvider,
+};
 
 use alloy_primitives::{Bytes, Signature, B256};
 use dogeos_reth_engine::BlockDataHint;
@@ -13,11 +16,35 @@ use sea_orm::{
 };
 use std::fmt;
 
+async fn read_frontier_transition<T: ReadConnectionProvider + Sync + ?Sized>(
+    connection: &T,
+    key: &str,
+) -> Result<Option<PendingFrontierTransition>, DatabaseError> {
+    models::metadata::Entity::find_by_id(key)
+        .one(connection.get_connection())
+        .await?
+        .map(|row| {
+            let transition: PendingFrontierTransition = serde_json::from_str(&row.value)?;
+            transition.validate()?;
+            Ok(transition)
+        })
+        .transpose()
+}
+
 /// The [`DatabaseWriteOperations`] trait provides write methods for interacting with the
 /// database.
 #[async_trait::async_trait]
 #[auto_impl::auto_impl(Arc)]
 pub trait DatabaseWriteOperations {
+    /// Store the single pending Engine forkchoice transition.
+    async fn set_pending_frontier_transition(
+        &self,
+        transition: PendingFrontierTransition,
+    ) -> Result<(), DatabaseError>;
+
+    /// Acknowledge the pending transition, retaining its recovery witness in the same transaction.
+    async fn clear_pending_frontier_transition(&self) -> Result<(), DatabaseError>;
+
     /// Insert a [`BlockInfo`] representing an L1 block into the database.
     async fn insert_l1_block_info(&self, block_info: BlockInfo) -> Result<(), DatabaseError>;
 
@@ -151,20 +178,20 @@ pub trait DatabaseWriteOperations {
         batch_info: BatchInfo,
     ) -> Result<(), DatabaseError>;
 
-    /// Insert the genesis block into the database.
+    /// Replace the database genesis row with the canonical genesis hash.
     async fn insert_genesis_block(&self, genesis_hash: B256) -> Result<(), DatabaseError>;
 
     /// Delete any genesis-height (block 0) rows whose hash does not match the chain's genesis
     /// hash, returning how many were removed. The static dev migration seeds the Scroll dev
-    /// genesis row; the real genesis is inserted by `reconcile_genesis_block` (the insert cannot
-    /// overwrite — its conflict key includes the hash), and the seeded row would otherwise shadow
-    /// the real one nondeterministically in highest-block queries such as
+    /// genesis row, and an older release inserted the real genesis beside it; the seeded row
+    /// would otherwise shadow the real one nondeterministically in highest-block queries such as
     /// `get_latest_safe_l2_info`, presenting as a same-height different-hash safe divergence.
     ///
     /// This primitive has no floor: it removes the LAST height-0 row too, leaving `l2_block`
     /// without a genesis — the state [`DatabaseError::GenesisMissing`] reports and
-    /// `get_latest_safe_l2_info` panics on. Production callers must pair it with
-    /// `insert_genesis_block` in the same transaction, as [`Self::reconcile_genesis_block`] does.
+    /// `get_latest_safe_l2_info` fails on with [`DatabaseError::MissingSafeL2Frontier`]. Production
+    /// callers must pair it with `insert_genesis_block` in the same transaction, as
+    /// [`Self::reconcile_genesis_block`] does.
     async fn delete_mismatched_genesis_blocks(
         &self,
         genesis_hash: B256,
@@ -243,6 +270,56 @@ pub trait DatabaseWriteOperations {
 
 #[async_trait::async_trait]
 impl<T: WriteConnectionProvider + ?Sized + Sync> DatabaseWriteOperations for T {
+    async fn set_pending_frontier_transition(
+        &self,
+        transition: PendingFrontierTransition,
+    ) -> Result<(), DatabaseError> {
+        use models::metadata::Column;
+
+        transition.validate()?;
+        if transition.expected == transition.target {
+            return Ok(())
+        }
+        let transition: models::metadata::ActiveModel = Metadata {
+            key: FRONTIER_TRANSITION_KEY.to_owned(),
+            value: serde_json::to_string(&transition)?,
+        }
+        .into();
+        models::metadata::Entity::insert(transition)
+            .on_conflict(OnConflict::column(Column::Key).update_column(Column::Value).to_owned())
+            .exec_without_returning(self.get_connection())
+            .await?;
+        Ok(())
+    }
+
+    async fn clear_pending_frontier_transition(&self) -> Result<(), DatabaseError> {
+        if let Some(transition) = self.get_pending_frontier_transition().await? {
+            // Head/finalized-only acknowledgements must not erase evidence of a safe rewind:
+            // Reth can lose its deferred tag write even after acknowledging a later head FCU.
+            if transition.expected.safe != transition.target.safe ||
+                self.get_confirmed_frontier_transition().await?.is_none()
+            {
+                let row: models::metadata::ActiveModel = Metadata {
+                    key: CONFIRMED_FRONTIER_KEY.to_owned(),
+                    value: serde_json::to_string(&transition)?,
+                }
+                .into();
+                models::metadata::Entity::insert(row)
+                    .on_conflict(
+                        OnConflict::column(models::metadata::Column::Key)
+                            .update_column(models::metadata::Column::Value)
+                            .to_owned(),
+                    )
+                    .exec_without_returning(self.get_connection())
+                    .await?;
+            }
+        }
+        models::metadata::Entity::delete_by_id(FRONTIER_TRANSITION_KEY)
+            .exec(self.get_connection())
+            .await?;
+        Ok(())
+    }
+
     async fn insert_l1_block_info(&self, block_info: BlockInfo) -> Result<(), DatabaseError> {
         tracing::trace!(target: "scroll::db", %block_info, "Inserting L1 block info into database.");
         let finalized_l1_block_number = self.get_finalized_l1_block_number().await?;
@@ -556,14 +633,7 @@ impl<T: WriteConnectionProvider + ?Sized + Sync> DatabaseWriteOperations for T {
             .one(self.get_connection())
             .await?;
 
-        if let Some(batch) = batch {
-            let finalized_block_info = models::l2_block::Entity::find()
-                .filter(models::l2_block::Column::BatchHash.eq(batch.hash.clone()))
-                .order_by_desc(models::l2_block::Column::BlockNumber)
-                .one(self.get_connection())
-                .await?
-                .map(|block| block.block_info())
-                .expect("Finalized batch must have at least one L2 block.");
+        if batch.is_some() {
             models::batch_commit::Entity::update_many()
                 .filter(filter)
                 .col_expr(
@@ -573,7 +643,7 @@ impl<T: WriteConnectionProvider + ?Sized + Sync> DatabaseWriteOperations for T {
                 .exec(self.get_connection())
                 .await?;
 
-            Ok(Some(finalized_block_info))
+            Ok(Some(self.get_latest_finalized_l2_info().await?))
         } else {
             Ok(None)
         }
@@ -794,6 +864,10 @@ impl<T: WriteConnectionProvider + ?Sized + Sync> DatabaseWriteOperations for T {
     }
 
     async fn insert_genesis_block(&self, genesis_hash: B256) -> Result<(), DatabaseError> {
+        models::l2_block::Entity::delete_many()
+            .filter(models::l2_block::Column::BlockNumber.eq(0))
+            .exec(self.get_connection())
+            .await?;
         let genesis_block = BlockInfo::new(0, genesis_hash);
         let genesis_batch = BatchInfo::new(0, B256::ZERO);
         self.insert_blocks(vec![genesis_block], genesis_batch).await
@@ -1092,6 +1166,19 @@ impl<T: WriteConnectionProvider + ?Sized + Sync> DatabaseWriteOperations for T {
 #[async_trait::async_trait]
 #[auto_impl::auto_impl(Arc)]
 pub trait DatabaseReadOperations {
+    /// Last acknowledged safe transition (or first intent), retained because Engine
+    /// acknowledgement does not imply fsync of its safe tag.
+    async fn get_confirmed_frontier_transition(
+        &self,
+    ) -> Result<Option<PendingFrontierTransition>, DatabaseError>;
+
+    /// Highest non-reverted L2 block in a finalized batch, or genesis.
+    async fn get_latest_finalized_l2_info(&self) -> Result<BlockInfo, DatabaseError>;
+    /// Return the pending Engine forkchoice transition, if one exists.
+    async fn get_pending_frontier_transition(
+        &self,
+    ) -> Result<Option<PendingFrontierTransition>, DatabaseError>;
+
     /// Get a [`BatchCommitData`] from the database by its batch index.
     async fn get_batch_by_index(
         &self,
@@ -1185,6 +1272,39 @@ pub trait DatabaseReadOperations {
 
 #[async_trait::async_trait]
 impl<T: ReadConnectionProvider + Sync + ?Sized> DatabaseReadOperations for T {
+    async fn get_confirmed_frontier_transition(
+        &self,
+    ) -> Result<Option<PendingFrontierTransition>, DatabaseError> {
+        read_frontier_transition(self, CONFIRMED_FRONTIER_KEY).await
+    }
+
+    async fn get_latest_finalized_l2_info(&self) -> Result<BlockInfo, DatabaseError> {
+        let row = models::l2_block::Entity::find()
+            .left_join(models::batch_commit::Entity)
+            .filter(models::l2_block::Column::Reverted.eq(false))
+            .filter(
+                Condition::any().add(models::l2_block::Column::BlockNumber.eq(0)).add(
+                    Condition::all()
+                        .add(
+                            models::batch_commit::Column::Status
+                                .eq(BatchStatus::Finalized.as_str()),
+                        )
+                        .add(models::batch_commit::Column::RevertedBlockNumber.is_null()),
+                ),
+            )
+            .order_by_desc(models::l2_block::Column::BlockNumber)
+            .one(self.get_connection())
+            .await?
+            .ok_or(DatabaseError::MissingSafeL2Frontier)?;
+        Ok(row.block_info())
+    }
+
+    async fn get_pending_frontier_transition(
+        &self,
+    ) -> Result<Option<PendingFrontierTransition>, DatabaseError> {
+        read_frontier_transition(self, FRONTIER_TRANSITION_KEY).await
+    }
+
     async fn get_batch_by_index(
         &self,
         batch_index: u64,
@@ -1596,7 +1716,7 @@ impl<T: ReadConnectionProvider + Sync + ?Sized> DatabaseReadOperations for T {
             .order_by_desc(models::l2_block::Column::BlockNumber)
             .one(self.get_connection())
             .await?
-            .expect("there should always be at least the genesis block in the database");
+            .ok_or(DatabaseError::MissingSafeL2Frontier)?;
 
         Ok((safe_block.block_info(), safe_block.batch_info()))
     }

@@ -621,6 +621,238 @@ async fn can_sequence_eip7702_transaction_from_rpc() -> eyre::Result<()> {
     Ok(())
 }
 
+/// `dogeos_estimateFee` quotes, at the block a transaction is sent on, the L1 data fee its receipt
+/// is charged and a total that covers what the transaction pays. `scroll_estimateL1DataFee` quotes
+/// the same L1 fee without executing the transaction. Covers legacy and EIP-1559 sends, a deploy, a
+/// call, a gas-price-gated call and EIP-7702 (also queued behind a pooled transaction and
+/// delegating to code), a failing transaction and a sender who cannot afford the fees.
+#[allow(clippy::large_stack_frames)]
+#[tokio::test]
+async fn estimate_fee_quotes_the_receipt_l1_fee() -> eyre::Result<()> {
+    use alloy_consensus::SignableTransaction;
+    use alloy_eips::{eip2718::Encodable2718, eip7702::Authorization};
+    use alloy_rpc_types_eth::TransactionRequest;
+    use alloy_signer::SignerSync;
+    use jsonrpsee::{core::client::ClientT, rpc_params};
+    use serde_json::{json, Value};
+
+    reth_tracing::init_test_tracing();
+
+    let mut fixture =
+        TestFixture::builder().sequencer().block_time(0).allow_empty_blocks(true).build().await?;
+    fixture.l1().for_node(0).sync().await?;
+    fixture.expect_event_on(0).l1_synced().await?;
+
+    let (signer, chain_id) = {
+        let wallet = fixture.wallet.lock().await;
+        (wallet.inner.clone(), wallet.chain_id)
+    };
+    let sender = signer.address();
+    let client = fixture.sequencer().node.rpc_client().expect("sequencer serves HTTP RPC");
+
+    // Init code that deploys a contract whose code is STOP, followed by data it does not copy.
+    let init_code = Bytes::from(
+        [&alloy_primitives::hex!("6001600c60003960016000f300")[..], &[0xab; 2_000]].concat(),
+    );
+    let first_nonce = fixture.wallet.lock().await.inner_nonce;
+    let contract = sender.create(first_nonce + 2);
+    // Init code for a contract that reverts when `GASPRICE` is zero, and one that does an SSTORE.
+    let gated_init = Bytes::from(alloy_primitives::hex!(
+        "600b600c600039600b6000f3" "3a1560075700005b5f80fd"
+    ));
+    let gated = sender.create(first_nonce + 4);
+    let store_init = Bytes::from(alloy_primitives::hex!("6005600c60003960056000f3" "60015f5500"));
+    let store = sender.create(first_nonce + 6);
+    // `approve` calldata, sent to the STOP contract: it checks the calldata's pricing, not ERC-20
+    // execution.
+    let approve = Bytes::from(
+        [&alloy_primitives::hex!("095ea7b3")[..], &[0; 12], sender.as_slice(), &[0xff; 32]]
+            .concat(),
+    );
+    let authorization = |address: Address, nonce: u64| {
+        let authorization = Authorization { chain_id: U256::from(chain_id), address, nonce };
+        let signature = signer.sign_hash_sync(&authorization.signature_hash()).unwrap();
+        authorization.into_signed(signature)
+    };
+
+    for (name, request) in [
+        (
+            "legacy send",
+            json!({"from": sender, "to": Address::repeat_byte(0x11), "value": "0x1", "type": "0x0"}),
+        ),
+        ("send", json!({"from": sender, "to": Address::repeat_byte(0x11), "value": "0x1"})),
+        ("deploy", json!({"from": sender, "data": init_code})),
+        ("approve", json!({"from": sender, "to": contract, "data": approve})),
+        ("deploy gated", json!({"from": sender, "data": gated_init})),
+        // Gas is estimated with the quoted gas price, so the contract does not revert.
+        ("gated call", json!({"from": sender, "to": gated})),
+        ("deploy store", json!({"from": sender, "data": store_init})),
+        ("eip-7702", Value::Null),
+    ] {
+        let nonce = fixture.wallet.lock().await.inner_nonce;
+        // Self-sponsored: the authorization nonce follows the transaction's own nonce.
+        let request = if request.is_null() {
+            json!({
+                "from": sender,
+                "to": sender,
+                "authorizationList": [authorization(Address::repeat_byte(0xde), nonce + 1)]
+            })
+        } else {
+            request
+        };
+        let estimate: Value =
+            client.request("dogeos_estimateFee", rpc_params![request.clone(), "latest"]).await?;
+        let quantity = |key: &str| estimate[key].as_str().unwrap().parse::<U256>().unwrap();
+        // The same quote by block number, and by default (latest).
+        let head: U256 = client.request("eth_blockNumber", rpc_params![]).await?;
+        let by_number: Value =
+            client.request("dogeos_estimateFee", rpc_params![request.clone(), head]).await?;
+        assert_eq!(by_number, estimate, "{name}");
+        let by_default: Value =
+            client.request("dogeos_estimateFee", rpc_params![request.clone()]).await?;
+        assert_eq!(by_default, estimate, "{name}");
+        // The Scroll method does not estimate gas: given the same gas it quotes the same fee, and
+        // by default (pending block, RPC gas cap) a longer gas field costs no less.
+        let mut with_gas = request.clone();
+        with_gas["gas"] = estimate["gasLimit"].clone();
+        let alias: U256 =
+            client.request("scroll_estimateL1DataFee", rpc_params![with_gas, "latest"]).await?;
+        assert_eq!(alias, quantity("l1DataFee"), "{name}");
+        let alias: U256 =
+            client.request("scroll_estimateL1DataFee", rpc_params![request.clone()]).await?;
+        assert!(alias >= quantity("l1DataFee"), "{name}: {alias} vs {estimate}");
+
+        // Sign the transaction a wallet builds from the estimate.
+        let mut filled = request;
+        filled["nonce"] = json!(nonce);
+        filled["chainId"] = json!(chain_id);
+        filled["gas"] = estimate["gasLimit"].clone();
+        if filled["type"] == "0x0" {
+            filled["gasPrice"] = estimate["maxFeePerGas"].clone();
+        } else {
+            filled["maxFeePerGas"] = estimate["maxFeePerGas"].clone();
+            filled["maxPriorityFeePerGas"] = estimate["maxPriorityFeePerGas"].clone();
+        }
+        let mut transaction = serde_json::from_value::<TransactionRequest>(filled)?;
+        transaction.to.get_or_insert(alloy_primitives::TxKind::Create);
+        let transaction = transaction
+            .build_typed_tx()
+            .map_err(|request| eyre::eyre!("{name}: incomplete request {request:?}"))?;
+        let signature = signer.sign_hash_sync(&transaction.signature_hash())?;
+        let raw: Bytes = transaction.into_envelope(signature).encoded_2718().into();
+        fixture.wallet.lock().await.inner_nonce += if name == "eip-7702" { 2 } else { 1 };
+
+        let hash: B256 = client.request("eth_sendRawTransaction", rpc_params![raw]).await?;
+        fixture.build_block().expect_tx(hash).expect_tx_count(1).build_and_await_block().await?;
+        let receipt: Value = client.request("eth_getTransactionReceipt", rpc_params![hash]).await?;
+        assert_eq!(receipt["status"], "0x1", "{name}: {receipt}");
+        let receipt_quantity = |key: &str| receipt[key].as_str().unwrap().parse::<U256>().unwrap();
+        let l1_fee = receipt_quantity("l1Fee");
+        let l1_data_fee = quantity("l1DataFee");
+        assert!(l1_fee > U256::ZERO, "{name}: {receipt}");
+        // Never below the receipt, and close to it: the placeholder signature compresses at most a
+        // byte worse than a real one, well within 2% (with these fixtures the two are equal).
+        assert!(
+            l1_fee <= l1_data_fee && l1_data_fee - l1_fee <= l1_fee / U256::from(50),
+            "{name}: receipt {l1_fee} vs estimate {l1_data_fee}"
+        );
+        let block: Value = client
+            .request("eth_getBlockByHash", rpc_params![receipt["blockHash"].clone(), false])
+            .await?;
+        assert_eq!(block["baseFeePerGas"], estimate["baseFeePerGas"], "{name}");
+        let paid = receipt_quantity("gasUsed") * receipt_quantity("effectiveGasPrice") + l1_fee;
+        assert!(paid <= quantity("totalFee"), "{name}: paid {paid} vs {estimate}");
+    }
+
+    // A pending quote counts a queued transaction in the nonce, so the authorization of a
+    // self-sponsored EIP-7702 transaction queued behind it applies when gas is estimated: the
+    // delegated SSTORE is paid for and the transaction does not run out of gas.
+    // The wallet account is delegated now, and the pool admits one in-flight transaction for
+    // those, so use a fresh account.
+    let other = PrivateKeySigner::random();
+    let sign = |signer: &PrivateKeySigner, transaction: alloy_consensus::TypedTransaction| {
+        let signature = signer.sign_hash_sync(&transaction.signature_hash()).unwrap();
+        Bytes::from(transaction.into_envelope(signature).encoded_2718())
+    };
+    let transfer = |nonce: u64, to: Address, value: U256| {
+        alloy_consensus::TypedTransaction::Eip1559(alloy_consensus::TxEip1559 {
+            chain_id,
+            nonce,
+            gas_limit: 21_000,
+            max_fee_per_gas: 10_000_000_000,
+            to: alloy_primitives::TxKind::Call(to),
+            value,
+            ..Default::default()
+        })
+    };
+    let nonce = fixture.wallet.lock().await.inner_nonce;
+    let funding = sign(&signer, transfer(nonce, other.address(), U256::from(10u128.pow(18))));
+    fixture.wallet.lock().await.inner_nonce += 1;
+    let funding: B256 = client.request("eth_sendRawTransaction", rpc_params![funding]).await?;
+    fixture.build_block().expect_tx(funding).expect_tx_count(1).build_and_await_block().await?;
+    let queued = sign(&other, transfer(0, Address::repeat_byte(0x11), U256::from(1)));
+    let queued: B256 = client.request("eth_sendRawTransaction", rpc_params![queued]).await?;
+    let nonce = 1;
+    let authorization = {
+        let authorization =
+            Authorization { chain_id: U256::from(chain_id), address: store, nonce: nonce + 1 };
+        let signature = other.sign_hash_sync(&authorization.signature_hash())?;
+        authorization.into_signed(signature)
+    };
+    let request = json!({
+        "from": other.address(),
+        "to": other.address(),
+        "authorizationList": [authorization]
+    });
+    let estimate: Value =
+        client.request("dogeos_estimateFee", rpc_params![request.clone(), "pending"]).await?;
+    let mut filled = request;
+    filled["nonce"] = json!(nonce);
+    filled["chainId"] = json!(chain_id);
+    filled["gas"] = estimate["gasLimit"].clone();
+    filled["maxFeePerGas"] = estimate["maxFeePerGas"].clone();
+    filled["maxPriorityFeePerGas"] = estimate["maxPriorityFeePerGas"].clone();
+    let transaction = serde_json::from_value::<TransactionRequest>(filled)?
+        .build_typed_tx()
+        .map_err(|request| eyre::eyre!("incomplete request {request:?}"))?;
+    let raw = sign(&other, transaction);
+    let hash: B256 = client.request("eth_sendRawTransaction", rpc_params![raw]).await?;
+    fixture
+        .build_block()
+        .expect_tx(queued)
+        .expect_tx(hash)
+        .expect_tx_count(2)
+        .build_and_await_block()
+        .await?;
+    let receipt: Value = client.request("eth_getTransactionReceipt", rpc_params![hash]).await?;
+    assert_eq!(receipt["status"], "0x1", "{receipt}");
+
+    // Like `eth_estimateGas`, a transaction that fails returns an error. The Scroll method, which
+    // does not execute it, still quotes its L1 fee.
+    let failing = json!({"from": sender, "data": "0xfe"});
+    let estimate: Result<Value, _> =
+        client.request("dogeos_estimateFee", rpc_params![failing.clone(), "latest"]).await;
+    assert!(estimate.is_err(), "{estimate:?}");
+    let alias: U256 = client.request("scroll_estimateL1DataFee", rpc_params![failing]).await?;
+    assert!(alias > U256::ZERO);
+
+    // A sender who cannot afford the fees still gets a quote, whichever fee fields it sets.
+    for fees in [
+        json!({}),
+        json!({"gasPrice": "0x3b9aca00"}),
+        json!({"maxFeePerGas": "0x3b9aca00", "maxPriorityFeePerGas": "0x1"}),
+    ] {
+        let mut unfunded =
+            json!({"from": Address::repeat_byte(0x99), "to": Address::repeat_byte(0x11)});
+        unfunded.as_object_mut().unwrap().extend(fees.as_object().unwrap().clone());
+        let estimate: Value =
+            client.request("dogeos_estimateFee", rpc_params![unfunded.clone(), "latest"]).await?;
+        assert_eq!(estimate["gasLimit"], "0x5208", "{unfunded}: {estimate}");
+    }
+
+    Ok(())
+}
+
 /// We test the bridge from the eth-wire protocol to the scroll-wire protocol.
 ///
 /// The network has three participants:

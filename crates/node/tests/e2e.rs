@@ -764,12 +764,14 @@ async fn can_bridge_blocks() -> eyre::Result<()> {
 
 /// Restart both a sequencer and a follower with a fresh Engine and `SQLite` connection at each
 /// durable finalization checkpoint. No new block is built after FCU, so tag persistence may lag.
+/// Checkpoint 3 has no saved transition (a database written by an older release) and a database
+/// head two blocks past Reth's, as after Reth lost unsaved blocks and its safe-tag write.
 #[tokio::test]
 async fn restart_recovers_frontier_checkpoints_on_sequencer_and_follower() -> eyre::Result<()> {
     use scroll_db::{DatabaseConnectionProvider, PendingFrontierTransition, StoredForkchoiceState};
     use scroll_engine::{ScrollAuthApiEngineClient, ScrollEngineApi};
 
-    for checkpoint in 0..3 {
+    for checkpoint in 0..4 {
         let mut fixture = TestFixture::builder()
             .sequencer()
             .followers(1)
@@ -803,6 +805,9 @@ async fn restart_recovers_frontier_checkpoints_on_sequencer_and_follower() -> ey
                         tx.insert_batch(batch.clone()).await?;
                         tx.insert_blocks(vec![tip], (&batch).into()).await?;
                         tx.update_batch_status(batch.hash, BatchStatus::Finalized).await?;
+                        if checkpoint == 3 {
+                            return tx.set_l2_head_block_number(tip.number + 2).await
+                        }
                         tx.set_l2_head_block_number(tip.number).await?;
                         tx.set_pending_frontier_transition(PendingFrontierTransition {
                             expected,
@@ -812,7 +817,7 @@ async fn restart_recovers_frontier_checkpoints_on_sequencer_and_follower() -> ey
                     }
                 })
                 .await?;
-            if checkpoint > 0 {
+            if (1..3).contains(&checkpoint) {
                 let client = ScrollAuthApiEngineClient::new(
                     node.node.inner.add_ons_handle.rpc_server_handles.auth.http_client(),
                 );
@@ -847,6 +852,11 @@ async fn restart_recovers_frontier_checkpoints_on_sequencer_and_follower() -> ey
             let database = node.rollup_manager_handle.get_database_handle().await?;
             assert_eq!(database.get_pending_frontier_transition().await?, None);
             assert_eq!(database.get_latest_finalized_l2_info().await?, tip);
+            assert_eq!(
+                database.get_l2_head_block_number().await?,
+                tip.number,
+                "checkpoint {checkpoint}"
+            );
             for tag in
                 [BlockNumberOrTag::Latest, BlockNumberOrTag::Safe, BlockNumberOrTag::Finalized]
             {
@@ -859,6 +869,9 @@ async fn restart_recovers_frontier_checkpoints_on_sequencer_and_follower() -> ey
                 );
             }
         }
+        // No manual step: the sequencer builds on the recovered head.
+        fixture.l1().sync().await?;
+        fixture.build_block().expect_block_number(tip.number + 1).build_and_await_block().await?;
         // Shut down while the fixture still owns its files.
         for node_index in 0..2 {
             fixture.shutdown_node(node_index).await?;

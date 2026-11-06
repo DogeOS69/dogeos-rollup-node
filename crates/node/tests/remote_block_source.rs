@@ -4,7 +4,13 @@
 //! - Import blocks from a remote L2 node (the sequencer)
 //! - Build new blocks on top of each imported block
 
+use alloy_eips::BlockNumberOrTag;
+use alloy_primitives::{Bytes, B256};
+use reth_rpc_api::EthApiServer;
 use rollup_node::test_utils::{EventAssertions, TestFixture};
+use rollup_node_primitives::{BatchCommitData, BatchStatus, BlockInfo};
+use scroll_db::{DatabaseConnectionProvider, DatabaseWriteOperations};
+use std::{sync::Arc, time::Duration};
 
 #[allow(clippy::large_stack_frames)]
 #[tokio::test]
@@ -149,6 +155,66 @@ async fn test_remote_block_source_resumes_from_correct_head() -> eyre::Result<()
     fixture.expect_event_on(1).block_sequenced(5).await?;
     fixture.expect_event_on(1).block_sequenced(6).await?;
     fixture.expect_event_on(1).block_sequenced(7).await?;
+
+    Ok(())
+}
+
+/// A remote-source node whose restart needs a startup forkchoice update must still launch. Reth
+/// runs the Engine only after its add-ons launch, so the remote source add-on must not wait on
+/// the orchestrator while the orchestrator's recovery waits on the Engine.
+#[allow(clippy::large_stack_frames)]
+#[tokio::test]
+async fn test_remote_source_node_restarts_when_recovery_moves_the_engine() -> eyre::Result<()> {
+    reth_tracing::init_test_tracing();
+
+    let mut fixture = TestFixture::builder().sequencer().remote_source_node().build().await?;
+    fixture.l1().sync().await?;
+    fixture.build_block().expect_block_number(1).build_and_await_block().await?;
+    fixture.expect_event_on(1).block_sequenced(2).await?;
+
+    // Finalize block 1 in the remote source's database only, so its restart must move Reth's
+    // safe and finalized tags.
+    let node = fixture.remote_source();
+    let block = node.node.rpc.inner.eth_api().block_by_number(1.into(), false).await?;
+    let block = BlockInfo::from(&block.expect("block 1 must exist").header);
+    let database = node.rollup_manager_handle.get_database_handle().await?;
+    let batch = BatchCommitData {
+        hash: B256::repeat_byte(0xb1),
+        index: 1,
+        block_number: 1,
+        block_timestamp: 1,
+        calldata: Arc::new(Bytes::new()),
+        blob_versioned_hash: None,
+        finalized_block_number: Some(1),
+        reverted_block_number: None,
+    };
+    database
+        .tx_mut(move |tx| {
+            let batch = batch.clone();
+            async move {
+                tx.insert_batch(batch.clone()).await?;
+                tx.insert_blocks(vec![block], (&batch).into()).await?;
+                tx.update_batch_status(batch.hash, BatchStatus::Finalized).await
+            }
+        })
+        .await?;
+    fixture.shutdown_node(1).await?;
+    database.inner().get_connection().clone().close().await?;
+    drop(database);
+
+    tokio::time::timeout(Duration::from_secs(60), fixture.start_node(1))
+        .await
+        .expect("the remote-source node must launch")?;
+    let finalized = fixture
+        .remote_source()
+        .node
+        .rpc
+        .inner
+        .eth_api()
+        .block_by_number(BlockNumberOrTag::Finalized, false)
+        .await?
+        .expect("finalized block must exist");
+    assert_eq!(BlockInfo::from(&finalized.header), block);
 
     Ok(())
 }

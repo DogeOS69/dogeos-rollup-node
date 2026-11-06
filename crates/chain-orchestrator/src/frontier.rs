@@ -455,6 +455,19 @@ mod tests {
         let (_, lost) = rpc_block(101, safe.hash, 0xc1);
         seed_frontier(&database, genesis, safe).await;
         database.set_l2_head_block_number(lost.number).await.unwrap();
+        // A deposit in the lost block must become includable again; one in a kept block must not.
+        for (queue_index, l2_block) in [(0, safe.number), (1, lost.number)] {
+            let message = dogeos_protocol_types::TxL1Message { queue_index, ..Default::default() };
+            database
+                .insert_l1_message(rollup_node_primitives::L1MessageEnvelope::new(
+                    message,
+                    0,
+                    Some(l2_block),
+                    None,
+                ))
+                .await
+                .unwrap();
+        }
         let expected = StoredForkchoiceState { head: lost, safe: old_safe, finalized: genesis };
         let target = StoredForkchoiceState { safe, ..expected };
         database
@@ -482,6 +495,12 @@ mod tests {
         assert_eq!(engine.fcs(), &ForkchoiceState::new(safe, safe, genesis));
         assert_eq!(database.get_pending_frontier_transition().await.unwrap(), None);
         assert_eq!(database.get_l2_head_block_number().await.unwrap(), safe.number);
+        let messages = database
+            .get_n_l1_messages(Some(scroll_db::L1MessageKey::from_queue_index(0)), 2)
+            .await
+            .unwrap();
+        let mapped: Vec<_> = messages.iter().map(|message| message.l2_block_number).collect();
+        assert_eq!(mapped, [Some(safe.number), None]);
     }
 
     #[tokio::test]

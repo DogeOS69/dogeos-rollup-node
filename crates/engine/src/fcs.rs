@@ -71,8 +71,9 @@ impl ForkchoiceState {
         } else {
             None
         };
-        let genesis =
-            fetched_genesis.as_ref().or((latest_block.header.number == 0).then_some(&latest_block));
+        let genesis = fetched_genesis
+            .as_ref()
+            .or_else(|| (latest_block.header.number == 0).then_some(&latest_block));
         let safe_block = safe_block.as_ref().or(genesis);
         let finalized_block = finalized_block.as_ref().or(genesis);
         let (Some(safe_block), Some(finalized_block)) = (safe_block, finalized_block) else {

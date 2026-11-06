@@ -132,7 +132,10 @@ where
         {
             Ok(response) => match response.payload_status.status {
                 PayloadStatusEnum::Valid => {}
-                status => return Err(ChainOrchestratorError::FrontierTransitionStatus(status)),
+                status => {
+                    tracing::error!(target: "scroll::chain_orchestrator", ?transition, ?observed, %status, "Engine rejected a saved frontier move");
+                    return Err(ChainOrchestratorError::FrontierTransitionStatus(status))
+                }
             },
             Err(source @ EngineError::TransportError(_)) => {
                 // The Engine may have applied FCU before losing the HTTP response.
@@ -192,10 +195,16 @@ where
             })
         }
         if observed.safe != safe {
-            let confirmed = database.get_confirmed_frontier_transition().await?;
-            let known_transition = confirmed.is_some_and(|transition| {
-                transition.expected.safe == observed.safe && transition.target.safe == safe
-            });
+            // A lost tag write of the last acknowledged safe move explains an Engine safe block at
+            // that move's start, or below it on the canonical chain.
+            let known_transition = match database.get_confirmed_frontier_transition().await? {
+                Some(transition) if transition.target.safe == safe => {
+                    transition.expected.safe == observed.safe ||
+                        canonical_ancestor(provider, observed.safe, transition.expected.safe)
+                            .await?
+                }
+                _ => false,
+            };
             if !known_transition && !canonical_ancestor(provider, observed.safe, safe).await? {
                 return Err(ChainOrchestratorError::FrontierConflict {
                     tag: "safe",
@@ -566,6 +575,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn startup_accepts_a_safe_tag_below_the_start_of_the_acknowledged_rewind() {
+        // Reth persisted safe 2, then lost the tag writes of an advance to 3 and of the
+        // acknowledged rewind from 3 to 1.
+        let database = setup_test_db().await;
+        let (genesis_block, genesis) = rpc_block(0, B256::ZERO, 0xf0);
+        let (safe_block, safe) = rpc_block(1, genesis.hash, 0xa1);
+        let (lagging_block, lagging) = rpc_block(2, safe.hash, 0xa2);
+        let (head_block, head) = rpc_block(3, lagging.hash, 0xa3);
+        seed_frontier(&database, genesis, safe).await;
+        database.set_l2_head_block_number(head.number).await.unwrap();
+        let expected = StoredForkchoiceState { head, safe: head, finalized: genesis };
+        database
+            .set_pending_frontier_transition(PendingFrontierTransition {
+                expected,
+                target: StoredForkchoiceState { safe, ..expected },
+            })
+            .await
+            .unwrap();
+        database.clear_pending_frontier_transition().await.unwrap();
+        let asserter = Asserter::new();
+        push_tags(&asserter, &head_block, &lagging_block, &genesis_block);
+        // Tag 2 is a canonical ancestor of the rewind's start, then startup selects the head.
+        for block in [&lagging_block, &head_block, &safe_block, &head_block] {
+            asserter.push_success(&Some(block.clone()));
+        }
+        let (provider, client, mut engine) =
+            mock_engine(asserter, ForkchoiceState::from_block_info(genesis));
+        client.push_fork_choice_updated(ScriptedResponse::Ok(valid_fcu()));
+
+        recover_database_frontier(&provider, &mut engine, &database).await.unwrap();
+        assert_eq!(client.fork_choice_updated_calls(), 1);
+        assert_eq!(engine.fcs(), &ForkchoiceState::new(head, safe, genesis));
+    }
+
+    #[tokio::test]
     async fn startup_recovers_finalized_even_when_safe_matches() {
         let database = setup_test_db().await;
         let (genesis_block, genesis) = rpc_block(0, B256::ZERO, 0xf0);
@@ -664,17 +708,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn absent_tags_are_only_initialized_at_observed_genesis() {
-        for number in [0, 1] {
-            let (block, info) = rpc_block(number, B256::ZERO, 0xf0);
+    async fn absent_tags_fall_back_to_the_provider_genesis() {
+        // A fresh node, and one that optimistic sync moved past genesis without setting tags.
+        let (genesis_block, genesis) = rpc_block(0, B256::ZERO, 0xf0);
+        let (head_block, head) = rpc_block(1, genesis.hash, 0xf1);
+        for (block, info) in [(genesis_block.clone(), genesis), (head_block, head)] {
             let asserter = Asserter::new();
             asserter.push_success(&Some(block));
             asserter.push_success(&Option::<RpcBlock<ScrollRpcTransaction>>::None);
             asserter.push_success(&Option::<RpcBlock<ScrollRpcTransaction>>::None);
+            if info != genesis {
+                asserter.push_success(&Some(genesis_block.clone()));
+            }
             let provider =
                 ProviderBuilder::<_, _, Scroll>::default().connect_mocked_client(asserter);
             let observed = ForkchoiceState::try_from_provider(&provider).await.unwrap();
-            assert_eq!(observed, (number == 0).then_some(ForkchoiceState::from_block_info(info)));
+            assert_eq!(observed, Some(ForkchoiceState::new(info, genesis, genesis)));
         }
         let database = setup_test_db().await;
         let (provider, _, mut engine) =

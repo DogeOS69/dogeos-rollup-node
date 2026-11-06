@@ -61,9 +61,18 @@ impl ForkchoiceState {
         let finalized_block =
             provider.get_block(BlockId::Number(BlockNumberOrTag::Finalized)).await?;
         let Some(latest_block) = latest_block else { return Ok(None) };
-        // A fresh execution node has no safe/finalized tags until its first FCU. Only a known
-        // genesis head permits filling absent tags; transport errors still propagate above.
-        let genesis = (latest_block.header.number == 0).then_some(&latest_block);
+        // A fresh execution node has no safe/finalized tags until its first FCU, and an optimistic
+        // sync never sets them. Absent tags fall back to the provider's genesis block; transport
+        // errors still propagate above.
+        let fetched_genesis = if latest_block.header.number != 0 &&
+            (safe_block.is_none() || finalized_block.is_none())
+        {
+            provider.get_block(BlockId::Number(BlockNumberOrTag::Number(0))).await?
+        } else {
+            None
+        };
+        let genesis =
+            fetched_genesis.as_ref().or((latest_block.header.number == 0).then_some(&latest_block));
         let safe_block = safe_block.as_ref().or(genesis);
         let finalized_block = finalized_block.as_ref().or(genesis);
         let (Some(safe_block), Some(finalized_block)) = (safe_block, finalized_block) else {

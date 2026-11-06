@@ -90,11 +90,18 @@ where
         if observed != transition.expected && observed != transition.target {
             engine.replace_fcs_from_provider(observe_forkchoice(provider).await?);
             observed = stored_forkchoice(engine.fcs());
-            // Unsafe head can advance independently; safe must be explained by this intent or
-            // by a delayed persistence write on the same canonical chain.
+            // Unsafe head can advance independently. Safe must be explained by this intent, by the
+            // last acknowledged safe move whose tag write Reth lost, or by a delayed tag write on
+            // the canonical chain below either end of this intent.
+            let acknowledged = database.get_confirmed_frontier_transition().await?;
             if observed.safe != transition.expected.safe &&
                 observed.safe != transition.target.safe &&
-                !canonical_ancestor(provider, observed.safe, transition.expected.safe).await?
+                !acknowledged.is_some_and(|acknowledged| {
+                    acknowledged.expected.safe == observed.safe &&
+                        acknowledged.target.safe == transition.expected.safe
+                }) &&
+                !canonical_ancestor(provider, observed.safe, transition.expected.safe).await? &&
+                !canonical_ancestor(provider, observed.safe, transition.target.safe).await?
             {
                 return Err(ChainOrchestratorError::FrontierConflict {
                     tag: "safe",
@@ -466,6 +473,96 @@ mod tests {
         assert_eq!(engine.fcs(), &ForkchoiceState::new(safe, safe, genesis));
         assert_eq!(database.get_pending_frontier_transition().await.unwrap(), None);
         assert_eq!(database.get_l2_head_block_number().await.unwrap(), safe.number);
+    }
+
+    #[tokio::test]
+    async fn startup_replays_a_rewind_when_reth_lost_its_old_safe_block() {
+        // A rewind from safe 101 to 100 was saved with head 102. The crash left Reth with blocks
+        // through 100 and its safe tag at 99.
+        let database = setup_test_db().await;
+        let (genesis_block, genesis) = rpc_block(0, B256::ZERO, 0xf0);
+        let (old_block, old) = rpc_block(99, genesis.hash, 0xb1);
+        let (safe_block, safe) = rpc_block(100, old.hash, 0xa1);
+        let (_, rewound) = rpc_block(101, safe.hash, 0xc1);
+        let (_, head) = rpc_block(102, rewound.hash, 0xc2);
+        seed_frontier(&database, genesis, safe).await;
+        database.set_l2_head_block_number(head.number).await.unwrap();
+        let expected = StoredForkchoiceState { head, safe: rewound, finalized: genesis };
+        let target = StoredForkchoiceState { safe, ..expected };
+        database
+            .set_pending_frontier_transition(PendingFrontierTransition { expected, target })
+            .await
+            .unwrap();
+        let asserter = Asserter::new();
+        let absent = || asserter.push_success(&Option::<RpcBlock<ScrollRpcTransaction>>::None);
+        push_tags(&asserter, &safe_block, &old_block, &genesis_block);
+        // Blocks 101 and 102 are gone, so the replay moves to block 100.
+        absent();
+        asserter.push_success(&Some(safe_block.clone()));
+        absent();
+        absent();
+        // The replay re-reads the tags. Tag 99 is no ancestor of the lost 101, but is of 100.
+        push_tags(&asserter, &safe_block, &old_block, &genesis_block);
+        asserter.push_success(&Some(old_block.clone()));
+        absent();
+        asserter.push_success(&Some(old_block));
+        asserter.push_success(&Some(safe_block.clone()));
+        // Startup then selects the head again.
+        asserter.push_success(&Some(safe_block));
+        absent();
+        absent();
+        let (provider, client, mut engine) =
+            mock_engine(asserter, ForkchoiceState::from_block_info(genesis));
+        client.push_fork_choice_updated(ScriptedResponse::Ok(valid_fcu()));
+
+        recover_database_frontier(&provider, &mut engine, &database).await.unwrap();
+        assert_eq!(client.fork_choice_updated_calls(), 1);
+        assert_eq!(client.fork_choice_inputs()[0].0.head_block_hash, safe.hash);
+        assert_eq!(engine.fcs(), &ForkchoiceState::new(safe, safe, genesis));
+        assert_eq!(database.get_pending_frontier_transition().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn saved_move_replay_accepts_a_safe_tag_the_last_acknowledged_move_explains() {
+        // A rewind from safe 101 to 100 was acknowledged, but Reth lost its tag write. A later
+        // finalized-only move to 100 is still saved.
+        let database = setup_test_db().await;
+        let (genesis_block, genesis) = rpc_block(0, B256::ZERO, 0xf0);
+        let (safe_block, safe) = rpc_block(100, genesis.hash, 0xa1);
+        let (rewound_block, rewound) = rpc_block(101, safe.hash, 0xc1);
+        seed_frontier(&database, genesis, safe).await;
+        database
+            .update_batch_status(B256::ZERO, rollup_node_primitives::BatchStatus::Finalized)
+            .await
+            .unwrap();
+        database.set_l2_head_block_number(rewound.number).await.unwrap();
+        let rewind = PendingFrontierTransition {
+            expected: StoredForkchoiceState { head: rewound, safe: rewound, finalized: genesis },
+            target: StoredForkchoiceState { head: rewound, safe, finalized: genesis },
+        };
+        database.set_pending_frontier_transition(rewind).await.unwrap();
+        database.clear_pending_frontier_transition().await.unwrap();
+        let finalize = PendingFrontierTransition {
+            expected: rewind.target,
+            target: StoredForkchoiceState { finalized: safe, ..rewind.target },
+        };
+        database.set_pending_frontier_transition(finalize).await.unwrap();
+        let asserter = Asserter::new();
+        push_tags(&asserter, &rewound_block, &rewound_block, &genesis_block);
+        // The saved head is still there, then the replay re-reads the tags.
+        asserter.push_success(&Some(rewound_block.clone()));
+        push_tags(&asserter, &rewound_block, &rewound_block, &genesis_block);
+        // Startup then selects the head again.
+        asserter.push_success(&Some(safe_block));
+        asserter.push_success(&Some(rewound_block));
+        let (provider, client, mut engine) =
+            mock_engine(asserter, ForkchoiceState::from_block_info(genesis));
+        client.push_fork_choice_updated(ScriptedResponse::Ok(valid_fcu()));
+
+        recover_database_frontier(&provider, &mut engine, &database).await.unwrap();
+        assert_eq!(client.fork_choice_updated_calls(), 1);
+        assert_eq!(stored_forkchoice(engine.fcs()), finalize.target);
+        assert_eq!(database.get_pending_frontier_transition().await.unwrap(), None);
     }
 
     #[tokio::test]

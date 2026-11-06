@@ -8,7 +8,8 @@
 //! administrative revert that stops half way, and forkchoice answers that are not checked).
 //! Each test name starts with the RG key of the row it pins.
 //!
-//! RG-46 asserts that finalized conflicts roll back the database unwind. Other passing tests
+//! RG-46 asserts that finalized conflicts roll back the database unwind, and the RG-49 forkchoice
+//! tests for unwinds, reverts and finalization assert the fixed behaviour. Other passing tests
 //! document behaviour that is not fixed; when a row is fixed, change the matching assertion
 //! instead of deleting the test. Tests marked `#[ignore]` assert the intended behaviour, fail
 //! today and carry the reason in the ignore message; run them with `--ignored`.
@@ -475,17 +476,14 @@ async fn rg49_admin_revert_unwinds_the_database_only_together_with_the_watcher_r
 }
 
 // RG-49, unchecked forkchoice answers. `Engine::update_fcs` returns `Ok` for an `INVALID` answer
-// and leaves its own forkchoice state unchanged. The orchestrator call sites below write
-// `update_fcs(..).await?` and drop the returned status, so an `INVALID` answer is reported as
-// success although the Engine did not accept the new state.
+// and leaves its own forkchoice state unchanged, so a call site that drops the returned status
+// reports success although the Engine did not accept the new state.
 //
-// Each test drives one call site with an Engine whose forkchoice update answers `INVALID`. The
-// assertion is the same in every test and holds under any fix: the handler either fails, or it
-// reports success only when the Engine's forkchoice state holds what the handler reported. Each
-// test also checks that the forkchoice update reached the Engine, so it cannot pass by never
-// making the call. `handle_l1_reorg` and `handle_batch_revert` are fixed: they fail with
-// `FrontierTransitionStatus`, which stops the run loop, and keep the pending transition so a
-// restart replays it.
+// Each test drives one call site with an Engine whose forkchoice update answers `INVALID`, and
+// checks that the update reached the Engine, so it cannot pass by never making the call. L1
+// reorgs, batch reverts, finalization and the administrative revert are fixed: they save the
+// move first, fail with `FrontierTransitionStatus`, which stops the run loop, and keep the saved
+// move so a restart replays it. `UpdateFcsHead` is not fixed yet.
 
 /// A scripted Engine client whose forkchoice updates answer `INVALID`. Several answers are queued
 /// so that a fix which retries or falls back to a second forkchoice update reaches the assertion
@@ -509,8 +507,8 @@ fn engine_rejecting_forkchoice() -> Arc<ScriptedEngineClient> {
 }
 
 /// `handle_l1_reorg`: the unwind deletes batch 2, so the safe block moves back to L2 block 5. The
-/// Engine answers `INVALID` and keeps safe at block 10. The handler still returns the `L1Reorg`
-/// event with safe block 5.
+/// Engine answers `INVALID` and keeps safe at block 10, so the handler fails instead of returning
+/// the `L1Reorg` event.
 #[tokio::test]
 async fn rg49_l1_reorg_reports_the_new_safe_block_only_if_the_engine_accepted_it() {
     let database = Arc::new(setup_test_db().await);
@@ -547,8 +545,8 @@ async fn rg49_l1_reorg_reports_the_new_safe_block_only_if_the_engine_accepted_it
 }
 
 /// `handle_l1_finalized`: batch 1 is consolidated and its L1 block is now finalized, so the
-/// finalized L2 block becomes 5. The Engine answers `INVALID` and keeps finalized at block 0. The
-/// handler still returns the `L1BlockFinalized` event.
+/// finalized L2 block becomes 5. The Engine answers `INVALID` and keeps finalized at block 0, so
+/// the handler fails instead of returning the `L1BlockFinalized` event.
 #[tokio::test]
 async fn rg49_l1_finalized_reports_the_new_finalized_block_only_if_the_engine_accepted_it() {
     let database = Arc::new(setup_test_db().await);
@@ -558,7 +556,7 @@ async fn rg49_l1_finalized_reports_the_new_finalized_block_only_if_the_engine_ac
     database.update_batch_status(B256::repeat_byte(0xb1), BatchStatus::Consolidated).await.unwrap();
     let engine_client = engine_rejecting_forkchoice();
     let mut orchestrator = orchestrator_with_engine(
-        database,
+        database.clone(),
         ForkchoiceState::new(info(10, 10), info(10, 10), info(0, 0)),
         0,
         Probes::default(),
@@ -572,18 +570,23 @@ async fn rg49_l1_finalized_reports_the_new_finalized_block_only_if_the_engine_ac
         engine_client.fork_choice_updated_calls() >= 1,
         "the update reached the Engine, result: {result:?}"
     );
-    if let Ok(Some(ChainOrchestratorEvent::L1BlockFinalized(..))) = &result {
-        assert_eq!(
-            orchestrator.engine.fcs().finalized_block_info().number,
-            5,
-            "the L1BlockFinalized event reports a finalized block the Engine did not accept"
-        );
-    }
+    assert!(
+        matches!(
+            &result,
+            Err(error @ ChainOrchestratorError::FrontierTransitionStatus(
+                alloy_rpc_types_engine::PayloadStatusEnum::Invalid { .. }
+            )) if error.is_frontier_fatal()
+        ),
+        "got {result:?}"
+    );
+    assert_eq!(*orchestrator.engine.fcs().finalized_block_info(), info(0, 0));
+    let pending = database.get_pending_frontier_transition().await.unwrap();
+    assert_eq!(pending.map(|transition| transition.target.finalized), Some(info(5, 5)));
 }
 
 /// `handle_batch_revert`: reverting batch 2 moves the safe block back to L2 block 5. The Engine
-/// answers `INVALID` and keeps safe at block 10. The handler still returns the `BatchReverted`
-/// event with safe head 5.
+/// answers `INVALID` and keeps safe at block 10, so the handler fails instead of returning the
+/// `BatchReverted` event.
 #[tokio::test]
 async fn rg49_batch_revert_reports_the_new_safe_head_only_if_the_engine_accepted_it() {
     let database = Arc::new(setup_test_db().await);
@@ -667,7 +670,7 @@ async fn rg49_batch_revert_fails_on_a_syncing_forkchoice_answer() {
 }
 
 /// `RevertToL1Block`: the unwind deletes batch 2, so the safe block moves back to L2 block 5. The
-/// Engine answers `INVALID` and keeps safe at block 10. The command still replies `true`.
+/// Engine answers `INVALID` and keeps safe at block 10, so the command fails and never replies.
 #[tokio::test]
 async fn rg49_admin_revert_replies_success_only_if_the_engine_accepted_the_new_safe_block() {
     let database = Arc::new(setup_test_db().await);
@@ -688,13 +691,9 @@ async fn rg49_admin_revert_replies_success_only_if_the_engine_accepted_the_new_s
         .await;
 
     assert!(engine_client.fork_choice_updated_calls() >= 1, "the update reached the Engine");
-    if result.is_ok() && matches!(reply_rx.await, Ok(true)) {
-        assert_eq!(
-            orchestrator.engine.fcs().safe_block_info().number,
-            5,
-            "the admin caller is told the revert succeeded, but the Engine kept the old safe block"
-        );
-    }
+    assert!(matches!(&result, Err(error) if error.is_frontier_fatal()), "got {result:?}");
+    assert!(reply_rx.await.is_err(), "a rejected revert must not reply");
+    assert_eq!(orchestrator.engine.fcs().safe_block_info().number, 10);
 }
 
 /// `UpdateFcsHead`: the admin moves the head from L2 block 5 to block 8. The Engine answers

@@ -50,6 +50,28 @@ async fn canonical_ancestor<P: Provider<Scroll>>(
     Ok(true)
 }
 
+/// Returns the newest block Reth kept from `safe` up to height `number`, or `safe` itself when
+/// Reth no longer has `safe` on its canonical chain.
+async fn kept_head<P: Provider<Scroll>>(
+    provider: &P,
+    safe: BlockInfo,
+    mut number: u64,
+) -> Result<BlockInfo, ChainOrchestratorError> {
+    if number <= safe.number ||
+        provider.get_block(safe.number.into()).await?.map(|b| BlockInfo::from(&b.header)) !=
+            Some(safe)
+    {
+        return Ok(safe)
+    }
+    while number > safe.number {
+        if let Some(block) = provider.get_block(number.into()).await? {
+            return Ok(BlockInfo::from(&block.header))
+        }
+        number -= 1;
+    }
+    Ok(safe)
+}
+
 /// Applies an immutable durable intent. Even a cached target requires a checked Engine call.
 pub(crate) async fn apply_pending_frontier_transition<P, EC>(
     provider: &P,
@@ -134,6 +156,22 @@ where
 {
     async {
         engine.replace_fcs_from_provider(observe_forkchoice(provider).await?);
+        // Reth may have lost the unsafe head a saved move names. Replay the move's safe and
+        // finalized blocks on the newest block Reth kept instead of failing on every restart.
+        if let Some(mut transition) = database.get_pending_frontier_transition().await? {
+            let head = transition.target.head;
+            if provider.get_block(head.number.into()).await?.map(|b| BlockInfo::from(&b.header)) !=
+                Some(head)
+            {
+                transition.target.head =
+                    kept_head(provider, transition.target.safe, head.number).await?;
+                if transition.target == transition.expected {
+                    database.clear_pending_frontier_transition().await?;
+                } else {
+                    database.set_pending_frontier_transition(transition).await?;
+                }
+            }
+        }
         apply_pending_frontier_transition(provider, engine, database).await?;
         let observed = stored_forkchoice(engine.fcs());
         observed.validate()?;
@@ -163,20 +201,7 @@ where
         // Select the persisted unsafe head only after resolving a possible safe rewind. If the
         // execution node lost recent blocks, walk back to the durable safe boundary and purge
         // mappings for the discarded unsafe suffix in the same transaction as the repair intent.
-        let mut head = safe;
-        let mut number = database.get_l2_head_block_number().await?;
-        if number > safe.number &&
-            provider.get_block(safe.number.into()).await?.map(|b| BlockInfo::from(&b.header)) ==
-                Some(safe)
-        {
-            while number > safe.number {
-                if let Some(block) = provider.get_block(number.into()).await? {
-                    head = BlockInfo::from(&block.header);
-                    break
-                }
-                number -= 1;
-            }
-        }
+        let head = kept_head(provider, safe, database.get_l2_head_block_number().await?).await?;
         let target = StoredForkchoiceState { head, safe, finalized };
         target.validate()?;
         database
@@ -405,6 +430,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn startup_replays_a_saved_move_on_the_newest_block_reth_kept() {
+        // The safe move was saved with head 101, then the crash lost block 101 in Reth.
+        let database = setup_test_db().await;
+        let (genesis_block, genesis) = rpc_block(0, B256::ZERO, 0xf0);
+        let (old_safe_block, old_safe) = rpc_block(99, genesis.hash, 0xb1);
+        let (safe_block, safe) = rpc_block(100, old_safe.hash, 0xa1);
+        let (_, lost) = rpc_block(101, safe.hash, 0xc1);
+        seed_frontier(&database, genesis, safe).await;
+        database.set_l2_head_block_number(lost.number).await.unwrap();
+        let expected = StoredForkchoiceState { head: lost, safe: old_safe, finalized: genesis };
+        let target = StoredForkchoiceState { safe, ..expected };
+        database
+            .set_pending_frontier_transition(PendingFrontierTransition { expected, target })
+            .await
+            .unwrap();
+        let asserter = Asserter::new();
+        let absent = || asserter.push_success(&Option::<RpcBlock<ScrollRpcTransaction>>::None);
+        push_tags(&asserter, &safe_block, &old_safe_block, &genesis_block);
+        // The saved head is gone; the newest kept block is the safe block.
+        absent();
+        asserter.push_success(&Some(safe_block.clone()));
+        absent();
+        // The replay re-reads the tags, then startup selects the head again.
+        push_tags(&asserter, &safe_block, &old_safe_block, &genesis_block);
+        asserter.push_success(&Some(safe_block));
+        absent();
+        let (provider, client, mut engine) =
+            mock_engine(asserter, ForkchoiceState::new(lost, old_safe, genesis));
+        client.push_fork_choice_updated(ScriptedResponse::Ok(valid_fcu()));
+
+        recover_database_frontier(&provider, &mut engine, &database).await.unwrap();
+        assert_eq!(client.fork_choice_updated_calls(), 1);
+        assert_eq!(client.fork_choice_inputs()[0].0.head_block_hash, safe.hash);
+        assert_eq!(engine.fcs(), &ForkchoiceState::new(safe, safe, genesis));
+        assert_eq!(database.get_pending_frontier_transition().await.unwrap(), None);
+        assert_eq!(database.get_l2_head_block_number().await.unwrap(), safe.number);
+    }
+
+    #[tokio::test]
     async fn startup_recovers_finalized_even_when_safe_matches() {
         let database = setup_test_db().await;
         let (genesis_block, genesis) = rpc_block(0, B256::ZERO, 0xf0);
@@ -455,6 +519,10 @@ mod tests {
                 if checkpoint % 2 == 0 { &old_block } else { &safe_block },
                 &genesis_block,
             );
+            if checkpoint < 2 {
+                // Reth still has the head the saved move names.
+                asserter.push_success(&Some(old_block.clone()));
+            }
             // A new Engine cache must learn actual provider tags before recovery.
             let (provider, client, mut engine) =
                 mock_engine(asserter, ForkchoiceState::from_block_info(genesis));

@@ -1161,10 +1161,11 @@ async fn shutdown_consolidates_most_recent_batch_on_startup() -> eyre::Result<()
     .expect("restart recovery must consolidate batch 2");
 
     assert!(processing_observer.await?, "startup catch-up must mark the batch Processing");
+    // Startup moves Reth back to the database head (block 4), so the whole batch is rebuilt.
     assert_eq!(
         recovered_blocks,
-        (partial_head..=57).collect::<Vec<_>>(),
-        "the matching partial head must be reused before building only the missing suffix"
+        (5..=57).collect::<Vec<_>>(),
+        "partial head {partial_head} must be rebuilt from the database head"
     );
     assert_eq!(recovered_outcome.blocks.len(), 53);
     assert_eq!(recovered_outcome.target_status, BatchStatus::Consolidated);

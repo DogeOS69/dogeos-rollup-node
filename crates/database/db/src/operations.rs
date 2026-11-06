@@ -183,15 +183,15 @@ pub trait DatabaseWriteOperations {
 
     /// Delete any genesis-height (block 0) rows whose hash does not match the chain's genesis
     /// hash, returning how many were removed. The static dev migration seeds the Scroll dev
-    /// genesis row; the real genesis is inserted by `reconcile_genesis_block` (the insert cannot
-    /// overwrite — its conflict key includes the hash), and the seeded row would otherwise shadow
-    /// the real one nondeterministically in highest-block queries such as
+    /// genesis row, and an older release inserted the real genesis beside it; the seeded row
+    /// would otherwise shadow the real one nondeterministically in highest-block queries such as
     /// `get_latest_safe_l2_info`, presenting as a same-height different-hash safe divergence.
     ///
     /// This primitive has no floor: it removes the LAST height-0 row too, leaving `l2_block`
     /// without a genesis — the state [`DatabaseError::GenesisMissing`] reports and
-    /// `get_latest_safe_l2_info` panics on. Production callers must pair it with
-    /// `insert_genesis_block` in the same transaction, as [`Self::reconcile_genesis_block`] does.
+    /// `get_latest_safe_l2_info` fails on with [`DatabaseError::MissingSafeL2Frontier`]. Production
+    /// callers must pair it with `insert_genesis_block` in the same transaction, as
+    /// [`Self::reconcile_genesis_block`] does.
     async fn delete_mismatched_genesis_blocks(
         &self,
         genesis_hash: B256,

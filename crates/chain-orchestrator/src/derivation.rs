@@ -397,12 +397,10 @@ where
         .await
         .map_err(|error| AttemptFailure::fatal("reconcileFrontier", "FRONTIER_ERROR", error))?;
     // The batch extends the database's safe block, so the Engine's chain must contain it.
-    // Otherwise the Engine kept a fork the database has left, and reconciliation, which matches
-    // blocks by number, would continue that fork. Reth's canonical block at that height is
-    // checked because the Engine's safe tag can sit above the database's (after a crash before the
-    // database commit) or below it (when Reth did not persist its latest safe tag). The block
-    // may only be missing below the tag's height when Reth lost blocks; the reorg number check
-    // then halts. Genesis comes from the chain spec and cannot fork.
+    // Otherwise the Engine kept a fork the database has left, and reconciliation would continue
+    // that fork. The frontier check above already moved the Engine's cached safe block to the
+    // database's; this also checks Reth's canonical block at that height, which the cache can
+    // miss. Genesis comes from the chain spec and cannot fork.
     let engine_safe = *engine.fcs().safe_block_info();
     let db_safe = frontier;
     if db_safe.number > 0 {

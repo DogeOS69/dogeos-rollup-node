@@ -320,20 +320,36 @@ mod tests {
     }
 
     #[test]
-    fn test_should_decode_v8_mock() -> eyre::Result<()> {
-        let blob = read_to_bytes("./testdata/blob_v7_uncompressed.bin")?;
-        let mut blob = blob.to_vec();
-        // Manually patch the version byte to 8 to simulate a v8 blob.
-        // BlobSliceIter skips the first byte (index 0) of every 32-byte chunk.
-        // So the first data byte (version) is at index 1.
-        blob[1] = 8;
+    fn test_should_decode_supported_v7_format_versions() -> eyre::Result<()> {
+        for fixture in ["blob_v7_uncompressed.bin", "blob_v7_compressed.bin"] {
+            let mut blob = read_to_bytes(&format!("./testdata/{fixture}"))?.to_vec();
+            let expected = decode_v7(&blob)?.data;
+            for version in 7..=11 {
+                // The first byte of each field element is reserved padding.
+                blob[1] = version;
+                let batch = decode_v7(&blob)?;
+                assert_eq!(batch.version, version, "{fixture}");
+                assert_eq!(batch.data, expected, "{fixture}, version {version}");
+            }
+        }
+        Ok(())
+    }
 
-        let batch = decode_v7(&blob)?;
-        assert_eq!(batch.version, 8);
-
-        let blocks = batch.data.l2_blocks();
-        assert_eq!(blocks.len(), 4);
-
+    #[test]
+    fn test_should_reject_unsupported_v7_format_versions() -> eyre::Result<()> {
+        for fixture in ["blob_v7_uncompressed.bin", "blob_v7_compressed.bin"] {
+            let mut blob = read_to_bytes(&format!("./testdata/{fixture}"))?.to_vec();
+            for version in [6, 12] {
+                blob[1] = version;
+                assert!(
+                    matches!(
+                        decode_v7(&blob),
+                        Err(DecodingError::UnsupportedCodecVersion(actual)) if actual == version
+                    ),
+                    "{fixture}, version {version}"
+                );
+            }
+        }
         Ok(())
     }
 }

@@ -729,6 +729,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restart_recovers_two_acknowledged_safe_rewinds_after_tag_loss() {
+        use scroll_db::DatabaseConnectionProvider;
+
+        let original = setup_test_db().await;
+        let (genesis_block, genesis) = rpc_block(0, B256::ZERO, 0xf0);
+        let (safe_block, safe) = rpc_block(1, genesis.hash, 0xa1);
+        let (_, intermediate) = rpc_block(2, safe.hash, 0xa2);
+        let (head_block, head) = rpc_block(3, intermediate.hash, 0xa3);
+        seed_frontier(&original, genesis, safe).await;
+        original.set_l2_head_block_number(head.number).await.unwrap();
+
+        // Reth acknowledges both safe rewinds while keeping the same canonical head.
+        let (provider, client, mut engine) =
+            mock_engine(Asserter::new(), ForkchoiceState::new(head, head, genesis));
+        for (from, to) in [(head, intermediate), (intermediate, safe)] {
+            let expected = StoredForkchoiceState { head, safe: from, finalized: genesis };
+            let target = StoredForkchoiceState { safe: to, ..expected };
+            original
+                .set_pending_frontier_transition(PendingFrontierTransition { expected, target })
+                .await
+                .unwrap();
+            client.push_fork_choice_updated(ScriptedResponse::Ok(valid_fcu()));
+            assert!(apply_pending_frontier_transition(&provider, &mut engine, &original)
+                .await
+                .unwrap());
+        }
+
+        let path = original.tmp_dir().unwrap().path().join("test.db");
+        original.inner().get_connection().clone().close().await.unwrap();
+        let database = Database::new(path.to_str().unwrap()).await.unwrap();
+
+        // Both safe-tag writes were lost. The database must still explain the original tag.
+        let asserter = Asserter::new();
+        push_tags(&asserter, &head_block, &head_block, &genesis_block);
+        asserter.push_success(&Some(safe_block));
+        asserter.push_success(&Some(head_block));
+        let (provider, client, mut engine) =
+            mock_engine(asserter, ForkchoiceState::from_block_info(genesis));
+        client.push_fork_choice_updated(ScriptedResponse::Ok(valid_fcu()));
+
+        recover_database_frontier(&provider, &mut engine, &database).await.unwrap();
+        assert_eq!(engine.fcs(), &ForkchoiceState::new(head, safe, genesis));
+        assert_eq!(database.get_pending_frontier_transition().await.unwrap(), None);
+    }
+
+    #[tokio::test]
     async fn startup_rejects_database_frontier_conflicting_with_finalized() {
         let database = setup_test_db().await;
         let (genesis_block, genesis) = rpc_block(0, B256::ZERO, 0xf0);

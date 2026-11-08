@@ -321,7 +321,7 @@ mod tests {
     #[test]
     fn test_should_decode_supported_v7_format_versions() -> eyre::Result<()> {
         for fixture in ["blob_v7_uncompressed.bin", "blob_v7_compressed.bin"] {
-            let mut blob = read_to_bytes(&format!("./testdata/{fixture}"))?.to_vec();
+            let mut blob = read_to_bytes(format!("./testdata/{fixture}"))?.to_vec();
             let expected = decode_v7(&blob)?.data;
             for version in 7..=11 {
                 // The first byte of each field element is reserved padding.
@@ -337,7 +337,7 @@ mod tests {
     #[test]
     fn test_should_reject_unsupported_v7_format_versions() -> eyre::Result<()> {
         for fixture in ["blob_v7_uncompressed.bin", "blob_v7_compressed.bin"] {
-            let mut blob = read_to_bytes(&format!("./testdata/{fixture}"))?.to_vec();
+            let mut blob = read_to_bytes(format!("./testdata/{fixture}"))?.to_vec();
             for version in [6, 12] {
                 blob[1] = version;
                 assert!(

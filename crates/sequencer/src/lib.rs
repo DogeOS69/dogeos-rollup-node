@@ -188,16 +188,18 @@ where
         Ok(())
     }
 
-    /// Handles a new payload by fetching it from the engine, validating it and committing it as
-    /// the FCS head.
+    /// Handles a new payload by fetching it from the engine, validating it, submitting it with
+    /// `newPayload` and committing it as the FCS head.
     ///
-    /// Returns `Ok(Some(block))` once the engine confirmed the block as its head with `VALID`,
-    /// and `Ok(None)` when the payload is empty and empty blocks are disabled. Fails with
-    /// [`SequencerError::PayloadError`] when the payload does not convert into a block or its hash
-    /// does not match the reconstructed header after applying [`DEFAULT_BLOCK_DIFFICULTY`], with
-    /// [`SequencerError::FcuNotValid`] when the engine answered anything but `VALID`, and with the
-    /// engine error when a call itself failed. On every `Ok(None)` and error path the local FCS
-    /// mirror is left unchanged.
+    /// Returns `Ok(Some(block))` once the engine validated the block and confirmed it as its head,
+    /// both with `VALID`, and `Ok(None)` when the payload is empty and empty blocks are disabled.
+    /// Fails with [`SequencerError::PayloadError`] when the payload does not convert into a block
+    /// or its hash does not match the reconstructed header after applying
+    /// [`DEFAULT_BLOCK_DIFFICULTY`], with [`SequencerError::InvalidPayload`] when either call
+    /// answered `INVALID`, with [`SequencerError::NewPayloadNotValid`] or
+    /// [`SequencerError::FcuNotValid`] when the respective call answered anything else but
+    /// `VALID`, and with the engine error when a call itself failed. On every `Ok(None)` and error
+    /// path the local FCS mirror is left unchanged.
     pub async fn finalize_payload_building<EC: ScrollEngineApi + Sync + Send + 'static>(
         &mut self,
         payload_id: PayloadId,
@@ -226,14 +228,35 @@ where
             let expected_hash = payload.block_hash;
             // Convert and validate, including the difficulty used by `block_data_hint`, before
             // committing the head so a deterministic local failure cannot leave it advanced.
-            let ExecutionData { payload, sidecar } =
-                ExecutionData { payload: payload.into(), sidecar: Default::default() };
-            let mut block: DogeosBlock = payload
+            let ExecutionData { payload: generic, sidecar } =
+                ExecutionData { payload: payload.clone().into(), sidecar: Default::default() };
+            let mut block: DogeosBlock = generic
                 .try_into_block_with_sidecar::<ScrollTransactionSigned>(&sidecar)
                 .map_err(|_| SequencerError::PayloadError)?;
             block.header.difficulty = DEFAULT_BLOCK_DIFFICULTY;
             if block.hash_slow() != expected_hash {
                 return Err(SequencerError::PayloadError)
+            }
+            // `getPayload` does not insert the block into the engine tree; reth does that
+            // asynchronously, unordered with respect to our forkchoice update, which then answers
+            // SYNCING when it wins. Hand the block over explicitly so the update below finds it.
+            let status = engine.new_payload(payload).await?;
+            if let PayloadStatusEnum::Invalid { validation_error } = status.status {
+                return Err(SequencerError::InvalidPayload {
+                    block_info,
+                    latest_valid_hash: status.latest_valid_hash,
+                    validation_error,
+                });
+            }
+            if !status.is_valid() {
+                tracing::error!(
+                    target: "rollup_node::sequencer",
+                    ?block_info,
+                    status = ?status.status,
+                    latest_valid_hash = ?status.latest_valid_hash,
+                    "Engine did not validate the freshly built block"
+                );
+                return Err(SequencerError::NewPayloadNotValid);
             }
             let result = engine.update_fcs_checked(Some(block_info), None, None).await?;
             if let PayloadStatusEnum::Invalid { ref validation_error } =
@@ -431,7 +454,9 @@ mod recovery_tests {
             proofs::calculate_transaction_root, Block, BlockBody, Header, Sealable,
         };
         use alloy_primitives::Address;
-        use alloy_rpc_types_engine::{ExecutionPayloadV1, ForkchoiceUpdated, PayloadStatusEnum};
+        use alloy_rpc_types_engine::{
+            ExecutionPayloadV1, ForkchoiceUpdated, PayloadStatus, PayloadStatusEnum,
+        };
         use dogeos_chainspec::DOGEOS_DEV;
         use dogeos_protocol_types::{ScrollTxEnvelope, TxL1Message};
         use futures::StreamExt;
@@ -513,6 +538,9 @@ mod recovery_tests {
             ForkchoiceUpdated::from_status(PayloadStatusEnum::Valid).with_payload_id(payload(2)),
         ));
         client.push_get_payload(ScriptedResponse::Ok(ExecutionPayloadV1::from_block_slow(&built)));
+        client.push_new_payload(ScriptedResponse::Ok(PayloadStatus::from_status(
+            PayloadStatusEnum::Valid,
+        )));
         client.push_fork_choice_updated(ScriptedResponse::Ok(ForkchoiceUpdated::from_status(
             PayloadStatusEnum::Valid,
         )));
@@ -645,6 +673,10 @@ mod tests {
         }
     }
 
+    fn valid() -> PayloadStatus {
+        PayloadStatus::from_status(PayloadStatusEnum::Valid)
+    }
+
     /// A payload whose `block_hash` matches the block the sequencer derives
     /// from it (with the difficulty pinned to `DEFAULT_BLOCK_DIFFICULTY`),
     /// computed through the same conversion `finalize_payload_building`
@@ -694,6 +726,7 @@ mod tests {
                 Engine::new(client.clone(), ForkchoiceState::new(genesis, genesis, genesis));
 
             client.push_get_payload(ScriptedResponse::Ok(consistent_payload(1)));
+            client.push_new_payload(ScriptedResponse::Ok(valid()));
             client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(status.clone())));
 
             let result =
@@ -713,8 +746,57 @@ mod tests {
         }
     }
 
-    /// The happy path is unchanged: VALID commits the head and returns the
-    /// converted block.
+    /// The built block is submitted with `newPayload` before the forkchoice update, and anything
+    /// but `VALID` (or a transport failure) ends the slot without the update: SYNCING and
+    /// ACCEPTED skip with `NewPayloadNotValid`, INVALID is the fatal `InvalidPayload`. No
+    /// forkchoice response is scripted, so a regression that still sends the update panics in
+    /// the scripted client.
+    #[tokio::test]
+    async fn finalize_payload_building_requires_a_valid_new_payload_before_the_forkchoice_update() {
+        for response in [
+            ScriptedResponse::Ok(PayloadStatus::from_status(PayloadStatusEnum::Syncing)),
+            ScriptedResponse::Ok(PayloadStatus::from_status(PayloadStatusEnum::Accepted)),
+            ScriptedResponse::Ok(PayloadStatus::from_status(PayloadStatusEnum::Invalid {
+                validation_error: "scripted".to_string(),
+            })),
+            ScriptedResponse::TransportFailure,
+        ] {
+            let mut sequencer = test_sequencer().await;
+            let client = Arc::new(ScriptedEngineClient::new());
+            let genesis = BlockInfo { number: 0, hash: B256::repeat_byte(0x11) };
+            let mut engine =
+                Engine::new(client.clone(), ForkchoiceState::new(genesis, genesis, genesis));
+
+            client.push_get_payload(ScriptedResponse::Ok(consistent_payload(1)));
+            client.push_new_payload(response.clone());
+
+            let result =
+                sequencer.finalize_payload_building(PayloadId::new([7; 8]), &mut engine).await;
+            match &response {
+                ScriptedResponse::Ok(PayloadStatus {
+                    status: PayloadStatusEnum::Invalid { .. },
+                    ..
+                }) => assert!(
+                    matches!(result, Err(SequencerError::InvalidPayload { .. })),
+                    "{response:?}: got {result:?}"
+                ),
+                ScriptedResponse::Ok(_) => assert!(
+                    matches!(result, Err(SequencerError::NewPayloadNotValid)),
+                    "{response:?}: got {result:?}"
+                ),
+                _ => assert!(
+                    matches!(result, Err(SequencerError::EngineError(_))),
+                    "{response:?}: got {result:?}"
+                ),
+            }
+            assert_eq!(client.new_payload_calls(), 1, "{response:?}");
+            assert_eq!(client.fork_choice_updated_calls(), 0, "{response:?}");
+            assert_eq!(*engine.fcs().head_block_info(), genesis, "{response:?}");
+        }
+    }
+
+    /// The happy path: `newPayload` and the forkchoice update both answer
+    /// VALID, which commits the head and returns the converted block.
     #[tokio::test]
     async fn finalize_payload_building_commits_head_on_valid() {
         let mut sequencer = test_sequencer().await;
@@ -725,6 +807,7 @@ mod tests {
 
         let payload = consistent_payload(1);
         client.push_get_payload(ScriptedResponse::Ok(payload.clone()));
+        client.push_new_payload(ScriptedResponse::Ok(valid()));
         client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Valid)));
 
         let block = sequencer
@@ -741,12 +824,14 @@ mod tests {
         );
         assert_eq!(*engine.fcs().safe_block_info(), genesis);
         assert_eq!(*engine.fcs().finalized_block_info(), genesis);
+        assert_eq!(client.new_payload_calls(), 1);
+        assert_eq!(client.fork_choice_updated_calls(), 1);
     }
 
-    /// Conversion and the hash check run before any forkchoice update: a
-    /// payload whose `block_hash` does not match its contents is rejected with
-    /// `PayloadError` without the engine ever being asked to adopt it. No
-    /// forkchoice response is scripted, so a regression that commits the head
+    /// Conversion and the hash check run before `newPayload` and any forkchoice
+    /// update: a payload whose `block_hash` does not match its contents is
+    /// rejected with `PayloadError` without the engine ever being asked to
+    /// execute or adopt it. No engine response is scripted, so a regression that commits the head
     /// first panics in the scripted client before the assertions run.
     #[tokio::test]
     async fn finalize_payload_building_rejects_a_payload_whose_hash_does_not_match() {
@@ -765,6 +850,7 @@ mod tests {
             matches!(result, Err(SequencerError::PayloadError)),
             "expected PayloadError, got {result:?}"
         );
+        assert_eq!(client.new_payload_calls(), 0, "the hash check must run before newPayload");
         assert_eq!(
             client.fork_choice_updated_calls(),
             0,
@@ -786,6 +872,7 @@ mod tests {
             Engine::new(client.clone(), ForkchoiceState::new(genesis, genesis, genesis));
 
         client.push_get_payload(ScriptedResponse::Ok(consistent_payload(1)));
+        client.push_new_payload(ScriptedResponse::Ok(valid()));
         client.push_fork_choice_updated(ScriptedResponse::TransportFailure);
 
         let result = sequencer.finalize_payload_building(PayloadId::new([7; 8]), &mut engine).await;

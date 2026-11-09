@@ -2025,11 +2025,16 @@ mod run_loop_policy_tests {
 
     #[tokio::test]
     async fn sequencer_forkchoice_rejection_stops_or_skips_without_side_effects() {
-        for status in [
+        // The same verdicts, returned first by `newPayload` (which then stops before the
+        // forkchoice update) and then by the forkchoice update after a VALID `newPayload`.
+        for (rejected_by_new_payload, status) in [
             PayloadStatusEnum::Invalid { validation_error: "scripted invalid candidate".into() },
             PayloadStatusEnum::Syncing,
             PayloadStatusEnum::Accepted,
-        ] {
+        ]
+        .into_iter()
+        .flat_map(|status| [(true, status.clone()), (false, status)])
+        {
             let database = Arc::new(setup_test_db().await);
             database.insert_genesis_block(B256::ZERO).await.unwrap();
             database.set_l2_head_block_number(SAFE).await.unwrap();
@@ -2061,7 +2066,16 @@ mod run_loop_policy_tests {
                 Some(PayloadId::new([9; 8])),
             )));
             client.push_get_payload(ScriptedResponse::Ok(candidate_payload));
-            client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(status.clone(), None)));
+            if rejected_by_new_payload {
+                client.push_new_payload(ScriptedResponse::Ok(PayloadStatus::from_status(
+                    status.clone(),
+                )));
+            } else {
+                client.push_new_payload(ScriptedResponse::Ok(PayloadStatus::from_status(
+                    PayloadStatusEnum::Valid,
+                )));
+                client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(status.clone(), None)));
+            }
             let (mut orchestrator, _handle, _notifications) = test_orchestrator(
                 database.clone(),
                 client.clone(),
@@ -2133,7 +2147,12 @@ mod run_loop_policy_tests {
                 ));
                 drop(orchestrator);
             }
-            assert_eq!(client.fork_choice_updated_calls(), 2, "do not retry the candidate");
+            assert_eq!(client.new_payload_calls(), 1, "do not retry the candidate");
+            assert_eq!(
+                client.fork_choice_updated_calls(),
+                if rejected_by_new_payload { 1 } else { 2 },
+                "do not retry the candidate"
+            );
             assert_eq!(database.get_l2_head_block_number().await.unwrap(), SAFE);
             assert!(database.get_signature(candidate.hash).await.unwrap().is_none());
             assert_eq!(

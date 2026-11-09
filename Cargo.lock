@@ -11432,6 +11432,7 @@ dependencies = [
  "alloy-provider",
  "alloy-rpc-types-engine",
  "alloy-signer-local",
+ "async-trait",
  "dogeos-chainspec",
  "dogeos-hardforks",
  "dogeos-protocol-types",

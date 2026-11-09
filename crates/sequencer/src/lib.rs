@@ -747,10 +747,10 @@ mod tests {
     }
 
     /// The built block is submitted with `newPayload` before the forkchoice update, and anything
-    /// but `VALID` (or a transport failure) ends the slot without the update: SYNCING and the
-    /// spec-illegal ACCEPTED skip with `NewPayloadNotValid`, INVALID is the fatal
-    /// `InvalidPayload`. No forkchoice response is scripted, so a regression that still sends the
-    /// update panics in the scripted client.
+    /// but `VALID` (or a transport failure) ends the slot without the update: SYNCING and
+    /// ACCEPTED skip with `NewPayloadNotValid`, INVALID is the fatal `InvalidPayload`. No
+    /// forkchoice response is scripted, so a regression that still sends the update panics in
+    /// the scripted client.
     #[tokio::test]
     async fn finalize_payload_building_requires_a_valid_new_payload_before_the_forkchoice_update() {
         for response in [

@@ -108,7 +108,7 @@ async fn setup_pipeline<P: L1Provider + Clone + Send + Sync + 'static>(
 
     // construct the pipeline.
     let l1_provider = factory(db.clone()).await;
-    DerivationPipeline::new(l1_provider, db, u64::MAX).await
+    DerivationPipeline::new(&reth_tasks::TaskExecutor::test(), l1_provider, db, u64::MAX).await
 }
 
 /// Benchmark the derivation pipeline with blobs fetched from file. This does not bench the network

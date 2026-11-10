@@ -402,4 +402,40 @@ mod tests {
         }
     }
 
+    /// A chain that agrees with the batch until one block's parent diverges rebuilds only the
+    /// suffix from that point: every later block is a child of a block that no longer exists,
+    /// even if it would match on its own.
+    #[tokio::test]
+    async fn parent_mismatch_reorgs_the_remaining_suffix() {
+        let asserter = Asserter::new();
+        let first = push_block(&asserter, safe_at(SAFE), DERIVED_BASE_FEE);
+        // Block SAFE + 2 repeats the old safe tip as its parent instead of extending the
+        // verified first block, so it cannot continue the verified prefix.
+        push_block(&asserter, safe_at(SAFE), DERIVED_BASE_FEE);
+        // This block would match the last verified parent if considered independently. Once the
+        // previous block mismatches, however, it remains part of the suffix to rebuild.
+        push_block(&asserter, first, DERIVED_BASE_FEE);
+        let provider = ProviderBuilder::<_, _, Scroll>::default().connect_mocked_client(asserter);
+
+        let batch = batch(vec![
+            derived(SAFE + 1, DERIVED_BASE_FEE),
+            derived(SAFE + 2, DERIVED_BASE_FEE),
+            derived(SAFE + 3, DERIVED_BASE_FEE),
+        ]);
+        let result = reconcile_batch(provider, &batch, safe_at(SAFE)).await.unwrap();
+
+        assert_eq!(result.actions.len(), 3);
+        assert!(matches!(
+            &result.actions[0],
+            BlockConsolidationAction::UpdateFcs(block) if block.block_info == first
+        ));
+        assert!(
+            matches!(
+                result.actions.as_slice()[1..],
+                [BlockConsolidationAction::Reorg(1), BlockConsolidationAction::Reorg(2)]
+            ),
+            "the suffix was not rebuilt from the mismatch: {:?}",
+            result.actions
+        );
+    }
 }

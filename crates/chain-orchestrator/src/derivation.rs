@@ -435,9 +435,15 @@ where
             ));
         }
     }
-    let reconciliation = reconcile_batch(l2_client, batch, frontier)
-        .await
-        .map_err(|error| AttemptFailure::fatal("reconcileBatch", "ERROR", error))?;
+    let reconciliation = reconcile_batch(l2_client, batch, frontier).await.map_err(|error| {
+        let outcome = if matches!(error, ChainOrchestratorError::InvalidDerivedBlockSequence { .. })
+        {
+            "INVALID_BLOCK_SEQUENCE"
+        } else {
+            "ERROR"
+        };
+        AttemptFailure::fatal("reconcileBatch", outcome, error)
+    })?;
     let target_status = reconciliation.target_status;
     let aggregated = reconciliation.aggregate_actions();
 
@@ -1647,6 +1653,52 @@ mod tests {
         assert_eq!(fatal.outcome, "ERROR");
         assert!(!driver.can_accept_batch());
         assert_eq!(pipeline.len(), 1, "the later result must not be polled after fatal failure");
+    }
+
+    /// A committed batch whose first block does not immediately follow the persisted
+    /// consolidation frontier must fail before any L2 block fetch or Engine request, so later
+    /// batches stay blocked behind the invalid one.
+    #[tokio::test]
+    async fn gapped_batch_fails_before_l2_or_engine_requests() {
+        let database = setup_test_db().await;
+        insert_batch(&database, 1, 1, None).await;
+        let client = Arc::new(ScriptedEngineClient::new());
+        let mut engine = engine_at_safe(client.clone());
+        let asserter = Asserter::new();
+        // Only the attempt's canonical check of the seeded safe block is answered; a gap must
+        // be rejected before the batch's own block fetches would need responses.
+        push_safe_block(&asserter);
+        let provider = absent_block_provider(asserter);
+        let mut derived = batch(1, BatchStatus::Consolidated);
+        derived.attributes[0].block_number = SAFE + 51;
+        let mut driver = DerivationDriver::default();
+        driver.hold_batch(derived);
+        driver.wait_for_attempt().await;
+
+        let AttemptStep::Fatal(fatal) = driver.run_attempt(&provider, &mut engine, &database).await
+        else {
+            panic!("a gap after the persisted consolidation frontier must fail-stop")
+        };
+        assert_eq!(fatal.method, "reconcileBatch");
+        assert_eq!(fatal.outcome, "INVALID_BLOCK_SEQUENCE");
+        assert!(matches!(
+            *fatal.error,
+            ChainOrchestratorError::InvalidDerivedBlockSequence {
+                attribute_index: 0,
+                previous_block_number: SAFE,
+                actual_block_number,
+                ..
+            } if actual_block_number == SAFE + 51
+        ));
+        assert_eq!(client.fork_choice_updated_calls(), 0);
+        assert_eq!(client.get_payload_calls(), 0);
+        assert_eq!(client.new_payload_calls(), 0);
+        assert_eq!(*engine.fcs().safe_block_info(), info(SAFE, 0x11));
+        assert!(!driver.can_accept_batch(), "later batches must remain blocked");
+        assert_eq!(
+            database.get_batch_status_by_hash(B256::repeat_byte(1)).await.unwrap(),
+            Some(BatchStatus::Committed)
+        );
     }
 
     /// Scripts a successful rebuild of block `SAFE + 1`, so an attempt that skips a guard

@@ -880,6 +880,143 @@ async fn restart_recovers_frontier_checkpoints_on_sequencer_and_follower() -> ey
     Ok(())
 }
 
+/// Exercise RG216 with real Engines and reopened service databases on both node roles.
+/// After orderly shutdown, restore only the persisted safe tag to 3 to deterministically model
+/// loss of the two acknowledged tag writes. This is fault injection, not a process-crash test.
+#[tokio::test]
+async fn restart_recovers_two_safe_rewinds_with_injected_tag_loss() -> eyre::Result<()> {
+    use reth_db::{
+        tables,
+        transaction::{DbTx, DbTxMut},
+        Database as _,
+    };
+    use reth_storage_api::{BlockHashReader, DatabaseProviderFactory};
+    use scroll_db::{DatabaseConnectionProvider, PendingFrontierTransition, StoredForkchoiceState};
+    use scroll_engine::{ScrollAuthApiEngineClient, ScrollEngineApi};
+
+    let mut fixture =
+        TestFixture::builder().sequencer().followers(1).allow_empty_blocks(true).build().await?;
+    fixture.l1().sync().await?;
+    let genesis = BlockInfo::new(0, fixture.chain_spec.genesis_hash());
+    let mut blocks = vec![genesis];
+    for number in 1..=3 {
+        let block =
+            fixture.build_block().expect_block_number(number).build_and_await_block().await?;
+        fixture.expect_event_on(1).chain_extended(number).await?;
+        blocks.push(BlockInfo::from(&block));
+    }
+    let head = blocks[3];
+    let safe = blocks[1];
+    let mut databases = Vec::new();
+    for node in fixture.nodes.iter().flatten() {
+        let database = node.rollup_manager_handle.get_database_handle().await?;
+        let batch = BatchCommitData {
+            hash: B256::repeat_byte(0xb1),
+            index: 1,
+            block_number: 1,
+            block_timestamp: 1,
+            calldata: Arc::new(Bytes::new()),
+            blob_versioned_hash: None,
+            finalized_block_number: None,
+            reverted_block_number: None,
+        };
+        database.insert_batch(batch.clone()).await?;
+        database.insert_blocks(vec![safe], (&batch).into()).await?;
+        database.update_batch_status(batch.hash, BatchStatus::Consolidated).await?;
+        database.set_l2_head_block_number(head.number).await?;
+        let client = ScrollAuthApiEngineClient::new(
+            node.node.inner.add_ons_handle.rpc_server_handles.auth.http_client(),
+        );
+        for number in (1..=3).rev() {
+            if number < 3 {
+                let expected =
+                    StoredForkchoiceState { head, safe: blocks[number + 1], finalized: genesis };
+                let target = StoredForkchoiceState { safe: blocks[number], ..expected };
+                database
+                    .set_pending_frontier_transition(PendingFrontierTransition { expected, target })
+                    .await?;
+            }
+            let response = client
+                .fork_choice_updated_v1(
+                    alloy_rpc_types_engine::ForkchoiceState {
+                        head_block_hash: head.hash,
+                        safe_block_hash: blocks[number].hash,
+                        finalized_block_hash: genesis.hash,
+                    },
+                    None,
+                )
+                .await?;
+            assert!(matches!(
+                response.payload_status.status,
+                alloy_rpc_types_engine::PayloadStatusEnum::Valid
+            ));
+            if number < 3 {
+                database.clear_pending_frontier_transition().await?;
+            }
+            let observed = node
+                .node
+                .rpc
+                .inner
+                .eth_api()
+                .block_by_number(BlockNumberOrTag::Safe, false)
+                .await?
+                .unwrap();
+            assert_eq!(BlockInfo::from(&observed.header), blocks[number]);
+        }
+        // Read the disk provider, not the live Engine cache. Storage v2 keeps canonical
+        // hashes in static files, so the MDBX CanonicalHeaders table alone is insufficient.
+        time::timeout(Duration::from_secs(10), async {
+            loop {
+                if node.node.inner.provider.database_provider_ro()?.block_hash(head.number)? ==
+                    Some(head.hash)
+                {
+                    return eyre::Ok(())
+                }
+                time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await??;
+        databases.push(database);
+    }
+    for (node_index, database) in databases.iter().enumerate() {
+        fixture.shutdown_node(node_index).await?;
+        database.inner().get_connection().clone().close().await?;
+        // No Engine remains running. Keep canonical blocks intact and change only the disk tag.
+        let tx = fixture.dbs[node_index].tx_mut()?;
+        tx.put::<tables::ChainState>(tables::ChainStateKey::LastSafeBlock, head.number)?;
+        tx.commit()?;
+        assert_eq!(
+            fixture.dbs[node_index]
+                .tx()?
+                .get::<tables::ChainState>(tables::ChainStateKey::LastSafeBlock)?,
+            Some(head.number)
+        );
+    }
+    drop(databases);
+    for node_index in 0..2 {
+        fixture.start_node(node_index).await?;
+        let node = fixture.nodes[node_index].as_ref().unwrap();
+        let database = node.rollup_manager_handle.get_database_handle().await?;
+        assert_eq!(database.get_pending_frontier_transition().await?, None);
+        assert_eq!(database.get_latest_safe_l2_info().await?.0, safe);
+        for (tag, expected) in [
+            (BlockNumberOrTag::Latest, head),
+            (BlockNumberOrTag::Safe, safe),
+            (BlockNumberOrTag::Finalized, genesis),
+        ] {
+            let observed =
+                node.node.rpc.inner.eth_api().block_by_number(tag, false).await?.unwrap();
+            assert_eq!(BlockInfo::from(&observed.header), expected, "node {node_index}, tag {tag}");
+        }
+    }
+    fixture.l1().sync().await?;
+    fixture.build_block().expect_block_number(4).build_and_await_block().await?;
+    for node_index in 0..2 {
+        fixture.shutdown_node(node_index).await?;
+    }
+    Ok(())
+}
+
 /// Test that when the rollup node manager is shutdown, it consolidates the most recent batch
 /// on startup.
 #[allow(clippy::large_stack_frames)]

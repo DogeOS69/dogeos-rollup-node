@@ -24,6 +24,67 @@ pub struct PendingFrontierTransition {
     pub target: StoredForkchoiceState,
 }
 
+/// Acknowledged safe-tag evidence. Finalized canonical starts can be pruned; old forks remain
+/// witnesses because Engine acknowledgement (including reading a tag back) is not a persistence
+/// barrier. Reading a legacy record cannot reconstruct starts an older release already erased.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ConfirmedFrontierTransition {
+    /// The most recently acknowledged forkchoice transition.
+    /// Flattening keeps records written before safe history was introduced readable.
+    #[serde(flatten)]
+    pub transition: PendingFrontierTransition,
+    /// Earlier safe starts connected to this target by acknowledged transitions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) previous_safe: Vec<BlockInfo>,
+}
+
+impl ConfirmedFrontierTransition {
+    pub(crate) fn acknowledge(
+        transition: PendingFrontierTransition,
+        previous: Option<Self>,
+    ) -> Result<Self, crate::DatabaseError> {
+        transition.validate()?;
+        let mut previous_safe = Vec::new();
+        if let Some(previous) = previous {
+            // Acknowledgements cannot move finalized backwards across records either.
+            PendingFrontierTransition {
+                expected: previous.transition.target,
+                target: transition.target,
+            }
+            .validate()?;
+            if previous.transition.target.safe == transition.expected.safe ||
+                previous.transition.target.safe == transition.target.safe
+            {
+                // Extend a connected move, or preserve evidence when recovery reapplies the
+                // same target. Head/finalized-only moves must preserve it as well.
+                previous_safe = previous.previous_safe;
+                let start = previous.transition.expected.safe;
+                if !previous_safe.contains(&start) {
+                    previous_safe.push(start);
+                }
+            }
+        }
+        previous_safe.retain(|block| *block != transition.expected.safe);
+        Ok(Self { transition, previous_safe })
+    }
+
+    /// Safe starts that can explain a lost tag write, always compared by hash as well as height.
+    pub fn safe_starts(&self) -> impl Iterator<Item = BlockInfo> + '_ {
+        std::iter::once(self.transition.expected.safe).chain(self.previous_safe.iter().copied())
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), crate::DatabaseError> {
+        self.transition.validate()?;
+        let mut seen = std::collections::HashSet::new();
+        if self.safe_starts().any(|block| !seen.insert((block.number, block.hash))) {
+            return Err(crate::DatabaseError::InvalidFrontierTransition(
+                "safe history contains duplicate starts",
+            ))
+        }
+        Ok(())
+    }
+}
+
 impl StoredForkchoiceState {
     /// Checks ordering and identity at equal heights before persisting or replaying a frontier.
     pub fn validate(&self) -> Result<(), crate::DatabaseError> {

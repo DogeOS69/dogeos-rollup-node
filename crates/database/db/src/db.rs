@@ -3,8 +3,8 @@ use crate::{
     error::DatabaseError,
     metrics::{DatabaseMetrics, DatabaseOperation, DatabaseOperationMetrics},
     service::{query::DatabaseQuery, retry::Retry, DatabaseService, DatabaseServiceError},
-    DatabaseConnectionProvider, DatabaseReadOperations, DatabaseWriteOperations, L1MessageKey,
-    PendingFrontierTransition, UnwindResult,
+    ConfirmedFrontierTransition, DatabaseConnectionProvider, DatabaseReadOperations,
+    DatabaseWriteOperations, L1MessageKey, PendingFrontierTransition, UnwindResult,
 };
 use alloy_primitives::{Signature, B256};
 use dogeos_reth_engine::BlockDataHint;
@@ -595,7 +595,7 @@ impl DatabaseWriteOperations for Database {
 impl DatabaseReadOperations for Database {
     async fn get_confirmed_frontier_transition(
         &self,
-    ) -> Result<Option<PendingFrontierTransition>, DatabaseError> {
+    ) -> Result<Option<ConfirmedFrontierTransition>, DatabaseError> {
         metered!(
             DatabaseOperation::GetConfirmedFrontierTransition,
             self,
@@ -1009,7 +1009,129 @@ mod test {
         drop(db);
         let db = Database::new(path.to_str().unwrap()).await.unwrap();
         assert_eq!(db.get_pending_frontier_transition().await.unwrap(), None);
-        assert_eq!(db.get_confirmed_frontier_transition().await.unwrap(), Some(updated));
+        assert_eq!(
+            db.get_confirmed_frontier_transition().await.unwrap().unwrap().transition,
+            updated
+        );
+    }
+
+    #[tokio::test]
+    async fn acknowledged_safe_history_upgrades_atomically_and_survives_reopen() {
+        use crate::{frontier_transition_types::CONFIRMED_FRONTIER_KEY, StoredForkchoiceState};
+        use rollup_node_primitives::Metadata;
+
+        let original = setup_test_db().await;
+        let block = |number| BlockInfo::new(number, B256::repeat_byte(number as u8));
+        let state =
+            |safe| StoredForkchoiceState { head: block(5), safe: block(safe), finalized: block(0) };
+        let first = PendingFrontierTransition { expected: state(3), target: state(2) };
+        // Upgrade a real old-format record, which contains only expected/target.
+        let row: models::metadata::ActiveModel = Metadata {
+            key: CONFIRMED_FRONTIER_KEY.into(),
+            value: serde_json::to_string(&first).unwrap(),
+        }
+        .into();
+        models::metadata::Entity::insert(row)
+            .exec(original.inner().get_connection())
+            .await
+            .unwrap();
+        let legacy = original.get_confirmed_frontier_transition().await.unwrap().unwrap();
+        assert_eq!(legacy.transition, first);
+        assert_eq!(legacy.safe_starts().collect::<Vec<_>>(), [block(3)]);
+
+        let second = PendingFrontierTransition { expected: state(2), target: state(1) };
+        original.set_pending_frontier_transition(second).await.unwrap();
+        let result = original
+            .tx_mut(|tx| async move {
+                tx.clear_pending_frontier_transition().await?;
+                Err::<(), _>(DatabaseError::MissingSafeL2Frontier)
+            })
+            .await;
+        assert!(result.is_err());
+        assert_eq!(original.get_pending_frontier_transition().await.unwrap(), Some(second));
+        assert_eq!(original.get_confirmed_frontier_transition().await.unwrap(), Some(legacy));
+        original.clear_pending_frontier_transition().await.unwrap();
+
+        // A head-only acknowledgement must not erase either rewind's evidence.
+        let head_only = PendingFrontierTransition {
+            expected: state(1),
+            target: StoredForkchoiceState { head: block(4), ..state(1) },
+        };
+        original.set_pending_frontier_transition(head_only).await.unwrap();
+        original.clear_pending_frontier_transition().await.unwrap();
+        let path = original.tmp_dir().unwrap().path().join("test.db");
+        original.inner().get_connection().clone().close().await.unwrap();
+        let db = Database::new(path.to_str().unwrap()).await.unwrap();
+        assert_eq!(db.get_pending_frontier_transition().await.unwrap(), None);
+        let confirmed = db.get_confirmed_frontier_transition().await.unwrap().unwrap();
+        for number in 1..=3 {
+            assert!(confirmed.safe_starts().any(|start| start == block(number)));
+        }
+
+        // Duplicate recovery acknowledgements do not grow the history.
+        let repair = PendingFrontierTransition { expected: state(3), target: head_only.target };
+        db.set_pending_frontier_transition(repair).await.unwrap();
+        db.clear_pending_frontier_transition().await.unwrap();
+        let repaired = db.get_confirmed_frontier_transition().await.unwrap().unwrap();
+        db.set_pending_frontier_transition(repair).await.unwrap();
+        db.clear_pending_frontier_transition().await.unwrap();
+        assert_eq!(db.get_confirmed_frontier_transition().await.unwrap(), Some(repaired));
+
+        // Canonical finalized starts can be pruned; a height alone is not sufficient.
+        db.insert_blocks(vec![block(1), block(2), block(3)], BatchInfo::new(0, B256::ZERO))
+            .await
+            .unwrap();
+        db.update_batch_status(B256::ZERO, rollup_node_primitives::BatchStatus::Finalized)
+            .await
+            .unwrap();
+        for number in [2, 3] {
+            let expected =
+                db.get_confirmed_frontier_transition().await.unwrap().unwrap().transition.target;
+            let target = StoredForkchoiceState { finalized: block(number), ..state(number) };
+            db.set_pending_frontier_transition(PendingFrontierTransition { expected, target })
+                .await
+                .unwrap();
+            db.clear_pending_frontier_transition().await.unwrap();
+            let starts = db
+                .get_confirmed_frontier_transition()
+                .await
+                .unwrap()
+                .unwrap()
+                .safe_starts()
+                .collect::<Vec<_>>();
+            // The latest expected safe remains part of the transition itself.
+            assert_eq!(starts, if number == 2 { vec![block(1), block(3)] } else { vec![block(2)] });
+        }
+    }
+
+    #[tokio::test]
+    async fn corrupt_confirmed_history_does_not_acknowledge_pending_transition() {
+        use crate::{frontier_transition_types::CONFIRMED_FRONTIER_KEY, StoredForkchoiceState};
+        use rollup_node_primitives::Metadata;
+
+        let db = setup_test_db().await;
+        let block = |number| BlockInfo::new(number, B256::repeat_byte(number as u8));
+        let expected =
+            StoredForkchoiceState { head: block(3), safe: block(3), finalized: block(1) };
+        let transition = PendingFrontierTransition {
+            expected,
+            target: StoredForkchoiceState { safe: block(2), ..expected },
+        };
+        db.set_pending_frontier_transition(transition).await.unwrap();
+        let mut invalid = serde_json::to_value(transition).unwrap();
+        invalid["previous_safe"] = serde_json::json!([expected.safe]);
+        for value in ["{".to_owned(), invalid.to_string()] {
+            let row: models::metadata::ActiveModel =
+                Metadata { key: CONFIRMED_FRONTIER_KEY.into(), value }.into();
+            models::metadata::Entity::insert(row).exec(db.inner().get_connection()).await.unwrap();
+            assert!(db.get_confirmed_frontier_transition().await.is_err());
+            assert!(db.clear_pending_frontier_transition().await.is_err());
+            assert_eq!(db.get_pending_frontier_transition().await.unwrap(), Some(transition));
+            models::metadata::Entity::delete_by_id(CONFIRMED_FRONTIER_KEY)
+                .exec(db.inner().get_connection())
+                .await
+                .unwrap();
+        }
     }
 
     #[tokio::test]

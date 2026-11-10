@@ -1,4 +1,4 @@
-use super::{models, DatabaseError, PendingFrontierTransition};
+use super::{models, ConfirmedFrontierTransition, DatabaseError, PendingFrontierTransition};
 use crate::{
     frontier_transition_types::{CONFIRMED_FRONTIER_KEY, FRONTIER_TRANSITION_KEY},
     ReadConnectionProvider, WriteConnectionProvider,
@@ -294,25 +294,53 @@ impl<T: WriteConnectionProvider + ?Sized + Sync> DatabaseWriteOperations for T {
 
     async fn clear_pending_frontier_transition(&self) -> Result<(), DatabaseError> {
         if let Some(transition) = self.get_pending_frontier_transition().await? {
-            // Head/finalized-only acknowledgements must not erase evidence of a safe rewind:
-            // Reth can lose its deferred tag write even after acknowledging a later head FCU.
-            if transition.expected.safe != transition.target.safe ||
-                self.get_confirmed_frontier_transition().await?.is_none()
-            {
-                let row: models::metadata::ActiveModel = Metadata {
-                    key: CONFIRMED_FRONTIER_KEY.to_owned(),
-                    value: serde_json::to_string(&transition)?,
+            let mut confirmed = ConfirmedFrontierTransition::acknowledge(
+                transition,
+                self.get_confirmed_frontier_transition().await?,
+            )?;
+            // Only finalized canonical blocks are permanently covered by normal ancestry
+            // recovery. Height alone cannot prune an old fork: even a later finalized-tag
+            // acknowledgement may be lost along with the safe-tag writes.
+            let finalized = transition.target.finalized;
+            let mut retained = Vec::new();
+            for block in confirmed.previous_safe {
+                if block == finalized {
+                    continue
                 }
-                .into();
-                models::metadata::Entity::insert(row)
-                    .on_conflict(
-                        OnConflict::column(models::metadata::Column::Key)
-                            .update_column(models::metadata::Column::Value)
-                            .to_owned(),
-                    )
-                    .exec_without_returning(self.get_connection())
-                    .await?;
+                let canonical_finalized = if block.number < finalized.number {
+                    models::l2_block::Entity::find()
+                        .inner_join(models::batch_commit::Entity)
+                        .filter(models::l2_block::Column::BlockHash.eq(block.hash.to_vec()))
+                        .filter(models::l2_block::Column::Reverted.eq(false))
+                        .filter(
+                            models::batch_commit::Column::Status
+                                .eq(BatchStatus::Finalized.as_str()),
+                        )
+                        .filter(models::batch_commit::Column::RevertedBlockNumber.is_null())
+                        .one(self.get_connection())
+                        .await?
+                        .is_some_and(|row| row.block_info() == block)
+                } else {
+                    false
+                };
+                if !canonical_finalized {
+                    retained.push(block);
+                }
             }
+            confirmed.previous_safe = retained;
+            let row: models::metadata::ActiveModel = Metadata {
+                key: CONFIRMED_FRONTIER_KEY.to_owned(),
+                value: serde_json::to_string(&confirmed)?,
+            }
+            .into();
+            models::metadata::Entity::insert(row)
+                .on_conflict(
+                    OnConflict::column(models::metadata::Column::Key)
+                        .update_column(models::metadata::Column::Value)
+                        .to_owned(),
+                )
+                .exec_without_returning(self.get_connection())
+                .await?;
         }
         models::metadata::Entity::delete_by_id(FRONTIER_TRANSITION_KEY)
             .exec(self.get_connection())
@@ -1166,11 +1194,10 @@ impl<T: WriteConnectionProvider + ?Sized + Sync> DatabaseWriteOperations for T {
 #[async_trait::async_trait]
 #[auto_impl::auto_impl(Arc)]
 pub trait DatabaseReadOperations {
-    /// Last acknowledged safe transition (or first intent), retained because Engine
-    /// acknowledgement does not imply fsync of its safe tag.
+    /// Acknowledged transitions' safe-tag evidence; Engine acknowledgement is not an fsync.
     async fn get_confirmed_frontier_transition(
         &self,
-    ) -> Result<Option<PendingFrontierTransition>, DatabaseError>;
+    ) -> Result<Option<ConfirmedFrontierTransition>, DatabaseError>;
 
     /// Highest non-reverted L2 block in a finalized batch, or genesis.
     async fn get_latest_finalized_l2_info(&self) -> Result<BlockInfo, DatabaseError>;
@@ -1274,8 +1301,16 @@ pub trait DatabaseReadOperations {
 impl<T: ReadConnectionProvider + Sync + ?Sized> DatabaseReadOperations for T {
     async fn get_confirmed_frontier_transition(
         &self,
-    ) -> Result<Option<PendingFrontierTransition>, DatabaseError> {
-        read_frontier_transition(self, CONFIRMED_FRONTIER_KEY).await
+    ) -> Result<Option<ConfirmedFrontierTransition>, DatabaseError> {
+        models::metadata::Entity::find_by_id(CONFIRMED_FRONTIER_KEY)
+            .one(self.get_connection())
+            .await?
+            .map(|row| {
+                let confirmed: ConfirmedFrontierTransition = serde_json::from_str(&row.value)?;
+                confirmed.validate()?;
+                Ok(confirmed)
+            })
+            .transpose()
     }
 
     async fn get_latest_finalized_l2_info(&self) -> Result<BlockInfo, DatabaseError> {

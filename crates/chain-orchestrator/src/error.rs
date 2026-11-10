@@ -80,6 +80,20 @@ pub enum ChainOrchestratorError {
     /// A gap was detected in batch commit events: the previous batch before index {0} is missing.
     #[error("Batch commit gap detected at index {0}, previous batch commit not found")]
     BatchCommitGap(u64),
+    /// A derived batch does not continue immediately after the persisted consolidation frontier.
+    #[error(
+        "Derived batch {batch_info:?} has a non-contiguous block at attribute index {attribute_index}: block {actual_block_number} does not immediately follow block {previous_block_number}"
+    )]
+    InvalidDerivedBlockSequence {
+        /// The batch containing the invalid block sequence.
+        batch_info: BatchInfo,
+        /// The position of the invalid block attributes within the batch.
+        attribute_index: usize,
+        /// The persisted frontier or preceding derived block number.
+        previous_block_number: u64,
+        /// The block number supplied by the committed batch.
+        actual_block_number: u64,
+    },
     /// An error occurred while making a network request.
     #[error("Network request error: {0}")]
     NetworkRequestError(#[from] reth_network_p2p::error::RequestError),

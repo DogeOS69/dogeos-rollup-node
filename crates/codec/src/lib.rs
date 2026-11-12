@@ -36,6 +36,9 @@ pub enum Codec {
     V6,
     /// V7 variant of the codec. All data of interest is moved from the calldata to the blob.
     /// <https://github.com/scroll-tech/da-codec/blob/main/encoding/codecv7_types.go#L33>
+    ///
+    /// Versions 7 through 12 (DogeOS TsukiV2) share this layout and decoder, so they have no
+    /// variants of their own.
     V7,
 }
 
@@ -127,13 +130,15 @@ mod tests {
 
     #[test]
     fn test_should_route_v7_family_versions_to_the_blob_decoder() {
-        // The empty payload fails to decode, but only after the router accepted
-        // the version and the blob decoder accepted its envelope version.
+        // The empty payload fails with Eof inside the v7 decoder, which is only
+        // reached after the router and the envelope check accept the version.
         for version in 7..=12 {
-            let error = Codec::decode(commit(version)).expect_err("empty payload");
             assert!(
-                !matches!(error, CodecError::Decoding(DecodingError::UnsupportedCodecVersion(_))),
-                "version {version}: {error:?}"
+                matches!(
+                    Codec::decode(commit(version)),
+                    Err(CodecError::Decoding(DecodingError::Eof))
+                ),
+                "version {version} must reach the v7 decoder and fail on the empty payload"
             );
         }
         assert!(matches!(

@@ -133,12 +133,11 @@ mod tests {
         // The empty payload fails with Eof inside the v7 decoder, which is only
         // reached after the router and the envelope check accept the version.
         for version in 7..=12 {
+            let result = Codec::decode(commit(version));
             assert!(
-                matches!(
-                    Codec::decode(commit(version)),
-                    Err(CodecError::Decoding(DecodingError::Eof))
-                ),
-                "version {version} must reach the v7 decoder and fail on the empty payload"
+                matches!(result, Err(CodecError::Decoding(DecodingError::Eof))),
+                "version {version} must reach the v7 decoder and fail on the empty payload, got \
+                 {result:?}"
             );
         }
         assert!(matches!(

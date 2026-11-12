@@ -59,7 +59,7 @@ impl Codec {
                 let blob = input.blob().ok_or(DecodingError::MissingBlob)?;
                 decode_v4(calldata, blob.as_ref())?
             }
-            7..=11 => {
+            7..=12 => {
                 let blob = input.blob().ok_or(DecodingError::MissingBlob)?;
                 decode_v7(blob.as_ref())?
             }
@@ -96,4 +96,49 @@ fn get_codec_version(calldata: &[u8]) -> Result<u8, DecodingError> {
     }
 
     Ok(version.uint_try_to().expect("fits in single byte"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Commit {
+        calldata: Bytes,
+        blob: Box<Blob>,
+    }
+
+    impl CommitDataSource for Commit {
+        fn calldata(&self) -> &Bytes {
+            &self.calldata
+        }
+        fn blob(&self) -> Option<&Blob> {
+            Some(&self.blob)
+        }
+    }
+
+    /// A commit whose calldata and (otherwise empty) blob both name `version`.
+    fn commit(version: u8) -> Commit {
+        let mut calldata = vec![0u8; 4 + 32];
+        calldata[4 + 31] = version;
+        let mut blob = Box::new(Blob::ZERO);
+        blob[1] = version;
+        Commit { calldata: calldata.into(), blob }
+    }
+
+    #[test]
+    fn test_should_route_v7_family_versions_to_the_blob_decoder() {
+        // The empty payload fails to decode, but only after the router accepted
+        // the version and the blob decoder accepted its envelope version.
+        for version in 7..=12 {
+            let error = Codec::decode(commit(version)).expect_err("empty payload");
+            assert!(
+                !matches!(error, CodecError::Decoding(DecodingError::UnsupportedCodecVersion(_))),
+                "version {version}: {error:?}"
+            );
+        }
+        assert!(matches!(
+            Codec::decode(commit(13)),
+            Err(CodecError::Decoding(DecodingError::UnsupportedCodecVersion(13)))
+        ));
+    }
 }

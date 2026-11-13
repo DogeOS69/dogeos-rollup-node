@@ -5,7 +5,7 @@ script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 
 # Canonical reviewed sources; every guarded package family must resolve to
 # these exact strings (see verify_reth_sources.jq for the enforced rules).
-components_source="git+https://github.com/DogeOS69/dogeos-reth.git?rev=9690fcbfb453a8bc5caa5a86628723f584d483c9#9690fcbfb453a8bc5caa5a86628723f584d483c9"
+components_source="git+https://github.com/DogeOS69/dogeos-reth.git?rev=50aec262f28fe746fa5f2b5dd3fff1cfd96c0c42#50aec262f28fe746fa5f2b5dd3fff1cfd96c0c42"
 reth_source="git+https://github.com/DogeOS69/reth.git?rev=b4a77efea79928b82712669ac71eee0e5f878db5#b4a77efea79928b82712669ac71eee0e5f878db5"
 revm_source="git+https://github.com/DogeOS69/dogeos-revm.git?tag=tsuki-v0.13#516ff663b2fb2503dba8ef6b0d667f16334ac05a"
 official_reth_source="git+https://github.com/paradigmxyz/reth?rev=b25f32a977b489f9b84254c7811a2a5a25a81369#b25f32a977b489f9b84254c7811a2a5a25a81369"

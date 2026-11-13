@@ -390,8 +390,8 @@ impl ScrollRollupNodeConfig {
         // masked (legacy) queue hash, codec 12 (TsukiV2) and later by the full-width hash.
         // Testnet-only: the legacy chain is computed only where TsukiV2 activates after genesis
         // (Chikyu, whose pre-TsukiV2 batches carry masked hashes); mainnet activates TsukiV2 at
-        // genesis, so its legacy column stays empty. Added by the codec-keyed queue hash PR
-        // (stacked on #106); remove when no supported network has batches below codec 12.
+        // genesis, so its legacy column stays empty. Added by dogeos-rollup-node #107; remove
+        // when no supported network has batches below codec 12.
         let l1_v2_message_queue_start_index =
             l1_v2_message_queue_start_index(chain_spec.chain().named());
         let with_legacy_queue_hash = with_legacy_queue_hash(chain_spec.as_ref());

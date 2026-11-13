@@ -13,8 +13,8 @@
 //! Testnet-only: the legacy rule exists because `Chikyu` (`DogeOS` testnet) committed its batches
 //! below codec 12 with masked queue hashes before `TsukiV2`, and a node that syncs from genesis
 //! must still find their L1 messages. It is computed only on a chain whose `TsukiV2` activates
-//! after genesis, so it is inert on mainnet (`TsukiV2` at genesis). Added by the codec-keyed queue
-//! hash PR in dogeos-rollup-node (stacked on #106). Remove it, together with the
+//! after genesis, so it is inert on mainnet (`TsukiV2` at genesis). Added by dogeos-rollup-node
+//! #107. Remove it, together with the
 //! `legacy_queue_hash` column, when no supported network has batches below codec 12.
 
 use alloy_primitives::{b256, keccak256, B256};

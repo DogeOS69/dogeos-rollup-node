@@ -4,8 +4,8 @@
 //! hash; codec 12 (`TsukiV2`) and later use the full-width hash in `queue_hash`. This column holds
 //! the masked chain and stays empty on a chain whose `TsukiV2` activates at genesis (mainnet). The
 //! node recomputes both columns at startup (`recompute_l1_message_queue_hashes`), because a
-//! static migration cannot see the chain spec. Remove with the legacy rule when no supported
-//! network has batches below codec 12.
+//! static migration cannot see the chain spec. Added by dogeos-rollup-node #107. Remove with the
+//! legacy rule when no supported network has batches below codec 12.
 
 use super::m20250304_125946_add_l1_msg_table::L1Message;
 use sea_orm_migration::{prelude::*, schema::*};

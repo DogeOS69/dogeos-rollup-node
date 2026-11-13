@@ -10,7 +10,8 @@ pub struct Model {
     #[sea_orm(primary_key)]
     pub(crate) queue_index: i64,
     queue_hash: Option<Vec<u8>>,
-    hash: Vec<u8>,
+    legacy_queue_hash: Option<Vec<u8>>,
+    pub(crate) hash: Vec<u8>,
     l1_block_number: i64,
     gas_limit: String,
     to: Vec<u8>,
@@ -33,6 +34,7 @@ impl From<L1MessageEnvelope> for ActiveModel {
         Self {
             queue_index: ActiveValue::Set(value.transaction.queue_index as i64),
             queue_hash: ActiveValue::Set(value.queue_hash.map(|q| q.to_vec())),
+            legacy_queue_hash: ActiveValue::Set(value.legacy_queue_hash.map(|q| q.to_vec())),
             hash: ActiveValue::Set(value.transaction.tx_hash().to_vec()),
             l1_block_number: ActiveValue::Set(value.l1_block_number as i64),
             gas_limit: ActiveValue::Set(value.transaction.gas_limit.to_string()),
@@ -52,6 +54,7 @@ impl From<Model> for L1MessageEnvelope {
             l1_block_number: value.l1_block_number as u64,
             l2_block_number: value.l2_block_number.map(|b| b as u64),
             queue_hash: value.queue_hash.map(|q| B256::from_slice(&q)),
+            legacy_queue_hash: value.legacy_queue_hash.map(|q| B256::from_slice(&q)),
             transaction: TxL1Message {
                 queue_index: value.queue_index as u64,
                 gas_limit: value.gas_limit.parse().expect("gas limit is valid"),

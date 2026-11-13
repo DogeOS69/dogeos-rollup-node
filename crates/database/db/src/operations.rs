@@ -4,12 +4,13 @@ use crate::{ReadConnectionProvider, WriteConnectionProvider};
 use alloy_primitives::{Bytes, Signature, B256};
 use dogeos_reth_engine::BlockDataHint;
 use rollup_node_primitives::{
-    BatchCommitData, BatchConsolidationOutcome, BatchInfo, BatchStatus, BlockInfo,
-    L1BlockStartupInfo, L1MessageEnvelope, L2BlockInfoWithL1Messages, Metadata,
+    fold_legacy_queue_hash, fold_queue_hash, uses_legacy_queue_hash, BatchCommitData,
+    BatchConsolidationOutcome, BatchInfo, BatchStatus, BlockInfo, L1BlockStartupInfo,
+    L1MessageEnvelope, L2BlockInfoWithL1Messages, Metadata,
 };
 use sea_orm::{
     sea_query::{CaseStatement, Expr, OnConflict},
-    ColumnTrait, Condition, DbErr, EntityTrait, QueryFilter, QueryOrder, QuerySelect,
+    ColumnTrait, Condition, DbErr, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Value,
 };
 use std::fmt;
 
@@ -120,6 +121,19 @@ pub trait DatabaseWriteOperations {
 
     /// Insert an [`L1MessageEnvelope`] into the database.
     async fn insert_l1_message(&self, l1_message: L1MessageEnvelope) -> Result<(), DatabaseError>;
+
+    /// Recomputes both queue hash columns of every stored L1 message, unless the database already
+    /// holds hashes for this exact rule set. Messages below `l1_v2_message_queue_start_index`
+    /// have no queue hash; the legacy (masked) column is filled only if `with_legacy` is set.
+    /// Returns the number of messages rewritten, or `None` if the hashes were already current.
+    ///
+    /// Runs once at startup so a database written under another rule (testnet nodes stored the
+    /// masked hash in `queue_hash` before the full-width rule) matches the node's live rule.
+    async fn recompute_l1_message_queue_hashes(
+        &self,
+        l1_v2_message_queue_start_index: u64,
+        with_legacy: bool,
+    ) -> Result<Option<u64>, DatabaseError>;
 
     /// Sets the `skipped` column to true for the provided list of L1 messages queue indexes.
     async fn update_skipped_l1_messages(&self, indexes: Vec<u64>) -> Result<(), DatabaseError>;
@@ -685,6 +699,89 @@ impl<T: WriteConnectionProvider + ?Sized + Sync> DatabaseWriteOperations for T {
         } else {
             Ok(result.map(|_| ())?)
         }
+    }
+
+    async fn recompute_l1_message_queue_hashes(
+        &self,
+        l1_v2_message_queue_start_index: u64,
+        with_legacy: bool,
+    ) -> Result<Option<u64>, DatabaseError> {
+        // Bump the version when the stored rule changes.
+        const QUEUE_HASH_RULE_KEY: &str = "l1_message_queue_hash_rule";
+        let rule = format!("v1;start={l1_v2_message_queue_start_index};legacy={with_legacy}");
+
+        let current = models::metadata::Entity::find()
+            .filter(models::metadata::Column::Key.eq(QUEUE_HASH_RULE_KEY))
+            .one(self.get_connection())
+            .await?;
+        if current.is_some_and(|m| m.value == rule) {
+            return Ok(None)
+        }
+
+        // Clear both columns first so no intermediate value trips the unique indexes.
+        models::l1_message::Entity::update_many()
+            .col_expr(models::l1_message::Column::QueueHash, Expr::value(Value::Bytes(None)))
+            .col_expr(models::l1_message::Column::LegacyQueueHash, Expr::value(Value::Bytes(None)))
+            .exec(self.get_connection())
+            .await?;
+
+        let rows = models::l1_message::Entity::find()
+            .filter(
+                models::l1_message::Column::QueueIndex.gte(l1_v2_message_queue_start_index as i64),
+            )
+            .order_by_asc(models::l1_message::Column::QueueIndex)
+            .all(self.get_connection())
+            .await?;
+
+        let mut previous: Option<(i64, B256, B256)> = None;
+        let mut rewritten = 0u64;
+        for row in rows {
+            let queue_index = row.queue_index;
+            let (prev_full, prev_legacy) = match previous {
+                None if queue_index == l1_v2_message_queue_start_index as i64 => {
+                    (B256::ZERO, B256::ZERO)
+                }
+                Some((index, full, legacy)) if index + 1 == queue_index => (full, legacy),
+                // A gap: the live path rejects it, so the stored chain cannot continue here.
+                _ => {
+                    return Err(DatabaseError::L1MessageNotFound(L1MessageKey::QueueIndex(
+                        queue_index as u64 - 1,
+                    )))
+                }
+            };
+            let tx_hash = B256::from_slice(&row.hash);
+            let full = fold_queue_hash(prev_full, tx_hash);
+            let legacy = fold_legacy_queue_hash(prev_legacy, tx_hash);
+
+            models::l1_message::Entity::update_many()
+                .col_expr(
+                    models::l1_message::Column::QueueHash,
+                    Expr::value(Value::Bytes(Some(Box::new(full.to_vec())))),
+                )
+                .col_expr(
+                    models::l1_message::Column::LegacyQueueHash,
+                    Expr::value(Value::Bytes(with_legacy.then(|| Box::new(legacy.to_vec())))),
+                )
+                .filter(models::l1_message::Column::QueueIndex.eq(queue_index))
+                .exec(self.get_connection())
+                .await?;
+
+            previous = Some((queue_index, full, legacy));
+            rewritten += 1;
+        }
+
+        let metadata: models::metadata::ActiveModel =
+            Metadata { key: QUEUE_HASH_RULE_KEY.to_string(), value: rule }.into();
+        models::metadata::Entity::insert(metadata)
+            .on_conflict(
+                OnConflict::column(models::metadata::Column::Key)
+                    .update_column(models::metadata::Column::Value)
+                    .to_owned(),
+            )
+            .exec(self.get_connection())
+            .await?;
+
+        Ok(Some(rewritten))
     }
 
     async fn update_skipped_l1_messages(&self, indexes: Vec<u64>) -> Result<(), DatabaseError> {
@@ -1385,17 +1482,20 @@ impl<T: ReadConnectionProvider + Sync + ?Sized> DatabaseReadOperations for T {
             }
             // Provides n L1 messages with increasing queue index starting from the message with
             // the provided queue hash.
-            Some(L1MessageKey::QueueHash(ref h)) => {
-                // Lookup message by queue hash.
+            Some(
+                ref key @ (L1MessageKey::QueueHash(ref h) | L1MessageKey::LegacyQueueHash(ref h)),
+            ) => {
+                // Lookup message by queue hash, in the column of the key's rule.
+                let column = if matches!(key, L1MessageKey::LegacyQueueHash(_)) {
+                    models::l1_message::Column::LegacyQueueHash
+                } else {
+                    models::l1_message::Column::QueueHash
+                };
                 let record = models::l1_message::Entity::find()
-                    .filter(
-                        Condition::all()
-                            .add(models::l1_message::Column::QueueHash.is_not_null())
-                            .add(models::l1_message::Column::QueueHash.eq(h.to_vec())),
-                    )
+                    .filter(Condition::all().add(column.is_not_null()).add(column.eq(h.to_vec())))
                     .one(self.get_connection())
                     .await?
-                    .ok_or_else(|| DatabaseError::L1MessageNotFound(L1MessageKey::QueueHash(*h)))?;
+                    .ok_or_else(|| DatabaseError::L1MessageNotFound(key.clone()))?;
                 // Yield n messages starting from the found queue index.
                 Ok(models::l1_message::Entity::find()
                     .filter(models::l1_message::Column::QueueIndex.gte(record.queue_index))
@@ -1665,8 +1765,11 @@ impl<T: ReadConnectionProvider + Sync + ?Sized> DatabaseReadOperations for T {
 pub enum L1MessageKey {
     /// The queue index of the message.
     QueueIndex(u64),
-    /// The queue hash of the message.
+    /// The full-width queue hash of the message.
     QueueHash(B256),
+    /// The legacy (masked) queue hash of the message. Testnet-only; see
+    /// [`rollup_node_primitives::fold_legacy_queue_hash`].
+    LegacyQueueHash(B256),
     /// The transaction hash of the message.
     TransactionHash(B256),
     /// Start from the first message for the provided block number.
@@ -1684,6 +1787,16 @@ impl L1MessageKey {
     /// Create a new [`L1MessageKey`] from a queue hash.
     pub const fn from_queue_hash(hash: B256) -> Self {
         Self::QueueHash(hash)
+    }
+
+    /// Create a new [`L1MessageKey`] from the queue hash a committed batch of the given codec
+    /// version names: the legacy (masked) hash below codec 12, the full-width hash from 12 on.
+    pub const fn from_batch_queue_hash(hash: B256, batch_codec_version: u8) -> Self {
+        if uses_legacy_queue_hash(batch_codec_version) {
+            Self::LegacyQueueHash(hash)
+        } else {
+            Self::QueueHash(hash)
+        }
     }
 
     /// Create a new [`L1MessageKey`] from a transaction hash.
@@ -1720,6 +1833,7 @@ impl fmt::Display for L1MessageKey {
         match self {
             Self::QueueIndex(index) => write!(f, "QueueIndex({index})"),
             Self::QueueHash(hash) => write!(f, "QueueHash({hash:#x})"),
+            Self::LegacyQueueHash(hash) => write!(f, "LegacyQueueHash({hash:#x})"),
             Self::TransactionHash(hash) => write!(f, "TransactionHash({hash:#x})"),
             Self::BlockNumber(number) => write!(f, "BlockNumber({number})"),
             Self::NotIncluded(start) => match start {

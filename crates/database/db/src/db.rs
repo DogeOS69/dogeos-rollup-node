@@ -378,6 +378,21 @@ impl DatabaseWriteOperations for Database {
         )
     }
 
+    async fn recompute_l1_message_queue_hashes(
+        &self,
+        l1_v2_message_queue_start_index: u64,
+        with_legacy: bool,
+    ) -> Result<Option<u64>, DatabaseError> {
+        metered!(
+            DatabaseOperation::RecomputeL1MessageQueueHashes,
+            self,
+            tx_mut(move |tx| async move {
+                tx.recompute_l1_message_queue_hashes(l1_v2_message_queue_start_index, with_legacy)
+                    .await
+            })
+        )
+    }
+
     async fn update_skipped_l1_messages(&self, indexes: Vec<u64>) -> Result<(), DatabaseError> {
         metered!(
             DatabaseOperation::UpdateSkippedL1Messages,
@@ -1248,7 +1263,7 @@ mod test {
         let db = setup_test_db().await;
 
         // Generate unstructured bytes.
-        let mut bytes = [0u8; 2048];
+        let mut bytes = [0u8; 10240];
         rand::rng().fill(bytes.as_mut_slice());
         let mut u = Unstructured::new(&bytes);
 
@@ -1884,5 +1899,162 @@ mod test {
             db.reconcile_genesis_block(B256::ZERO, seeded_test_genesis()).await,
             Err(DatabaseError::GenesisMismatch { .. })
         ));
+    }
+
+    /// A database written before the legacy column existed holds Scroll's masked hashes in
+    /// `queue_hash` (testnet nodes before the full-width rule). The schema migration adds the
+    /// legacy column, and the startup recompute moves the masked chain there and writes the
+    /// full-width chain to `queue_hash`, once.
+    #[tokio::test]
+    async fn queue_hash_migration_on_an_existing_database() {
+        use rollup_node_primitives::{fold_legacy_queue_hash, fold_queue_hash};
+        use scroll_migration::{Migrator, MigratorTrait, ScrollDevMigrationInfo};
+
+        let dir = tempfile::Builder::new().prefix("scroll-test-").tempdir().unwrap();
+        let db = Database::test(dir).await.unwrap();
+        let inner = db.inner();
+        let conn = inner.get_connection();
+        // Every migration before the legacy column.
+        let before = Migrator::<ScrollDevMigrationInfo>::migrations().len() as u32 - 1;
+        Migrator::<ScrollDevMigrationInfo>::up(conn, Some(before)).await.unwrap();
+
+        let messages: Vec<TxL1Message> = (0..4u64)
+            .map(|queue_index| TxL1Message {
+                queue_index,
+                gas_limit: 100_000 + queue_index,
+                value: alloy_primitives::U256::from(queue_index),
+                ..Default::default()
+            })
+            .collect();
+        let (mut full, mut legacy) = (Vec::new(), Vec::new());
+        let (mut prev_full, mut prev_legacy) = (B256::ZERO, B256::ZERO);
+        for message in &messages {
+            prev_full = fold_queue_hash(prev_full, message.tx_hash());
+            prev_legacy = fold_legacy_queue_hash(prev_legacy, message.tx_hash());
+            full.push(prev_full);
+            legacy.push(prev_legacy);
+            // The old node stored the masked hash in `queue_hash`.
+            let hex = |bytes: &[u8]| alloy_primitives::hex::encode(bytes);
+            conn.execute_unprepared(&format!(
+                "INSERT INTO l1_message (queue_index, queue_hash, hash, l1_block_number, \
+                 l2_block_number, gas_limit, \"to\", value, sender, input, skipped) VALUES \
+                 ({}, X'{}', X'{}', {}, NULL, '{}', X'{}', X'{}', X'{}', X'', 0)",
+                message.queue_index,
+                hex(prev_legacy.as_slice()),
+                hex(message.tx_hash().as_slice()),
+                message.queue_index + 1,
+                message.gas_limit,
+                hex(message.to.as_slice()),
+                hex(&message.value.to_le_bytes::<32>()),
+                hex(message.sender.as_slice()),
+            ))
+            .await
+            .unwrap();
+        }
+
+        // The new image: schema migration, then the startup recompute.
+        Migrator::<ScrollDevMigrationInfo>::up(conn, None).await.unwrap();
+        // The added column is SQL NULL on existing rows, never a zero value.
+        assert_eq!(legacy_queue_hash_null_count(&db).await, 4);
+        assert_eq!(db.recompute_l1_message_queue_hashes(0, true).await.unwrap(), Some(4));
+        assert_eq!(legacy_queue_hash_null_count(&db).await, 0);
+        // Once per rule set.
+        assert_eq!(db.recompute_l1_message_queue_hashes(0, true).await.unwrap(), None);
+
+        let stored =
+            db.get_n_l1_messages(Some(L1MessageKey::from_queue_index(0)), 10).await.unwrap();
+        assert_eq!(stored.iter().map(|m| m.transaction.clone()).collect::<Vec<_>>(), messages);
+        assert_eq!(stored.iter().map(|m| m.queue_hash.unwrap()).collect::<Vec<_>>(), full);
+        assert_eq!(stored.iter().map(|m| m.legacy_queue_hash.unwrap()).collect::<Vec<_>>(), legacy);
+
+        // A batch below codec 12 finds its messages by the masked hash, one from 12 by the full
+        // one; neither hash is found in the other rule's column.
+        let after = |key| {
+            let db = &db;
+            async move { db.get_n_l1_messages(Some(key), 2).await }
+        };
+        assert_eq!(
+            after(L1MessageKey::from_batch_queue_hash(legacy[1], 11)).await.unwrap(),
+            stored[1..3]
+        );
+        assert_eq!(
+            after(L1MessageKey::from_batch_queue_hash(full[1], 12)).await.unwrap(),
+            stored[1..3]
+        );
+        assert!(after(L1MessageKey::from_batch_queue_hash(legacy[1], 12)).await.is_err());
+        assert!(after(L1MessageKey::from_batch_queue_hash(full[1], 11)).await.is_err());
+
+        // A rule change rewrites again: without the legacy chain, its column is cleared.
+        assert_eq!(db.recompute_l1_message_queue_hashes(0, false).await.unwrap(), Some(4));
+        let stored =
+            db.get_n_l1_messages(Some(L1MessageKey::from_queue_index(0)), 10).await.unwrap();
+        assert!(stored.iter().all(|m| m.legacy_queue_hash.is_none()));
+        assert_eq!(legacy_queue_hash_null_count(&db).await, 4);
+        assert_eq!(stored.iter().map(|m| m.queue_hash.unwrap()).collect::<Vec<_>>(), full);
+
+        // Messages below the V2 start index have no queue hash; the chain starts at the index.
+        assert_eq!(db.recompute_l1_message_queue_hashes(2, true).await.unwrap(), Some(2));
+        let stored =
+            db.get_n_l1_messages(Some(L1MessageKey::from_queue_index(0)), 10).await.unwrap();
+        assert!(stored[..2]
+            .iter()
+            .all(|m| m.queue_hash.is_none() && m.legacy_queue_hash.is_none()));
+        assert_eq!(stored[2].queue_hash, Some(fold_queue_hash(B256::ZERO, messages[2].tx_hash())));
+        assert_eq!(
+            stored[3].legacy_queue_hash,
+            Some(fold_legacy_queue_hash(
+                fold_legacy_queue_hash(B256::ZERO, messages[2].tx_hash()),
+                messages[3].tx_hash()
+            ))
+        );
+    }
+
+    /// Rows whose `legacy_queue_hash` is SQL NULL (as opposed to a stored zero value).
+    async fn legacy_queue_hash_null_count(db: &Database) -> i64 {
+        let inner = db.inner();
+        let row = inner
+            .get_connection()
+            .query_one(Statement::from_string(
+                sea_orm::DatabaseBackend::Sqlite,
+                "SELECT COUNT(*) AS n FROM l1_message WHERE legacy_queue_hash IS NULL",
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        row.try_get("", "n").unwrap()
+    }
+
+    /// Where the legacy chain is never computed (`TsukiV2` at genesis, e.g. mainnet), every
+    /// message is stored with a NULL legacy hash. The unique index allows any number of NULLs,
+    /// so consecutive messages all land.
+    #[tokio::test]
+    async fn messages_without_a_legacy_queue_hash_store_null_and_all_land() {
+        use rollup_node_primitives::fold_queue_hash;
+
+        let db = setup_test_db().await;
+        let mut full = B256::ZERO;
+        for queue_index in 0..6u64 {
+            let message = TxL1Message { queue_index, gas_limit: 21_000, ..Default::default() };
+            full = fold_queue_hash(full, message.tx_hash());
+            let envelope = L1MessageEnvelope::new(message, 1, None, Some(full));
+            assert_eq!(envelope.legacy_queue_hash, None);
+            // Bounded, so a constraint error retried by the service fails the test, not hangs it.
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                db.insert_l1_message(envelope),
+            )
+            .await
+            .expect("insert must not spin on a constraint error")
+            .unwrap();
+        }
+        let stored =
+            db.get_n_l1_messages(Some(L1MessageKey::from_queue_index(0)), 10).await.unwrap();
+        assert_eq!(stored.len(), 6);
+        assert!(stored.iter().all(|m| m.legacy_queue_hash.is_none()));
+        assert_eq!(legacy_queue_hash_null_count(&db).await, 6);
+
+        // The startup recompute without the legacy chain also leaves NULLs.
+        assert_eq!(db.recompute_l1_message_queue_hashes(0, false).await.unwrap(), Some(6));
+        assert_eq!(legacy_queue_hash_null_count(&db).await, 6);
     }
 }

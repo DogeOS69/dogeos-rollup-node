@@ -35,7 +35,7 @@ type TestL1Provider = MockL1Provider<Arc<Database>>;
 type TestOrchestrator<EC = PanicEngineClient> =
     ChainOrchestrator<TestNetwork, DogeosChainSpec, TestL1Provider, ScrollRootProvider, EC>;
 
-fn info(number: u64, tag: u8) -> BlockInfo {
+pub(super) fn info(number: u64, tag: u8) -> BlockInfo {
     BlockInfo { number, hash: B256::repeat_byte(tag) }
 }
 
@@ -68,11 +68,13 @@ async fn test_scroll_network(
 
 /// Observation points on the orchestrator's outputs. Each one is optional.
 #[derive(Default)]
-struct Probes {
+pub(super) struct Probes {
     /// Receives every block the orchestrator announces to the network.
-    announced: Option<mpsc::UnboundedSender<(DogeosBlock, alloy_primitives::Signature)>>,
+    pub(super) announced: Option<mpsc::UnboundedSender<(DogeosBlock, alloy_primitives::Signature)>>,
     /// Receives every command the orchestrator sends to the L1 watcher.
-    watcher_commands: Option<mpsc::UnboundedSender<L1WatcherCommand>>,
+    pub(super) watcher_commands: Option<mpsc::UnboundedSender<L1WatcherCommand>>,
+    /// Also compute the legacy (masked) queue hash of each L1 message.
+    pub(super) with_legacy_queue_hash: bool,
 }
 
 /// An orchestrator with no held batch, an Engine that panics if called and the given forkchoice
@@ -86,7 +88,7 @@ async fn orchestrator(
 }
 
 /// Like [`orchestrator`], and reports the outputs named in `probes`.
-async fn orchestrator_probed(
+pub(super) async fn orchestrator_probed(
     database: Arc<Database>,
     fcs: ForkchoiceState,
     v2_start: u64,
@@ -117,7 +119,12 @@ async fn orchestrator_with_engine<EC: ScrollEngineApi + Unpin + Send + Sync + 's
         NoopFullBlockClient::<DogeosNetworkPrimitives>::default(),
         Arc::new(DogeosConsensus),
     ));
-    let config = ChainOrchestratorConfig::<DogeosChainSpec>::new(DOGEOS_DEV.clone(), 1, v2_start);
+    let config = ChainOrchestratorConfig::<DogeosChainSpec>::new(
+        DOGEOS_DEV.clone(),
+        1,
+        v2_start,
+        probes.with_legacy_queue_hash,
+    );
     let (mut orchestrator, _handle) = ChainOrchestrator::new(
         database,
         config,
@@ -137,7 +144,7 @@ async fn orchestrator_with_engine<EC: ScrollEngineApi + Unpin + Send + Sync + 's
     orchestrator
 }
 
-fn deposit(queue_index: u64) -> TxL1Message {
+pub(super) fn deposit(queue_index: u64) -> TxL1Message {
     TxL1Message {
         queue_index,
         gas_limit: 100_000,

@@ -51,6 +51,12 @@ pub enum ScriptedResponse<T> {
     Ok(T),
     /// Return a generic transport failure.
     TransportFailure,
+    /// Return the authenticated Engine client's request timeout.
+    RequestTimeout,
+    /// Return the authenticated Engine client's error for a lost connection.
+    ConnectionLost,
+    /// Return a JSON-RPC error response with the given code.
+    RpcErrorResponse(i32),
     /// Delay before resolving to the nested response.
     DelayThen(Duration, Box<Self>),
 }
@@ -70,6 +76,19 @@ async fn resolve<T>(
             ScriptedResponse::TransportFailure => {
                 return Err(TransportErrorKind::custom(std::io::Error::other(
                     "scripted transport failure",
+                )))
+            }
+            ScriptedResponse::RequestTimeout => {
+                return Err(TransportErrorKind::custom(jsonrpsee::core::ClientError::RequestTimeout))
+            }
+            ScriptedResponse::ConnectionLost => {
+                return Err(TransportErrorKind::custom(jsonrpsee::core::ClientError::Transport(
+                    std::io::Error::other("scripted connection loss").into(),
+                )))
+            }
+            ScriptedResponse::RpcErrorResponse(code) => {
+                return Err(TransportErrorKind::custom(jsonrpsee::core::ClientError::Call(
+                    jsonrpsee::types::ErrorObject::owned(code, "scripted error", None::<()>),
                 )))
             }
             ScriptedResponse::DelayThen(delay, inner) => {

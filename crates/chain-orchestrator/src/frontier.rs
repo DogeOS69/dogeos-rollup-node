@@ -28,6 +28,17 @@ pub(crate) enum HeadSelection {
     KeepEngineHead,
 }
 
+impl HeadSelection {
+    /// A sequencer keeps the stored head; a follower keeps Reth's head.
+    pub(crate) const fn for_node(is_sequencer: bool) -> Self {
+        if is_sequencer {
+            Self::StoredHead
+        } else {
+            Self::KeepEngineHead
+        }
+    }
+}
+
 pub(crate) const fn stored_forkchoice(value: &ForkchoiceState) -> StoredForkchoiceState {
     StoredForkchoiceState {
         head: *value.head_block_info(),
@@ -112,6 +123,24 @@ async fn kept_head<P: Provider<Scroll>>(
     Ok(safe)
 }
 
+/// Returns Reth's head if a follower should keep it instead of `head`: it is above `head` and
+/// `head` is its canonical ancestor.
+async fn kept_engine_head<P: Provider<Scroll>>(
+    provider: &P,
+    head_selection: HeadSelection,
+    engine_head: BlockInfo,
+    head: BlockInfo,
+) -> Result<Option<BlockInfo>, ChainOrchestratorError> {
+    if head_selection != HeadSelection::KeepEngineHead ||
+        engine_head.number <= head.number ||
+        !canonical_ancestor(provider, head, engine_head).await?
+    {
+        return Ok(None)
+    }
+    tracing::info!(target: "scroll::chain_orchestrator", ?head, ?engine_head, "Keeping Reth's head above the stored L2 head");
+    Ok(Some(engine_head))
+}
+
 /// Applies an immutable durable intent. Even a cached target requires a checked Engine call.
 pub(crate) async fn apply_pending_frontier_transition<P, EC>(
     provider: &P,
@@ -181,7 +210,16 @@ where
             },
             Err(source @ EngineError::TransportError(_)) => {
                 // The Engine may have applied FCU before losing the HTTP response.
-                engine.replace_fcs_from_provider(observe_forkchoice(provider).await?);
+                match observe_forkchoice(provider).await {
+                    Ok(observed) => engine.replace_fcs_from_provider(observed),
+                    // Reth busy enough to drop the update may not answer the tag reads either.
+                    // Keep the unavailable-Engine outcome so the caller retries; the intent stays.
+                    Err(observe_error) if source.is_engine_unavailable() => {
+                        tracing::warn!(target: "scroll::chain_orchestrator", error = ?observe_error, "Could not re-read forkchoice tags after an unanswered Engine request");
+                        return Err(ChainOrchestratorError::EngineError(source))
+                    }
+                    Err(observe_error) => return Err(observe_error),
+                }
                 if stored_forkchoice(engine.fcs()) != transition.target {
                     return Err(ChainOrchestratorError::EngineError(source))
                 }
@@ -223,6 +261,18 @@ where
                 } else {
                     database.set_pending_frontier_transition(transition).await?;
                 }
+            } else if let Some(engine_head) =
+                kept_engine_head(provider, head_selection, *engine.fcs().head_block_info(), head)
+                    .await?
+            {
+                // A follower's saved move may name a head far below Reth's (for example one saved
+                // by an earlier startup that timed out); replaying it would make Reth unwind.
+                transition.target.head = engine_head;
+                if transition.target == transition.expected {
+                    database.clear_pending_frontier_transition().await?;
+                } else {
+                    database.set_pending_frontier_transition(transition).await?;
+                }
             }
         }
         apply_pending_frontier_transition(provider, engine, database).await?;
@@ -253,19 +303,14 @@ where
         // mappings for the discarded unsafe suffix in the same transaction as the repair intent.
         // A follower whose Reth ran ahead of the stored head (P2P sync) keeps Reth's head when the
         // stored head is its canonical ancestor: moving the head down would make Reth unwind every
-        // block above it inside the forkchoice update. The stored head and its mapping purge are
-        // unchanged; consolidation maps the blocks above it once the node is synced.
+        // block above it inside the forkchoice update. The stored L2 head (the newest block Reth
+        // kept up to it) and its mapping purge are as without this rule; `consolidate_chain` maps
+        // the blocks above it once the node is synced.
         let stored_head =
             kept_head(provider, safe, database.get_l2_head_block_number().await?).await?;
-        let head = if head_selection == HeadSelection::KeepEngineHead &&
-            observed.head.number > stored_head.number &&
-            canonical_ancestor(provider, stored_head, observed.head).await?
-        {
-            tracing::info!(target: "scroll::chain_orchestrator", ?stored_head, engine_head = ?observed.head, "Keeping Reth's head above the stored L2 head");
-            observed.head
-        } else {
-            stored_head
-        };
+        let head = kept_engine_head(provider, head_selection, observed.head, stored_head)
+            .await?
+            .unwrap_or(stored_head);
         let target = StoredForkchoiceState { head, safe, finalized };
         target.validate()?;
         database
@@ -274,7 +319,7 @@ where
                 tx.purge_l1_message_to_l2_block_mappings(Some(
                     stored_head.number.saturating_add(1),
                 ))
-                    .await?;
+                .await?;
                 tx.set_pending_frontier_transition(PendingFrontierTransition {
                     expected: observed,
                     target,
@@ -313,7 +358,7 @@ where
                     target: "scroll::chain_orchestrator",
                     attempt,
                     backoff_ms = u64::try_from(backoff.as_millis()).unwrap_or(u64::MAX),
-                    error = %error,
+                    error = ?error,
                     "Engine did not answer during startup frontier recovery; retrying"
                 );
                 tokio::time::sleep(backoff).await;
@@ -584,9 +629,8 @@ mod tests {
     async fn follower_startup_keeps_reth_head_far_above_the_stored_head() {
         let (sent_heads, head, stored_number, _, tip) =
             recover_with_reth_far_ahead(HeadSelection::KeepEngineHead).await;
-        // Reth's tags already match the target, so no forkchoice update is needed at all; any
-        // that is sent must keep Reth's head.
-        assert!(sent_heads.iter().all(|sent| *sent == tip.hash), "{sent_heads:?}");
+        // Reth's tags already match the target, so no forkchoice update is sent at all.
+        assert!(sent_heads.is_empty(), "{sent_heads:?}");
         assert_eq!(head, tip);
         assert_eq!(stored_number, STORED_HEAD);
     }
@@ -599,6 +643,153 @@ mod tests {
         assert_eq!(sent_heads, vec![stored.hash]);
         assert_eq!(head, stored);
         assert_eq!(stored_number, STORED_HEAD);
+    }
+
+    #[test]
+    fn a_sequencer_keeps_the_stored_head_and_a_follower_reth_head() {
+        assert_eq!(HeadSelection::for_node(true), HeadSelection::StoredHead);
+        assert_eq!(HeadSelection::for_node(false), HeadSelection::KeepEngineHead);
+    }
+
+    /// Reth's head below the stored head (Reth lost blocks): both selections walk down to the
+    /// newest block Reth kept, as before.
+    #[tokio::test]
+    async fn reth_head_below_the_stored_head_walks_down_for_both_selections() {
+        for head_selection in [HeadSelection::KeepEngineHead, HeadSelection::StoredHead] {
+            let database = setup_test_db().await;
+            let (genesis_block, genesis) = rpc_block(0, B256::ZERO, 0xf0);
+            let (safe_block, safe) = rpc_block(100, genesis.hash, 0xa1);
+            seed_frontier(&database, genesis, safe).await;
+            database.set_l2_head_block_number(101).await.unwrap();
+            let asserter = Asserter::new();
+            push_tags(&asserter, &safe_block, &safe_block, &genesis_block);
+            asserter.push_success(&Some(safe_block.clone()));
+            asserter.push_success(&Option::<()>::None);
+            let (provider, client, mut engine) =
+                mock_engine(asserter, ForkchoiceState::new(safe, safe, genesis));
+            recover_database_frontier(&provider, &mut engine, &database, head_selection)
+                .await
+                .unwrap();
+            assert_eq!(*engine.fcs().head_block_info(), safe, "{head_selection:?}");
+            assert_eq!(database.get_l2_head_block_number().await.unwrap(), safe.number);
+            assert_eq!(client.fork_choice_updated_calls(), 0);
+        }
+    }
+
+    /// A follower keeps Reth's head only if the stored head is its canonical ancestor: when Reth
+    /// answers another block at the stored height, the stored head is used.
+    #[tokio::test]
+    async fn follower_uses_the_stored_head_when_it_is_not_reth_heads_ancestor() {
+        let database = setup_test_db().await;
+        let (genesis_block, genesis) = rpc_block(0, B256::ZERO, 0xf0);
+        let (safe_block, safe) = rpc_block(100, genesis.hash, 0xa1);
+        let (stored_block, stored) = rpc_block(STORED_HEAD, B256::repeat_byte(0x51), 0xb1);
+        let (other_block, _) = rpc_block(STORED_HEAD, B256::repeat_byte(0x53), 0xb2);
+        let (tip_block, tip) = rpc_block(RETH_TIP, B256::repeat_byte(0x52), 0xc1);
+        seed_frontier(&database, genesis, safe).await;
+        database.set_l2_head_block_number(STORED_HEAD).await.unwrap();
+        let asserter = Asserter::new();
+        push_tags(&asserter, &tip_block, &safe_block, &genesis_block);
+        for block in [&safe_block, &stored_block, &other_block] {
+            asserter.push_success(&Some(block.clone()));
+        }
+        let (provider, client, mut engine) =
+            mock_engine(asserter, ForkchoiceState::new(tip, safe, genesis));
+        client.push_fork_choice_updated(ScriptedResponse::Ok(valid_fcu()));
+        recover_database_frontier(&provider, &mut engine, &database, HeadSelection::KeepEngineHead)
+            .await
+            .unwrap();
+        let sent: Vec<_> =
+            client.fork_choice_inputs().iter().map(|(fcs, _)| fcs.head_block_hash).collect();
+        assert_eq!(sent, vec![stored.hash]);
+    }
+
+    /// A move saved by an earlier startup (for example one whose forkchoice update timed out)
+    /// names the stored head far below Reth's. A follower rewrites it to keep Reth's head instead
+    /// of replaying the downward update; a sequencer replays it.
+    #[tokio::test]
+    async fn saved_downward_move_keeps_reth_head_on_a_follower() {
+        for head_selection in [HeadSelection::KeepEngineHead, HeadSelection::StoredHead] {
+            let database = setup_test_db().await;
+            let (genesis_block, genesis) = rpc_block(0, B256::ZERO, 0xf0);
+            let (safe_block, safe) = rpc_block(100, genesis.hash, 0xa1);
+            let (stored_block, stored) = rpc_block(STORED_HEAD, B256::repeat_byte(0x51), 0xb1);
+            let (tip_block, tip) = rpc_block(RETH_TIP, B256::repeat_byte(0x52), 0xc1);
+            seed_frontier(&database, genesis, safe).await;
+            database.set_l2_head_block_number(STORED_HEAD).await.unwrap();
+            let observed = StoredForkchoiceState { head: tip, safe, finalized: genesis };
+            database
+                .set_pending_frontier_transition(PendingFrontierTransition {
+                    expected: observed,
+                    target: StoredForkchoiceState { head: stored, ..observed },
+                })
+                .await
+                .unwrap();
+            let asserter = Asserter::new();
+            push_tags(&asserter, &tip_block, &safe_block, &genesis_block);
+            // The saved head is still in Reth.
+            asserter.push_success(&Some(stored_block.clone()));
+            let follower = head_selection == HeadSelection::KeepEngineHead;
+            let replayed: &[&RpcBlock<ScrollRpcTransaction>] = if follower {
+                // Rewrite proof, then head selection with its proof.
+                &[&stored_block, &tip_block, &safe_block, &stored_block, &stored_block, &tip_block]
+            } else {
+                // The replayed move, then head selection.
+                &[&safe_block, &stored_block]
+            };
+            for block in replayed {
+                asserter.push_success(&Some((*block).clone()));
+            }
+            let (provider, client, mut engine) =
+                mock_engine(asserter, ForkchoiceState::new(tip, safe, genesis));
+            client.push_fork_choice_updated(ScriptedResponse::Ok(valid_fcu()));
+
+            recover_database_frontier(&provider, &mut engine, &database, head_selection)
+                .await
+                .unwrap();
+            let sent: Vec<_> =
+                client.fork_choice_inputs().iter().map(|(fcs, _)| fcs.head_block_hash).collect();
+            if follower {
+                assert!(sent.is_empty(), "no downward update: {sent:?}");
+                assert_eq!(*engine.fcs().head_block_info(), tip);
+            } else {
+                assert_eq!(sent, vec![stored.hash]);
+                assert_eq!(*engine.fcs().head_block_info(), stored);
+            }
+            assert_eq!(database.get_pending_frontier_transition().await.unwrap(), None);
+        }
+    }
+
+    /// After an unanswered forkchoice update, Reth may not answer the tag re-read either. The
+    /// outcome stays an unavailable Engine (so callers retry) and the intent stays; a failed
+    /// re-read after any other transport failure is still that read's error.
+    #[tokio::test]
+    async fn failed_tag_reread_after_an_unanswered_update_stays_engine_unavailable() {
+        for (response, unavailable) in
+            [(ScriptedResponse::RequestTimeout, true), (ScriptedResponse::TransportFailure, false)]
+        {
+            let database = setup_test_db().await;
+            let finalized = BlockInfo::new(0, B256::ZERO);
+            let old = BlockInfo::new(100, B256::repeat_byte(1));
+            let new = BlockInfo::new(101, B256::repeat_byte(2));
+            let expected = StoredForkchoiceState { head: old, safe: old, finalized };
+            database
+                .set_pending_frontier_transition(PendingFrontierTransition {
+                    expected,
+                    target: StoredForkchoiceState { head: new, safe: new, finalized },
+                })
+                .await
+                .unwrap();
+            // No tag answers: the re-read fails.
+            let (provider, client, mut engine) =
+                mock_engine(Asserter::new(), ForkchoiceState::new(old, old, finalized));
+            client.push_fork_choice_updated(response);
+            let error = apply_pending_frontier_transition(&provider, &mut engine, &database)
+                .await
+                .unwrap_err();
+            assert_eq!(error.is_engine_unavailable(), unavailable, "{error:?}");
+            assert!(database.get_pending_frontier_transition().await.unwrap().is_some());
+        }
     }
 
     /// The startup forkchoice update times out (Reth busy); recovery retries after the backoff

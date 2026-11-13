@@ -51,6 +51,12 @@ pub enum ScriptedResponse<T> {
     Ok(T),
     /// Return a generic transport failure.
     TransportFailure,
+    /// Return the authenticated Engine client's request timeout.
+    RequestTimeout,
+    /// Return the authenticated Engine client's HTTP error for a lost connection.
+    ConnectionLost,
+    /// Return a JSON-RPC error response with the given code.
+    RpcErrorResponse(i32),
     /// Delay before resolving to the nested response.
     DelayThen(Duration, Box<Self>),
 }
@@ -72,6 +78,23 @@ async fn resolve<T>(
                     "scripted transport failure",
                 )))
             }
+            ScriptedResponse::RequestTimeout => {
+                return Err(TransportErrorKind::custom(jsonrpsee::core::ClientError::RequestTimeout))
+            }
+            ScriptedResponse::ConnectionLost => {
+                return Err(TransportErrorKind::custom(jsonrpsee::core::ClientError::Transport(
+                    Box::new(jsonrpsee::http_client::transport::Error::Http(
+                        jsonrpsee::core::http_helpers::HttpError::Stream(Box::new(
+                            std::io::Error::from(std::io::ErrorKind::ConnectionReset),
+                        )),
+                    )),
+                )))
+            }
+            ScriptedResponse::RpcErrorResponse(code) => {
+                return Err(TransportErrorKind::custom(jsonrpsee::core::ClientError::Call(
+                    jsonrpsee::types::ErrorObject::owned(code, "scripted error", None::<()>),
+                )))
+            }
             ScriptedResponse::DelayThen(delay, inner) => {
                 tokio::time::sleep(delay).await;
                 response = *inner;
@@ -86,6 +109,7 @@ pub struct ScriptedEngineClient {
     new_payload: Mutex<VecDeque<ScriptedResponse<PayloadStatus>>>,
     fork_choice_updated: Mutex<VecDeque<ScriptedResponse<ForkchoiceUpdated>>>,
     get_payload: Mutex<VecDeque<ScriptedResponse<ExecutionPayloadV1>>>,
+    fork_choice_inputs: Mutex<Vec<(ForkchoiceState, bool)>>,
     new_payload_calls: AtomicU64,
     fork_choice_updated_calls: AtomicU64,
     get_payload_calls: AtomicU64,
@@ -129,6 +153,18 @@ impl ScriptedEngineClient {
     pub fn get_payload_calls(&self) -> u64 {
         self.get_payload_calls.load(Ordering::SeqCst)
     }
+
+    /// Returns true if every scripted response has been consumed.
+    pub fn is_drained(&self) -> bool {
+        self.new_payload.lock().expect("scripted response mutex poisoned").is_empty() &&
+            self.fork_choice_updated.lock().expect("scripted response mutex poisoned").is_empty() &&
+            self.get_payload.lock().expect("scripted response mutex poisoned").is_empty()
+    }
+
+    /// Returns every forkchoice input and whether the call supplied payload attributes.
+    pub fn fork_choice_inputs(&self) -> Vec<(ForkchoiceState, bool)> {
+        self.fork_choice_inputs.lock().expect("scripted input mutex poisoned").clone()
+    }
 }
 
 #[async_trait::async_trait]
@@ -143,10 +179,14 @@ impl ScrollEngineApi for ScriptedEngineClient {
 
     async fn fork_choice_updated_v1(
         &self,
-        _fork_choice_state: ForkchoiceState,
-        _payload_attributes: Option<ScrollPayloadAttributes>,
+        fork_choice_state: ForkchoiceState,
+        payload_attributes: Option<ScrollPayloadAttributes>,
     ) -> ScrollEngineApiResult<ForkchoiceUpdated> {
         self.fork_choice_updated_calls.fetch_add(1, Ordering::SeqCst);
+        self.fork_choice_inputs
+            .lock()
+            .expect("scripted input mutex poisoned")
+            .push((fork_choice_state, payload_attributes.is_some()));
         resolve(&self.fork_choice_updated, "fork_choice_updated_v1").await
     }
 

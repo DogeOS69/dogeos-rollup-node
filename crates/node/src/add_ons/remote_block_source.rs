@@ -26,9 +26,6 @@ where
     config: RemoteBlockSourceArgs,
     /// Handle to the chain orchestrator for sending commands.
     orchestrator_handle: ChainOrchestratorHandle<N>,
-    /// An event stream for listening to chain orchestrator events, used to wait for block build
-    /// completion.
-    events: EventStream<ChainOrchestratorEvent>,
     /// A provider for the remote node, used to fetch blocks and block information.
     remote: RootProvider<Scroll>,
     /// Local block reader, used to find the highest common block with the remote.
@@ -236,7 +233,9 @@ where
     ///
     /// Performs no remote I/O: the resume point is determined lazily on the
     /// first successful poll, where errors are logged and retried at poll
-    /// cadence instead of failing node launch.
+    /// cadence instead of failing node launch. It does not wait on the
+    /// orchestrator either: Reth runs the Engine only after its add-ons
+    /// launch, and the orchestrator may need the Engine to finish recovery.
     pub async fn new(
         config: RemoteBlockSourceArgs,
         handle: ChainOrchestratorHandle<N>,
@@ -251,19 +250,9 @@ where
         let client = RpcClient::builder().layer(retry_layer).http(url);
         let remote = ProviderBuilder::<_, _, Scroll>::default().connect_client(client);
 
-        // Get event listener for waiting on block completion
-        let events = match handle.get_event_listener().await {
-            Ok(stream) => stream,
-            Err(e) => {
-                tracing::error!(target: "scroll::remote_source", ?e, "Failed to get event listener");
-                return Err(eyre::eyre!(e));
-            }
-        };
-
         Ok(Self {
             config,
             orchestrator_handle: handle,
-            events,
             remote,
             provider,
             last_imported_block: None,
@@ -314,6 +303,14 @@ where
         mut self,
         mut shutdown: impl std::future::Future<Output = ()> + Unpin,
     ) -> eyre::Result<()> {
+        // Used to wait for block build completion.
+        let mut events = match self.orchestrator_handle.get_event_listener().await {
+            Ok(stream) => stream,
+            Err(e) => {
+                tracing::error!(target: "scroll::remote_source", ?e, "Failed to get event listener");
+                return Err(eyre::eyre!(e));
+            }
+        };
         let mut poll_interval = interval(Duration::from_millis(self.config.poll_interval_ms));
 
         loop {
@@ -321,7 +318,7 @@ where
                 biased;
                 _guard = &mut shutdown => break,
                 _ = poll_interval.tick() => {
-                    if let Err(e) = self.follow_and_build().await {
+                    if let Err(e) = self.follow_and_build(&mut events).await {
                         // `{e:?}` keeps eyre's `Caused by:` chain and `Location:`.
                         // Every transport error renders identically once the URL
                         // is scrubbed, so the location is what tells a
@@ -347,7 +344,10 @@ where
     }
 
     /// Follows the remote node and builds blocks on top of imported blocks.
-    async fn follow_and_build(&mut self) -> eyre::Result<()> {
+    async fn follow_and_build(
+        &mut self,
+        events: &mut EventStream<ChainOrchestratorEvent>,
+    ) -> eyre::Result<()> {
         // First successful contact with the remote determines the resume point.
         if self.last_imported_block.is_none() {
             let resume = self.init_last_imported_block().await?;
@@ -439,7 +439,7 @@ where
             // Wait for BlockSequenced event
             tracing::debug!(target: "scroll::remote_source", "Waiting for block to be built...");
             loop {
-                match self.events.next().await {
+                match events.next().await {
                     Some(ChainOrchestratorEvent::BlockSequenced(block)) => {
                         tracing::info!(target: "scroll::remote_source",
                             block_number = block.header.number,

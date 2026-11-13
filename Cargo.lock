@@ -11962,7 +11962,6 @@ dependencies = [
  "eyre",
  "futures",
  "hyper 1.10.1",
- "hyper-util",
  "jsonrpsee",
  "metrics",
  "metrics-derive",

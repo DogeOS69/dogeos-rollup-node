@@ -46,9 +46,8 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 jsonrpsee = { version = "0.26.0", features = ["client"] }
-# The error types of jsonrpsee's HTTP client transport, to tell a lost connection from an answer.
+# The error type of jsonrpsee's HTTP client transport, to tell a lost connection from an answer.
 hyper = { version = "1.5", default-features = false }
-hyper-util = { version = "0.1", default-features = false, features = ["client-legacy"] }
 
 [dev-dependencies]
 alloy-consensus.workspace = true

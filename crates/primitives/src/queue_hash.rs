@@ -14,8 +14,10 @@
 //! below codec 12 with masked queue hashes before `TsukiV2`, and a node that syncs from genesis
 //! must still find their L1 messages. It is computed only on a chain whose `TsukiV2` activates
 //! after genesis, so it is inert on mainnet (`TsukiV2` at genesis). Added by dogeos-rollup-node
-//! #107. Remove it, together with the
-//! `legacy_queue_hash` column, when no supported network has batches below codec 12.
+//! #107. Remove it when no supported network has batches below codec 12,
+//! together with: the `legacy_queue_hash` column and envelope field,
+//! `L1MessageKey::LegacyQueueHash` and `from_batch_queue_hash`, the orchestrator's
+//! `with_legacy_queue_hash` config and the legacy part of `recompute_l1_message_queue_hashes`.
 
 use alloy_primitives::{b256, keccak256, B256};
 
@@ -68,6 +70,22 @@ mod tests {
         let legacy_b = fold_legacy_queue_hash(legacy_a, tx_b);
         assert_eq!(legacy_b, fold_queue_hash(legacy_a, tx_b) & LEGACY_QUEUE_HASH_MASK);
         assert_ne!(&legacy_b[..28], &fold_queue_hash(full_a, tx_b)[..28]);
+    }
+
+    /// Expected values computed outside this code with `cast keccak` (foundry): full width
+    /// `keccak(prev || tx)`, legacy the same with the last 4 bytes cleared at every step.
+    #[test]
+    fn folds_match_independently_computed_vectors() {
+        let tx_a = B256::repeat_byte(0xaa);
+        let tx_b = B256::repeat_byte(0xbb);
+        let full_1 = b256!("e60eb41b492e32a28ec6d7ba5db66f1206fcdf79cf8042e94129c92deaf6ffbe");
+        let full_2 = b256!("5a3796172fe281d0caa0bacaeb99d54d09ef721cf75a7f455f89a117425c07f0");
+        let legacy_1 = b256!("e60eb41b492e32a28ec6d7ba5db66f1206fcdf79cf8042e94129c92d00000000");
+        let legacy_2 = b256!("d8609d3f6a6926a698428efe07f18f7ace012755973eef0b18e4836a00000000");
+        assert_eq!(fold_queue_hash(B256::ZERO, tx_a), full_1);
+        assert_eq!(fold_queue_hash(full_1, tx_b), full_2);
+        assert_eq!(fold_legacy_queue_hash(B256::ZERO, tx_a), legacy_1);
+        assert_eq!(fold_legacy_queue_hash(legacy_1, tx_b), legacy_2);
     }
 
     #[test]

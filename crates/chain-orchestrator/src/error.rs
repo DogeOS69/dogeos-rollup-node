@@ -40,6 +40,10 @@ pub enum ChainOrchestratorError {
     /// missing.
     #[error("L1 message queue gap detected at index {0}, previous L1 message not found")]
     L1MessageQueueGap(u64),
+    /// The legacy queue hash is computed, but the stored message before index {0} has none, so
+    /// the legacy chain cannot continue (the startup recompute should have filled it).
+    #[error("L1 message {0}: the previous message has no legacy queue hash")]
+    MissingLegacyQueueHash(u64),
     /// An inconsistency was detected when trying to consolidate the chain.
     #[error("Chain inconsistency detected")]
     ChainInconsistency,

@@ -1751,7 +1751,15 @@ async fn compute_l1_message_queue_hashes(
             .into_iter()
             .next()
             .ok_or(DatabaseError::L1MessageNotFound(L1MessageKey::QueueIndex(index)))?;
-        (previous.queue_hash.unwrap_or_default(), previous.legacy_queue_hash.unwrap_or_default())
+        // A missing legacy hash would silently restart that chain from zero; refuse instead.
+        let previous_legacy = match previous.legacy_queue_hash {
+            Some(hash) => hash,
+            None if with_legacy => {
+                return Err(ChainOrchestratorError::MissingLegacyQueueHash(l1_message.queue_index))
+            }
+            None => B256::ZERO,
+        };
+        (previous.queue_hash.unwrap_or_default(), previous_legacy)
     } else {
         return Ok((None, None))
     };

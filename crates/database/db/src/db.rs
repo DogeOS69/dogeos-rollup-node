@@ -2057,4 +2057,35 @@ mod test {
         assert_eq!(db.recompute_l1_message_queue_hashes(0, false).await.unwrap(), Some(6));
         assert_eq!(legacy_queue_hash_null_count(&db).await, 6);
     }
+
+    /// A recompute that fails (a gap in the stored queue) changes nothing: both columns and the
+    /// metadata marker stay as they were, and the node refuses to start instead of half-writing.
+    #[tokio::test]
+    async fn a_failed_queue_hash_recompute_changes_nothing() {
+        let db = setup_test_db().await;
+        for queue_index in [0u64, 1, 3] {
+            let message = TxL1Message { queue_index, gas_limit: 21_000, ..Default::default() };
+            let marker = B256::repeat_byte(queue_index as u8 + 1);
+            db.insert_l1_message(
+                L1MessageEnvelope::new(message, 1, None, Some(marker))
+                    .with_legacy_queue_hash(Some(marker)),
+            )
+            .await
+            .unwrap();
+        }
+        let before =
+            db.get_n_l1_messages(Some(L1MessageKey::from_queue_index(0)), 10).await.unwrap();
+
+        let err = db.recompute_l1_message_queue_hashes(0, true).await.unwrap_err();
+        assert!(
+            matches!(err, DatabaseError::L1MessageNotFound(L1MessageKey::QueueIndex(2))),
+            "{err:?}"
+        );
+        assert_eq!(
+            db.get_n_l1_messages(Some(L1MessageKey::from_queue_index(0)), 10).await.unwrap(),
+            before
+        );
+        // No marker was written, so the next start tries again.
+        assert!(db.recompute_l1_message_queue_hashes(0, true).await.is_err());
+    }
 }

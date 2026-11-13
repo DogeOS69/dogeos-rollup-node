@@ -122,13 +122,16 @@ pub trait DatabaseWriteOperations {
     /// Insert an [`L1MessageEnvelope`] into the database.
     async fn insert_l1_message(&self, l1_message: L1MessageEnvelope) -> Result<(), DatabaseError>;
 
-    /// Recomputes both queue hash columns of every stored L1 message, unless the database already
-    /// holds hashes for this exact rule set. Messages below `l1_v2_message_queue_start_index`
-    /// have no queue hash; the legacy (masked) column is filled only if `with_legacy` is set.
-    /// Returns the number of messages rewritten, or `None` if the hashes were already current.
+    /// Recomputes both queue hash columns of every stored L1 message, unless the metadata marker
+    /// says they were last computed under this exact rule set (start index, legacy on or off).
+    /// Messages below `l1_v2_message_queue_start_index` have no queue hash; the legacy (masked)
+    /// column is filled only if `with_legacy` is set. Returns the number of messages rewritten,
+    /// or `None` if the hashes were already current.
     ///
-    /// Runs once at startup so a database written under another rule (testnet nodes stored the
-    /// masked hash in `queue_hash` before the full-width rule) matches the node's live rule.
+    /// Runs at startup on every network, so a database written under another rule (testnet nodes
+    /// stored the masked hash in `queue_hash` before the full-width rule) matches the node's live
+    /// rule. It is atomic: on error (a gap in the stored queue) nothing is changed. It loads the
+    /// affected rows into memory and updates them one by one; that is a one-off per rule set.
     async fn recompute_l1_message_queue_hashes(
         &self,
         l1_v2_message_queue_start_index: u64,

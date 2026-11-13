@@ -109,3 +109,65 @@ async fn legacy_chain_is_not_stored_unless_configured() {
     assert_eq!(messages.len(), 3, "every message lands with a NULL legacy hash");
     assert_chains(&messages, false);
 }
+
+/// With a non-zero V2 start index, messages below it have no queue hash in either column, and
+/// the message at the start index folds zero in both chains. The startup recompute agrees.
+#[tokio::test]
+async fn messages_below_the_v2_start_index_have_no_hash_and_the_chains_start_at_it() {
+    let v2_start = 2;
+    let database = Arc::new(setup_test_db().await);
+    let probes = Probes { with_legacy_queue_hash: true, ..Default::default() };
+    let orchestrator = orchestrator_probed(
+        database.clone(),
+        ForkchoiceState::from_genesis(B256::ZERO),
+        v2_start,
+        probes,
+    )
+    .await;
+    for queue_index in 0..5u64 {
+        orchestrator
+            .handle_l1_message(deposit(queue_index), info(queue_index + 1, queue_index as u8 + 1))
+            .await
+            .unwrap();
+    }
+    let messages = stored(&database).await;
+    assert_eq!(messages.len(), 5);
+    for message in &messages[..2] {
+        assert_eq!((message.queue_hash, message.legacy_queue_hash), (None, None));
+    }
+    let tx_2 = messages[2].transaction.tx_hash();
+    assert_eq!(messages[2].queue_hash, Some(fold_queue_hash(B256::ZERO, tx_2)));
+    assert_eq!(messages[2].legacy_queue_hash, Some(fold_legacy_queue_hash(B256::ZERO, tx_2)));
+    let tx_3 = messages[3].transaction.tx_hash();
+    assert_eq!(
+        messages[3].legacy_queue_hash,
+        Some(fold_legacy_queue_hash(fold_legacy_queue_hash(B256::ZERO, tx_2), tx_3))
+    );
+
+    assert_eq!(database.recompute_l1_message_queue_hashes(v2_start, true).await.unwrap(), Some(3));
+    assert_eq!(stored(&database).await, messages);
+}
+
+/// If the legacy chain is on but the previous message has no legacy hash (a database the
+/// startup recompute did not cover), the message is refused instead of restarting the legacy
+/// chain from zero.
+#[tokio::test]
+async fn a_missing_previous_legacy_hash_is_an_error_not_a_restart() {
+    let database = Arc::new(setup_test_db().await);
+    let without = orchestrator_probed(
+        database.clone(),
+        ForkchoiceState::from_genesis(B256::ZERO),
+        0,
+        Probes::default(),
+    )
+    .await;
+    without.handle_l1_message(deposit(0), info(1, 1)).await.unwrap();
+
+    let probes = Probes { with_legacy_queue_hash: true, ..Default::default() };
+    let with =
+        orchestrator_probed(database.clone(), ForkchoiceState::from_genesis(B256::ZERO), 0, probes)
+            .await;
+    let err = with.handle_l1_message(deposit(1), info(2, 2)).await.unwrap_err();
+    assert!(matches!(err, ChainOrchestratorError::MissingLegacyQueueHash(1)), "{err:?}");
+    assert_eq!(stored(&database).await.len(), 1);
+}

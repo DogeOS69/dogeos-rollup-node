@@ -3,10 +3,10 @@ use alloy_provider::Provider;
 use dogeos_rpc_types::Scroll;
 use futures::{stream::FuturesOrdered, TryStreamExt};
 use rollup_node_primitives::{
-    BatchConsolidationOutcome, BatchInfo, BatchStatus, L2BlockInfoWithL1Messages,
+    BatchConsolidationOutcome, BatchInfo, BatchStatus, BlockInfo, L2BlockInfoWithL1Messages,
 };
 use scroll_derivation_pipeline::BatchDerivationResult;
-use scroll_engine::{block_matches_attributes, ForkchoiceState};
+use scroll_engine::block_matches_attributes;
 
 /// Reconciles a batch of derived attributes with the L2 chain to produce a reconciliation result.
 ///
@@ -16,10 +16,10 @@ use scroll_engine::{block_matches_attributes, ForkchoiceState};
 pub(crate) async fn reconcile_batch<L2P: Provider<Scroll>>(
     l2_provider: L2P,
     batch: &BatchDerivationResult,
-    fcs: &ForkchoiceState,
+    frontier: BlockInfo,
 ) -> Result<BatchReconciliationResult, ChainOrchestratorError> {
     let mut futures = FuturesOrdered::new();
-    for (index, attributes) in batch.attributes.iter().enumerate() {
+    for attributes in &batch.attributes {
         let l2_provider = &l2_provider;
         let fut = async move {
             // Fetch the block corresponding to the derived attributes from the L2 provider.
@@ -29,46 +29,64 @@ pub(crate) async fn reconcile_batch<L2P: Provider<Scroll>>(
                 .await?
                 .map(|b| b.into_consensus().map_transactions(|tx| tx.inner.into_inner()));
 
-            let current_block = if let Some(block) = current_block {
-                block
-            } else {
-                // The block does not exist, a reorg is needed.
-                return Ok::<_, ChainOrchestratorError>(BlockConsolidationAction::Reorg(index));
-            };
-
-            // Check if the block matches the derived attributes.
-            if block_matches_attributes(&attributes.attributes, attributes.base_fee, &current_block)
-            {
-                // Extract the block info with L1 messages.
-                let block_info: L2BlockInfoWithL1Messages = (&current_block).into();
-
-                // The derived attributes match the L2 chain but are associated with a block
-                // number less than or equal to the finalized block, so skip.
-                if attributes.block_number <= fcs.finalized_block_info().number {
-                    Ok::<_, ChainOrchestratorError>(BlockConsolidationAction::Skip(block_info))
-                } else {
-                    // The block matches the derived attributes but is above the finalized block,
-                    // so we need to update the fcs.
-                    Ok::<_, ChainOrchestratorError>(BlockConsolidationAction::UpdateFcs(block_info))
-                }
-            } else {
-                // The block does not match the derived attributes, a reorg is needed.
-                Ok::<_, ChainOrchestratorError>(BlockConsolidationAction::Reorg(index))
-            }
+            Ok::<_, ChainOrchestratorError>(current_block)
         };
         futures.push_back(fut);
     }
 
-    let mut actions: Vec<BlockConsolidationAction> = futures.try_collect().await?;
+    let current_blocks: Vec<_> = futures.try_collect().await?;
+    let mut actions = Vec::with_capacity(batch.attributes.len());
+    let mut expected_parent = frontier;
+    let mut previous_derived_number: Option<u64> = None;
+    let mut rebuild_suffix = false;
 
-    // Every block was compared against the L2 chain as it stands now, before any of these
-    // actions ran. Once one block is rebuilt, the blocks after it are children of a block that
-    // no longer exists, so a later block that matched the old chain must not be kept: fork
-    // choice would be moved back onto the discarded branch. From the first rebuild on,
-    // everything is rebuilt, in order.
-    if let Some(first_reorg) = actions.iter().position(BlockConsolidationAction::is_reorg) {
-        for (index, action) in actions.iter_mut().enumerate().skip(first_reorg) {
-            *action = BlockConsolidationAction::Reorg(index);
+    for (index, (attributes, current_block)) in
+        batch.attributes.iter().zip(current_blocks).enumerate()
+    {
+        let sequence_parent = previous_derived_number
+            .or_else(|| (attributes.block_number > frontier.number).then_some(frontier.number));
+        if let Some(parent) = sequence_parent {
+            if parent.checked_add(1) != Some(attributes.block_number) {
+                return Err(ChainOrchestratorError::DerivedPayloadMismatch {
+                    batch_info: batch.batch_info,
+                    block_number: attributes.block_number,
+                    reason: format!("non-contiguous sequence after block {parent}"),
+                })
+            }
+        }
+        previous_derived_number = Some(attributes.block_number);
+
+        let already_safe = attributes.block_number <= frontier.number;
+        let matching_block = current_block.filter(|block| {
+            !rebuild_suffix &&
+                block.header.number == attributes.block_number &&
+                block_matches_attributes(&attributes.attributes, attributes.base_fee, block) &&
+                if already_safe {
+                    attributes.block_number < frontier.number || BlockInfo::from(block) == frontier
+                } else {
+                    block.header.parent_hash == expected_parent.hash
+                }
+        });
+        let Some(current_block) = matching_block else {
+            // Replayed safe history must match; only an unsafe suffix may be rebuilt.
+            if already_safe {
+                return Err(ChainOrchestratorError::DerivedPayloadMismatch {
+                    batch_info: batch.batch_info,
+                    block_number: attributes.block_number,
+                    reason: format!("replayed block differs from safe history at {frontier}"),
+                })
+            }
+            rebuild_suffix = true;
+            actions.push(BlockConsolidationAction::Reorg(index));
+            continue
+        };
+
+        let block_info: L2BlockInfoWithL1Messages = (&current_block).into();
+        expected_parent = block_info.block_info;
+        if already_safe {
+            actions.push(BlockConsolidationAction::Skip(block_info));
+        } else {
+            actions.push(BlockConsolidationAction::UpdateFcs(block_info));
         }
     }
 
@@ -221,13 +239,20 @@ mod tests {
         }
     }
 
-    /// Answers the L2 provider's block-by-number request with a block that matches `attributes`
-    /// except for its base fee, which is whatever the chain actually has.
-    fn push_block(asserter: &Asserter, number: u64, base_fee: u64) {
-        let header =
-            ConsensusHeader { number, base_fee_per_gas: Some(base_fee), ..Default::default() };
-        let rpc_header = RpcHeader::from_consensus(header.seal_slow(), None, None);
+    /// Answers the L2 provider's block-by-number request with a child of `parent` that matches
+    /// `attributes` except for its base fee, which is whatever the chain actually has.
+    fn push_block(asserter: &Asserter, parent: BlockInfo, base_fee: u64) -> BlockInfo {
+        let header = ConsensusHeader {
+            parent_hash: parent.hash,
+            number: parent.number + 1,
+            base_fee_per_gas: Some(base_fee),
+            ..Default::default()
+        };
+        let sealed = header.seal_slow();
+        let block = BlockInfo { number: parent.number + 1, hash: sealed.hash() };
+        let rpc_header = RpcHeader::from_consensus(sealed, None, None);
         asserter.push_success(&Some(RpcBlock::<ScrollRpcTransaction, _>::empty(rpc_header)));
+        block
     }
 
     fn batch(attributes: Vec<DerivedAttributes>) -> BatchDerivationResult {
@@ -239,8 +264,8 @@ mod tests {
         }
     }
 
-    fn fcs_at(number: u64) -> ForkchoiceState {
-        ForkchoiceState::from_block_info(BlockInfo { number, hash: B256::repeat_byte(0x11) })
+    fn safe_at(number: u64) -> BlockInfo {
+        BlockInfo { number, hash: B256::repeat_byte(0x11) }
     }
 
     /// Every block is compared against the chain as it stands, before any of the actions run.
@@ -251,9 +276,9 @@ mod tests {
     async fn a_base_fee_mismatch_rebuilds_the_rest_of_the_batch() {
         let asserter = Asserter::new();
         // Block n disagrees on the base fee; n + 1 and n + 2 match the old chain exactly.
-        push_block(&asserter, SAFE + 1, DERIVED_BASE_FEE - 1);
-        push_block(&asserter, SAFE + 2, DERIVED_BASE_FEE);
-        push_block(&asserter, SAFE + 3, DERIVED_BASE_FEE);
+        let first = push_block(&asserter, safe_at(SAFE), DERIVED_BASE_FEE - 1);
+        let second = push_block(&asserter, first, DERIVED_BASE_FEE);
+        push_block(&asserter, second, DERIVED_BASE_FEE);
         let provider = ProviderBuilder::<_, _, Scroll>::default().connect_mocked_client(asserter);
 
         let batch = batch(vec![
@@ -261,7 +286,7 @@ mod tests {
             derived(SAFE + 2, DERIVED_BASE_FEE),
             derived(SAFE + 3, DERIVED_BASE_FEE),
         ]);
-        let result = reconcile_batch(provider, &batch, &fcs_at(SAFE)).await.unwrap();
+        let result = reconcile_batch(provider, &batch, safe_at(SAFE)).await.unwrap();
 
         assert!(
             matches!(
@@ -284,14 +309,13 @@ mod tests {
     #[tokio::test]
     async fn a_matching_chain_is_not_rebuilt() {
         let asserter = Asserter::new();
-        for number in [SAFE + 1, SAFE + 2] {
-            push_block(&asserter, number, DERIVED_BASE_FEE);
-        }
+        let first = push_block(&asserter, safe_at(SAFE), DERIVED_BASE_FEE);
+        push_block(&asserter, first, DERIVED_BASE_FEE);
         let provider = ProviderBuilder::<_, _, Scroll>::default().connect_mocked_client(asserter);
 
         let batch =
             batch(vec![derived(SAFE + 1, DERIVED_BASE_FEE), derived(SAFE + 2, DERIVED_BASE_FEE)]);
-        let result = reconcile_batch(provider, &batch, &fcs_at(SAFE)).await.unwrap();
+        let result = reconcile_batch(provider, &batch, safe_at(SAFE)).await.unwrap();
 
         assert!(
             result.actions.iter().all(|action| action.is_update_fcs()),
@@ -300,23 +324,22 @@ mod tests {
         );
     }
 
-    /// A base-fee divergence at or below the finalized head cannot be reorged away, so it stops
-    /// consolidation instead of being skipped. A finalized block that DA does not describe is a
+    /// A base-fee divergence at or below the safe block cannot be reorged away, so it stops
+    /// consolidation instead of being skipped. A safe block that DA does not describe is a
     /// divergence the node must not paper over.
     #[tokio::test]
-    async fn a_divergence_below_the_finalized_head_is_not_skipped() {
+    async fn a_divergence_below_the_safe_block_is_not_skipped() {
         let asserter = Asserter::new();
-        push_block(&asserter, SAFE + 1, DERIVED_BASE_FEE - 1);
+        let replayed = push_block(&asserter, safe_at(SAFE), DERIVED_BASE_FEE - 1);
         let provider = ProviderBuilder::<_, _, Scroll>::default().connect_mocked_client(asserter);
 
         let batch = batch(vec![derived(SAFE + 1, DERIVED_BASE_FEE)]);
-        // The finalized head is already past the derived block.
-        let result = reconcile_batch(provider, &batch, &fcs_at(SAFE + 1)).await.unwrap();
+        // The safe block is already the derived block.
+        let result = reconcile_batch(provider, &batch, replayed).await;
 
         assert!(
-            matches!(result.actions.as_slice(), [BlockConsolidationAction::Reorg(0)]),
-            "a finalized divergence was skipped: {:?}",
-            result.actions
+            matches!(result, Err(ChainOrchestratorError::DerivedPayloadMismatch { .. })),
+            "a safe divergence was skipped: {result:?}"
         );
     }
 }

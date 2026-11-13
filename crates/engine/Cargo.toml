@@ -46,6 +46,8 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 jsonrpsee = { version = "0.26.0", features = ["client"] }
+# The error type of jsonrpsee's HTTP client transport, to tell a lost connection from an answer.
+hyper = { version = "1.5", default-features = false }
 
 [dev-dependencies]
 alloy-consensus.workspace = true
@@ -54,6 +56,7 @@ async-trait.workspace = true
 reth-testing-utils.workspace = true
 dogeos-protocol-types = { workspace = true, features = ["arbitrary"] }
 dogeos-reth-engine.workspace = true
+tokio = { workspace = true, features = ["macros", "net", "rt", "time"] }
 
 [features]
 test-utils = [

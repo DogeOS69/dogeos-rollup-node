@@ -55,6 +55,9 @@ pub(crate) enum AttemptStep {
 enum HoldStatus {
     Syncing,
     Accepted,
+    /// The Engine API timed out or its connection failed; see
+    /// [`EngineError::is_engine_unavailable`].
+    EngineUnavailable,
 }
 
 impl HoldStatus {
@@ -62,6 +65,7 @@ impl HoldStatus {
         match self {
             Self::Syncing => "SYNCING",
             Self::Accepted => "ACCEPTED",
+            Self::EngineUnavailable => "ENGINE_UNAVAILABLE",
         }
     }
 }
@@ -157,8 +161,9 @@ impl DerivationDriver {
         }
     }
 
-    /// Runs one attempt. Only received `SYNCING`, plus `ACCEPTED` from `newPayload`, schedule a
-    /// further in-process reconciliation.
+    /// Runs one attempt. Only received `SYNCING`, `ACCEPTED` from `newPayload`, and an
+    /// unavailable Engine (a request timeout or lost connection) schedule a further in-process
+    /// reconciliation.
     pub(crate) async fn run_attempt<L2P, EC>(
         &mut self,
         l2_client: &L2P,
@@ -565,11 +570,29 @@ where
     Ok(ConsolidatedBatch { batch_outcome, block_outcomes })
 }
 
+/// Maps a failed Engine request. An unavailable Engine holds the batch: the attempt has not
+/// committed anything to the database, the local forkchoice only advances on a received answer,
+/// and the next attempt reconciles afresh, so a request that took effect after all is found
+/// canonical then. Any other error fail-stops.
 fn engine_request_failure(
     batch_info: BatchInfo,
     method: &'static str,
 ) -> impl FnOnce(EngineError) -> AttemptFailure {
     move |source| {
+        if source.is_engine_unavailable() {
+            tracing::error!(
+                target: "scroll::chain_orchestrator",
+                batch_index = batch_info.index,
+                batch_hash = ?batch_info.hash,
+                method,
+                error = %source,
+                "Engine request for derived batch failed without an answer; holding and retrying"
+            );
+            return AttemptFailure::Hold(HoldReason {
+                method,
+                status: HoldStatus::EngineUnavailable,
+            });
+        }
         AttemptFailure::fatal(
             method,
             "ERROR",
@@ -1191,9 +1214,7 @@ mod tests {
             Some(BatchStatus::Committed),
             "a hold must not change the database"
         );
-        let DerivationStatus::Held(held) = driver.status(0) else {
-            panic!("expected held status")
-        };
+        let DerivationStatus::Held(held) = driver.status(0) else { panic!("expected held status") };
         assert_eq!(held.last_engine_method.as_deref(), Some(FCU_METHOD));
         assert_eq!(held.last_engine_status.as_deref(), Some("ENGINE_UNAVAILABLE"));
         assert_eq!(held.current_backoff_ms, Some(INITIAL_HOLD_BACKOFF_MS));

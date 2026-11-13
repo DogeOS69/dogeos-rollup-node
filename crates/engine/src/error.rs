@@ -40,49 +40,139 @@ impl EngineError {
     }
 
     /// Returns true if the Engine API was unavailable: the authenticated client's request timed
-    /// out, its connection failed, or the server disconnected. Nothing was learned about the
-    /// request, which may or may not have taken effect, so it is safe only for a caller that
-    /// retries it from fresh state. A JSON-RPC error response, a malformed reply and any other
-    /// transport error return false.
+    /// out, the HTTP connection could not be made or broke before a response was read, or the
+    /// server disconnected. Nothing was learned about the request, which may or may not have taken
+    /// effect, so it is safe only for a caller that retries it from fresh state.
+    ///
+    /// Any answer returns false: a JSON-RPC error response, an HTTP rejection (such as 401 for a
+    /// wrong JWT secret), a malformed or oversized reply. So do a request too large to send and
+    /// any error from another transport, since they would fail the same way on every retry.
     pub fn is_engine_unavailable(&self) -> bool {
-        use jsonrpsee::core::ClientError;
+        use jsonrpsee::{
+            core::{http_helpers::HttpError, ClientError},
+            http_client::transport::Error as HttpTransportError,
+        };
         let Self::TransportError(RpcError::Transport(TransportErrorKind::Custom(error))) = self
         else {
             return false;
         };
-        matches!(
-            error.downcast_ref::<ClientError>(),
-            Some(
-                ClientError::RequestTimeout |
-                    ClientError::Transport(_) |
-                    ClientError::ServiceDisconnect
-            )
-        )
+        match error.downcast_ref::<ClientError>() {
+            Some(ClientError::RequestTimeout | ClientError::ServiceDisconnect) => true,
+            Some(ClientError::Transport(transport)) => matches!(
+                transport.downcast_ref::<HttpTransportError>(),
+                Some(HttpTransportError::Http(HttpError::Stream(_)))
+            ),
+            _ => false,
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jsonrpsee::{core::ClientError, types::ErrorObject};
+    use jsonrpsee::{
+        core::{client::ClientT, ClientError},
+        http_client::HttpClientBuilder,
+        rpc_params,
+        types::ErrorObject,
+    };
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        time::Duration,
+    };
 
     fn engine_error(error: ClientError) -> EngineError {
         EngineError::TransportError(TransportErrorKind::custom(error))
     }
 
-    #[test]
-    fn timeouts_and_lost_connections_are_unavailability() {
-        assert!(engine_error(ClientError::RequestTimeout).is_engine_unavailable());
-        assert!(engine_error(ClientError::ServiceDisconnect).is_engine_unavailable());
-        let lost = ClientError::Transport(std::io::Error::other("connection refused").into());
-        assert!(engine_error(lost).is_engine_unavailable());
+    /// Sends one request with a real jsonrpsee HTTP client (the authenticated Engine client's
+    /// transport) to `url` and classifies the error.
+    async fn classify(url: String, max_request_size: u32) -> (String, bool) {
+        let client = HttpClientBuilder::default()
+            .request_timeout(Duration::from_millis(500))
+            .max_request_size(max_request_size)
+            .build(url)
+            .unwrap();
+        let error = client
+            .request::<String, _>("engine_getPayloadV1", rpc_params!["0x0000000000000001"])
+            .await
+            .unwrap_err();
+        let error = engine_error(error);
+        (error.to_string(), error.is_engine_unavailable())
+    }
+
+    /// A one-shot HTTP server: reads the request, then writes `reply` (if any) and closes, or
+    /// with `hang` keeps the connection open without answering.
+    fn serve_once(reply: Option<&'static str>, hang: bool) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = [0u8; 4096];
+            let _ = stream.read(&mut buffer);
+            if let Some(reply) = reply {
+                let _ = stream.write_all(reply.as_bytes());
+            }
+            if hang {
+                std::thread::sleep(Duration::from_secs(2));
+            }
+        });
+        url
+    }
+
+    #[tokio::test]
+    async fn real_http_client_timeouts_and_lost_connections_are_unavailability() {
+        let refused = {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://{}", listener.local_addr().unwrap())
+        };
+        let closed_without_reply = serve_once(None, false);
+        let no_answer = serve_once(None, true);
+        for (case, url) in [
+            ("connection refused", refused),
+            ("closed without a reply", closed_without_reply),
+            ("no answer within the timeout", no_answer),
+        ] {
+            let (error, unavailable) = classify(url, 10 * 1024 * 1024).await;
+            assert!(unavailable, "{case}: {error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn real_http_client_answers_and_local_errors_are_not_unavailability() {
+        let unauthorized =
+            serve_once(Some("HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n"), false);
+        let not_json = serve_once(
+            Some("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 8\r\n\r\nnot-json"),
+            false,
+        );
+        let error_response = serve_once(
+            Some(concat!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 69\r\n\r\n",
+                r#"{"jsonrpc":"2.0","id":0,"error":{"code":-38001,"message":"Unknown"}}"#,
+                " "
+            )),
+            false,
+        );
+        for (case, url, max_request_size) in [
+            ("HTTP 401", unauthorized, 10 * 1024 * 1024),
+            ("malformed body", not_json, 10 * 1024 * 1024),
+            ("JSON-RPC error response", error_response, 10 * 1024 * 1024),
+            ("request too large", "http://127.0.0.1:1".to_owned(), 1),
+        ] {
+            let (error, unavailable) = classify(url, max_request_size).await;
+            assert!(!unavailable, "{case}: {error}");
+        }
     }
 
     #[test]
-    fn answers_and_other_errors_are_not_unavailability() {
+    fn non_client_errors_are_not_unavailability() {
         let response = ClientError::Call(ErrorObject::owned(-32000, "boom", None::<()>));
         assert!(!engine_error(response).is_engine_unavailable());
         assert!(!engine_error(ClientError::Custom("malformed".into())).is_engine_unavailable());
+        let other_transport = ClientError::Transport(std::io::Error::other("ws error").into());
+        assert!(!engine_error(other_transport).is_engine_unavailable());
         let other = EngineError::TransportError(TransportErrorKind::custom(std::io::Error::other(
             "not a client error",
         )));

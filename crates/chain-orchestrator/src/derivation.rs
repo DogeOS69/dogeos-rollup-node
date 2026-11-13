@@ -571,9 +571,10 @@ where
 }
 
 /// Maps a failed Engine request. An unavailable Engine holds the batch: the attempt has not
-/// committed anything to the database, the local forkchoice only advances on a received answer,
-/// and the next attempt reconciles afresh, so a request that took effect after all is found
-/// canonical then. Any other error fail-stops.
+/// committed anything to the database, and each local forkchoice step follows only a received
+/// answer, so after a hold partway through a batch the local forkchoice sits at the last block
+/// Reth confirmed. The next attempt reconciles afresh from there, and a request that took effect
+/// after all is found canonical then. Any other error fail-stops.
 fn engine_request_failure(
     batch_info: BatchInfo,
     method: &'static str,
@@ -743,6 +744,22 @@ mod tests {
         GetPayloadConnectionLost,
         NewPayloadTimedOut,
         FinalFcuTimedOut,
+    }
+
+    impl HoldBoundary {
+        /// The Engine method and status the held status reports after the first attempt.
+        const fn expected_hold(self) -> (&'static str, &'static str) {
+            match self {
+                Self::BuildFcuSyncing => (BUILD_FCU_METHOD, "SYNCING"),
+                Self::NewPayloadSyncing => (NEW_PAYLOAD_METHOD, "SYNCING"),
+                Self::NewPayloadAccepted => (NEW_PAYLOAD_METHOD, "ACCEPTED"),
+                Self::FinalFcuSyncing => (FCU_METHOD, "SYNCING"),
+                Self::BuildFcuTimedOut => (BUILD_FCU_METHOD, "ENGINE_UNAVAILABLE"),
+                Self::GetPayloadConnectionLost => (GET_PAYLOAD_METHOD, "ENGINE_UNAVAILABLE"),
+                Self::NewPayloadTimedOut => (NEW_PAYLOAD_METHOD, "ENGINE_UNAVAILABLE"),
+                Self::FinalFcuTimedOut => (FCU_METHOD, "ENGINE_UNAVAILABLE"),
+            }
+        }
     }
 
     fn info(number: u64, tag: u8) -> BlockInfo {
@@ -983,6 +1000,10 @@ mod tests {
             Some(BatchStatus::Committed),
             "a hold must not commit a partial consolidation outcome"
         );
+        let DerivationStatus::Held(held) = driver.status(0) else { panic!("expected held status") };
+        let (method, status) = boundary.expected_hold();
+        assert_eq!(held.last_engine_method.as_deref(), Some(method));
+        assert_eq!(held.last_engine_status.as_deref(), Some(status));
 
         make_attempt_due(&mut driver);
         driver.wait_for_attempt().await;
@@ -992,6 +1013,7 @@ mod tests {
         };
         assert_eq!(consolidated.block_outcomes.len(), 1);
         assert_eq!(consolidated.batch_outcome.batch_info.index, 1);
+        assert!(client.is_drained(), "the retry runs every scripted call exactly once");
         assert!(driver.can_accept_batch());
         assert_eq!(engine.fcs().head_block_info().number, SAFE + 1);
         assert_eq!(engine.fcs().safe_block_info().number, SAFE + 1);
@@ -1229,6 +1251,118 @@ mod tests {
         assert_eq!(client.fork_choice_updated_calls(), 2);
         assert_eq!(
             database.get_batch_status_by_hash(B256::repeat_byte(1)).await.unwrap(),
+            Some(BatchStatus::Consolidated)
+        );
+    }
+
+    /// The Engine stays unavailable for several attempts: each one holds, never fail-stops, and
+    /// the backoff doubles to its cap; the first answer then completes the batch.
+    #[tokio::test]
+    async fn repeated_request_timeouts_hold_with_capped_backoff_then_complete() {
+        let database = setup_test_db().await;
+        insert_batch(&database, 1, 1, None).await;
+        let client = Arc::new(ScriptedEngineClient::new());
+        let backoffs = [2_000, 4_000, 8_000, 16_000, 30_000, 30_000];
+        for _ in backoffs {
+            client.push_fork_choice_updated(ScriptedResponse::RequestTimeout);
+        }
+        script_rebuild(&client, payload(SAFE + 1));
+        let mut engine = engine_at_safe(client.clone());
+        let asserter = Asserter::new();
+        for _ in 0..=backoffs.len() {
+            push_absent_block(&asserter);
+        }
+        let provider = absent_block_provider(asserter);
+        let mut driver = DerivationDriver::default();
+        driver.hold_batch(batch(1, BatchStatus::Consolidated));
+
+        for (attempt, backoff_ms) in backoffs.into_iter().enumerate() {
+            make_attempt_due(&mut driver);
+            driver.wait_for_attempt().await;
+            let step = driver.run_attempt(&provider, &mut engine, &database).await;
+            assert!(matches!(step, AttemptStep::Held), "attempt {attempt}: {step:?}");
+            let DerivationStatus::Held(held) = driver.status(0) else {
+                panic!("expected held status")
+            };
+            assert_eq!(held.current_backoff_ms, Some(backoff_ms), "attempt {attempt}");
+            assert_eq!(held.last_engine_status.as_deref(), Some("ENGINE_UNAVAILABLE"));
+        }
+        make_attempt_due(&mut driver);
+        driver.wait_for_attempt().await;
+        let step = driver.run_attempt(&provider, &mut engine, &database).await;
+        assert!(matches!(step, AttemptStep::Completed(_)), "{step:?}");
+        assert!(client.is_drained());
+        assert_eq!(
+            database.get_batch_status_by_hash(B256::repeat_byte(1)).await.unwrap(),
+            Some(BatchStatus::Consolidated)
+        );
+    }
+
+    /// A two-block batch whose second block times out after the first was imported and made
+    /// safe in Reth: the hold leaves the local forkchoice at the first block and the database at
+    /// its own (non-genesis) safe block, and the retry finds the first block canonical, rebuilds
+    /// the second and consolidates the batch once.
+    #[tokio::test]
+    async fn request_timeout_partway_through_a_batch_holds_then_completes_once() {
+        let database = setup_test_db().await;
+        let db_safe = info(SAFE, 0x11);
+        insert_batch_with_block(&database, 0xa1, 10, db_safe).await;
+        insert_batch(&database, 2, 11, None).await;
+        let derived =
+            derived_batch(2, vec![(DERIVED_BASE_FEE, vec![]), (DERIVED_BASE_FEE + 7, vec![])]);
+        // Reth's view of the first block once imported; the first attempt builds exactly it.
+        let first_block = push_matching_empty_block(&Asserter::new(), &derived.attributes[0]);
+        let first = ExecutionPayloadV1 {
+            block_hash: first_block.hash,
+            ..built_payload(SAFE + 1, DERIVED_BASE_FEE, vec![])
+        };
+        let mut second = built_payload(SAFE + 2, DERIVED_BASE_FEE + 7, vec![]);
+        second.parent_hash = first_block.hash;
+
+        let client = Arc::new(ScriptedEngineClient::new());
+        // First attempt: block SAFE + 1 is rebuilt and made safe; SAFE + 2's build times out.
+        script_rebuild(&client, first);
+        client.push_fork_choice_updated(ScriptedResponse::RequestTimeout);
+        // Second attempt: SAFE + 1 is canonical, so safe moves to it; SAFE + 2 is rebuilt.
+        client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Valid, None)));
+        script_rebuild(&client, second);
+        let asserter = Asserter::new();
+        push_canonical_block(&asserter, db_safe);
+        push_absent_block(&asserter);
+        push_absent_block(&asserter);
+        push_canonical_block(&asserter, db_safe);
+        push_matching_empty_block(&asserter, &derived.attributes[0]);
+        push_absent_block(&asserter);
+        let provider = absent_block_provider(asserter);
+        let mut engine = engine_at_safe(client.clone());
+        let mut driver = DerivationDriver::default();
+        driver.hold_batch(derived);
+
+        driver.wait_for_attempt().await;
+        let step = driver.run_attempt(&provider, &mut engine, &database).await;
+        assert!(matches!(step, AttemptStep::Held), "{step:?}");
+        assert_eq!(*engine.fcs().safe_block_info(), first_block);
+        assert_eq!(database.get_latest_safe_l2_info().await.unwrap().0, db_safe);
+        assert_eq!(
+            database.get_batch_status_by_hash(B256::repeat_byte(2)).await.unwrap(),
+            Some(BatchStatus::Committed)
+        );
+
+        make_attempt_due(&mut driver);
+        driver.wait_for_attempt().await;
+        let step = driver.run_attempt(&provider, &mut engine, &database).await;
+        let AttemptStep::Completed(consolidated) = step else {
+            panic!("the retry must consolidate the batch, got {step:?}")
+        };
+        assert!(matches!(
+            consolidated.block_outcomes.as_slice(),
+            [BlockConsolidationOutcome::UpdateFcs(_), BlockConsolidationOutcome::Reorged(_)]
+        ));
+        assert!(client.is_drained());
+        assert_eq!(engine.fcs().safe_block_info().number, SAFE + 2);
+        assert_eq!(database.get_latest_safe_l2_info().await.unwrap().0.number, SAFE + 2);
+        assert_eq!(
+            database.get_batch_status_by_hash(B256::repeat_byte(2)).await.unwrap(),
             Some(BatchStatus::Consolidated)
         );
     }

@@ -54,6 +54,7 @@ async-trait.workspace = true
 reth-testing-utils.workspace = true
 dogeos-protocol-types = { workspace = true, features = ["arbitrary"] }
 dogeos-reth-engine.workspace = true
+tokio = { workspace = true, features = ["macros", "net", "rt", "time"] }
 
 [features]
 test-utils = [

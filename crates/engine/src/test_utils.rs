@@ -85,7 +85,7 @@ async fn resolve<T>(
                 return Err(TransportErrorKind::custom(jsonrpsee::core::ClientError::Transport(
                     Box::new(jsonrpsee::http_client::transport::Error::Http(
                         jsonrpsee::core::http_helpers::HttpError::Stream(Box::new(
-                            std::io::Error::other("scripted connection loss"),
+                            std::io::Error::from(std::io::ErrorKind::ConnectionReset),
                         )),
                     )),
                 )))

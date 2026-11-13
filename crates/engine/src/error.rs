@@ -70,12 +70,13 @@ impl EngineError {
 }
 
 /// Returns true if an HTTP stream error from jsonrpsee's HTTP client is a failed or lost
-/// connection: a connect error, an I/O error, or a connection that was closed, cancelled, timed
-/// out or ended before the message was complete. A parse or protocol error and a body length
+/// connection: a connect error, a connection-loss I/O error, or a connection that was closed,
+/// cancelled, timed out or ended before the message was complete. A parse or protocol error
+/// (which hyper may report as an `InvalidData` or `InvalidInput` I/O error) and a body length
 /// limit return false.
 fn is_lost_connection(error: &(dyn std::error::Error + 'static)) -> bool {
-    if error.is::<std::io::Error>() {
-        return true;
+    if let Some(error) = error.downcast_ref::<std::io::Error>() {
+        return is_connection_loss(error.kind());
     }
     if let Some(error) = error.downcast_ref::<hyper_util::client::legacy::Error>() {
         return error.is_connect() ||
@@ -86,9 +87,27 @@ fn is_lost_connection(error: &(dyn std::error::Error + 'static)) -> bool {
             error.is_canceled() ||
             error.is_closed() ||
             error.is_timeout() ||
-            std::error::Error::source(error).is_some_and(|source| source.is::<std::io::Error>());
+            std::error::Error::source(error).is_some_and(is_lost_connection);
     }
     false
+}
+
+/// The I/O error kinds of a connection that failed or was lost, not of a malformed exchange.
+const fn is_connection_loss(kind: std::io::ErrorKind) -> bool {
+    use std::io::ErrorKind;
+    matches!(
+        kind,
+        ErrorKind::ConnectionRefused |
+            ErrorKind::ConnectionReset |
+            ErrorKind::ConnectionAborted |
+            ErrorKind::NotConnected |
+            ErrorKind::BrokenPipe |
+            ErrorKind::TimedOut |
+            ErrorKind::UnexpectedEof |
+            ErrorKind::HostUnreachable |
+            ErrorKind::NetworkUnreachable |
+            ErrorKind::AddrNotAvailable
+    )
 }
 
 #[cfg(test)]
@@ -124,7 +143,7 @@ mod tests {
             .await
             .unwrap_err();
         let error = engine_error(error);
-        (error.to_string(), error.is_engine_unavailable())
+        (format!("{error:?}"), error.is_engine_unavailable())
     }
 
     /// A one-shot HTTP server: reads the request, then writes `reply` (if any) and closes, or
@@ -154,12 +173,13 @@ mod tests {
         };
         let closed_without_reply = serve_once(None, false);
         let no_answer = serve_once(None, true);
-        for (case, url) in [
-            ("connection refused", refused),
-            ("closed without a reply", closed_without_reply),
-            ("no answer within the timeout", no_answer),
+        for (case, url, expected) in [
+            ("connection refused", refused, "ConnectionRefused"),
+            ("closed without a reply", closed_without_reply, "IncompleteMessage"),
+            ("no answer within the timeout", no_answer, "RequestTimeout"),
         ] {
             let (error, unavailable) = classify(url, 10 * 1024 * 1024).await;
+            assert!(error.contains(expected), "{case} reached another error: {error}");
             assert!(unavailable, "{case}: {error}");
         }
     }
@@ -195,15 +215,25 @@ mod tests {
             )),
             false,
         );
-        for (case, url, max_request_size) in [
-            ("HTTP 401", unauthorized, 10 * 1024 * 1024),
-            ("malformed body", not_json, 10 * 1024 * 1024),
-            ("JSON-RPC error response", error_response, 10 * 1024 * 1024),
-            ("request too large", "http://127.0.0.1:1".to_owned(), 1),
-            ("malformed HTTP headers", malformed_headers, 10 * 1024 * 1024),
-            ("oversized chunked response", oversized_chunked, 10 * 1024 * 1024),
+        let invalid_chunk_size = serve_once(
+            Some(String::from(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                 Transfer-Encoding: chunked\r\n\r\nZ\r\n",
+            )),
+            false,
+        );
+        const LIMIT: u32 = 10 * 1024 * 1024;
+        for (case, url, max_request_size, expected) in [
+            ("HTTP 401", unauthorized, LIMIT, "status_code: 401"),
+            ("malformed body", not_json, LIMIT, "Http(Malformed)"),
+            ("JSON-RPC error response", error_response, LIMIT, "ServerError(-38001)"),
+            ("request too large", "http://127.0.0.1:1".to_owned(), 1, "RequestTooLarge"),
+            ("malformed HTTP headers", malformed_headers, LIMIT, "Parse(Header"),
+            ("oversized chunked response", oversized_chunked, LIMIT, "LengthLimitError"),
+            ("invalid chunk size", invalid_chunk_size, LIMIT, "Invalid chunk size line"),
         ] {
             let (error, unavailable) = classify(url, max_request_size).await;
+            assert!(error.contains(expected), "{case} reached another error: {error}");
             assert!(!unavailable, "{case}: {error}");
         }
     }

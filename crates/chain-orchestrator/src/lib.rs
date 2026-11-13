@@ -2,7 +2,7 @@
 //! L2 p2p network.
 
 use alloy_eips::Encodable2718;
-use alloy_primitives::{bytes::Bytes, keccak256, B256};
+use alloy_primitives::{bytes::Bytes, B256};
 use alloy_provider::Provider;
 use alloy_rpc_types_engine::{ExecutionPayloadV1, PayloadStatusEnum};
 use dogeos_hardforks::DogeosHardforks;
@@ -15,8 +15,8 @@ use reth_network_api::{BlockDownloaderProvider, FullNetwork};
 use reth_network_p2p::{sync::SyncState as RethSyncState, FullBlockClient};
 use reth_tokio_util::{EventSender, EventStream};
 use rollup_node_primitives::{
-    BatchCommitData, BatchInfo, BatchStatus, BlockInfo, ChainImport, L1MessageEnvelope,
-    L2BlockInfoWithL1Messages,
+    fold_legacy_queue_hash, fold_queue_hash, BatchCommitData, BatchInfo, BatchStatus, BlockInfo,
+    ChainImport, L1MessageEnvelope, L2BlockInfoWithL1Messages,
 };
 use rollup_node_providers::L1MessageProvider;
 use rollup_node_sequencer::{Sequencer, SequencerError, SequencerEvent};
@@ -1060,13 +1060,15 @@ impl<
         l1_block_info: BlockInfo,
     ) -> Result<Option<ChainOrchestratorEvent>, ChainOrchestratorError> {
         let event = ChainOrchestratorEvent::L1MessageCommitted(l1_message.queue_index);
-        let queue_hash = compute_l1_message_queue_hash(
+        let (queue_hash, legacy_queue_hash) = compute_l1_message_queue_hashes(
             &self.database,
             &l1_message,
             self.config.l1_v2_message_queue_start_index(),
+            self.config.with_legacy_queue_hash(),
         )
         .await?;
-        let l1_message = L1MessageEnvelope::new(l1_message, l1_block_info.number, None, queue_hash);
+        let l1_message = L1MessageEnvelope::new(l1_message, l1_block_info.number, None, queue_hash)
+            .with_legacy_queue_hash(legacy_queue_hash);
 
         // Perform a consistency check to ensure the previous L1 message exists in the database.
         self.database
@@ -1730,37 +1732,40 @@ const fn supersedes_blocked_import(
         )
 }
 
-/// Fold a transaction hash into the full 256-bit `DogeOS` message queue commitment.
-fn hash_msg_queue(rolling_hash: B256, tx_hash: B256) -> B256 {
-    let mut input = [0u8; 64];
-    input[..32].copy_from_slice(rolling_hash.as_slice());
-    input[32..].copy_from_slice(tx_hash.as_slice());
-    keccak256(input)
-}
-
-/// Compute the queue hash, preserving all 256 bits at every step.
-/// The first V2 message starts from zero; earlier messages have no queue hash.
-async fn compute_l1_message_queue_hash(
+/// Computes the full-width queue hash of an L1 message and, if `with_legacy` is set, its legacy
+/// (masked) queue hash. Each folds the previous message's hash of the same rule; the first V2
+/// message folds zero, and earlier messages have no queue hash.
+async fn compute_l1_message_queue_hashes(
     database: &Arc<Database>,
     l1_message: &TxL1Message,
     l1_v2_message_queue_start_index: u64,
-) -> Result<Option<alloy_primitives::FixedBytes<32>>, ChainOrchestratorError> {
-    let queue_hash = if l1_message.queue_index == l1_v2_message_queue_start_index {
-        Some(hash_msg_queue(B256::ZERO, l1_message.tx_hash()))
+    with_legacy: bool,
+) -> Result<(Option<B256>, Option<B256>), ChainOrchestratorError> {
+    let (previous, previous_legacy) = if l1_message.queue_index == l1_v2_message_queue_start_index {
+        (B256::ZERO, B256::ZERO)
     } else if l1_message.queue_index > l1_v2_message_queue_start_index {
         let index = l1_message.queue_index - 1;
         let previous = database
             .get_n_l1_messages(Some(L1MessageKey::from_queue_index(index)), 1)
             .await?
-            .first()
-            .map(|m| m.queue_hash)
-            .ok_or(DatabaseError::L1MessageNotFound(L1MessageKey::QueueIndex(index)))?
-            .unwrap_or_default();
-        Some(hash_msg_queue(previous, l1_message.tx_hash()))
+            .into_iter()
+            .next()
+            .ok_or(DatabaseError::L1MessageNotFound(L1MessageKey::QueueIndex(index)))?;
+        // A missing legacy hash would silently restart that chain from zero; refuse instead.
+        let previous_legacy = match previous.legacy_queue_hash {
+            Some(hash) => hash,
+            None if with_legacy => {
+                return Err(ChainOrchestratorError::MissingLegacyQueueHash(l1_message.queue_index))
+            }
+            None => B256::ZERO,
+        };
+        (previous.queue_hash.unwrap_or_default(), previous_legacy)
     } else {
-        None
+        return Ok((None, None))
     };
-    Ok(queue_hash)
+    let tx_hash = l1_message.tx_hash();
+    let legacy = with_legacy.then(|| fold_legacy_queue_hash(previous_legacy, tx_hash));
+    Ok((Some(fold_queue_hash(previous, tx_hash)), legacy))
 }
 
 #[cfg(test)]
@@ -1888,7 +1893,8 @@ mod run_loop_policy_tests {
             NoopFullBlockClient::<DogeosNetworkPrimitives>::default(),
             Arc::new(DogeosConsensus),
         ));
-        let config = ChainOrchestratorConfig::<DogeosChainSpec>::new(DOGEOS_DEV.clone(), 1, 0);
+        let config =
+            ChainOrchestratorConfig::<DogeosChainSpec>::new(DOGEOS_DEV.clone(), 1, 0, false);
         let (mut orchestrator, handle) = ChainOrchestrator::new(
             database,
             config,
@@ -2875,3 +2881,6 @@ mod run_loop_policy_tests {
 
 #[cfg(test)]
 mod reorg_finding_tests;
+
+#[cfg(test)]
+mod queue_hash_tests;

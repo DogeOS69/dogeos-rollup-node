@@ -386,6 +386,36 @@ impl ScrollRollupNodeConfig {
             );
         }
 
+        // L1 message queue hashes. Batches below codec 12 name their L1 messages by Scroll's
+        // masked (legacy) queue hash, codec 12 (TsukiV2) and later by the full-width hash.
+        // Testnet-only: the legacy chain is computed only where TsukiV2 activates after genesis
+        // (Chikyu, whose pre-TsukiV2 batches carry masked hashes); mainnet activates TsukiV2 at
+        // genesis, so its legacy column stays NULL (the recompute below runs everywhere, but there
+        // it only rewrites the full-width chain under the current rule). Added by
+        // dogeos-rollup-node #107; remove when no supported network has batches below codec
+        // 12.
+        let l1_v2_message_queue_start_index =
+            l1_v2_message_queue_start_index(chain_spec.chain().named());
+        let with_legacy_queue_hash = with_legacy_queue_hash(chain_spec.as_ref());
+        // Rewrite stored hashes once when the rule set changes (e.g. the first start of this
+        // image on a database that holds masked hashes in `queue_hash`).
+        if let Some(rewritten @ 1..) = db
+            .recompute_l1_message_queue_hashes(
+                l1_v2_message_queue_start_index,
+                with_legacy_queue_hash,
+            )
+            .await
+            .map_err(|err| eyre::eyre!("failed to recompute L1 message queue hashes: {err}"))?
+        {
+            tracing::info!(
+                target: "scroll::node::args",
+                rewritten,
+                l1_v2_message_queue_start_index,
+                with_legacy_queue_hash,
+                "Recomputed L1 message queue hashes"
+            );
+        }
+
         let chain_spec_fcs = || {
             ForkchoiceState::head_from_chain_spec(chain_spec.clone())
                 .expect("failed to derive forkchoice state from chain spec")
@@ -568,12 +598,11 @@ impl ScrollRollupNodeConfig {
                 .expect("failed to fetch block client"),
             Arc::new(DogeosConsensus),
         );
-        let l1_v2_message_queue_start_index =
-            l1_v2_message_queue_start_index(chain_spec.chain().named());
         let config: ChainOrchestratorConfig<Arc<CS>> = ChainOrchestratorConfig::new(
             chain_spec,
             self.chain_orchestrator_args.optimistic_sync_trigger,
             l1_v2_message_queue_start_index,
+            with_legacy_queue_hash,
         );
 
         // Instantiate the derivation pipeline
@@ -1241,6 +1270,15 @@ const fn td_constant(chain: Option<NamedChain>) -> U128 {
     }
 }
 
+/// Whether the node computes the legacy (masked) queue hash of each L1 message: only where
+/// `TsukiV2` activates after genesis, so a chain may hold batches below codec 12 (testnet-only;
+/// see [`rollup_node_primitives::fold_legacy_queue_hash`]).
+fn with_legacy_queue_hash<CS: EthChainSpec<Header: BlockHeader> + DogeosHardforks>(
+    chain_spec: &CS,
+) -> bool {
+    !chain_spec.is_tsuki_v2_active_at_timestamp(chain_spec.genesis_header().timestamp())
+}
+
 /// The L1 message queue index at which queue hashes should be computed .
 const fn l1_v2_message_queue_start_index(chain: Option<NamedChain>) -> u64 {
     match chain {
@@ -1255,6 +1293,14 @@ mod tests {
     use super::*;
     use clap::{CommandFactory, Parser};
     use std::path::PathBuf;
+
+    #[test]
+    fn legacy_queue_hash_is_computed_only_where_tsuki_v2_follows_genesis() {
+        use dogeos_chainspec::{DOGEOS_CHIKYU, DOGEOS_DEV, DOGEOS_MAINNET};
+        assert!(with_legacy_queue_hash(DOGEOS_CHIKYU.as_ref()));
+        assert!(!with_legacy_queue_hash(DOGEOS_MAINNET.as_ref()));
+        assert!(!with_legacy_queue_hash(DOGEOS_DEV.as_ref()));
+    }
 
     /// The startup genesis reconciliation compares the chain spec's genesis
     /// against the height-0 rows, so it depends on knowing which genesis the

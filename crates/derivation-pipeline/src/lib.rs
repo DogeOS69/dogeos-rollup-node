@@ -362,9 +362,13 @@ pub async fn derive<L1P: L1Provider + Sync + Send>(
 
     // set the cursor for the l1 provider.
     let payload_data = &decoded.data;
-    let mut l1_messages_iter =
-        iter_l1_messages_from_payload(&l1_provider, payload_data, l1_v2_message_queue_start_index)
-            .await?;
+    let mut l1_messages_iter = iter_l1_messages_from_payload(
+        &l1_provider,
+        payload_data,
+        decoded.version,
+        l1_v2_message_queue_start_index,
+    )
+    .await?;
 
     let skipped_l1_messages_bitmap =
         decoded.data.skipped_l1_message_bitmap.clone().unwrap_or_default();
@@ -444,7 +448,8 @@ fn ensure_batch_contains_only_l2_transactions(
 
 /// Returns an iterator over L1 messages from the `PayloadData`. If the `PayloadData` returns a
 /// `prev_l1_message_queue_hash` of zero, uses the `l1_v2_message_queue_start_index` to fetch
-/// messages from the L1 provider.
+/// messages from the L1 provider. A non-zero `prev_l1_message_queue_hash` is looked up under the
+/// queue hash rule of `batch_codec_version` (legacy masked below 12, full width from 12).
 ///
 /// # Errors
 ///
@@ -454,6 +459,7 @@ fn ensure_batch_contains_only_l2_transactions(
 async fn iter_l1_messages_from_payload<L1P: L1Provider>(
     provider: &L1P,
     data: &PayloadData,
+    batch_codec_version: u8,
     l1_v2_message_queue_start_index: u64,
 ) -> Result<Box<dyn Iterator<Item = L1MessageEnvelope> + Send>, DerivationPipelineError> {
     let total_l1_messages = data.blocks.iter().map(|b| b.context.num_l1_messages as u64).sum();
@@ -478,7 +484,10 @@ async fn iter_l1_messages_from_payload<L1P: L1Provider>(
                 .map_err(Into::into)?
         } else {
             let mut messages = provider
-                .get_n_messages(L1MessageKey::from_queue_hash(*hash), total_l1_messages + 1)
+                .get_n_messages(
+                    L1MessageKey::from_batch_queue_hash(*hash, batch_codec_version),
+                    total_l1_messages + 1,
+                )
                 .await
                 .map_err(Into::into)?;
             // we skip the first l1 message, as we are interested in the one starting after
@@ -528,6 +537,7 @@ mod tests {
         l1_block_number: 717,
         l2_block_number: None,
         queue_hash: None,
+        legacy_queue_hash: None,
         transaction: TxL1Message {
             queue_index: 33,
             gas_limit: 168000,
@@ -542,6 +552,7 @@ mod tests {
         l1_block_number: 717,
         l2_block_number: None,
         queue_hash: None,
+        legacy_queue_hash: None,
         transaction: TxL1Message {
             queue_index: 34,
             gas_limit: 168000,
@@ -783,6 +794,7 @@ mod tests {
                 l1_block_number: 5,
                 l2_block_number: None,
                 queue_hash: None,
+                legacy_queue_hash: None,
                 transaction: TxL1Message {
                     queue_index: 19,
                     gas_limit: 1000000,
@@ -796,6 +808,7 @@ mod tests {
                 l1_block_number: 5,
                 l2_block_number: None,
                 queue_hash: None,
+                legacy_queue_hash: None,
                 transaction: TxL1Message {
                     queue_index: 20,
                     gas_limit: 400000,
@@ -809,6 +822,7 @@ mod tests {
                 l1_block_number: 10,
                 l2_block_number: None,
                 queue_hash: None,
+                legacy_queue_hash: None,
                 transaction: TxL1Message {
                     queue_index: 21,
                     gas_limit: 400000,
@@ -871,6 +885,7 @@ mod tests {
                 l1_block_number: 0,
                 l2_block_number: None,
                 queue_hash: None,
+                legacy_queue_hash: None,
                 transaction: TxL1Message { queue_index: index, ..Default::default() },
             })
             .collect::<Vec<_>>();
@@ -937,6 +952,7 @@ mod tests {
                             l1_block_number: 0,
                             l2_block_number: None,
                             queue_hash: None,
+                            legacy_queue_hash: None,
                             transaction: TxL1Message {
                                 queue_index: 932910,
                                 gas_limit: 168000,
@@ -950,6 +966,7 @@ mod tests {
                             l1_block_number: 0,
                             l2_block_number: None,
                             queue_hash: None,
+                            legacy_queue_hash: None,
                             transaction: TxL1Message {
                                 queue_index: 932911,
                                 gas_limit: 168000,
@@ -963,6 +980,7 @@ mod tests {
                             l1_block_number: 0,
                             l2_block_number: None,
                             queue_hash: None,
+                            legacy_queue_hash: None,
                             transaction: TxL1Message {
                                 queue_index: 932912,
                                 gas_limit: 168000,
@@ -976,6 +994,7 @@ mod tests {
                             l1_block_number: 0,
                             l2_block_number: None,
                             queue_hash: None,
+                            legacy_queue_hash: None,
                             transaction: TxL1Message {
                                 queue_index: 932913,
                                 gas_limit: 168000,
@@ -1026,3 +1045,6 @@ mod tests {
 
 #[cfg(test)]
 mod reorg_finding_tests;
+
+#[cfg(test)]
+mod queue_hash_tests;

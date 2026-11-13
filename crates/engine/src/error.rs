@@ -72,10 +72,9 @@ impl EngineError {
 
 /// Returns true if an HTTP stream error from jsonrpsee's HTTP client is a failed or lost
 /// connection: a connection-loss I/O error (also as the cause of a connect error), or a connection
-/// that was closed,
-/// cancelled, timed out or ended before the message was complete. A parse or protocol error
-/// (which hyper may report as an `InvalidData` or `InvalidInput` I/O error) and a body length
-/// limit return false.
+/// that was closed, cancelled, timed out or ended before the message was complete. A parse or
+/// protocol error (which hyper may report as an `InvalidData` or `InvalidInput` I/O error) and a
+/// body length limit return false.
 fn is_lost_connection(error: &(dyn std::error::Error + 'static)) -> bool {
     if let Some(error) = error.downcast_ref::<std::io::Error>() {
         return is_connection_loss(error.kind());

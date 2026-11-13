@@ -184,11 +184,7 @@ impl<
     ) -> Result<(Self, ChainOrchestratorHandle<N>), ChainOrchestratorError> {
         let (handle_tx, handle_rx) = mpsc::unbounded_channel();
         let handle = ChainOrchestratorHandle::new(handle_tx);
-        let head_selection = if sequencer.is_some() {
-            frontier::HeadSelection::StoredHead
-        } else {
-            frontier::HeadSelection::KeepEngineHead
-        };
+        let head_selection = frontier::HeadSelection::for_node(sequencer.is_some());
         Ok((
             Self {
                 block_client,

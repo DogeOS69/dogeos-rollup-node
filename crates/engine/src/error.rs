@@ -41,8 +41,9 @@ impl EngineError {
 
     /// Returns true if the Engine API was unavailable: the authenticated client's request timed
     /// out, the HTTP connection could not be made, or it broke or closed before a response was
-    /// read. Nothing was learned about the request, which may or may not have taken effect, so it
-    /// is safe only for a caller that retries it from fresh state.
+    /// read (or, for a WS or IPC client, the service disconnected). Nothing was learned about the
+    /// request, which may or may not have taken effect, so it is safe only for a caller that
+    /// retries it from fresh state.
     ///
     /// Any answer returns false: a JSON-RPC error response, an HTTP rejection (such as 401 for a
     /// wrong JWT secret), an unparsable or oversized reply. So do a request too large to send and
@@ -70,17 +71,14 @@ impl EngineError {
 }
 
 /// Returns true if an HTTP stream error from jsonrpsee's HTTP client is a failed or lost
-/// connection: a connect error, a connection-loss I/O error, or a connection that was closed,
+/// connection: a connection-loss I/O error (also as the cause of a connect error), or a connection
+/// that was closed,
 /// cancelled, timed out or ended before the message was complete. A parse or protocol error
 /// (which hyper may report as an `InvalidData` or `InvalidInput` I/O error) and a body length
 /// limit return false.
 fn is_lost_connection(error: &(dyn std::error::Error + 'static)) -> bool {
     if let Some(error) = error.downcast_ref::<std::io::Error>() {
         return is_connection_loss(error.kind());
-    }
-    if let Some(error) = error.downcast_ref::<hyper_util::client::legacy::Error>() {
-        return error.is_connect() ||
-            std::error::Error::source(error).is_some_and(is_lost_connection);
     }
     if let Some(error) = error.downcast_ref::<hyper::Error>() {
         return error.is_incomplete_message() ||
@@ -89,7 +87,9 @@ fn is_lost_connection(error: &(dyn std::error::Error + 'static)) -> bool {
             error.is_timeout() ||
             std::error::Error::source(error).is_some_and(is_lost_connection);
     }
-    false
+    // hyper-util's client and connect errors wrap the cause (an I/O error for a refused or failed
+    // connection, a hyper error otherwise): decide by it, so a DNS or bind failure is not retried.
+    std::error::Error::source(error).is_some_and(is_lost_connection)
 }
 
 /// The I/O error kinds of a connection that failed or was lost, not of a malformed exchange.
@@ -131,9 +131,12 @@ mod tests {
 
     /// Sends one request with a real jsonrpsee HTTP client (the authenticated Engine client's
     /// transport) to `url` and classifies the error.
-    async fn classify(url: String, max_request_size: u32) -> (String, bool) {
+    /// The timeout for cases that are answered (or refused) at once; generous for a loaded box.
+    const ANSWER_TIMEOUT: Duration = Duration::from_secs(10);
+
+    async fn classify(url: String, max_request_size: u32, timeout: Duration) -> (String, bool) {
         let client = HttpClientBuilder::default()
-            .request_timeout(Duration::from_millis(500))
+            .request_timeout(timeout)
             .max_request_size(max_request_size)
             .max_response_size(1024)
             .build(url)
@@ -173,12 +176,17 @@ mod tests {
         };
         let closed_without_reply = serve_once(None, false);
         let no_answer = serve_once(None, true);
-        for (case, url, expected) in [
-            ("connection refused", refused, "ConnectionRefused"),
-            ("closed without a reply", closed_without_reply, "IncompleteMessage"),
-            ("no answer within the timeout", no_answer, "RequestTimeout"),
+        for (case, url, expected, timeout) in [
+            ("connection refused", refused, "ConnectionRefused", ANSWER_TIMEOUT),
+            ("closed without a reply", closed_without_reply, "IncompleteMessage", ANSWER_TIMEOUT),
+            (
+                "no answer within the timeout",
+                no_answer,
+                "RequestTimeout",
+                Duration::from_millis(500),
+            ),
         ] {
-            let (error, unavailable) = classify(url, 10 * 1024 * 1024).await;
+            let (error, unavailable) = classify(url, 10 * 1024 * 1024, timeout).await;
             assert!(error.contains(expected), "{case} reached another error: {error}");
             assert!(unavailable, "{case}: {error}");
         }
@@ -232,7 +240,7 @@ mod tests {
             ("oversized chunked response", oversized_chunked, LIMIT, "LengthLimitError"),
             ("invalid chunk size", invalid_chunk_size, LIMIT, "Invalid chunk size line"),
         ] {
-            let (error, unavailable) = classify(url, max_request_size).await;
+            let (error, unavailable) = classify(url, max_request_size, ANSWER_TIMEOUT).await;
             assert!(error.contains(expected), "{case} reached another error: {error}");
             assert!(!unavailable, "{case}: {error}");
         }

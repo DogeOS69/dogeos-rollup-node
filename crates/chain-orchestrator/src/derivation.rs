@@ -96,11 +96,11 @@ impl AttemptFailure {
 
     /// Holds the batch if the Engine got no answer to `method`, and fail-stops otherwise.
     ///
-    /// Holding is safe at every Engine call of an attempt: before the database commit nothing is
-    /// committed and each local forkchoice step follows only a received answer, so the next
-    /// attempt reconciles afresh from the last block Reth confirmed; a frontier move is a durable
-    /// intent that the next attempt replays first. A request that took effect after all is found
-    /// applied then.
+    /// Holding is safe at every Engine call of an attempt: the batch outcome is not committed
+    /// before its Engine calls succeed, each local forkchoice step follows only a received answer
+    /// or a re-read of Reth's tags, and what frontier recovery does commit first (the stored head,
+    /// the mapping purge, a saved move) is idempotent and replayed by the next attempt. A request
+    /// that took effect after all is found applied then.
     fn engine(
         batch_info: BatchInfo,
         method: &'static str,
@@ -113,7 +113,7 @@ impl AttemptFailure {
                 batch_index = batch_info.index,
                 batch_hash = ?batch_info.hash,
                 method,
-                error = %error,
+                error = ?error,
                 "Engine request for derived batch failed without an answer; holding and retrying"
             );
             return Self::Hold(HoldReason { method, status: HoldStatus::EngineUnavailable });

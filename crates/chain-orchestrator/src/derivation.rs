@@ -55,6 +55,9 @@ pub(crate) enum AttemptStep {
 enum HoldStatus {
     Syncing,
     Accepted,
+    /// The Engine API timed out or its connection failed; see
+    /// [`EngineError::is_engine_unavailable`].
+    EngineUnavailable,
 }
 
 impl HoldStatus {
@@ -62,6 +65,7 @@ impl HoldStatus {
         match self {
             Self::Syncing => "SYNCING",
             Self::Accepted => "ACCEPTED",
+            Self::EngineUnavailable => "ENGINE_UNAVAILABLE",
         }
     }
 }
@@ -157,8 +161,9 @@ impl DerivationDriver {
         }
     }
 
-    /// Runs one attempt. Only received `SYNCING`, plus `ACCEPTED` from `newPayload`, schedule a
-    /// further in-process reconciliation.
+    /// Runs one attempt. Only received `SYNCING`, `ACCEPTED` from `newPayload`, and an
+    /// unavailable Engine (a request timeout or lost connection) schedule a further in-process
+    /// reconciliation.
     pub(crate) async fn run_attempt<L2P, EC>(
         &mut self,
         l2_client: &L2P,
@@ -565,11 +570,30 @@ where
     Ok(ConsolidatedBatch { batch_outcome, block_outcomes })
 }
 
+/// Maps a failed Engine request. An unavailable Engine holds the batch: the attempt has not
+/// committed anything to the database, and each local forkchoice step follows only a received
+/// answer, so after a hold partway through a batch the local forkchoice sits at the last block
+/// Reth confirmed. The next attempt reconciles afresh from there, and a request that took effect
+/// after all is found canonical then. Any other error fail-stops.
 fn engine_request_failure(
     batch_info: BatchInfo,
     method: &'static str,
 ) -> impl FnOnce(EngineError) -> AttemptFailure {
     move |source| {
+        if source.is_engine_unavailable() {
+            tracing::error!(
+                target: "scroll::chain_orchestrator",
+                batch_index = batch_info.index,
+                batch_hash = ?batch_info.hash,
+                method,
+                error = %source,
+                "Engine request for derived batch failed without an answer; holding and retrying"
+            );
+            return AttemptFailure::Hold(HoldReason {
+                method,
+                status: HoldStatus::EngineUnavailable,
+            });
+        }
         AttemptFailure::fatal(
             method,
             "ERROR",
@@ -716,6 +740,26 @@ mod tests {
         NewPayloadSyncing,
         NewPayloadAccepted,
         FinalFcuSyncing,
+        BuildFcuTimedOut,
+        GetPayloadConnectionLost,
+        NewPayloadTimedOut,
+        FinalFcuTimedOut,
+    }
+
+    impl HoldBoundary {
+        /// The Engine method and status the held status reports after the first attempt.
+        const fn expected_hold(self) -> (&'static str, &'static str) {
+            match self {
+                Self::BuildFcuSyncing => (BUILD_FCU_METHOD, "SYNCING"),
+                Self::NewPayloadSyncing => (NEW_PAYLOAD_METHOD, "SYNCING"),
+                Self::NewPayloadAccepted => (NEW_PAYLOAD_METHOD, "ACCEPTED"),
+                Self::FinalFcuSyncing => (FCU_METHOD, "SYNCING"),
+                Self::BuildFcuTimedOut => (BUILD_FCU_METHOD, "ENGINE_UNAVAILABLE"),
+                Self::GetPayloadConnectionLost => (GET_PAYLOAD_METHOD, "ENGINE_UNAVAILABLE"),
+                Self::NewPayloadTimedOut => (NEW_PAYLOAD_METHOD, "ENGINE_UNAVAILABLE"),
+                Self::FinalFcuTimedOut => (FCU_METHOD, "ENGINE_UNAVAILABLE"),
+            }
+        }
     }
 
     fn info(number: u64, tag: u8) -> BlockInfo {
@@ -866,6 +910,50 @@ mod tests {
                 )));
                 client.push_fork_choice_updated(ScriptedResponse::Ok(valid_fcu()));
             }
+            HoldBoundary::BuildFcuTimedOut => {
+                client.push_fork_choice_updated(ScriptedResponse::RequestTimeout);
+                client.push_fork_choice_updated(ScriptedResponse::Ok(valid_build()));
+                client.push_get_payload(ScriptedResponse::Ok(payload(SAFE + 1)));
+                client.push_new_payload(ScriptedResponse::Ok(payload_status(
+                    PayloadStatusEnum::Valid,
+                )));
+                client.push_fork_choice_updated(ScriptedResponse::Ok(valid_fcu()));
+            }
+            HoldBoundary::GetPayloadConnectionLost => {
+                client.push_fork_choice_updated(ScriptedResponse::Ok(valid_build()));
+                client.push_get_payload(ScriptedResponse::ConnectionLost);
+                client.push_fork_choice_updated(ScriptedResponse::Ok(valid_build()));
+                client.push_get_payload(ScriptedResponse::Ok(payload(SAFE + 1)));
+                client.push_new_payload(ScriptedResponse::Ok(payload_status(
+                    PayloadStatusEnum::Valid,
+                )));
+                client.push_fork_choice_updated(ScriptedResponse::Ok(valid_fcu()));
+            }
+            HoldBoundary::NewPayloadTimedOut => {
+                client.push_fork_choice_updated(ScriptedResponse::Ok(valid_build()));
+                client.push_get_payload(ScriptedResponse::Ok(payload(SAFE + 1)));
+                client.push_new_payload(ScriptedResponse::RequestTimeout);
+                client.push_fork_choice_updated(ScriptedResponse::Ok(valid_build()));
+                client.push_get_payload(ScriptedResponse::Ok(payload(SAFE + 1)));
+                client.push_new_payload(ScriptedResponse::Ok(payload_status(
+                    PayloadStatusEnum::Valid,
+                )));
+                client.push_fork_choice_updated(ScriptedResponse::Ok(valid_fcu()));
+            }
+            HoldBoundary::FinalFcuTimedOut => {
+                client.push_fork_choice_updated(ScriptedResponse::Ok(valid_build()));
+                client.push_get_payload(ScriptedResponse::Ok(payload(SAFE + 1)));
+                client.push_new_payload(ScriptedResponse::Ok(payload_status(
+                    PayloadStatusEnum::Valid,
+                )));
+                client.push_fork_choice_updated(ScriptedResponse::RequestTimeout);
+                client.push_fork_choice_updated(ScriptedResponse::Ok(valid_build()));
+                client.push_get_payload(ScriptedResponse::Ok(payload(SAFE + 1)));
+                client.push_new_payload(ScriptedResponse::Ok(payload_status(
+                    PayloadStatusEnum::Valid,
+                )));
+                client.push_fork_choice_updated(ScriptedResponse::Ok(valid_fcu()));
+            }
             HoldBoundary::FinalFcuSyncing => {
                 client.push_fork_choice_updated(ScriptedResponse::Ok(valid_build()));
                 client.push_get_payload(ScriptedResponse::Ok(payload(SAFE + 1)));
@@ -912,6 +1000,10 @@ mod tests {
             Some(BatchStatus::Committed),
             "a hold must not commit a partial consolidation outcome"
         );
+        let DerivationStatus::Held(held) = driver.status(0) else { panic!("expected held status") };
+        let (method, status) = boundary.expected_hold();
+        assert_eq!(held.last_engine_method.as_deref(), Some(method));
+        assert_eq!(held.last_engine_status.as_deref(), Some(status));
 
         make_attempt_due(&mut driver);
         driver.wait_for_attempt().await;
@@ -921,6 +1013,7 @@ mod tests {
         };
         assert_eq!(consolidated.block_outcomes.len(), 1);
         assert_eq!(consolidated.batch_outcome.batch_info.index, 1);
+        assert!(client.is_drained(), "the retry runs every scripted call exactly once");
         assert!(driver.can_accept_batch());
         assert_eq!(engine.fcs().head_block_info().number, SAFE + 1);
         assert_eq!(engine.fcs().safe_block_info().number, SAFE + 1);
@@ -1086,6 +1179,215 @@ mod tests {
     #[tokio::test]
     async fn checked_final_fcu_syncing_does_not_advance_local_fcs() {
         assert_hold_then_complete(HoldBoundary::FinalFcuSyncing).await;
+    }
+
+    // An Engine that does not answer in time or drops the connection holds the batch like
+    // `SYNCING` does: no database change, local forkchoice unchanged, a fresh attempt later.
+    #[tokio::test]
+    async fn build_fcu_request_timeout_holds_then_completes_once() {
+        assert_hold_then_complete(HoldBoundary::BuildFcuTimedOut).await;
+    }
+
+    #[tokio::test]
+    async fn get_payload_connection_loss_holds_then_completes_once() {
+        assert_hold_then_complete(HoldBoundary::GetPayloadConnectionLost).await;
+    }
+
+    #[tokio::test]
+    async fn new_payload_request_timeout_holds_then_completes_once() {
+        assert_hold_then_complete(HoldBoundary::NewPayloadTimedOut).await;
+    }
+
+    #[tokio::test]
+    async fn final_fcu_request_timeout_holds_then_completes_once() {
+        assert_hold_then_complete(HoldBoundary::FinalFcuTimedOut).await;
+    }
+
+    /// The case seen on a lagging testnet datadir: the batch's block is already canonical in
+    /// Reth, and the forkchoice update that advances safe to it times out.
+    #[tokio::test]
+    async fn canonical_fcu_request_timeout_holds_reports_status_then_completes() {
+        let database = setup_test_db().await;
+        insert_batch(&database, 1, 1, None).await;
+        let client = Arc::new(ScriptedEngineClient::new());
+        client.push_fork_choice_updated(ScriptedResponse::RequestTimeout);
+        client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Valid, None)));
+        let mut engine = engine_at_safe(client.clone());
+
+        let mut derived = batch(1, BatchStatus::Consolidated);
+        derived.attributes[0].attributes.transactions = Some(vec![]);
+        let asserter = Asserter::new();
+        push_matching_empty_block(&asserter, &derived.attributes[0]);
+        let canonical = push_matching_empty_block(&asserter, &derived.attributes[0]);
+        let provider = absent_block_provider(asserter);
+        let mut driver = DerivationDriver::default();
+        driver.hold_batch(derived);
+
+        driver.wait_for_attempt().await;
+        assert!(matches!(
+            driver.run_attempt(&provider, &mut engine, &database).await,
+            AttemptStep::Held
+        ));
+        assert!(!driver.can_accept_batch());
+        assert_eq!(engine.fcs().head_block_info().number, SAFE);
+        assert_eq!(engine.fcs().safe_block_info().number, SAFE);
+        assert_eq!(
+            database.get_batch_status_by_hash(B256::repeat_byte(1)).await.unwrap(),
+            Some(BatchStatus::Committed),
+            "a hold must not change the database"
+        );
+        let DerivationStatus::Held(held) = driver.status(0) else { panic!("expected held status") };
+        assert_eq!(held.last_engine_method.as_deref(), Some(FCU_METHOD));
+        assert_eq!(held.last_engine_status.as_deref(), Some("ENGINE_UNAVAILABLE"));
+        assert_eq!(held.current_backoff_ms, Some(INITIAL_HOLD_BACKOFF_MS));
+
+        make_attempt_due(&mut driver);
+        driver.wait_for_attempt().await;
+        assert!(matches!(
+            driver.run_attempt(&provider, &mut engine, &database).await,
+            AttemptStep::Completed(_)
+        ));
+        assert_eq!(*engine.fcs().safe_block_info(), canonical);
+        assert_eq!(client.fork_choice_updated_calls(), 2);
+        assert_eq!(
+            database.get_batch_status_by_hash(B256::repeat_byte(1)).await.unwrap(),
+            Some(BatchStatus::Consolidated)
+        );
+    }
+
+    /// The Engine stays unavailable for several attempts: each one holds, never fail-stops, and
+    /// the backoff doubles to its cap; the first answer then completes the batch.
+    #[tokio::test]
+    async fn repeated_request_timeouts_hold_with_capped_backoff_then_complete() {
+        let database = setup_test_db().await;
+        insert_batch(&database, 1, 1, None).await;
+        let client = Arc::new(ScriptedEngineClient::new());
+        let backoffs = [2_000, 4_000, 8_000, 16_000, 30_000, 30_000];
+        for _ in backoffs {
+            client.push_fork_choice_updated(ScriptedResponse::RequestTimeout);
+        }
+        script_rebuild(&client, payload(SAFE + 1));
+        let mut engine = engine_at_safe(client.clone());
+        let asserter = Asserter::new();
+        for _ in 0..=backoffs.len() {
+            push_absent_block(&asserter);
+        }
+        let provider = absent_block_provider(asserter);
+        let mut driver = DerivationDriver::default();
+        driver.hold_batch(batch(1, BatchStatus::Consolidated));
+
+        for (attempt, backoff_ms) in backoffs.into_iter().enumerate() {
+            make_attempt_due(&mut driver);
+            driver.wait_for_attempt().await;
+            let step = driver.run_attempt(&provider, &mut engine, &database).await;
+            assert!(matches!(step, AttemptStep::Held), "attempt {attempt}: {step:?}");
+            let DerivationStatus::Held(held) = driver.status(0) else {
+                panic!("expected held status")
+            };
+            assert_eq!(held.current_backoff_ms, Some(backoff_ms), "attempt {attempt}");
+            assert_eq!(held.last_engine_status.as_deref(), Some("ENGINE_UNAVAILABLE"));
+        }
+        make_attempt_due(&mut driver);
+        driver.wait_for_attempt().await;
+        let step = driver.run_attempt(&provider, &mut engine, &database).await;
+        assert!(matches!(step, AttemptStep::Completed(_)), "{step:?}");
+        assert!(client.is_drained());
+        assert_eq!(
+            database.get_batch_status_by_hash(B256::repeat_byte(1)).await.unwrap(),
+            Some(BatchStatus::Consolidated)
+        );
+    }
+
+    /// A two-block batch whose second block times out after the first was imported and made
+    /// safe in Reth: the hold leaves the local forkchoice at the first block and the database at
+    /// its own (non-genesis) safe block, and the retry finds the first block canonical, rebuilds
+    /// the second and consolidates the batch once.
+    #[tokio::test]
+    async fn request_timeout_partway_through_a_batch_holds_then_completes_once() {
+        let database = setup_test_db().await;
+        let db_safe = info(SAFE, 0x11);
+        insert_batch_with_block(&database, 0xa1, 10, db_safe).await;
+        insert_batch(&database, 2, 11, None).await;
+        let derived =
+            derived_batch(2, vec![(DERIVED_BASE_FEE, vec![]), (DERIVED_BASE_FEE + 7, vec![])]);
+        // Reth's view of the first block once imported; the first attempt builds exactly it.
+        let first_block = push_matching_empty_block(&Asserter::new(), &derived.attributes[0]);
+        let first = ExecutionPayloadV1 {
+            block_hash: first_block.hash,
+            ..built_payload(SAFE + 1, DERIVED_BASE_FEE, vec![])
+        };
+        let mut second = built_payload(SAFE + 2, DERIVED_BASE_FEE + 7, vec![]);
+        second.parent_hash = first_block.hash;
+
+        let client = Arc::new(ScriptedEngineClient::new());
+        // First attempt: block SAFE + 1 is rebuilt and made safe; SAFE + 2's build times out.
+        script_rebuild(&client, first);
+        client.push_fork_choice_updated(ScriptedResponse::RequestTimeout);
+        // Second attempt: SAFE + 1 is canonical, so safe moves to it; SAFE + 2 is rebuilt.
+        client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Valid, None)));
+        script_rebuild(&client, second);
+        let asserter = Asserter::new();
+        push_canonical_block(&asserter, db_safe);
+        push_absent_block(&asserter);
+        push_absent_block(&asserter);
+        push_canonical_block(&asserter, db_safe);
+        push_matching_empty_block(&asserter, &derived.attributes[0]);
+        push_absent_block(&asserter);
+        let provider = absent_block_provider(asserter);
+        let mut engine = engine_at_safe(client.clone());
+        let mut driver = DerivationDriver::default();
+        driver.hold_batch(derived);
+
+        driver.wait_for_attempt().await;
+        let step = driver.run_attempt(&provider, &mut engine, &database).await;
+        assert!(matches!(step, AttemptStep::Held), "{step:?}");
+        assert_eq!(*engine.fcs().safe_block_info(), first_block);
+        assert_eq!(database.get_latest_safe_l2_info().await.unwrap().0, db_safe);
+        assert_eq!(
+            database.get_batch_status_by_hash(B256::repeat_byte(2)).await.unwrap(),
+            Some(BatchStatus::Committed)
+        );
+
+        make_attempt_due(&mut driver);
+        driver.wait_for_attempt().await;
+        let step = driver.run_attempt(&provider, &mut engine, &database).await;
+        let AttemptStep::Completed(consolidated) = step else {
+            panic!("the retry must consolidate the batch, got {step:?}")
+        };
+        assert!(matches!(
+            consolidated.block_outcomes.as_slice(),
+            [BlockConsolidationOutcome::UpdateFcs(_), BlockConsolidationOutcome::Reorged(_)]
+        ));
+        assert!(client.is_drained());
+        assert_eq!(engine.fcs().safe_block_info().number, SAFE + 2);
+        assert_eq!(database.get_latest_safe_l2_info().await.unwrap().0.number, SAFE + 2);
+        assert_eq!(
+            database.get_batch_status_by_hash(B256::repeat_byte(2)).await.unwrap(),
+            Some(BatchStatus::Consolidated)
+        );
+    }
+
+    /// A JSON-RPC error response is an answer from the Engine, not unavailability: fail-stop.
+    #[tokio::test]
+    async fn engine_error_response_fail_stops() {
+        let database = setup_test_db().await;
+        insert_batch(&database, 1, 1, None).await;
+        let client = Arc::new(ScriptedEngineClient::new());
+        client.push_fork_choice_updated(ScriptedResponse::RpcErrorResponse(-32000));
+        let mut engine = engine_at_safe(client);
+        let asserter = Asserter::new();
+        push_absent_block(&asserter);
+        let provider = absent_block_provider(asserter);
+        let mut driver = DerivationDriver::default();
+        driver.hold_batch(batch(1, BatchStatus::Consolidated));
+        driver.wait_for_attempt().await;
+
+        let AttemptStep::Fatal(fatal) = driver.run_attempt(&provider, &mut engine, &database).await
+        else {
+            panic!("an Engine error response must fail-stop")
+        };
+        assert_eq!(fatal.method, BUILD_FCU_METHOD);
+        assert_eq!(fatal.outcome, "ERROR");
     }
 
     #[tokio::test]
@@ -1317,7 +1619,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transport_error_fail_stops_without_polling_next_batch() {
+    async fn unclassified_transport_error_fail_stops_without_polling_next_batch() {
         let database = setup_test_db().await;
         insert_batch(&database, 1, 1, None).await;
         let client = Arc::new(ScriptedEngineClient::new());
@@ -1336,7 +1638,7 @@ mod tests {
 
         let AttemptStep::Fatal(fatal) = driver.run_attempt(&provider, &mut engine, &database).await
         else {
-            panic!("transport failures must fail-stop")
+            panic!("a transport failure that is not a timeout or connection loss must fail-stop")
         };
         assert_eq!(fatal.method, BUILD_FCU_METHOD);
         assert_eq!(fatal.outcome, "ERROR");

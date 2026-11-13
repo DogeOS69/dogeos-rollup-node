@@ -51,6 +51,12 @@ pub enum ScriptedResponse<T> {
     Ok(T),
     /// Return a generic transport failure.
     TransportFailure,
+    /// Return the authenticated Engine client's request timeout.
+    RequestTimeout,
+    /// Return the authenticated Engine client's HTTP error for a lost connection.
+    ConnectionLost,
+    /// Return a JSON-RPC error response with the given code.
+    RpcErrorResponse(i32),
     /// Delay before resolving to the nested response.
     DelayThen(Duration, Box<Self>),
 }
@@ -70,6 +76,23 @@ async fn resolve<T>(
             ScriptedResponse::TransportFailure => {
                 return Err(TransportErrorKind::custom(std::io::Error::other(
                     "scripted transport failure",
+                )))
+            }
+            ScriptedResponse::RequestTimeout => {
+                return Err(TransportErrorKind::custom(jsonrpsee::core::ClientError::RequestTimeout))
+            }
+            ScriptedResponse::ConnectionLost => {
+                return Err(TransportErrorKind::custom(jsonrpsee::core::ClientError::Transport(
+                    Box::new(jsonrpsee::http_client::transport::Error::Http(
+                        jsonrpsee::core::http_helpers::HttpError::Stream(Box::new(
+                            std::io::Error::from(std::io::ErrorKind::ConnectionReset),
+                        )),
+                    )),
+                )))
+            }
+            ScriptedResponse::RpcErrorResponse(code) => {
+                return Err(TransportErrorKind::custom(jsonrpsee::core::ClientError::Call(
+                    jsonrpsee::types::ErrorObject::owned(code, "scripted error", None::<()>),
                 )))
             }
             ScriptedResponse::DelayThen(delay, inner) => {
@@ -129,6 +152,13 @@ impl ScriptedEngineClient {
     /// Returns the number of `getPayload` calls.
     pub fn get_payload_calls(&self) -> u64 {
         self.get_payload_calls.load(Ordering::SeqCst)
+    }
+
+    /// Returns true if every scripted response has been consumed.
+    pub fn is_drained(&self) -> bool {
+        self.new_payload.lock().expect("scripted response mutex poisoned").is_empty() &&
+            self.fork_choice_updated.lock().expect("scripted response mutex poisoned").is_empty() &&
+            self.get_payload.lock().expect("scripted response mutex poisoned").is_empty()
     }
 
     /// Returns every forkchoice input and whether the call supplied payload attributes.

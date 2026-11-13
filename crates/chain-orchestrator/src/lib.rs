@@ -137,6 +137,8 @@ pub struct ChainOrchestrator<
     derivation_pipeline: DerivationPipeline,
     /// Owns the single derived result being reconciled or held for Engine sync.
     derivation_driver: DerivationDriver,
+    /// How frontier recovery chooses the unsafe head: a follower keeps Reth's head.
+    head_selection: frontier::HeadSelection,
     /// Optional event sender for broadcasting events to listeners.
     event_sender: Option<EventSender<ChainOrchestratorEvent>>,
     /// The metrics handler.
@@ -182,6 +184,7 @@ impl<
     ) -> Result<(Self, ChainOrchestratorHandle<N>), ChainOrchestratorError> {
         let (handle_tx, handle_rx) = mpsc::unbounded_channel();
         let handle = ChainOrchestratorHandle::new(handle_tx);
+        let head_selection = frontier::HeadSelection::for_node(sequencer.is_some());
         Ok((
             Self {
                 block_client,
@@ -196,7 +199,8 @@ impl<
                 sequencer,
                 signer,
                 derivation_pipeline,
-                derivation_driver: DerivationDriver::default(),
+                derivation_driver: DerivationDriver::new(head_selection),
+                head_selection,
                 handle_rx,
                 event_sender: None,
                 metric_handler: MetricsHandler::default(),
@@ -222,10 +226,11 @@ impl<
                 self.notify(ChainOrchestratorEvent::Shutdown);
                 return Ok(())
             }
-            result = frontier::recover_database_frontier(
+            result = frontier::recover_database_frontier_retrying(
                 &*self.l2_client,
                 &mut self.engine,
                 &self.database,
+                self.head_selection,
             ) => result?,
         }
 
@@ -665,8 +670,13 @@ impl<
     ) -> Result<(UnwindResult, HeldReorgOutcome), ChainOrchestratorError> {
         // A held block import may depend on L1 messages that the unwind removes.
         self.blocked_import = None;
-        frontier::ensure_database_frontier(&*self.l2_client, &mut self.engine, &self.database)
-            .await?;
+        frontier::ensure_database_frontier(
+            &*self.l2_client,
+            &mut self.engine,
+            &self.database,
+            self.head_selection,
+        )
+        .await?;
         let expected = frontier::stored_forkchoice(self.engine.fcs());
         let (unwind_result, outcome) = self
             .derivation_driver
@@ -910,8 +920,13 @@ impl<
         &mut self,
         block_number: u64,
     ) -> Result<Option<ChainOrchestratorEvent>, ChainOrchestratorError> {
-        frontier::ensure_database_frontier(&*self.l2_client, &mut self.engine, &self.database)
-            .await?;
+        frontier::ensure_database_frontier(
+            &*self.l2_client,
+            &mut self.engine,
+            &self.database,
+            self.head_selection,
+        )
+        .await?;
         let expected = frontier::stored_forkchoice(self.engine.fcs());
         let (finalized_block_info, triggered_batches) = self
             .database
@@ -1042,8 +1057,13 @@ impl<
         end_index: u64,
         l1_block_info: BlockInfo,
     ) -> Result<Option<ChainOrchestratorEvent>, ChainOrchestratorError> {
-        frontier::ensure_database_frontier(&*self.l2_client, &mut self.engine, &self.database)
-            .await?;
+        frontier::ensure_database_frontier(
+            &*self.l2_client,
+            &mut self.engine,
+            &self.database,
+            self.head_selection,
+        )
+        .await?;
         let expected = frontier::stored_forkchoice(self.engine.fcs());
         let (safe_block_info, batch_info) = self
             .database

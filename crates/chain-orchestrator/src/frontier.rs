@@ -15,6 +15,19 @@ use scroll_db::{
 };
 use scroll_engine::{Engine, EngineError, ForkchoiceState, ScrollEngineApi};
 
+/// How frontier recovery chooses the unsafe head when Reth's head is above the stored L2 head.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum HeadSelection {
+    #[default]
+    /// Use the stored L2 head: the newest block Reth kept up to it. A sequencer builds on the
+    /// head, and its L1 message state ends at the stored head.
+    StoredHead,
+    /// Keep Reth's head when the stored head is its canonical ancestor. A follower's Reth can run
+    /// far ahead of the stored head (P2P sync); moving the head down to the stored head makes Reth
+    /// unwind every block above it inside the forkchoice update.
+    KeepEngineHead,
+}
+
 pub(crate) const fn stored_forkchoice(value: &ForkchoiceState) -> StoredForkchoiceState {
     StoredForkchoiceState {
         head: *value.head_block_info(),
@@ -188,6 +201,7 @@ pub(crate) async fn recover_database_frontier<P, EC>(
     provider: &P,
     engine: &mut Engine<EC>,
     database: &Database,
+    head_selection: HeadSelection,
 ) -> Result<(), ChainOrchestratorError>
 where
     P: Provider<Scroll>,
@@ -237,13 +251,29 @@ where
         // Select the persisted unsafe head only after resolving a possible safe rewind. If the
         // execution node lost recent blocks, walk back to the durable safe boundary and purge
         // mappings for the discarded unsafe suffix in the same transaction as the repair intent.
-        let head = kept_head(provider, safe, database.get_l2_head_block_number().await?).await?;
+        // A follower whose Reth ran ahead of the stored head (P2P sync) keeps Reth's head when the
+        // stored head is its canonical ancestor: moving the head down would make Reth unwind every
+        // block above it inside the forkchoice update. The stored head and its mapping purge are
+        // unchanged; consolidation maps the blocks above it once the node is synced.
+        let stored_head =
+            kept_head(provider, safe, database.get_l2_head_block_number().await?).await?;
+        let head = if head_selection == HeadSelection::KeepEngineHead &&
+            observed.head.number > stored_head.number &&
+            canonical_ancestor(provider, stored_head, observed.head).await?
+        {
+            tracing::info!(target: "scroll::chain_orchestrator", ?stored_head, engine_head = ?observed.head, "Keeping Reth's head above the stored L2 head");
+            observed.head
+        } else {
+            stored_head
+        };
         let target = StoredForkchoiceState { head, safe, finalized };
         target.validate()?;
         database
             .tx_mut(move |tx| async move {
-                tx.set_l2_head_block_number(head.number).await?;
-                tx.purge_l1_message_to_l2_block_mappings(Some(head.number.saturating_add(1)))
+                tx.set_l2_head_block_number(stored_head.number).await?;
+                tx.purge_l1_message_to_l2_block_mappings(Some(
+                    stored_head.number.saturating_add(1),
+                ))
                     .await?;
                 tx.set_pending_frontier_transition(PendingFrontierTransition {
                     expected: observed,
@@ -260,11 +290,45 @@ where
     .map_err(ChainOrchestratorError::frontier_recovery)
 }
 
+/// Startup recovery that waits for an unavailable Engine instead of failing: a forkchoice update
+/// that times out or loses its connection is retried from fresh state with the derived-batch hold
+/// backoff (2 s doubling to 30 s), logged at error level each time. Any other error fails startup.
+pub(crate) async fn recover_database_frontier_retrying<P, EC>(
+    provider: &P,
+    engine: &mut Engine<EC>,
+    database: &Database,
+    head_selection: HeadSelection,
+) -> Result<(), ChainOrchestratorError>
+where
+    P: Provider<Scroll>,
+    EC: ScrollEngineApi + Sync + Send + 'static,
+{
+    let mut attempt = 0u64;
+    loop {
+        match recover_database_frontier(provider, engine, database, head_selection).await {
+            Err(error) if error.is_engine_unavailable() => {
+                attempt = attempt.saturating_add(1);
+                let backoff = crate::derivation::hold_backoff(attempt);
+                tracing::error!(
+                    target: "scroll::chain_orchestrator",
+                    attempt,
+                    backoff_ms = u64::try_from(backoff.as_millis()).unwrap_or(u64::MAX),
+                    error = %error,
+                    "Engine did not answer during startup frontier recovery; retrying"
+                );
+                tokio::time::sleep(backoff).await;
+            }
+            result => return result,
+        }
+    }
+}
+
 /// Reconciles and returns the database safe frontier. Startup recovery must run before the loop.
 pub(crate) async fn ensure_database_frontier<P, EC>(
     provider: &P,
     engine: &mut Engine<EC>,
     database: &Database,
+    head_selection: HeadSelection,
 ) -> Result<BlockInfo, ChainOrchestratorError>
 where
     P: Provider<Scroll>,
@@ -274,7 +338,7 @@ where
         apply_pending_frontier_transition(provider, engine, database).await?;
         let (safe, _) = database.get_latest_safe_l2_info().await?;
         if *engine.fcs().safe_block_info() != safe {
-            recover_database_frontier(provider, engine, database).await?;
+            recover_database_frontier(provider, engine, database, head_selection).await?;
         }
         Ok::<_, ChainOrchestratorError>(safe)
     }
@@ -430,8 +494,14 @@ mod tests {
             push_tags(&asserter, &other_block, &other_block, &genesis_block);
             let (provider, client, mut engine) =
                 mock_engine(asserter, ForkchoiceState::new(other, other, genesis));
-            let error =
-                recover_database_frontier(&provider, &mut engine, &database).await.unwrap_err();
+            let error = recover_database_frontier(
+                &provider,
+                &mut engine,
+                &database,
+                HeadSelection::StoredHead,
+            )
+            .await
+            .unwrap_err();
             assert!(matches!(error, ChainOrchestratorError::FrontierConflict { tag: "safe", .. }));
             assert_eq!(client.fork_choice_updated_calls(), 0);
             assert_eq!(database.get_pending_frontier_transition().await.unwrap(), None);
@@ -457,11 +527,154 @@ mod tests {
         let (provider, client, mut engine) =
             mock_engine(asserter, ForkchoiceState::new(head, old, genesis));
         client.push_fork_choice_updated(ScriptedResponse::Ok(valid_fcu()));
-        recover_database_frontier(&provider, &mut engine, &database).await.unwrap();
+        recover_database_frontier(&provider, &mut engine, &database, HeadSelection::StoredHead)
+            .await
+            .unwrap();
         assert_eq!(
             stored_forkchoice(engine.fcs()),
             StoredForkchoiceState { head, safe, finalized: genesis }
         );
+        assert_eq!(client.fork_choice_updated_calls(), 1);
+    }
+
+    /// Reth's tip about a million blocks above the stored rollup head, as on the testnet datadir
+    /// where the startup forkchoice update timed out while Reth unwound to the stored head.
+    const STORED_HEAD: u64 = 100_000;
+    const RETH_TIP: u64 = 1_100_000;
+
+    /// Runs startup recovery with Reth's tip far above the stored head and returns the heads the
+    /// forkchoice updates sent, the local forkchoice head and the stored L2 head afterwards.
+    async fn recover_with_reth_far_ahead(
+        head_selection: HeadSelection,
+    ) -> (Vec<B256>, BlockInfo, u64, BlockInfo, BlockInfo) {
+        let database = setup_test_db().await;
+        let (genesis_block, genesis) = rpc_block(0, B256::ZERO, 0xf0);
+        let (safe_block, safe) = rpc_block(100, genesis.hash, 0xa1);
+        let (stored_block, stored) = rpc_block(STORED_HEAD, B256::repeat_byte(0x51), 0xb1);
+        let (tip_block, tip) = rpc_block(RETH_TIP, B256::repeat_byte(0x52), 0xc1);
+        seed_frontier(&database, genesis, safe).await;
+        database.set_l2_head_block_number(STORED_HEAD).await.unwrap();
+        let asserter = Asserter::new();
+        push_tags(&asserter, &tip_block, &safe_block, &genesis_block);
+        // Stored head selection, then (keeping Reth's head) its canonical ancestry proof.
+        for block in [&safe_block, &stored_block, &stored_block, &tip_block] {
+            asserter.push_success(&Some(block.clone()));
+        }
+        let (provider, client, mut engine) =
+            mock_engine(asserter, ForkchoiceState::new(tip, safe, genesis));
+        client.push_fork_choice_updated(ScriptedResponse::Ok(valid_fcu()));
+
+        recover_database_frontier(&provider, &mut engine, &database, head_selection).await.unwrap();
+        let inputs = client.fork_choice_inputs();
+        assert!(inputs.iter().all(|(fcs, _)| fcs.safe_block_hash == safe.hash));
+        assert_eq!(database.get_pending_frontier_transition().await.unwrap(), None);
+        (
+            inputs.iter().map(|(fcs, _)| fcs.head_block_hash).collect(),
+            *engine.fcs().head_block_info(),
+            database.get_l2_head_block_number().await.unwrap(),
+            stored,
+            tip,
+        )
+    }
+
+    /// A follower keeps Reth's head: the startup forkchoice update must not move the head about a
+    /// million blocks down to the stored head, which makes Reth unwind them inside the call. The
+    /// stored head and its message-mapping purge are unchanged.
+    #[tokio::test]
+    async fn follower_startup_keeps_reth_head_far_above_the_stored_head() {
+        let (sent_heads, head, stored_number, _, tip) =
+            recover_with_reth_far_ahead(HeadSelection::KeepEngineHead).await;
+        // Reth's tags already match the target, so no forkchoice update is needed at all; any
+        // that is sent must keep Reth's head.
+        assert!(sent_heads.iter().all(|sent| *sent == tip.hash), "{sent_heads:?}");
+        assert_eq!(head, tip);
+        assert_eq!(stored_number, STORED_HEAD);
+    }
+
+    /// A sequencer keeps moving the head to the stored head.
+    #[tokio::test]
+    async fn sequencer_startup_moves_the_head_to_the_stored_head() {
+        let (sent_heads, head, stored_number, stored, _) =
+            recover_with_reth_far_ahead(HeadSelection::StoredHead).await;
+        assert_eq!(sent_heads, vec![stored.hash]);
+        assert_eq!(head, stored);
+        assert_eq!(stored_number, STORED_HEAD);
+    }
+
+    /// The startup forkchoice update times out (Reth busy); recovery retries after the backoff
+    /// and completes instead of failing startup.
+    #[tokio::test]
+    async fn startup_recovery_retries_after_an_engine_request_timeout() {
+        let database = setup_test_db().await;
+        let (genesis_block, genesis) = rpc_block(0, B256::ZERO, 0xf0);
+        let (old_block, old) = rpc_block(99, genesis.hash, 0xb1);
+        let (safe_block, safe) = rpc_block(100, old.hash, 0xa1);
+        let (head_block, head) = rpc_block(101, safe.hash, 0xc1);
+        seed_frontier(&database, genesis, safe).await;
+        database.set_l2_head_block_number(head.number).await.unwrap();
+        let asserter = Asserter::new();
+        // First attempt: tags, ancestry proof, head selection; after the timeout, tags again.
+        push_tags(&asserter, &head_block, &old_block, &genesis_block);
+        for block in [&old_block, &safe_block, &safe_block, &head_block] {
+            asserter.push_success(&Some(block.clone()));
+        }
+        push_tags(&asserter, &head_block, &old_block, &genesis_block);
+        // Second attempt: tags, the saved move's head (still in Reth), then head selection. The
+        // replayed move makes the tags match the target, so no further update is needed.
+        push_tags(&asserter, &head_block, &old_block, &genesis_block);
+        for block in [&head_block, &safe_block, &head_block] {
+            asserter.push_success(&Some(block.clone()));
+        }
+        let (provider, client, mut engine) =
+            mock_engine(asserter, ForkchoiceState::new(head, old, genesis));
+        client.push_fork_choice_updated(ScriptedResponse::RequestTimeout);
+        client.push_fork_choice_updated(ScriptedResponse::Ok(valid_fcu()));
+
+        recover_database_frontier_retrying(
+            &provider,
+            &mut engine,
+            &database,
+            HeadSelection::StoredHead,
+        )
+        .await
+        .unwrap();
+        assert_eq!(client.fork_choice_updated_calls(), 2);
+        assert_eq!(
+            stored_forkchoice(engine.fcs()),
+            StoredForkchoiceState { head, safe, finalized: genesis }
+        );
+        assert_eq!(database.get_pending_frontier_transition().await.unwrap(), None);
+    }
+
+    /// Any other startup recovery failure still fails startup.
+    #[tokio::test]
+    async fn startup_recovery_fails_on_an_engine_error_response() {
+        let database = setup_test_db().await;
+        let (genesis_block, genesis) = rpc_block(0, B256::ZERO, 0xf0);
+        let (old_block, old) = rpc_block(99, genesis.hash, 0xb1);
+        let (safe_block, safe) = rpc_block(100, old.hash, 0xa1);
+        let (head_block, head) = rpc_block(101, safe.hash, 0xc1);
+        seed_frontier(&database, genesis, safe).await;
+        database.set_l2_head_block_number(head.number).await.unwrap();
+        let asserter = Asserter::new();
+        push_tags(&asserter, &head_block, &old_block, &genesis_block);
+        for block in [&old_block, &safe_block, &safe_block, &head_block] {
+            asserter.push_success(&Some(block.clone()));
+        }
+        push_tags(&asserter, &head_block, &old_block, &genesis_block);
+        let (provider, client, mut engine) =
+            mock_engine(asserter, ForkchoiceState::new(head, old, genesis));
+        client.push_fork_choice_updated(ScriptedResponse::RpcErrorResponse(-32000));
+
+        let error = recover_database_frontier_retrying(
+            &provider,
+            &mut engine,
+            &database,
+            HeadSelection::StoredHead,
+        )
+        .await
+        .unwrap_err();
+        assert!(!error.is_engine_unavailable(), "{error:?}");
         assert_eq!(client.fork_choice_updated_calls(), 1);
     }
 
@@ -509,7 +722,9 @@ mod tests {
             mock_engine(asserter, ForkchoiceState::new(lost, old_safe, genesis));
         client.push_fork_choice_updated(ScriptedResponse::Ok(valid_fcu()));
 
-        recover_database_frontier(&provider, &mut engine, &database).await.unwrap();
+        recover_database_frontier(&provider, &mut engine, &database, HeadSelection::StoredHead)
+            .await
+            .unwrap();
         assert_eq!(client.fork_choice_updated_calls(), 1);
         assert_eq!(client.fork_choice_inputs()[0].0.head_block_hash, safe.hash);
         assert_eq!(engine.fcs(), &ForkchoiceState::new(safe, safe, genesis));
@@ -563,7 +778,9 @@ mod tests {
             mock_engine(asserter, ForkchoiceState::from_block_info(genesis));
         client.push_fork_choice_updated(ScriptedResponse::Ok(valid_fcu()));
 
-        recover_database_frontier(&provider, &mut engine, &database).await.unwrap();
+        recover_database_frontier(&provider, &mut engine, &database, HeadSelection::StoredHead)
+            .await
+            .unwrap();
         assert_eq!(client.fork_choice_updated_calls(), 1);
         assert_eq!(client.fork_choice_inputs()[0].0.head_block_hash, safe.hash);
         assert_eq!(engine.fcs(), &ForkchoiceState::new(safe, safe, genesis));
@@ -616,7 +833,9 @@ mod tests {
                 mock_engine(asserter, ForkchoiceState::from_block_info(genesis));
             client.push_fork_choice_updated(ScriptedResponse::Ok(valid_fcu()));
 
-            recover_database_frontier(&provider, &mut engine, &database).await.unwrap();
+            recover_database_frontier(&provider, &mut engine, &database, HeadSelection::StoredHead)
+                .await
+                .unwrap();
             assert_eq!(client.fork_choice_updated_calls(), 1, "lagging={lagging}");
             assert_eq!(stored_forkchoice(engine.fcs()), finalize.target);
             assert_eq!(database.get_pending_frontier_transition().await.unwrap(), None);
@@ -653,7 +872,9 @@ mod tests {
             mock_engine(asserter, ForkchoiceState::from_block_info(genesis));
         client.push_fork_choice_updated(ScriptedResponse::Ok(valid_fcu()));
 
-        recover_database_frontier(&provider, &mut engine, &database).await.unwrap();
+        recover_database_frontier(&provider, &mut engine, &database, HeadSelection::StoredHead)
+            .await
+            .unwrap();
         assert_eq!(client.fork_choice_updated_calls(), 1);
         assert_eq!(engine.fcs(), &ForkchoiceState::new(head, safe, genesis));
     }
@@ -675,7 +896,9 @@ mod tests {
         let (provider, client, mut engine) =
             mock_engine(asserter, ForkchoiceState::new(safe, safe, genesis));
         client.push_fork_choice_updated(ScriptedResponse::Ok(valid_fcu()));
-        recover_database_frontier(&provider, &mut engine, &database).await.unwrap();
+        recover_database_frontier(&provider, &mut engine, &database, HeadSelection::StoredHead)
+            .await
+            .unwrap();
         assert_eq!(engine.fcs(), &ForkchoiceState::from_block_info(safe));
         assert_eq!(client.fork_choice_updated_calls(), 1);
         assert_eq!(database.get_pending_frontier_transition().await.unwrap(), None);
@@ -719,7 +942,9 @@ mod tests {
             for _ in 0..2 {
                 client.push_fork_choice_updated(ScriptedResponse::Ok(valid_fcu()));
             }
-            recover_database_frontier(&provider, &mut engine, &database).await.unwrap();
+            recover_database_frontier(&provider, &mut engine, &database, HeadSelection::StoredHead)
+                .await
+                .unwrap();
             assert_eq!(
                 engine.fcs(),
                 &ForkchoiceState::new(safe, safe, genesis),
@@ -780,7 +1005,9 @@ mod tests {
             mock_engine(asserter, ForkchoiceState::from_block_info(genesis));
         client.push_fork_choice_updated(ScriptedResponse::Ok(valid_fcu()));
 
-        recover_database_frontier(&provider, &mut engine, &database).await.unwrap();
+        recover_database_frontier(&provider, &mut engine, &database, HeadSelection::StoredHead)
+            .await
+            .unwrap();
         assert_eq!(engine.fcs(), &ForkchoiceState::new(head, safe, genesis));
         assert_eq!(database.get_pending_frontier_transition().await.unwrap(), None);
     }
@@ -847,7 +1074,14 @@ mod tests {
                     let (provider, client, mut engine) =
                         mock_engine(asserter, ForkchoiceState::from_block_info(genesis));
                     client.push_fork_choice_updated(ScriptedResponse::Ok(valid_fcu()));
-                    recover_database_frontier(&provider, &mut engine, &database).await.unwrap();
+                    recover_database_frontier(
+                        &provider,
+                        &mut engine,
+                        &database,
+                        HeadSelection::StoredHead,
+                    )
+                    .await
+                    .unwrap();
                     assert_eq!(engine.fcs(), &ForkchoiceState::new(head, safe, genesis));
                     assert_eq!(client.fork_choice_updated_calls(), 1);
                     assert_eq!(database.get_pending_frontier_transition().await.unwrap(), None);
@@ -901,8 +1135,14 @@ mod tests {
             push_tags(&asserter, &observed_block, &observed_block, &genesis_block);
             let (provider, client, mut engine) =
                 mock_engine(asserter, ForkchoiceState::from_block_info(genesis));
-            let error =
-                recover_database_frontier(&provider, &mut engine, &database).await.unwrap_err();
+            let error = recover_database_frontier(
+                &provider,
+                &mut engine,
+                &database,
+                HeadSelection::StoredHead,
+            )
+            .await
+            .unwrap_err();
             assert!(
                 matches!(error, ChainOrchestratorError::FrontierConflict { tag: "safe", observed: block, .. } if block == observed)
             );
@@ -949,7 +1189,9 @@ mod tests {
         let (provider, client, mut engine) =
             mock_engine(asserter, ForkchoiceState::from_block_info(genesis));
         client.push_fork_choice_updated(ScriptedResponse::Ok(valid_fcu()));
-        recover_database_frontier(&provider, &mut engine, &database).await.unwrap();
+        recover_database_frontier(&provider, &mut engine, &database, HeadSelection::StoredHead)
+            .await
+            .unwrap();
         assert_eq!(engine.fcs(), &ForkchoiceState::from_block_info(safe));
         assert_eq!(client.fork_choice_updated_calls(), 1);
     }
@@ -964,7 +1206,10 @@ mod tests {
         push_tags(&asserter, &safe_block, &safe_block, &safe_block);
         let (provider, client, mut engine) =
             mock_engine(asserter, ForkchoiceState::from_block_info(genesis));
-        let error = recover_database_frontier(&provider, &mut engine, &database).await.unwrap_err();
+        let error =
+            recover_database_frontier(&provider, &mut engine, &database, HeadSelection::StoredHead)
+                .await
+                .unwrap_err();
         assert!(matches!(error, ChainOrchestratorError::FrontierConflict { tag: "finalized", .. }));
         assert_eq!(client.fork_choice_updated_calls(), 0);
         assert_eq!(database.get_pending_frontier_transition().await.unwrap(), None);
@@ -992,7 +1237,10 @@ mod tests {
         let database = setup_test_db().await;
         let (provider, _, mut engine) =
             mock_engine(Asserter::new(), ForkchoiceState::from_genesis(B256::ZERO));
-        let error = recover_database_frontier(&provider, &mut engine, &database).await.unwrap_err();
+        let error =
+            recover_database_frontier(&provider, &mut engine, &database, HeadSelection::StoredHead)
+                .await
+                .unwrap_err();
         assert!(matches!(error, ChainOrchestratorError::FrontierRecovery(source)
             if matches!(*source, ChainOrchestratorError::RpcError(_))));
     }
@@ -1010,10 +1258,15 @@ mod tests {
             .unwrap();
         let (provider, client, mut engine) =
             mock_engine(Asserter::new(), ForkchoiceState::from_genesis(B256::ZERO));
-        assert!(ensure_database_frontier(&provider, &mut engine, &database)
-            .await
-            .unwrap_err()
-            .is_frontier_fatal());
+        assert!(ensure_database_frontier(
+            &provider,
+            &mut engine,
+            &database,
+            HeadSelection::StoredHead
+        )
+        .await
+        .unwrap_err()
+        .is_frontier_fatal());
         scroll_db::metadata::Entity::delete_by_id("pending_frontier_transition")
             .exec(database.inner().get_connection())
             .await
@@ -1022,10 +1275,15 @@ mod tests {
             .exec(database.inner().get_connection())
             .await
             .unwrap();
-        assert!(ensure_database_frontier(&provider, &mut engine, &database)
-            .await
-            .unwrap_err()
-            .is_frontier_fatal());
+        assert!(ensure_database_frontier(
+            &provider,
+            &mut engine,
+            &database,
+            HeadSelection::StoredHead
+        )
+        .await
+        .unwrap_err()
+        .is_frontier_fatal());
         assert_eq!(client.fork_choice_updated_calls(), 0);
     }
 }

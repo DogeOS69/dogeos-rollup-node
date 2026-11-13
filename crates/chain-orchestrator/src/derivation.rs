@@ -2,7 +2,10 @@
 
 use crate::{
     consolidation::{reconcile_batch, BlockConsolidationAction},
-    frontier::{apply_pending_frontier_transition, ensure_database_frontier, stored_forkchoice},
+    frontier::{
+        apply_pending_frontier_transition, ensure_database_frontier, stored_forkchoice,
+        HeadSelection,
+    },
     metrics::DerivedBatchMetrics,
     status::{DerivationStatus, HeldBatchStatus},
     ChainOrchestratorError,
@@ -59,6 +62,9 @@ pub(crate) enum AttemptStep {
 enum HoldStatus {
     Syncing,
     Accepted,
+    /// The Engine API timed out or its connection failed; see
+    /// [`EngineError::is_engine_unavailable`].
+    EngineUnavailable,
 }
 
 impl HoldStatus {
@@ -66,6 +72,7 @@ impl HoldStatus {
         match self {
             Self::Syncing => "SYNCING",
             Self::Accepted => "ACCEPTED",
+            Self::EngineUnavailable => "ENGINE_UNAVAILABLE",
         }
     }
 }
@@ -85,6 +92,33 @@ enum AttemptFailure {
 impl AttemptFailure {
     fn fatal(method: &'static str, outcome: &'static str, error: ChainOrchestratorError) -> Self {
         Self::Fatal(FatalAttempt { method, outcome, error: Box::new(error) })
+    }
+
+    /// Holds the batch if the Engine got no answer to `method`, and fail-stops otherwise.
+    ///
+    /// Holding is safe at every Engine call of an attempt: before the database commit nothing is
+    /// committed and each local forkchoice step follows only a received answer, so the next
+    /// attempt reconciles afresh from the last block Reth confirmed; a frontier move is a durable
+    /// intent that the next attempt replays first. A request that took effect after all is found
+    /// applied then.
+    fn engine(
+        batch_info: BatchInfo,
+        method: &'static str,
+        outcome: &'static str,
+        error: ChainOrchestratorError,
+    ) -> Self {
+        if error.is_engine_unavailable() {
+            tracing::error!(
+                target: "scroll::chain_orchestrator",
+                batch_index = batch_info.index,
+                batch_hash = ?batch_info.hash,
+                method,
+                error = %error,
+                "Engine request for derived batch failed without an answer; holding and retrying"
+            );
+            return Self::Hold(HoldReason { method, status: HoldStatus::EngineUnavailable });
+        }
+        Self::fatal(method, outcome, error)
     }
 }
 
@@ -116,11 +150,17 @@ pub(crate) enum HeldReorgOutcome {
 #[derive(Debug, Default)]
 pub(crate) struct DerivationDriver {
     pending: Option<PendingBatch>,
+    head_selection: HeadSelection,
     attempt_sleep: Option<Pin<Box<Sleep>>>,
     metrics: DerivedBatchMetrics,
 }
 
 impl DerivationDriver {
+    /// Creates a driver whose frontier checks choose the unsafe head by `head_selection`.
+    pub(crate) fn new(head_selection: HeadSelection) -> Self {
+        Self { head_selection, ..Self::default() }
+    }
+
     /// Returns whether the pipeline may yield another result into the owned slot.
     pub(crate) const fn can_accept_batch(&self) -> bool {
         self.pending.is_none()
@@ -161,8 +201,9 @@ impl DerivationDriver {
         }
     }
 
-    /// Runs one attempt. Only received `SYNCING`, plus `ACCEPTED` from `newPayload`, schedule a
-    /// further in-process reconciliation.
+    /// Runs one attempt. Only received `SYNCING`, `ACCEPTED` from `newPayload`, and an
+    /// unavailable Engine (a request timeout or lost connection) schedule a further in-process
+    /// reconciliation.
     pub(crate) async fn run_attempt<L2P, EC>(
         &mut self,
         l2_client: &L2P,
@@ -190,7 +231,15 @@ impl DerivationDriver {
             "Attempting derived batch reconciliation"
         );
 
-        match reconcile_and_consolidate(l2_client, engine, database, &pending.batch).await {
+        match reconcile_and_consolidate(
+            l2_client,
+            engine,
+            database,
+            &pending.batch,
+            self.head_selection,
+        )
+        .await
+        {
             Ok(consolidated) => {
                 self.pending = None;
                 self.metrics.held.set(0.0);
@@ -370,7 +419,7 @@ impl DerivationDriver {
     }
 }
 
-fn hold_backoff(attempt: u64) -> Duration {
+pub(crate) fn hold_backoff(attempt: u64) -> Duration {
     let exponent = attempt.saturating_sub(1).min(63) as u32;
     let multiplier = 1u64.checked_shl(exponent).unwrap_or(u64::MAX);
     Duration::from_millis(
@@ -387,15 +436,18 @@ async fn reconcile_and_consolidate<L2P, EC>(
     engine: &mut Engine<EC>,
     database: &Database,
     batch: &BatchDerivationResult,
+    head_selection: HeadSelection,
 ) -> Result<ConsolidatedBatch, AttemptFailure>
 where
     L2P: Provider<Scroll>,
     EC: ScrollEngineApi + Sync + Send + 'static,
 {
     let batch_info = batch.batch_info;
-    let frontier = ensure_database_frontier(l2_client, engine, database)
+    let frontier = ensure_database_frontier(l2_client, engine, database, head_selection)
         .await
-        .map_err(|error| AttemptFailure::fatal("reconcileFrontier", "FRONTIER_ERROR", error))?;
+        .map_err(|error| {
+            AttemptFailure::engine(batch_info, "reconcileFrontier", "FRONTIER_ERROR", error)
+        })?;
     // The batch extends the database's safe block, so the Engine's chain must contain it.
     // Otherwise the Engine kept a fork the database has left, and reconciliation would continue
     // that fork. The frontier check above already moved the Engine's cached safe block to the
@@ -612,7 +664,7 @@ where
 
     if transition.is_some() {
         apply_pending_frontier_transition(l2_client, engine, database).await.map_err(|error| {
-            AttemptFailure::fatal("applyFrontierTransition", "FRONTIER_ERROR", error)
+            AttemptFailure::engine(batch_info, "applyFrontierTransition", "FRONTIER_ERROR", error)
         })?;
     }
 
@@ -624,6 +676,14 @@ fn engine_request_failure(
     method: &'static str,
 ) -> impl FnOnce(EngineError) -> AttemptFailure {
     move |source| {
+        if source.is_engine_unavailable() {
+            return AttemptFailure::engine(
+                batch_info,
+                method,
+                "ERROR",
+                ChainOrchestratorError::EngineError(source),
+            );
+        }
         AttemptFailure::fatal(
             method,
             "ERROR",
@@ -770,6 +830,10 @@ mod tests {
         NewPayloadSyncing,
         NewPayloadAccepted,
         FinalFcuSyncing,
+        BuildFcuTimedOut,
+        GetPayloadConnectionLost,
+        NewPayloadTimedOut,
+        FinalFcuTimedOut,
     }
 
     fn info(number: u64, tag: u8) -> BlockInfo {
@@ -937,6 +1001,15 @@ mod tests {
     fn script_hold_then_success(client: &ScriptedEngineClient, boundary: HoldBoundary) {
         let valid_build = || fcu(PayloadStatusEnum::Valid, Some(PayloadId::new([7; 8])));
         let valid_fcu = || fcu(PayloadStatusEnum::Valid, None);
+        // The retry's full rebuild: build, getPayload, newPayload, the block's forkchoice update
+        // and the batch's frontier move.
+        let script_success = || {
+            client.push_fork_choice_updated(ScriptedResponse::Ok(valid_build()));
+            client.push_get_payload(ScriptedResponse::Ok(payload(SAFE + 1)));
+            client.push_new_payload(ScriptedResponse::Ok(payload_status(PayloadStatusEnum::Valid)));
+            client.push_fork_choice_updated(ScriptedResponse::Ok(valid_fcu()));
+            client.push_fork_choice_updated(ScriptedResponse::Ok(valid_fcu()));
+        };
 
         match boundary {
             HoldBoundary::BuildFcuSyncing => {
@@ -968,6 +1041,30 @@ mod tests {
                 )));
                 client.push_fork_choice_updated(ScriptedResponse::Ok(valid_fcu()));
                 client.push_fork_choice_updated(ScriptedResponse::Ok(valid_fcu()));
+            }
+            HoldBoundary::BuildFcuTimedOut => {
+                client.push_fork_choice_updated(ScriptedResponse::RequestTimeout);
+                script_success();
+            }
+            HoldBoundary::GetPayloadConnectionLost => {
+                client.push_fork_choice_updated(ScriptedResponse::Ok(valid_build()));
+                client.push_get_payload(ScriptedResponse::ConnectionLost);
+                script_success();
+            }
+            HoldBoundary::NewPayloadTimedOut => {
+                client.push_fork_choice_updated(ScriptedResponse::Ok(valid_build()));
+                client.push_get_payload(ScriptedResponse::Ok(payload(SAFE + 1)));
+                client.push_new_payload(ScriptedResponse::RequestTimeout);
+                script_success();
+            }
+            HoldBoundary::FinalFcuTimedOut => {
+                client.push_fork_choice_updated(ScriptedResponse::Ok(valid_build()));
+                client.push_get_payload(ScriptedResponse::Ok(payload(SAFE + 1)));
+                client.push_new_payload(ScriptedResponse::Ok(payload_status(
+                    PayloadStatusEnum::Valid,
+                )));
+                client.push_fork_choice_updated(ScriptedResponse::RequestTimeout);
+                script_success();
             }
             HoldBoundary::FinalFcuSyncing => {
                 client.push_fork_choice_updated(ScriptedResponse::Ok(valid_build()));
@@ -1135,6 +1232,107 @@ mod tests {
     #[tokio::test]
     async fn gas_limit_mismatch_rebuilds_before_advancing_finalized() {
         assert_gas_limit_mismatch_rebuilds(BatchStatus::Finalized).await;
+    }
+
+    // An Engine that does not answer in time or drops the connection holds the batch like
+    // `SYNCING` does: nothing committed, local forkchoice unchanged, a fresh attempt later.
+    #[tokio::test]
+    async fn build_fcu_request_timeout_holds_then_completes_once() {
+        assert_hold_then_complete(HoldBoundary::BuildFcuTimedOut).await;
+    }
+
+    #[tokio::test]
+    async fn get_payload_connection_loss_holds_then_completes_once() {
+        assert_hold_then_complete(HoldBoundary::GetPayloadConnectionLost).await;
+    }
+
+    #[tokio::test]
+    async fn new_payload_request_timeout_holds_then_completes_once() {
+        assert_hold_then_complete(HoldBoundary::NewPayloadTimedOut).await;
+    }
+
+    #[tokio::test]
+    async fn final_fcu_request_timeout_holds_then_completes_once() {
+        assert_hold_then_complete(HoldBoundary::FinalFcuTimedOut).await;
+    }
+
+    /// The batch's safe move is committed with its durable intent, then the forkchoice update
+    /// applying it times out (Reth is still busy). The attempt holds instead of fail-stopping, the
+    /// commit and the intent stay, and the next attempt replays the intent first.
+    #[tokio::test]
+    async fn frontier_apply_request_timeout_after_commit_holds_with_the_intent_pending() {
+        let database = setup_test_db().await;
+        insert_batch(&database, 1, 1, None).await;
+        let client = Arc::new(ScriptedEngineClient::new());
+        client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(
+            PayloadStatusEnum::Valid,
+            Some(PayloadId::new([7; 8])),
+        )));
+        client.push_get_payload(ScriptedResponse::Ok(payload(SAFE + 1)));
+        client.push_new_payload(ScriptedResponse::Ok(payload_status(PayloadStatusEnum::Valid)));
+        client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Valid, None)));
+        client.push_fork_choice_updated(ScriptedResponse::RequestTimeout);
+        let mut engine = engine_at_safe(client.clone());
+        let asserter = Asserter::new();
+        push_safe_block(&asserter);
+        push_absent_block(&asserter);
+        // After the timeout, Reth's tags still show the block made head but not yet safe.
+        push_tags(&asserter, info(SAFE + 1, 0x22), info(SAFE, 0x11), seeded_genesis());
+        let provider = absent_block_provider(asserter);
+        let mut driver = DerivationDriver::default();
+        driver.hold_batch(batch(1, BatchStatus::Consolidated));
+        driver.wait_for_attempt().await;
+
+        let step = driver.run_attempt(&provider, &mut engine, &database).await;
+        assert!(matches!(step, AttemptStep::Held), "{step:?}");
+        assert!(client.is_drained());
+        let pending = database
+            .get_pending_frontier_transition()
+            .await
+            .unwrap()
+            .expect("the safe move stays a durable intent");
+        assert_eq!(pending.target.safe, info(SAFE + 1, 0x22));
+        assert_eq!(
+            database.get_batch_status_by_hash(B256::repeat_byte(1)).await.unwrap(),
+            Some(BatchStatus::Consolidated)
+        );
+        let DerivationStatus::Held(held) = driver.status(0) else { panic!("expected held status") };
+        assert_eq!(held.last_engine_status.as_deref(), Some("ENGINE_UNAVAILABLE"));
+    }
+
+    /// A saved frontier move whose forkchoice update times out at the start of an attempt holds the
+    /// batch instead of fail-stopping; the intent stays for the next attempt.
+    #[tokio::test]
+    async fn pending_frontier_replay_request_timeout_holds() {
+        let database = setup_test_db().await;
+        insert_batch(&database, 1, 1, None).await;
+        let finalized = seeded_genesis();
+        let old = info(SAFE, 0x11);
+        let expected = StoredForkchoiceState { head: old, safe: old, finalized };
+        let moved = info(SAFE + 1, 0x22);
+        database
+            .set_pending_frontier_transition(PendingFrontierTransition {
+                expected,
+                target: StoredForkchoiceState { head: moved, safe: moved, finalized },
+            })
+            .await
+            .unwrap();
+        let client = Arc::new(ScriptedEngineClient::new());
+        client.push_fork_choice_updated(ScriptedResponse::RequestTimeout);
+        let mut engine = Engine::new(client.clone(), ForkchoiceState::new(old, old, finalized));
+        // After the timeout recovery re-reads Reth's tags, which still show the old state.
+        let provider = forkchoice_provider(expected);
+        let mut driver = DerivationDriver::default();
+        driver.hold_batch(batch(1, BatchStatus::Consolidated));
+        driver.wait_for_attempt().await;
+
+        let step = driver.run_attempt(&provider, &mut engine, &database).await;
+        assert!(matches!(step, AttemptStep::Held), "{step:?}");
+        assert!(database.get_pending_frontier_transition().await.unwrap().is_some());
+        assert_eq!(
+            database.get_batch_status_by_hash(B256::repeat_byte(1)).await.unwrap(),
+            Some(BatchStatus::Committed)
+        );
     }
 
     #[tokio::test]

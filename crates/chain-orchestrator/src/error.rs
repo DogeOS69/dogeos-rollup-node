@@ -206,6 +206,16 @@ impl ChainOrchestratorError {
         }
     }
 
+    /// Returns true if the error is an Engine request that got no answer (see
+    /// [`scroll_engine::EngineError::is_engine_unavailable`]), also inside frontier recovery.
+    pub(crate) fn is_engine_unavailable(&self) -> bool {
+        match self {
+            Self::EngineError(error) => error.is_engine_unavailable(),
+            Self::FrontierRecovery(error) => error.is_engine_unavailable(),
+            _ => false,
+        }
+    }
+
     /// Returns true when continuing the run loop could process work against an unresolved Engine
     /// frontier.
     pub(crate) const fn is_frontier_fatal(&self) -> bool {

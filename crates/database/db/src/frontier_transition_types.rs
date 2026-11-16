@@ -1,6 +1,7 @@
 use rollup_node_primitives::BlockInfo;
 
 pub(crate) const FRONTIER_TRANSITION_KEY: &str = "pending_frontier_transition";
+pub(crate) const REQUIRED_HEAD_REWIND_KEY: &str = "required_frontier_head_rewind";
 pub(crate) const CONFIRMED_FRONTIER_KEY: &str = "confirmed_frontier_transition";
 
 /// A database representation of an Engine forkchoice state.

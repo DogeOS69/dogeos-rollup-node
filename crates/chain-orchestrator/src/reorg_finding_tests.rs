@@ -425,6 +425,8 @@ async fn rg49_signed_block_requested_before_an_unwind_is_discarded() {
         for number in [3, 4, 5] {
             push_signing_readback(&asserter, &signing_block(number));
         }
+        // The durable head rewind also requires exact post-FCU tag confirmation.
+        push_admin_tags(&asserter, BlockInfo::new(3, signing_block(3).hash_slow()));
         orchestrator.l2_client = Arc::new(
             ProviderBuilder::<_, _, Scroll>::default().connect_mocked_client(asserter.clone()),
         );
@@ -446,6 +448,7 @@ async fn rg49_signed_block_requested_before_an_unwind_is_discarded() {
         }
         assert_eq!(engine.fork_choice_updated_calls(), 1);
         assert_eq!(database.get_l2_head_block_number().await.unwrap(), 3);
+        assert!(asserter.read_q().is_empty());
         let mut events = orchestrator.event_listener();
 
         // No readback response is queued: stale ownership must be checked before even the RPC.

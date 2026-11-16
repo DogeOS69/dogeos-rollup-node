@@ -11,6 +11,9 @@ use scroll_engine::EngineError;
 /// A type that represents an error that occurred in the chain orchestrator.
 #[derive(Debug, thiserror::Error)]
 pub enum ChainOrchestratorError {
+    /// An administrative head update must wait for the durable frontier transition to finish.
+    #[error("cannot update forkchoice head while a frontier transition is pending")]
+    PendingFrontierTransition,
     /// The execution provider did not expose all latest/safe/finalized tags needed for recovery.
     #[error("execution provider is missing latest, safe, or finalized forkchoice tags")]
     MissingEngineForkchoiceTags,

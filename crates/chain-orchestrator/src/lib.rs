@@ -298,7 +298,7 @@ impl<
                             self.log_fatal_held_operation(context, "administrative L1 unwind", &err);
                             return Err(err)
                         }
-                        if err.is_frontier_fatal() {
+                        if err.is_fatal() {
                             return Err(err)
                         }
                         tracing::error!(target: "scroll::chain_orchestrator", ?err, "Error handling command");
@@ -408,7 +408,7 @@ impl<
     ) -> Result<(), ChainOrchestratorError> {
         match outcome {
             Ok(Some(event)) => self.notify(event),
-            Err(err) if err.is_frontier_fatal() => return Err(err),
+            Err(err) if err.is_fatal() => return Err(err),
             Err(err) => {
                 tracing::error!(target: "scroll::chain_orchestrator", ?err, "Encountered error in the chain orchestrator");
             }
@@ -701,11 +701,16 @@ impl<
                 let _ = tx.send(true);
             }
             ChainOrchestratorCommand::ImportBlock { block_with_peer, response } => {
-                let result = self
-                    .import_chain(vec![block_with_peer.block.clone()], block_with_peer)
-                    .await
-                    .map_err(|e| e.to_string());
-                let _ = response.send(result);
+                match self.import_chain(vec![block_with_peer.block.clone()], block_with_peer).await
+                {
+                    Err(err) if err.is_fatal() => {
+                        let _ = response.send(Err(err.to_string()));
+                        return Err(err);
+                    }
+                    result => {
+                        let _ = response.send(result.map_err(|err| err.to_string()));
+                    }
+                }
             }
             #[cfg(feature = "test-utils")]
             ChainOrchestratorCommand::SetGossip((enabled, tx)) => {
@@ -851,10 +856,10 @@ impl<
             }
             L1Notification::Synced => {
                 tracing::info!(target: "scroll::chain_orchestrator", "L1 is now synced");
-                self.sync_state.l1_mut().set_synced();
-                if self.sync_state.is_synced() {
+                if self.sync_state.l2().is_synced() {
                     metered!(Task::ChainConsolidation, self, consolidate_chain())?;
                 }
+                self.sync_state.l1_mut().set_synced();
                 self.notify(ChainOrchestratorEvent::L1Synced);
                 Ok(None)
             }
@@ -1678,13 +1683,12 @@ impl<
         // transition the L2 sync state to synced and consolidate the chain.
         if result.is_valid() && self.sync_state.l2().is_syncing() {
             tracing::info!(target: "scroll::chain_orchestrator", "L2 is now synced");
-            self.sync_state.l2_mut().set_synced();
-
-            // If both L1 and L2 are now synced, we transition to consolidated mode by consolidating
-            // the chain.
-            if self.sync_state.is_synced() {
+            // Publish overall readiness only after consolidation succeeds. If L1 is still
+            // catching up, publish L2 readiness now so the run loop can poll L1 notifications.
+            if self.sync_state.l1().is_synced() {
                 self.consolidate_chain().await?;
             }
+            self.sync_state.l2_mut().set_synced();
         }
 
         // Persist the L1 message to L2 block mappings for reorg awareness, update the l2 head block
@@ -1723,6 +1727,15 @@ impl<
     /// This involves validating the L1 messages in the blocks against the expected L1 messages
     /// synced from L1.
     async fn consolidate_chain(&mut self) -> Result<(), ChainOrchestratorError> {
+        // Earlier chunks may already be committed. Stop every caller on failure; restart
+        // recovery reruns consolidation from safe to head and replaces the chunk mappings.
+        self.try_consolidate_chain()
+            .await
+            .map_err(|err| ChainOrchestratorError::ChainConsolidation(Box::new(err)))
+    }
+
+    /// Performs consolidation without publishing readiness until every fallible step succeeds.
+    async fn try_consolidate_chain(&mut self) -> Result<(), ChainOrchestratorError> {
         tracing::trace!(target: "scroll::chain_orchestrator", fcs = ?self.engine.fcs(), "Consolidating chain from safe to head");
 
         let safe_block_number = self.engine.fcs().safe_block_info().number;
@@ -1771,10 +1784,6 @@ impl<
             }
         };
 
-        // send a notification to the network that the chain is synced such that it accepts
-        // transactions into the transaction pool.
-        self.network.handle().inner().update_sync_state(RethSyncState::Idle);
-
         // Fetch all unprocessed committed batches and push them to the derivation pipeline as
         // consolidated.
         let committed_batches =
@@ -1782,6 +1791,9 @@ impl<
         for batch_commit in committed_batches {
             self.derivation_pipeline.push_batch(batch_commit, BatchStatus::Consolidated).await;
         }
+
+        // Accept transactions only after validation, database updates and batch scheduling.
+        self.network.handle().inner().update_sync_state(RethSyncState::Idle);
 
         self.notify(ChainOrchestratorEvent::ChainConsolidated {
             from: safe_block_number,
@@ -3038,3 +3050,6 @@ mod run_loop_policy_tests {
 
 #[cfg(test)]
 mod reorg_finding_tests;
+
+#[cfg(test)]
+mod sync_completion_tests;

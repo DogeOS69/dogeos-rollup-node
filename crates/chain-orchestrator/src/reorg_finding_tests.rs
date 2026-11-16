@@ -621,20 +621,26 @@ async fn rg49_safe_only_batch_revert_preserves_pending_signatures() {
 #[tokio::test]
 async fn rg49_administrative_head_rewind_discards_pending_signatures() {
     for replacement in [info(3, 3), info(4, 44)] {
+        let block = signing_block(4);
+        let previous_head = BlockInfo { number: 4, hash: block.hash_slow() };
         let database = Arc::new(setup_test_db().await);
         database.set_l2_head_block_number(4).await.unwrap();
         let mut orchestrator = orchestrator_with_engine(
             database.clone(),
-            ForkchoiceState::new(info(4, 4), info(0, 0), info(0, 0)),
+            ForkchoiceState::new(previous_head, info(0, 0), info(0, 0)),
             0,
             Probes::default(),
             accepting_engine(),
         )
         .await;
-        let pending = pending_signature(&mut orchestrator, signing_block(5));
+        // The queued result belongs to the actual old head, including its hash. A same-height
+        // replacement must revoke it just as a lower head does.
+        let pending = pending_signature(&mut orchestrator, block.clone());
+        let SignerEvent::SignedBlock { generation, .. } = &pending;
+        let generation = *generation;
         let asserter = Asserter::new();
         if replacement.number < 4 {
-            push_signing_readback(&asserter, &signing_block(4));
+            push_signing_readback(&asserter, &block);
         }
         // A checked administrative FCU reads back latest, safe and finalized. The standalone
         // signing guard must discard the stale result without consuming these queued responses.
@@ -645,16 +651,31 @@ async fn rg49_administrative_head_rewind_discards_pending_signatures() {
             rpc_block.header.hash = info.hash;
             asserter.push_success(&Some(rpc_block));
         }
-        orchestrator.l2_client =
-            Arc::new(ProviderBuilder::<_, _, Scroll>::default().connect_mocked_client(asserter));
+        orchestrator.l2_client = Arc::new(
+            ProviderBuilder::<_, _, Scroll>::default().connect_mocked_client(asserter.clone()),
+        );
         let (reply, response) = tokio::sync::oneshot::channel();
         orchestrator
             .handle_command(ChainOrchestratorCommand::UpdateFcsHead((replacement, reply)))
             .await
             .unwrap();
         response.await.unwrap();
+        assert_eq!(
+            orchestrator.signing_generation,
+            generation + 1,
+            "administrative head replacement must advance the signing generation: {replacement:?}"
+        );
+        // Unchecked FCU leaves the tag responses queued; checked FCU consumes them. Neither
+        // path may read the provider while discarding this stale event.
+        let queued_responses = asserter.read_q().len();
         assert!(orchestrator.handle_signer_event(pending).await.unwrap().is_none());
+        assert_eq!(
+            asserter.read_q().len(),
+            queued_responses,
+            "discarding a stale signature must not read the provider: {replacement:?}"
+        );
         assert_eq!(database.get_l2_head_block_number().await.unwrap(), replacement.number);
+        assert!(database.get_signature(block.hash_slow()).await.unwrap().is_none());
     }
 }
 

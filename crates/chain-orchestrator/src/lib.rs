@@ -572,13 +572,47 @@ impl<
                         self.engine.fcs().head_block_info().number,
                     )
                     .await?;
-                self.engine.update_fcs(Some(head), None, None).await?;
+                // VALID updates the Engine cache optimistically; retain the last observation
+                // until the execution provider confirms the exact requested head and tags.
+                let previous = self.engine.fcs().clone();
+                let target =
+                    StoredForkchoiceState { head, ..frontier::stored_forkchoice(&previous) };
+                let response = self.engine.update_fcs_checked(Some(head), None, None).await;
+                self.engine.replace_fcs_from_provider(previous);
+                let response = response.map_err(|error| match error {
+                    // Local input validation precedes dispatch and cannot leave Engine ambiguity.
+                    error @ scroll_engine::EngineError::FcsError(_) => error.into(),
+                    error => ChainOrchestratorError::frontier_recovery(error),
+                })?;
+                if response.payload_status.status != PayloadStatusEnum::Valid {
+                    return Err(ChainOrchestratorError::FrontierTransitionStatus(
+                        response.payload_status.status,
+                    ))
+                }
+                let observed = scroll_engine::ForkchoiceState::try_from_provider(&*self.l2_client)
+                    .await
+                    .map_err(ChainOrchestratorError::frontier_recovery)?
+                    .ok_or(ChainOrchestratorError::MissingEngineForkchoiceTags)?;
+                self.engine.replace_fcs_from_provider(observed);
+                let observed = frontier::stored_forkchoice(self.engine.fcs());
+                if observed != target {
+                    return Err(ChainOrchestratorError::FrontierTransitionUnconfirmed {
+                        target: Box::new(target),
+                        observed: Box::new(observed),
+                    })
+                }
+                // The persisted head remains the recovery authority until this atomic commit.
+                // Ambiguous FCU/readback and terminal DB errors stop the node. Startup reconciles
+                // from that DB frontier using its existing kept-head policy; the admin may
+                // need to reissue the request: its intent is not durable across a crash.
+                // This head-only command creates no safe history.
                 self.database
                     .tx_mut(move |tx| async move {
                         tx.purge_l1_message_to_l2_block_mappings(Some(head.number + 1)).await?;
                         tx.set_l2_head_block_number(head.number).await
                     })
-                    .await?;
+                    .await
+                    .map_err(ChainOrchestratorError::frontier_recovery)?;
 
                 // Add all reverted transactions to the transaction pool.
                 self.reinsert_txs_into_pool(reverted_transactions).await;

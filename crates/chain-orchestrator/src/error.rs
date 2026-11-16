@@ -5,7 +5,7 @@ use alloy_transport::TransportErrorKind;
 use rollup_node_primitives::{BatchInfo, BlockInfo};
 use rollup_node_sequencer::SequencerError;
 use rollup_node_signer::SignerError;
-use scroll_db::{CanRetry, DatabaseError, L1MessageKey};
+use scroll_db::{CanRetry, DatabaseError, L1MessageKey, StoredForkchoiceState};
 use scroll_engine::EngineError;
 
 /// A type that represents an error that occurred in the chain orchestrator.
@@ -30,6 +30,14 @@ pub enum ChainOrchestratorError {
     /// The Engine did not accept a frontier update.
     #[error("Engine returned {0} during frontier update")]
     FrontierTransitionStatus(PayloadStatusEnum),
+    /// A VALID response did not apply the durable frontier within the bounded attempt.
+    #[error("Engine did not apply frontier after VALID: target={target:?}, observed={observed:?}")]
+    FrontierTransitionUnconfirmed {
+        /// The durable target that was not confirmed.
+        target: Box<StoredForkchoiceState>,
+        /// The last forkchoice actually read from the provider.
+        observed: Box<StoredForkchoiceState>,
+    },
     /// An error occurred while interacting with the database.
     #[error("database error occurred: {0}")]
     DatabaseError(#[from] DatabaseError),
@@ -238,6 +246,7 @@ impl ChainOrchestratorError {
             Self::MissingEngineForkchoiceTags |
                 Self::FrontierRecovery(_) |
                 Self::FrontierConflict { .. } |
+                Self::FrontierTransitionUnconfirmed { .. } |
                 Self::FrontierTransitionStatus(_)
         )
     }

@@ -762,6 +762,96 @@ async fn can_bridge_blocks() -> eyre::Result<()> {
     Ok(())
 }
 
+/// Recover a saved ancestor-head move through production startup, including Reth's VALID
+/// short-circuit that unwinds the head before applying safe/finalized. Check public RPC tags,
+/// the durable acknowledgement, and another restart with a fresh Engine cache.
+#[tokio::test]
+async fn restart_recovers_ancestor_head_move_and_applies_tags() -> eyre::Result<()> {
+    use reth_storage_api::{BlockHashReader, DatabaseProviderFactory};
+    use scroll_db::{DatabaseConnectionProvider, PendingFrontierTransition, StoredForkchoiceState};
+
+    let mut fixture = TestFixture::builder().sequencer().allow_empty_blocks(true).build().await?;
+    fixture.l1().sync().await?;
+    let genesis = BlockInfo::new(0, fixture.chain_spec.genesis_hash());
+    let mut blocks = vec![genesis];
+    for number in 1..=3 {
+        let block =
+            fixture.build_block().expect_block_number(number).build_and_await_block().await?;
+        blocks.push(BlockInfo::from(&block));
+    }
+    let node = fixture.nodes[0].as_ref().unwrap();
+    for (tag, expected) in [
+        (BlockNumberOrTag::Latest, blocks[3]),
+        (BlockNumberOrTag::Safe, genesis),
+        (BlockNumberOrTag::Finalized, genesis),
+    ] {
+        let block = node.node.rpc.inner.eth_api().block_by_number(tag, false).await?.unwrap();
+        assert_eq!(BlockInfo::from(&block.header), expected, "before recovery: {tag}");
+    }
+    // Ensure startup will really begin at head 3 rather than lose its unsaved suffix.
+    time::timeout(Duration::from_secs(10), async {
+        loop {
+            if node.node.inner.provider.database_provider_ro()?.block_hash(3)? ==
+                Some(blocks[3].hash)
+            {
+                return eyre::Ok(())
+            }
+            time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await??;
+    let database = node.rollup_manager_handle.get_database_handle().await?;
+    fixture.shutdown_node(0).await?;
+    for (number, block) in blocks.iter().enumerate().take(3).skip(1) {
+        let batch = BatchCommitData {
+            hash: B256::repeat_byte(0xb0 + number as u8),
+            index: number as u64,
+            block_number: number as u64,
+            block_timestamp: number as u64,
+            calldata: Arc::new(Bytes::new()),
+            blob_versioned_hash: None,
+            finalized_block_number: (number == 1).then_some(1),
+            reverted_block_number: None,
+        };
+        database.insert_batch(batch.clone()).await?;
+        database.insert_blocks(vec![*block], (&batch).into()).await?;
+        database
+            .update_batch_status(
+                batch.hash,
+                if number == 1 { BatchStatus::Finalized } else { BatchStatus::Consolidated },
+            )
+            .await?;
+    }
+    let expected = StoredForkchoiceState { head: blocks[3], safe: genesis, finalized: genesis };
+    let target = StoredForkchoiceState { head: blocks[2], safe: blocks[2], finalized: blocks[1] };
+    database.set_l2_head_block_number(target.head.number).await?;
+    database
+        .set_pending_frontier_transition(PendingFrontierTransition { expected, target })
+        .await?;
+    database.inner().get_connection().clone().close().await?;
+    drop(database);
+    for restart in 0..2 {
+        fixture.start_node(0).await?;
+        let node = fixture.nodes[0].as_ref().unwrap();
+        let database = node.rollup_manager_handle.get_database_handle().await?;
+        assert_eq!(database.get_pending_frontier_transition().await?, None);
+        assert_eq!(database.get_latest_safe_l2_info().await?.0, target.safe);
+        assert_eq!(database.get_latest_finalized_l2_info().await?, target.finalized);
+        assert_eq!(database.get_l2_head_block_number().await?, target.head.number);
+        for (tag, expected) in [
+            (BlockNumberOrTag::Latest, target.head),
+            (BlockNumberOrTag::Safe, target.safe),
+            (BlockNumberOrTag::Finalized, target.finalized),
+        ] {
+            let block = node.node.rpc.inner.eth_api().block_by_number(tag, false).await?.unwrap();
+            assert_eq!(BlockInfo::from(&block.header), expected, "restart {restart}: {tag}");
+        }
+        fixture.shutdown_node(0).await?;
+        database.inner().get_connection().clone().close().await?;
+    }
+    Ok(())
+}
+
 /// Restart both a sequencer and a follower with a fresh Engine and `SQLite` connection at each
 /// durable finalization checkpoint. No new block is built after FCU, so tag persistence may lag.
 /// Checkpoint 3 has no saved transition (a database written by an older release) and a database

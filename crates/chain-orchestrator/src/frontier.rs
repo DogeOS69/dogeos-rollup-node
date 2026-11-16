@@ -141,7 +141,61 @@ async fn kept_engine_head<P: Provider<Scroll>>(
     Ok(Some(engine_head))
 }
 
-/// Applies an immutable durable intent. Even a cached target requires a checked Engine call.
+/// Check that delayed tags are explained by the journal or canonical ancestry before replay.
+async fn validate_pending_observation<P: Provider<Scroll>>(
+    provider: &P,
+    database: &Database,
+    transition: &PendingFrontierTransition,
+    observed: StoredForkchoiceState,
+) -> Result<(), ChainOrchestratorError> {
+    if observed.safe != transition.expected.safe &&
+        observed.safe != transition.target.safe &&
+        !explained_by_acknowledged_move(
+            provider,
+            database,
+            observed.safe,
+            transition.expected.safe,
+        )
+        .await? &&
+        !canonical_ancestor(provider, observed.safe, transition.expected.safe).await? &&
+        !canonical_ancestor(provider, observed.safe, transition.target.safe).await?
+    {
+        return Err(ChainOrchestratorError::FrontierConflict {
+            tag: "safe",
+            target: transition.target.safe,
+            observed: observed.safe,
+        })
+    }
+    // The journal validates expected -> target. Other finalized tags must be canonical
+    // ancestors of the target, never ahead or a same-height fork.
+    if observed.finalized != transition.expected.finalized &&
+        !canonical_ancestor(provider, observed.finalized, transition.target.finalized).await?
+    {
+        return Err(ChainOrchestratorError::FrontierConflict {
+            tag: "finalized",
+            target: transition.target.finalized,
+            observed: observed.finalized,
+        })
+    }
+    Ok(())
+}
+
+/// Tags must match exactly. Independent unsafe-head progress can acknowledge a forward move,
+/// but a requested rewind must actually reach its target, even if the tags already agree.
+async fn confirms_target<P: Provider<Scroll>>(
+    provider: &P,
+    target: StoredForkchoiceState,
+    observed: StoredForkchoiceState,
+    rewinds_head: bool,
+) -> Result<bool, ChainOrchestratorError> {
+    if observed.safe != target.safe || observed.finalized != target.finalized {
+        return Ok(false)
+    }
+    Ok(observed.head == target.head ||
+        (!rewinds_head && canonical_ancestor(provider, target.head, observed.head).await?))
+}
+
+/// Applies an immutable durable intent. Neither a cached target nor VALID proves tag application.
 pub(crate) async fn apply_pending_frontier_transition<P, EC>(
     provider: &P,
     engine: &mut Engine<EC>,
@@ -159,72 +213,74 @@ where
         if observed != transition.expected && observed != transition.target {
             engine.replace_fcs_from_provider(observe_forkchoice(provider).await?);
             observed = stored_forkchoice(engine.fcs());
-            // Unsafe head can advance independently. Safe must be explained by this intent, by the
-            // acknowledged safe history whose tag writes Reth lost, or by a delayed tag write on
-            // the canonical chain below either end of this intent.
-            if observed.safe != transition.expected.safe &&
-                observed.safe != transition.target.safe &&
-                !explained_by_acknowledged_move(
-                    provider,
-                    database,
-                    observed.safe,
-                    transition.expected.safe,
+        }
+        validate_pending_observation(provider, database, &transition, observed).await?;
+        // The durable expected head also records a rewind when the local cache already names
+        // the candidate target (for example after an earlier ambiguous application).
+        let rewinds_head = transition.target.head.number < observed.head.number ||
+            transition.target.head.number < transition.expected.head.number;
+        for attempt in 0..2 {
+            let last_observed = engine.fcs().clone();
+            let response = engine
+                .update_fcs_checked(
+                    Some(transition.target.head),
+                    Some(transition.target.safe),
+                    Some(transition.target.finalized),
                 )
-                .await? &&
-                !canonical_ancestor(provider, observed.safe, transition.expected.safe).await? &&
-                !canonical_ancestor(provider, observed.safe, transition.target.safe).await?
-            {
-                return Err(ChainOrchestratorError::FrontierConflict {
-                    tag: "safe",
-                    target: transition.target.safe,
-                    observed: observed.safe,
-                })
-            }
-        }
-        // The journal already validates expected -> target; any other finalized tag must
-        // be a canonical ancestor of the target (never ahead or a same-height fork).
-        if observed.finalized != transition.expected.finalized &&
-            !canonical_ancestor(provider, observed.finalized, transition.target.finalized)
-                .await?
-        {
-            return Err(ChainOrchestratorError::FrontierConflict {
-                tag: "finalized",
-                target: transition.target.finalized,
-                observed: observed.finalized,
-            })
-        }
-        match engine
-            .update_fcs_checked(
-                Some(transition.target.head),
-                Some(transition.target.safe),
-                Some(transition.target.finalized),
-            )
-            .await
-        {
-            Ok(response) => match response.payload_status.status {
-                PayloadStatusEnum::Valid => {}
-                status => {
-                    tracing::error!(target: "scroll::chain_orchestrator", ?transition, ?observed, %status, "Engine rejected a saved frontier move");
-                    return Err(ChainOrchestratorError::FrontierTransitionStatus(status))
-                }
-            },
-            Err(source @ EngineError::TransportError(_)) => {
-                // The Engine may have applied FCU before losing the HTTP response.
-                match observe_forkchoice(provider).await {
-                    Ok(observed) => engine.replace_fcs_from_provider(observed),
-                    // Reth busy enough to drop the update may not answer the tag reads either.
-                    // Keep the unavailable-Engine outcome so the caller retries; the intent stays.
-                    Err(observe_error) if source.is_engine_unavailable() => {
-                        tracing::warn!(target: "scroll::chain_orchestrator", error = ?observe_error, "Could not re-read forkchoice tags after an unanswered Engine request");
+                .await;
+            // update_fcs_checked caches its candidate on VALID. Until readback succeeds the
+            // cache must instead retain the last observation, including on a provider error.
+            engine.replace_fcs_from_provider(last_observed);
+            match response {
+                Ok(response) => match response.payload_status.status {
+                    PayloadStatusEnum::Valid => {
+                        engine.replace_fcs_from_provider(observe_forkchoice(provider).await?);
+                    }
+                    status => {
+                        tracing::error!(target: "scroll::chain_orchestrator", ?transition, ?observed, %status, "Engine rejected a saved frontier move");
+                        return Err(ChainOrchestratorError::FrontierTransitionStatus(status))
+                    }
+                },
+                Err(source @ EngineError::TransportError(_)) => {
+                    // The Engine may have applied FCU before losing the HTTP response.
+                    match observe_forkchoice(provider).await {
+                        Ok(observed) => engine.replace_fcs_from_provider(observed),
+                        // Preserve #110's unavailable-Engine classification when tag reads
+                        // fail too, so startup and derivation retain their retry behavior.
+                        Err(observe_error) if source.is_engine_unavailable() => {
+                            tracing::warn!(target: "scroll::chain_orchestrator", error = ?observe_error, "Could not re-read forkchoice tags after an unanswered Engine request");
+                            return Err(ChainOrchestratorError::EngineError(source))
+                        }
+                        Err(observe_error) => return Err(observe_error),
+                    }
+                    if !confirms_target(
+                        provider,
+                        transition.target,
+                        stored_forkchoice(engine.fcs()),
+                        rewinds_head,
+                    )
+                    .await?
+                    {
                         return Err(ChainOrchestratorError::EngineError(source))
                     }
-                    Err(observe_error) => return Err(observe_error),
+                    break
                 }
-                if stored_forkchoice(engine.fcs()) != transition.target {
-                    return Err(ChainOrchestratorError::EngineError(source))
-                }
+                Err(source) => return Err(ChainOrchestratorError::EngineError(source)),
             }
-            Err(source) => return Err(ChainOrchestratorError::EngineError(source)),
+            observed = stored_forkchoice(engine.fcs());
+            if confirms_target(provider, transition.target, observed, rewinds_head).await? {
+                break
+            }
+            validate_pending_observation(provider, database, &transition, observed).await?;
+            // Reth's canonical-ancestor FCU can unwind the head and return VALID without
+            // applying either tag. A single FCU on that now-current head applies the tags.
+            // Do not retry another head: that could undo independent follower progress.
+            if attempt == 1 || observed.head != transition.target.head {
+                return Err(ChainOrchestratorError::FrontierTransitionUnconfirmed {
+                    target: Box::new(transition.target),
+                    observed: Box::new(observed),
+                })
+            }
         }
         database.clear_pending_frontier_transition().await?;
         Ok(true)
@@ -447,26 +503,345 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cached_target_requires_engine_confirmation() {
+    async fn repeated_valid_without_tag_application_retains_intent_and_observed_cache() {
         let database = setup_test_db().await;
-        let finalized = BlockInfo::new(0, B256::ZERO);
-        let old = BlockInfo::new(101, B256::repeat_byte(1));
-        let safe = BlockInfo::new(100, B256::repeat_byte(2));
-        let expected = StoredForkchoiceState { head: old, safe: old, finalized };
-        let target = StoredForkchoiceState { head: old, safe, finalized };
-        database
-            .set_pending_frontier_transition(PendingFrontierTransition { expected, target })
-            .await
-            .unwrap();
-        let (provider, client, mut engine) =
-            mock_engine(Asserter::new(), ForkchoiceState::new(old, safe, finalized));
-        client.push_fork_choice_updated(ScriptedResponse::Ok(valid_fcu()));
-        apply_pending_frontier_transition(&provider, &mut engine, &database).await.unwrap();
-        assert_eq!(
-            client.fork_choice_updated_calls(),
-            1,
-            "a local target is not remote confirmation"
+        let (genesis_block, genesis) = rpc_block(0, B256::ZERO, 0xf0);
+        let (_, finalized) = rpc_block(1, genesis.hash, 1);
+        let (target_block, target_head) = rpc_block(2, finalized.hash, 2);
+        let (_, old_head) = rpc_block(3, target_head.hash, 3);
+        let expected = StoredForkchoiceState { head: old_head, safe: genesis, finalized: genesis };
+        let target = StoredForkchoiceState { head: target_head, safe: target_head, finalized };
+        let transition = PendingFrontierTransition { expected, target };
+        database.set_pending_frontier_transition(transition).await.unwrap();
+        let asserter = Asserter::new();
+        // Both VALID responses leave only the head changed, as on Reth's ancestor FCU path.
+        for _ in 0..2 {
+            push_tags(&asserter, &target_block, &genesis_block, &genesis_block);
+        }
+        let (provider, client, mut engine) = mock_engine(
+            asserter,
+            ForkchoiceState::new(expected.head, expected.safe, expected.finalized),
         );
+        for _ in 0..2 {
+            client.push_fork_choice_updated(ScriptedResponse::Ok(valid_fcu()));
+        }
+        let error = apply_pending_frontier_transition(&provider, &mut engine, &database)
+            .await
+            .expect_err("VALID alone must not acknowledge unapplied tags");
+        assert!(error.is_frontier_fatal(), "{error:?}");
+        assert!(!error.is_engine_unavailable(), "{error:?}");
+        assert_eq!(client.fork_choice_updated_calls(), 2, "retry must be bounded");
+        assert_eq!(
+            stored_forkchoice(engine.fcs()),
+            StoredForkchoiceState { head: target_head, ..expected }
+        );
+        assert_eq!(database.get_pending_frontier_transition().await.unwrap(), Some(transition));
+    }
+
+    /// Explicit provider snapshots for an ancestor move, independent of scripted FCU verdicts.
+    async fn ancestor_transition(
+    ) -> (Database, Vec<RpcBlock<ScrollRpcTransaction>>, PendingFrontierTransition) {
+        let database = setup_test_db().await;
+        let mut blocks = Vec::new();
+        let mut infos = Vec::new();
+        let mut parent = B256::ZERO;
+        for number in 0..=3 {
+            let (block, info) = rpc_block(number, parent, number as u8);
+            parent = info.hash;
+            blocks.push(block);
+            infos.push(info);
+        }
+        let expected =
+            StoredForkchoiceState { head: infos[3], safe: infos[0], finalized: infos[0] };
+        let target = StoredForkchoiceState { head: infos[2], safe: infos[2], finalized: infos[1] };
+        let transition = PendingFrontierTransition { expected, target };
+        database.set_pending_frontier_transition(transition).await.unwrap();
+        (database, blocks, transition)
+    }
+
+    #[tokio::test]
+    async fn first_valid_with_actual_target_needs_only_one_fcu() {
+        let (database, blocks, transition) = ancestor_transition().await;
+        let asserter = Asserter::new();
+        push_tags(&asserter, &blocks[2], &blocks[2], &blocks[1]);
+        let (provider, client, mut engine) = mock_engine(
+            asserter,
+            ForkchoiceState::new(
+                transition.expected.head,
+                transition.expected.safe,
+                transition.expected.finalized,
+            ),
+        );
+        client.push_fork_choice_updated(ScriptedResponse::Ok(valid_fcu()));
+        assert!(apply_pending_frontier_transition(&provider, &mut engine, &database)
+            .await
+            .unwrap());
+        assert_eq!(client.fork_choice_updated_calls(), 1);
+        assert_eq!(stored_forkchoice(engine.fcs()), transition.target);
+        assert_eq!(database.get_pending_frontier_transition().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn ancestor_valid_retries_on_the_observed_target_head_and_applies_tags() {
+        let (database, blocks, transition) = ancestor_transition().await;
+        let asserter = Asserter::new();
+        push_tags(&asserter, &blocks[2], &blocks[0], &blocks[0]);
+        push_tags(&asserter, &blocks[2], &blocks[2], &blocks[1]);
+        let (provider, client, mut engine) = mock_engine(
+            asserter,
+            ForkchoiceState::new(
+                transition.expected.head,
+                transition.expected.safe,
+                transition.expected.finalized,
+            ),
+        );
+        for _ in 0..2 {
+            client.push_fork_choice_updated(ScriptedResponse::Ok(valid_fcu()));
+        }
+        assert!(apply_pending_frontier_transition(&provider, &mut engine, &database)
+            .await
+            .unwrap());
+        assert_eq!(client.fork_choice_updated_calls(), 2);
+        for (input, _) in client.fork_choice_inputs() {
+            assert_eq!(input.head_block_hash, transition.target.head.hash);
+            assert_eq!(input.safe_block_hash, transition.target.safe.hash);
+            assert_eq!(input.finalized_block_hash, transition.target.finalized.hash);
+        }
+        assert_eq!(stored_forkchoice(engine.fcs()), transition.target);
+        assert_eq!(database.get_pending_frontier_transition().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn cached_target_requires_engine_confirmation() {
+        for applied in [false, true] {
+            let (database, blocks, transition) = ancestor_transition().await;
+            let asserter = Asserter::new();
+            // A locally cached candidate is acknowledged only when public tags really agree.
+            push_tags(
+                &asserter,
+                &blocks[if applied { 2 } else { 3 }],
+                &blocks[if applied { 2 } else { 0 }],
+                &blocks[if applied { 1 } else { 0 }],
+            );
+            let (provider, client, mut engine) = mock_engine(
+                asserter,
+                ForkchoiceState::new(
+                    transition.target.head,
+                    transition.target.safe,
+                    transition.target.finalized,
+                ),
+            );
+            client.push_fork_choice_updated(ScriptedResponse::Ok(valid_fcu()));
+            let result = apply_pending_frontier_transition(&provider, &mut engine, &database).await;
+            assert_eq!(result.is_ok(), applied, "{result:?}");
+            assert_eq!(client.fork_choice_updated_calls(), 1);
+            assert_eq!(
+                database.get_pending_frontier_transition().await.unwrap(),
+                (!applied).then_some(transition)
+            );
+            assert_eq!(
+                stored_forkchoice(engine.fcs()),
+                if applied { transition.target } else { transition.expected }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn second_fcu_rejection_or_timeout_keeps_intent_and_observed_cache() {
+        let mut syncing = valid_fcu();
+        syncing.payload_status.status = PayloadStatusEnum::Syncing;
+        let mut invalid = valid_fcu();
+        invalid.payload_status.status =
+            PayloadStatusEnum::Invalid { validation_error: "rejected".into() };
+        for (response, unavailable) in [
+            (ScriptedResponse::Ok(syncing), false),
+            (ScriptedResponse::Ok(invalid), false),
+            (ScriptedResponse::RequestTimeout, true),
+            (ScriptedResponse::TransportFailure, false),
+        ] {
+            let (database, blocks, transition) = ancestor_transition().await;
+            let asserter = Asserter::new();
+            push_tags(&asserter, &blocks[2], &blocks[0], &blocks[0]);
+            // Transport ambiguity observes the same unapplied tags; non-VALID needs no read.
+            push_tags(&asserter, &blocks[2], &blocks[0], &blocks[0]);
+            let (provider, client, mut engine) = mock_engine(
+                asserter,
+                ForkchoiceState::new(
+                    transition.expected.head,
+                    transition.expected.safe,
+                    transition.expected.finalized,
+                ),
+            );
+            client.push_fork_choice_updated(ScriptedResponse::Ok(valid_fcu()));
+            client.push_fork_choice_updated(response);
+            let error = apply_pending_frontier_transition(&provider, &mut engine, &database)
+                .await
+                .unwrap_err();
+            assert!(error.is_frontier_fatal(), "{error:?}");
+            assert_eq!(error.is_engine_unavailable(), unavailable, "{error:?}");
+            assert_eq!(client.fork_choice_updated_calls(), 2);
+            assert_eq!(
+                stored_forkchoice(engine.fcs()),
+                StoredForkchoiceState { head: transition.target.head, ..transition.expected }
+            );
+            assert_eq!(database.get_pending_frontier_transition().await.unwrap(), Some(transition));
+        }
+    }
+
+    #[tokio::test]
+    async fn second_fcu_lost_response_can_acknowledge_actual_target() {
+        let (database, blocks, transition) = ancestor_transition().await;
+        let asserter = Asserter::new();
+        push_tags(&asserter, &blocks[2], &blocks[0], &blocks[0]);
+        push_tags(&asserter, &blocks[2], &blocks[2], &blocks[1]);
+        let (provider, client, mut engine) = mock_engine(
+            asserter,
+            ForkchoiceState::new(
+                transition.expected.head,
+                transition.expected.safe,
+                transition.expected.finalized,
+            ),
+        );
+        client.push_fork_choice_updated(ScriptedResponse::Ok(valid_fcu()));
+        client.push_fork_choice_updated(ScriptedResponse::RequestTimeout);
+        assert!(apply_pending_frontier_transition(&provider, &mut engine, &database)
+            .await
+            .unwrap());
+        assert_eq!(client.fork_choice_updated_calls(), 2);
+        assert_eq!(stored_forkchoice(engine.fcs()), transition.target);
+        assert_eq!(database.get_pending_frontier_transition().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn failed_post_valid_read_restores_last_observed_cache() {
+        for retry in [false, true] {
+            let (database, blocks, transition) = ancestor_transition().await;
+            let asserter = Asserter::new();
+            if retry {
+                push_tags(&asserter, &blocks[2], &blocks[0], &blocks[0]);
+            }
+            // No further answers: a provider read fails after a VALID response.
+            let (provider, client, mut engine) = mock_engine(
+                asserter,
+                ForkchoiceState::new(
+                    transition.expected.head,
+                    transition.expected.safe,
+                    transition.expected.finalized,
+                ),
+            );
+            for _ in 0..=usize::from(retry) {
+                client.push_fork_choice_updated(ScriptedResponse::Ok(valid_fcu()));
+            }
+            let error = apply_pending_frontier_transition(&provider, &mut engine, &database)
+                .await
+                .unwrap_err();
+            assert!(error.is_frontier_fatal(), "{error:?}");
+            assert!(!error.is_engine_unavailable(), "{error:?}");
+            assert_eq!(client.fork_choice_updated_calls(), 1 + u64::from(retry));
+            assert_eq!(
+                stored_forkchoice(engine.fcs()),
+                StoredForkchoiceState {
+                    head: if retry { transition.target.head } else { transition.expected.head },
+                    ..transition.expected
+                }
+            );
+            assert_eq!(database.get_pending_frontier_transition().await.unwrap(), Some(transition));
+        }
+    }
+
+    #[tokio::test]
+    async fn post_valid_conflicting_tags_are_never_retried() {
+        for tag in ["safe", "finalized", "finalized-ahead"] {
+            let (database, blocks, transition) = ancestor_transition().await;
+            let (fork_block, fork) = rpc_block(if tag == "safe" { 2 } else { 1 }, B256::ZERO, 0xff);
+            let asserter = Asserter::new();
+            push_tags(
+                &asserter,
+                &blocks[2],
+                if tag == "safe" { &fork_block } else { &blocks[0] },
+                if tag == "finalized-ahead" {
+                    &blocks[2]
+                } else if tag == "finalized" {
+                    &fork_block
+                } else {
+                    &blocks[0]
+                },
+            );
+            let (provider, client, mut engine) = mock_engine(
+                asserter,
+                ForkchoiceState::new(
+                    transition.expected.head,
+                    transition.expected.safe,
+                    transition.expected.finalized,
+                ),
+            );
+            client.push_fork_choice_updated(ScriptedResponse::Ok(valid_fcu()));
+            let error = apply_pending_frontier_transition(&provider, &mut engine, &database)
+                .await
+                .unwrap_err();
+            assert!(matches!(error, ChainOrchestratorError::FrontierConflict { .. }), "{error:?}");
+            assert_eq!(client.fork_choice_updated_calls(), 1);
+            assert_eq!(database.get_pending_frontier_transition().await.unwrap(), Some(transition));
+            assert_eq!(
+                if tag == "safe" {
+                    *engine.fcs().safe_block_info()
+                } else {
+                    *engine.fcs().finalized_block_info()
+                },
+                if tag == "finalized-ahead" { transition.target.head } else { fork }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn independently_advanced_head_requires_canonical_proof_and_no_requested_rewind() {
+        for (rewind, canonical) in [(false, true), (false, false), (true, true)] {
+            let (database, blocks, mut transition) = ancestor_transition().await;
+            if !rewind {
+                transition.expected.head = transition.target.head;
+                database.set_pending_frontier_transition(transition).await.unwrap();
+            }
+            let asserter = Asserter::new();
+            push_tags(&asserter, &blocks[3], &blocks[2], &blocks[1]);
+            if !rewind {
+                asserter.push_success(&Some(if canonical {
+                    blocks[2].clone()
+                } else {
+                    rpc_block(2, B256::ZERO, 0xff).0
+                }));
+                if canonical {
+                    asserter.push_success(&Some(blocks[3].clone()));
+                }
+            }
+            let (provider, client, mut engine) = mock_engine(
+                asserter,
+                ForkchoiceState::new(
+                    transition.expected.head,
+                    transition.expected.safe,
+                    transition.expected.finalized,
+                ),
+            );
+            client.push_fork_choice_updated(ScriptedResponse::Ok(valid_fcu()));
+            let result = apply_pending_frontier_transition(&provider, &mut engine, &database).await;
+            let acknowledged = !rewind && canonical;
+            assert_eq!(result.is_ok(), acknowledged, "{result:?}");
+            assert_eq!(
+                client.fork_choice_updated_calls(),
+                1,
+                "do not roll back independent progress"
+            );
+            assert_eq!(
+                stored_forkchoice(engine.fcs()),
+                StoredForkchoiceState {
+                    head: BlockInfo::from(&blocks[3].header),
+                    ..transition.target
+                }
+            );
+            assert_eq!(
+                database.get_pending_frontier_transition().await.unwrap(),
+                (!acknowledged).then_some(transition)
+            );
+        }
     }
 
     #[tokio::test]
@@ -569,6 +944,7 @@ mod tests {
         for block in [&old_block, &safe_block, &safe_block, &head_block] {
             asserter.push_success(&Some(block.clone()));
         }
+        push_tags(&asserter, &head_block, &safe_block, &genesis_block);
         let (provider, client, mut engine) =
             mock_engine(asserter, ForkchoiceState::new(head, old, genesis));
         client.push_fork_choice_updated(ScriptedResponse::Ok(valid_fcu()));
@@ -602,8 +978,14 @@ mod tests {
         let asserter = Asserter::new();
         push_tags(&asserter, &tip_block, &safe_block, &genesis_block);
         // Stored head selection, then (keeping Reth's head) its canonical ancestry proof.
-        for block in [&safe_block, &stored_block, &stored_block, &tip_block] {
+        for block in [&safe_block, &stored_block] {
             asserter.push_success(&Some(block.clone()));
+        }
+        if head_selection == HeadSelection::KeepEngineHead {
+            asserter.push_success(&Some(stored_block.clone()));
+            asserter.push_success(&Some(tip_block.clone()));
+        } else {
+            push_tags(&asserter, &stored_block, &safe_block, &genesis_block);
         }
         let (provider, client, mut engine) =
             mock_engine(asserter, ForkchoiceState::new(tip, safe, genesis));
@@ -693,6 +1075,7 @@ mod tests {
         for block in [&safe_block, &stored_block, &other_block] {
             asserter.push_success(&Some(block.clone()));
         }
+        push_tags(&asserter, &stored_block, &safe_block, &genesis_block);
         let (provider, client, mut engine) =
             mock_engine(asserter, ForkchoiceState::new(tip, safe, genesis));
         client.push_fork_choice_updated(ScriptedResponse::Ok(valid_fcu()));
@@ -730,6 +1113,9 @@ mod tests {
             // The saved head is still in Reth.
             asserter.push_success(&Some(stored_block.clone()));
             let follower = head_selection == HeadSelection::KeepEngineHead;
+            if !follower {
+                push_tags(&asserter, &stored_block, &safe_block, &genesis_block);
+            }
             let replayed: &[&RpcBlock<ScrollRpcTransaction>] = if follower {
                 // Rewrite proof, then head selection with its proof.
                 &[&stored_block, &tip_block, &safe_block, &stored_block, &stored_block, &tip_block]
@@ -813,7 +1199,9 @@ mod tests {
         // Second attempt: tags, the saved move's head (still in Reth), then head selection. The
         // replayed move makes the tags match the target, so no further update is needed.
         push_tags(&asserter, &head_block, &old_block, &genesis_block);
-        for block in [&head_block, &safe_block, &head_block] {
+        asserter.push_success(&Some(head_block.clone()));
+        push_tags(&asserter, &head_block, &safe_block, &genesis_block);
+        for block in [&safe_block, &head_block] {
             asserter.push_success(&Some(block.clone()));
         }
         let (provider, client, mut engine) =
@@ -907,6 +1295,7 @@ mod tests {
         absent();
         // The replay re-reads the tags, then startup selects the head again.
         push_tags(&asserter, &safe_block, &old_safe_block, &genesis_block);
+        push_tags(&asserter, &safe_block, &safe_block, &genesis_block);
         asserter.push_success(&Some(safe_block));
         absent();
         let (provider, client, mut engine) =
@@ -961,6 +1350,7 @@ mod tests {
         absent();
         asserter.push_success(&Some(old_block));
         asserter.push_success(&Some(safe_block.clone()));
+        push_tags(&asserter, &safe_block, &safe_block, &genesis_block);
         // Startup then selects the head again.
         asserter.push_success(&Some(safe_block));
         absent();
@@ -1017,6 +1407,7 @@ mod tests {
                 asserter.push_success(&Some(tag_block.clone()));
                 asserter.push_success(&Some(head_block.clone()));
             }
+            push_tags(&asserter, &head_block, &safe_block, &safe_block);
             // Startup then selects the head again.
             asserter.push_success(&Some(safe_block));
             asserter.push_success(&Some(head_block));
@@ -1059,6 +1450,7 @@ mod tests {
         for block in [&lagging_block, &head_block, &safe_block, &head_block] {
             asserter.push_success(&Some(block.clone()));
         }
+        push_tags(&asserter, &head_block, &safe_block, &genesis_block);
         let (provider, client, mut engine) =
             mock_engine(asserter, ForkchoiceState::from_block_info(genesis));
         client.push_fork_choice_updated(ScriptedResponse::Ok(valid_fcu()));
@@ -1083,7 +1475,8 @@ mod tests {
         let asserter = Asserter::new();
         push_tags(&asserter, &safe_block, &safe_block, &genesis_block);
         asserter.push_success(&Some(genesis_block));
-        asserter.push_success(&Some(safe_block));
+        asserter.push_success(&Some(safe_block.clone()));
+        push_tags(&asserter, &safe_block, &safe_block, &safe_block);
         let (provider, client, mut engine) =
             mock_engine(asserter, ForkchoiceState::new(safe, safe, genesis));
         client.push_fork_choice_updated(ScriptedResponse::Ok(valid_fcu()));
@@ -1126,7 +1519,9 @@ mod tests {
             if checkpoint < 2 {
                 // Reth still has the head the saved move names.
                 asserter.push_success(&Some(old_block.clone()));
+                push_tags(&asserter, &old_block, &safe_block, &genesis_block);
             }
+            push_tags(&asserter, &safe_block, &safe_block, &genesis_block);
             // A new Engine cache must learn actual provider tags before recovery.
             let (provider, client, mut engine) =
                 mock_engine(asserter, ForkchoiceState::from_block_info(genesis));
@@ -1162,14 +1557,17 @@ mod tests {
         let original = setup_test_db().await;
         let (genesis_block, genesis) = rpc_block(0, B256::ZERO, 0xf0);
         let (safe_block, safe) = rpc_block(1, genesis.hash, 0xa1);
-        let (_, intermediate) = rpc_block(2, safe.hash, 0xa2);
+        let (intermediate_block, intermediate) = rpc_block(2, safe.hash, 0xa2);
         let (head_block, head) = rpc_block(3, intermediate.hash, 0xa3);
         seed_frontier(&original, genesis, safe).await;
         original.set_l2_head_block_number(head.number).await.unwrap();
 
         // Reth acknowledges both safe rewinds while keeping the same canonical head.
+        let asserter = Asserter::new();
+        push_tags(&asserter, &head_block, &intermediate_block, &genesis_block);
+        push_tags(&asserter, &head_block, &safe_block, &genesis_block);
         let (provider, client, mut engine) =
-            mock_engine(Asserter::new(), ForkchoiceState::new(head, head, genesis));
+            mock_engine(asserter, ForkchoiceState::new(head, head, genesis));
         for (from, to) in [(head, intermediate), (intermediate, safe)] {
             let expected = StoredForkchoiceState { head, safe: from, finalized: genesis };
             let target = StoredForkchoiceState { safe: to, ..expected };
@@ -1190,8 +1588,9 @@ mod tests {
         // Both safe-tag writes were lost. The database must still explain the original tag.
         let asserter = Asserter::new();
         push_tags(&asserter, &head_block, &head_block, &genesis_block);
-        asserter.push_success(&Some(safe_block));
-        asserter.push_success(&Some(head_block));
+        asserter.push_success(&Some(safe_block.clone()));
+        asserter.push_success(&Some(head_block.clone()));
+        push_tags(&asserter, &head_block, &safe_block, &genesis_block);
         let (provider, client, mut engine) =
             mock_engine(asserter, ForkchoiceState::from_block_info(genesis));
         client.push_fork_choice_updated(ScriptedResponse::Ok(valid_fcu()));
@@ -1260,8 +1659,24 @@ mod tests {
                         asserter.push_success(&Some(blocks[5].0.clone()));
                         push_observed();
                     }
+                    if pending && attempt == 0 {
+                        push_tags(
+                            &asserter,
+                            &blocks[5].0,
+                            &blocks[safe.number as usize].0,
+                            &blocks[0].0,
+                        );
+                    }
                     asserter.push_success(&Some(blocks[safe.number as usize].0.clone()));
                     asserter.push_success(&Some(blocks[5].0.clone()));
+                    if !pending || attempt > 0 {
+                        push_tags(
+                            &asserter,
+                            &blocks[5].0,
+                            &blocks[safe.number as usize].0,
+                            &blocks[0].0,
+                        );
+                    }
                     let (provider, client, mut engine) =
                         mock_engine(asserter, ForkchoiceState::from_block_info(genesis));
                     client.push_fork_choice_updated(ScriptedResponse::Ok(valid_fcu()));
@@ -1376,7 +1791,8 @@ mod tests {
         push_tags(&asserter, &safe_block, &old_block, &genesis_block);
         // The observed finalized tag is a canonical ancestor of the new finalized block.
         asserter.push_success(&Some(genesis_block));
-        asserter.push_success(&Some(safe_block));
+        asserter.push_success(&Some(safe_block.clone()));
+        push_tags(&asserter, &safe_block, &safe_block, &safe_block);
         let (provider, client, mut engine) =
             mock_engine(asserter, ForkchoiceState::from_block_info(genesis));
         client.push_fork_choice_updated(ScriptedResponse::Ok(valid_fcu()));

@@ -1128,6 +1128,12 @@ impl<T: WriteConnectionProvider + ?Sized + Sync> DatabaseWriteOperations for T {
                 replaced = replaced
                     .add(models::l1_message::Column::L2BlockNumber.gt(block_info.number as i64));
                 self.set_l2_head_block_number(block_info.number).await?;
+            } else if let Some(tip) = outcome.blocks.last() {
+                // Reusing canonical blocks can catch up DB metadata without changing the
+                // Engine head or discarding its independent higher canonical suffix.
+                if tip.block_info.number > self.get_l2_head_block_number().await? {
+                    self.set_l2_head_block_number(tip.block_info.number).await?;
+                }
             }
             models::l1_message::Entity::update_many()
                 .col_expr(models::l1_message::Column::L2BlockNumber, Expr::value(None::<i64>))

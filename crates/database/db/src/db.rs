@@ -985,7 +985,7 @@ mod test {
     async fn consolidation_replaces_deposit_mappings_only_in_covered_blocks_and_discarded_tail() {
         use rollup_node_primitives::BatchStatus;
 
-        for head_updated in [false, true] {
+        for (database_head, head_updated) in [(9, false), (9, true), (12, false), (12, true)] {
             for include_deposits in [false, true] {
                 let db = setup_test_db().await;
                 let batch_info = BatchInfo::new(1, B256::repeat_byte(1));
@@ -1023,7 +1023,7 @@ mod test {
                     .await
                     .unwrap();
                 }
-                db.set_l2_head_block_number(12).await.unwrap();
+                db.set_l2_head_block_number(database_head).await.unwrap();
                 let mut outcome = BatchConsolidationOutcome::new(
                     batch_info,
                     BatchStatus::Consolidated,
@@ -1057,11 +1057,11 @@ mod test {
                         .collect::<Vec<_>>();
                     assert_eq!(
                         actual, expected,
-                        "head_updated={head_updated}, include_deposits={include_deposits}"
+                        "database_head={database_head}, head_updated={head_updated}, include_deposits={include_deposits}"
                     );
                     assert_eq!(
                         db.get_l2_head_block_number().await.unwrap(),
-                        if head_updated { 11 } else { 12 }
+                        if head_updated { 11 } else { database_head.max(11) }
                     );
                 }
                 // Empty outcomes carry no mapping coverage, including an empty replay.
@@ -1091,62 +1091,72 @@ mod test {
         use crate::StoredForkchoiceState;
         use rollup_node_primitives::BatchStatus;
 
-        let db = setup_test_db().await;
-        let batch_info = BatchInfo::new(1, B256::repeat_byte(1));
-        db.insert_batch(BatchCommitData {
-            hash: batch_info.hash,
-            index: 1,
-            block_number: 10,
-            block_timestamp: 0,
-            calldata: Arc::new(Bytes::new()),
-            blob_versioned_hash: None,
-            finalized_block_number: None,
-            reverted_block_number: None,
-        })
-        .await
-        .unwrap();
-        let transaction = TxL1Message {
-            queue_index: 0,
-            gas_limit: 100_000,
-            to: Default::default(),
-            value: Default::default(),
-            sender: Default::default(),
-            input: Bytes::new(),
-        };
-        db.insert_l1_message(L1MessageEnvelope::new(transaction, 1, Some(2), None)).await.unwrap();
-        db.set_l2_head_block_number(3).await.unwrap();
-        let tip = BlockInfo::new(2, B256::repeat_byte(2));
-        let expected = StoredForkchoiceState { head: tip, safe: tip, finalized: tip };
-        let error = db
-            .tx_mut(move |tx| async move {
-                let mut outcome =
-                    BatchConsolidationOutcome::new(batch_info, BatchStatus::Consolidated, true);
-                outcome
-                    .push_block(L2BlockInfoWithL1Messages { block_info: tip, l1_messages: vec![] });
-                tx.insert_batch_consolidation_outcome(outcome).await?;
-                assert_eq!(tx.get_n_l1_messages(None, 1).await?[0].l2_block_number, None);
-                // The later intent write rejects a finalized rewind, just as in the derivation
-                // caller.
-                tx.set_pending_frontier_transition(PendingFrontierTransition {
-                    expected,
-                    target: StoredForkchoiceState {
-                        finalized: BlockInfo::new(1, B256::repeat_byte(1)),
-                        ..expected
-                    },
-                })
-                .await
+        for head_updated in [false, true] {
+            let db = setup_test_db().await;
+            let batch_info = BatchInfo::new(1, B256::repeat_byte(1));
+            db.insert_batch(BatchCommitData {
+                hash: batch_info.hash,
+                index: 1,
+                block_number: 10,
+                block_timestamp: 0,
+                calldata: Arc::new(Bytes::new()),
+                blob_versioned_hash: None,
+                finalized_block_number: None,
+                reverted_block_number: None,
             })
             .await
-            .unwrap_err();
-        assert!(matches!(error, DatabaseError::InvalidFrontierTransition(_)));
-        assert_eq!(db.get_n_l1_messages(None, 1).await.unwrap()[0].l2_block_number, Some(2));
-        assert_eq!(db.get_l2_head_block_number().await.unwrap(), 3);
-        assert_eq!(
-            db.get_batch_status_by_hash(batch_info.hash).await.unwrap(),
-            Some(BatchStatus::Committed)
-        );
-        assert!(db.get_l2_block_and_batch_info_by_hash(tip.hash).await.unwrap().is_none());
-        assert!(db.get_pending_frontier_transition().await.unwrap().is_none());
+            .unwrap();
+            let transaction = TxL1Message {
+                queue_index: 0,
+                gas_limit: 100_000,
+                to: Default::default(),
+                value: Default::default(),
+                sender: Default::default(),
+                input: Bytes::new(),
+            };
+            db.insert_l1_message(L1MessageEnvelope::new(transaction, 1, Some(2), None))
+                .await
+                .unwrap();
+            let database_head = if head_updated { 3 } else { 1 };
+            db.set_l2_head_block_number(database_head).await.unwrap();
+            let tip = BlockInfo::new(2, B256::repeat_byte(2));
+            let expected = StoredForkchoiceState { head: tip, safe: tip, finalized: tip };
+            let error = db
+                .tx_mut(move |tx| async move {
+                    let mut outcome = BatchConsolidationOutcome::new(
+                        batch_info,
+                        BatchStatus::Consolidated,
+                        head_updated,
+                    );
+                    outcome.push_block(L2BlockInfoWithL1Messages {
+                        block_info: tip,
+                        l1_messages: vec![],
+                    });
+                    tx.insert_batch_consolidation_outcome(outcome).await?;
+                    assert_eq!(tx.get_n_l1_messages(None, 1).await?[0].l2_block_number, None);
+                    // The later intent write rejects a finalized rewind, just as in the derivation
+                    // caller.
+                    tx.set_pending_frontier_transition(PendingFrontierTransition {
+                        expected,
+                        target: StoredForkchoiceState {
+                            finalized: BlockInfo::new(1, B256::repeat_byte(1)),
+                            ..expected
+                        },
+                    })
+                    .await
+                })
+                .await
+                .unwrap_err();
+            assert!(matches!(error, DatabaseError::InvalidFrontierTransition(_)));
+            assert_eq!(db.get_n_l1_messages(None, 1).await.unwrap()[0].l2_block_number, Some(2));
+            assert_eq!(db.get_l2_head_block_number().await.unwrap(), database_head);
+            assert_eq!(
+                db.get_batch_status_by_hash(batch_info.hash).await.unwrap(),
+                Some(BatchStatus::Committed)
+            );
+            assert!(db.get_l2_block_and_batch_info_by_hash(tip.hash).await.unwrap().is_none());
+            assert!(db.get_pending_frontier_transition().await.unwrap().is_none());
+        }
     }
 
     #[tokio::test]

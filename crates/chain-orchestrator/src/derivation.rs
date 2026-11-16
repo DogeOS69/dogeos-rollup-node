@@ -153,6 +153,19 @@ fn remember_applied_block(
     }
 }
 
+fn remember_applied_prefix(
+    witnesses: &mut Vec<AppliedBlockWitness>,
+    reusable: &[(BlockInfo, &L2BlockInfoWithL1Messages)],
+    head: BlockInfo,
+) {
+    witnesses.retain(|old| old.block.block_info.number <= head.number);
+    for (parent, block) in
+        reusable.iter().filter(|(_, block)| block.block_info.number <= head.number)
+    {
+        remember_applied_block(witnesses, *parent, block);
+    }
+}
+
 /// Copyable metadata used to revalidate a held batch after an L1 unwind.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct HeldBatchIdentity {
@@ -338,7 +351,7 @@ impl DerivationDriver {
                     // not evidence that any of their deposits reached the canonical Engine chain.
                     let mut affected_parent: Option<BlockInfo> = None;
                     let mut affected_queue_index: Option<u64> = None;
-                    for witness in canonical_applied {
+                    for witness in &canonical_applied {
                         for hash in &witness.block.l1_messages {
                             let messages = match tx
                                 .get_n_l1_messages(
@@ -369,6 +382,13 @@ impl DerivationDriver {
                             }
                         }
                     }
+                    // Preserve checked, still-canonical deposits beyond this held slot's
+                    // lifetime. Normal unwind removes invalid origins and discarded suffix
+                    // mappings in the same transaction, including if a lower parent wins.
+                    tx.update_l1_messages_with_l2_blocks(
+                        canonical_applied.iter().map(|witness| witness.block.clone()).collect(),
+                    )
+                    .await?;
                     let mut unwind_result = tx.unwind(ancestor).await?;
                     if let Some(number) = unwind_result.l2_head_block_number {
                         if affected_parent.is_none_or(|parent| number < parent.number) {
@@ -649,13 +669,7 @@ where
                         .await
                         .map_err(engine_request_failure(batch_info, FCU_METHOD))?;
                     classify_checked_fcu(response, batch_info, Some(target.number))?;
-                    applied_blocks.retain(|old| old.block.block_info.number <= target.number);
-                    for (parent, block) in reusable
-                        .iter()
-                        .filter(|(_, block)| block.block_info.number <= target.number)
-                    {
-                        remember_applied_block(applied_blocks, *parent, block);
-                    }
+                    remember_applied_prefix(applied_blocks, &reusable, target);
                 }
                 l2_head_updated |= head.is_some();
                 expected_parent = target;
@@ -681,6 +695,7 @@ where
                         .await
                         .map_err(engine_request_failure(batch_info, FCU_METHOD))?;
                     classify_checked_fcu(response, batch_info, Some(expected_parent.number))?;
+                    remember_applied_prefix(applied_blocks, &reusable, expected_parent);
                 }
                 let build_response = engine
                     .build_payload(Some(expected_parent), attributes.attributes.clone())
@@ -755,20 +770,10 @@ where
         block_outcomes.push(outcome);
     }
 
-    let mut batch_outcome = reconciliation
+    let batch_outcome = reconciliation
         .into_batch_consolidation_outcome(reorg_results, l2_head_updated)
         .await
         .map_err(|error| AttemptFailure::fatal("consolidateBatch", "ERROR", error))?;
-    if let Some(tip) = batch_outcome.blocks.last() {
-        let database_head = database.get_l2_head_block_number().await.map_err(|error| {
-            AttemptFailure::fatal(
-                "getL2HeadBlockNumber",
-                "ERROR",
-                ChainOrchestratorError::DatabaseError(error),
-            )
-        })?;
-        batch_outcome.l2_head_updated |= tip.block_info.number > database_head;
-    }
     let mut persisted = batch_outcome.clone();
     persisted.with_skipped_l1_messages(batch.skipped_l1_messages.clone());
 
@@ -1578,7 +1583,7 @@ mod tests {
                 )
             };
             assert_eq!(consolidated.batch_outcome.blocks.len(), 1);
-            assert!(consolidated.batch_outcome.l2_head_updated);
+            assert!(!consolidated.batch_outcome.l2_head_updated);
             assert_eq!(client.fork_choice_updated_calls(), u64::from(!already_safe));
             assert_eq!(client.get_payload_calls(), 0);
             assert_eq!(client.new_payload_calls(), 0);
@@ -2567,6 +2572,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reused_batch_preserves_higher_deposit_when_database_head_lags() {
+        use rollup_node_primitives::L1MessageEnvelope;
+
+        let database = setup_test_db().await;
+        database.set_l2_head_block_number(SAFE).await.unwrap();
+        insert_batch(&database, 1, 10, None).await;
+        let safe = info(SAFE, 0x11);
+        let head = info(SAFE + 3, 0x33);
+        let message = dogeos_protocol_types::TxL1Message {
+            queue_index: 0,
+            gas_limit: 100_000,
+            to: Address::repeat_byte(0x33),
+            value: U256::from(1_000),
+            sender: Address::repeat_byte(0x44),
+            input: Bytes::new(),
+        };
+        database
+            .insert_l1_message(L1MessageEnvelope::new(message, 1, Some(head.number), None))
+            .await
+            .unwrap();
+        assert_eq!(database.get_l2_head_block_number().await.unwrap(), SAFE);
+        assert_eq!(database.get_latest_safe_l2_info().await.unwrap().0, safe);
+        assert_eq!(
+            database.get_n_l1_messages(None, 1).await.unwrap()[0].l2_block_number,
+            Some(head.number)
+        );
+
+        let derived =
+            derived_batch(1, vec![(DERIVED_BASE_FEE, vec![]), (DERIVED_BASE_FEE, vec![])]);
+        let asserter = Asserter::new();
+        push_safe_block(&asserter);
+        let first = push_matching_empty_block(&asserter, &derived.attributes[0]);
+        let second =
+            push_matching_empty_block_on(&asserter, &derived.attributes[1], first, SAFE + 2);
+        // Read back the exact durable target after the safe-only frontier move.
+        push_tags(&asserter, head, second, safe);
+        let provider = absent_block_provider(asserter);
+        let client = Arc::new(ScriptedEngineClient::new());
+        client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Valid, None)));
+        let mut engine = Engine::new(client.clone(), ForkchoiceState::new(head, safe, safe));
+        let mut driver = DerivationDriver::default();
+        driver.hold_batch(derived);
+        driver.wait_for_attempt().await;
+
+        let step = driver.run_attempt(&provider, &mut engine, &database).await;
+        let AttemptStep::Completed(completed) = step else {
+            panic!("matching batch below Engine head must complete, got {step:?}")
+        };
+        assert!(!completed.batch_outcome.l2_head_updated, "Engine head did not change");
+        assert_eq!(completed.batch_outcome.blocks.len(), 2);
+        assert!(!completed.block_outcomes.is_empty());
+        assert!(completed
+            .block_outcomes
+            .iter()
+            .all(|block| matches!(block, BlockConsolidationOutcome::UpdateFcs(_))));
+        assert_eq!(*engine.fcs().head_block_info(), head);
+        assert_eq!(*engine.fcs().safe_block_info(), second);
+        assert_eq!(*engine.fcs().finalized_block_info(), safe);
+        assert_eq!(client.fork_choice_updated_calls(), 1);
+        for (fcs, has_attributes) in client.fork_choice_inputs() {
+            assert_eq!(fcs.head_block_hash, head.hash, "no FCU may rewind the Engine head");
+            assert!(!has_attributes);
+        }
+        assert_eq!(client.get_payload_calls(), 0);
+        assert_eq!(client.new_payload_calls(), 0);
+        assert!(client.is_drained());
+        assert!(driver.can_accept_batch());
+        assert_eq!(database.get_l2_head_block_number().await.unwrap(), second.number);
+        assert_eq!(database.get_latest_safe_l2_info().await.unwrap().0, second);
+        assert_eq!(database.get_pending_frontier_transition().await.unwrap(), None);
+        assert_eq!(
+            database.get_batch_status_by_hash(B256::repeat_byte(1)).await.unwrap(),
+            Some(BatchStatus::Consolidated)
+        );
+        assert_eq!(
+            database.get_n_l1_messages(None, 1).await.unwrap()[0].l2_block_number,
+            Some(head.number),
+            "reusing blocks 101..102 must preserve the deposit in unchanged Engine head 103"
+        );
+    }
+
+    #[tokio::test]
     async fn retry_reusing_a_partially_rebuilt_batch_clears_old_deposit_mappings() {
         use rollup_node_primitives::L1MessageEnvelope;
 
@@ -2634,6 +2721,260 @@ mod tests {
         assert_eq!(database.get_latest_safe_l2_info().await.unwrap().0, second);
         assert_eq!(*engine.fcs().safe_block_info(), second);
         assert!(client.is_drained());
+    }
+
+    #[tokio::test]
+    async fn preparatory_fcu_prunes_superseded_witnesses_only_after_checked_success() {
+        for case in ["valid", "syncing", "timeout", "connection_lost", "transport", "invalid"] {
+            let database = setup_test_db().await;
+            insert_batch(&database, 1, 10, None).await;
+            let derived =
+                derived_batch(1, vec![(DERIVED_BASE_FEE, vec![]), (DERIVED_BASE_FEE, vec![])]);
+            let asserter = Asserter::new();
+            push_safe_block(&asserter);
+            let first = push_matching_empty_block(&asserter, &derived.attributes[0]);
+            push_absent_block(&asserter);
+            let provider = absent_block_provider(asserter);
+            let client = Arc::new(ScriptedEngineClient::new());
+            client.push_fork_choice_updated(match case {
+                "syncing" => ScriptedResponse::Ok(fcu(PayloadStatusEnum::Syncing, None)),
+                "timeout" => ScriptedResponse::RequestTimeout,
+                "connection_lost" => ScriptedResponse::ConnectionLost,
+                "transport" => ScriptedResponse::TransportFailure,
+                "invalid" => ScriptedResponse::Ok(fcu(
+                    PayloadStatusEnum::Invalid { validation_error: "rejected parent".into() },
+                    None,
+                )),
+                _ => ScriptedResponse::Ok(fcu(PayloadStatusEnum::Valid, None)),
+            });
+            if case == "valid" {
+                client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(
+                    PayloadStatusEnum::Syncing,
+                    None,
+                )));
+            }
+            let higher_head = info(SAFE + 10, 0x55);
+            let safe = info(SAFE, 0x11);
+            let mut engine =
+                Engine::new(client.clone(), ForkchoiceState::new(higher_head, safe, safe));
+            let mut driver = DerivationDriver::default();
+            driver.hold_batch(derived);
+            let old = info(SAFE + 2, 0x66);
+            // Evidence left by a prior successful attempt on the superseded suffix.
+            remember_applied_block(
+                &mut driver.pending.as_mut().unwrap().applied_blocks,
+                first,
+                &L2BlockInfoWithL1Messages {
+                    block_info: old,
+                    l1_messages: vec![B256::repeat_byte(0x77)],
+                },
+            );
+            driver.wait_for_attempt().await;
+            let step = driver.run_attempt(&provider, &mut engine, &database).await;
+            if matches!(case, "invalid" | "transport") {
+                assert!(matches!(step, AttemptStep::Fatal(_)), "{step:?}");
+            } else {
+                assert!(matches!(step, AttemptStep::Held), "{step:?}");
+            }
+            let witnesses = &driver.pending.as_ref().unwrap().applied_blocks;
+            if case == "valid" {
+                assert!(witnesses.is_empty(), "successful parent FCU discards the old suffix");
+            } else {
+                assert_eq!(witnesses.len(), 1, "{case}: unsuccessful FCU must retain evidence");
+                assert_eq!(witnesses[0].block.block_info, old);
+            }
+            assert_eq!(
+                *engine.fcs().head_block_info(),
+                if case == "valid" { first } else { higher_head }
+            );
+            assert_eq!(client.get_payload_calls(), 0);
+            assert_eq!(client.new_payload_calls(), 0);
+            assert!(client.is_drained());
+        }
+    }
+
+    #[tokio::test]
+    async fn unwind_materialization_checks_canonical_identity_purges_lower_suffix_and_rolls_back() {
+        use alloy_consensus::transaction::Recovered;
+        use alloy_eips::Encodable2718;
+        use rollup_node_primitives::L1MessageEnvelope;
+
+        for case in ["lower_parent", "noncanonical", "rollback"] {
+            let database = setup_test_db().await;
+            insert_batch(&database, 1, 10, None).await;
+            database
+                .update_batch_status(B256::repeat_byte(1), BatchStatus::Processing)
+                .await
+                .unwrap();
+            let messages: Vec<_> = (0..3)
+                .map(|queue_index| dogeos_protocol_types::TxL1Message {
+                    queue_index,
+                    gas_limit: 100_000,
+                    to: Address::repeat_byte(0x33),
+                    value: U256::from(1_000 + queue_index),
+                    sender: Address::repeat_byte(0x44),
+                    input: Bytes::new(),
+                })
+                .collect();
+            for (index, message) in messages.iter().enumerate() {
+                database
+                    .insert_l1_message(L1MessageEnvelope::new(
+                        message.clone(),
+                        if case == "noncanonical" || index == 2 { 3 } else { 9 },
+                        (index == 0).then_some(SAFE + 1),
+                        None,
+                    ))
+                    .await
+                    .unwrap();
+            }
+            let encoded: Vec<_> =
+                messages.iter().map(|tx| Bytes::from(tx.encoded_2718())).collect();
+            let derived = derived_batch(
+                1,
+                vec![
+                    (DERIVED_BASE_FEE, vec![encoded[0].clone()]),
+                    (DERIVED_BASE_FEE, encoded[1..].to_vec()),
+                    (DERIVED_BASE_FEE, vec![]),
+                ],
+            );
+            let safe = info(SAFE, 0x11);
+            let header = ConsensusHeader {
+                parent_hash: safe.hash,
+                number: SAFE + 1,
+                base_fee_per_gas: Some(DERIVED_BASE_FEE),
+                ..Default::default()
+            }
+            .seal_slow();
+            let first = BlockInfo::new(SAFE + 1, header.hash());
+            let mut rpc_block = RpcBlock::empty(RpcHeader::from_consensus(header, None, None));
+            rpc_block.transactions = alloy_rpc_types_eth::BlockTransactions::Full(vec![
+                ScrollRpcTransaction::from_transaction(
+                    Recovered::new_unchecked(messages[0].clone().into(), messages[0].sender),
+                    Default::default(),
+                ),
+            ]);
+            let asserter = Asserter::new();
+            push_safe_block(&asserter);
+            asserter.push_success(&Some(rpc_block));
+            push_absent_block(&asserter);
+            push_absent_block(&asserter);
+            let provider = absent_block_provider(asserter);
+            let client = Arc::new(ScriptedEngineClient::new());
+            let mut built = built_payload(SAFE + 2, DERIVED_BASE_FEE, encoded[1..].to_vec());
+            built.parent_hash = first.hash;
+            let second = BlockInfo::new(built.block_number, built.block_hash);
+            script_rebuild(&client, built);
+            client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(
+                PayloadStatusEnum::Syncing,
+                None,
+            )));
+            // The first block was independently applied and mapped before this held attempt.
+            let mut engine = Engine::new(client.clone(), ForkchoiceState::new(first, safe, safe));
+            let mut driver = DerivationDriver::default();
+            driver.hold_batch(derived);
+            driver.wait_for_attempt().await;
+            let step = driver.run_attempt(&provider, &mut engine, &database).await;
+            assert!(matches!(step, AttemptStep::Held), "{case}: {step:?}");
+            assert_eq!(*engine.fcs().head_block_info(), second);
+            let witnesses = &driver.pending.as_ref().unwrap().applied_blocks;
+            assert_eq!(witnesses.len(), 1);
+            assert_eq!(witnesses[0].block.block_info, second);
+            assert_eq!(witnesses[0].parent, first);
+            assert_eq!(client.new_payload_calls(), 1);
+            assert!(client.is_drained());
+            database.set_latest_l1_block_number(20).await.unwrap();
+            database.set_l2_head_block_number(second.number).await.unwrap();
+            // Retaining safe101 makes the required rewind to100 invalid. The failed intent
+            // must roll back materialization, origin deletion, metadata and batch invalidation.
+            let retained_safe = if case == "rollback" {
+                database.insert_blocks(vec![first], BatchInfo::new(0, B256::ZERO)).await.unwrap();
+                first
+            } else {
+                safe
+            };
+            let expected =
+                StoredForkchoiceState { head: second, safe: retained_safe, finalized: safe };
+            let asserter = Asserter::new();
+            push_canonical_block(
+                &asserter,
+                if case == "noncanonical" { info(second.number, 0x66) } else { second },
+            );
+            if case != "noncanonical" {
+                // The durable deposit in101 selects parent100, below the held witness's parent101.
+                push_canonical_block(&asserter, safe);
+            }
+            let result = driver
+                .unwind_and_revalidate(
+                    &database,
+                    5,
+                    Some(expected),
+                    &absent_block_provider(asserter),
+                )
+                .await;
+            let mappings: Vec<_> = database
+                .get_n_l1_messages(None, 3)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|message| message.l2_block_number)
+                .collect();
+            if case == "rollback" {
+                assert!(
+                    matches!(
+                        result,
+                        Err(ChainOrchestratorError::DatabaseError(
+                            scroll_db::DatabaseError::InvalidFrontierTransition(_)
+                        ))
+                    ),
+                    "{result:?}"
+                );
+                assert_eq!(mappings, vec![Some(first.number), None, None]);
+                assert_eq!(database.get_latest_l1_block_number().await.unwrap(), 20);
+                assert_eq!(database.get_l2_head_block_number().await.unwrap(), second.number);
+                assert_eq!(
+                    database.get_batch_status_by_hash(B256::repeat_byte(1)).await.unwrap(),
+                    Some(BatchStatus::Processing)
+                );
+                assert!(!driver.can_accept_batch());
+                assert_eq!(driver.pending.as_ref().unwrap().applied_blocks.len(), 1);
+                assert!(database.get_pending_frontier_transition().await.unwrap().is_none());
+                assert!(database.get_required_head_rewind().await.unwrap().is_none());
+            } else {
+                let (unwind, outcome) = result.unwrap();
+                assert!(matches!(outcome, HeldReorgOutcome::Invalidated { .. }));
+                assert!(driver.can_accept_batch());
+                assert!(database.get_batch_by_index(1).await.unwrap().is_none());
+                if case == "noncanonical" {
+                    assert_eq!(mappings, vec![Some(first.number), None, None]);
+                    assert_eq!(unwind.l2_head_block_number, None);
+                    assert!(database.get_pending_frontier_transition().await.unwrap().is_none());
+                } else {
+                    assert_eq!(unwind.l2_head_block_number, Some(SAFE));
+                    assert_eq!(unwind.queue_index, Some(0));
+                    assert_eq!(
+                        mappings,
+                        vec![None],
+                        "surviving origin in discarded102 loses its mapping"
+                    );
+                    assert_eq!(database.get_l2_head_block_number().await.unwrap(), SAFE);
+                    let required = database.get_required_head_rewind().await.unwrap().unwrap();
+                    assert_eq!(required.expected, expected);
+                    assert_eq!(required.target.head, safe);
+                    assert_eq!(required.target.safe, safe);
+                    assert_eq!(required.target.finalized, safe);
+                    assert_eq!(
+                        database.get_pending_frontier_transition().await.unwrap(),
+                        Some(required)
+                    );
+                }
+            }
+            assert_eq!(database.get_latest_safe_l2_info().await.unwrap().0, retained_safe);
+            assert!(database
+                .get_l2_block_and_batch_info_by_hash(second.hash)
+                .await
+                .unwrap()
+                .is_none());
+        }
     }
 
     #[tokio::test]

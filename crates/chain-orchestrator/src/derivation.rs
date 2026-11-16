@@ -129,6 +129,28 @@ struct PendingBatch {
     attempts_started: u64,
     last_hold: Option<HoldReason>,
     current_backoff_ms: Option<u64>,
+    applied_blocks: Vec<AppliedBlockWitness>,
+}
+
+/// Blocks whose checked head FCU succeeded while this slot was owned. These outlive attempts,
+/// but never authorize a rewind until the provider confirms the exact block is still canonical.
+#[derive(Debug, Clone)]
+struct AppliedBlockWitness {
+    parent: BlockInfo,
+    block: L2BlockInfoWithL1Messages,
+}
+
+fn remember_applied_block(
+    witnesses: &mut Vec<AppliedBlockWitness>,
+    parent: BlockInfo,
+    block: &L2BlockInfoWithL1Messages,
+) {
+    // A successful rebuild at this height supersedes any earlier fork's witness. Deposit-free
+    // blocks need no clone or witness, including when they replace a deposit-bearing block.
+    witnesses.retain(|old| old.block.block_info.number < block.block_info.number);
+    if !block.l1_messages.is_empty() {
+        witnesses.push(AppliedBlockWitness { parent, block: block.clone() });
+    }
 }
 
 /// Copyable metadata used to revalidate a held batch after an L1 unwind.
@@ -188,6 +210,7 @@ impl DerivationDriver {
             attempts_started: 0,
             last_hold: None,
             current_backoff_ms: None,
+            applied_blocks: Vec::new(),
         });
         self.metrics.held.set(1.0);
         self.schedule_immediate();
@@ -236,6 +259,7 @@ impl DerivationDriver {
             engine,
             database,
             &pending.batch,
+            &mut pending.applied_blocks,
             self.head_selection,
         )
         .await
@@ -287,64 +311,153 @@ impl DerivationDriver {
         database: &Database,
         ancestor: u64,
         transition_expected: Option<StoredForkchoiceState>,
+        l2_client: &impl Provider<Scroll>,
     ) -> Result<(UnwindResult, HeldReorgOutcome), ChainOrchestratorError> {
         let held = self.held_identity();
-        let (unwind_result, outcome) = database
-            .tx_mut(move |tx| async move {
-                let unwind_result = tx.unwind(ancestor).await?;
-                if let (Some(expected), Some(safe)) =
-                    (transition_expected, unwind_result.l2_safe_block_info)
+        let mut canonical_applied = Vec::new();
+        if let Some(pending) = &self.pending {
+            for witness in &pending.applied_blocks {
+                if !witness.block.l1_messages.is_empty() &&
+                    l2_client
+                        .get_block_by_number(witness.block.block_info.number.into())
+                        .await?
+                        .map(|block| BlockInfo::from(&block.header)) ==
+                        Some(witness.block.block_info)
                 {
-                    let head =
-                        if expected.head.number <= safe.number { safe } else { expected.head };
-                    // Journal validation rejects a finalized conflict before the unwind commits.
-                    tx.set_pending_frontier_transition(PendingFrontierTransition {
-                        expected,
-                        target: StoredForkchoiceState { head, safe, ..expected },
-                    })
-                    .await?;
+                    canonical_applied.push(witness.clone());
                 }
-                let Some(held) = held else {
-                    return Ok::<_, ChainOrchestratorError>((
-                        unwind_result,
-                        HeldReorgOutcome::NoHeldBatch,
-                    ))
-                };
-
-                let stored = tx.get_batch_by_index(held.batch_info.index).await?;
-                let surviving_row = stored.as_ref().filter(|batch| {
-                    batch.hash == held.batch_info.hash && batch.block_number <= ancestor
-                });
-                let finalization_invalid = held.target_status.is_finalized() &&
-                    surviving_row.is_some_and(|batch| {
-                        batch.finalized_block_number.is_none_or(|number| number > ancestor)
-                    });
-                let invalid_reason = match stored.as_ref() {
-                    None => Some("batch row removed or reverted"),
-                    Some(batch) if batch.hash != held.batch_info.hash => Some("batch hash changed"),
-                    Some(batch) if batch.block_number > ancestor => Some("batch commit reverted"),
-                    Some(_) if finalization_invalid => Some("batch finalization reverted"),
-                    Some(_) => None,
-                };
-
-                let outcome = if let Some(reason) = invalid_reason {
-                    if finalization_invalid {
-                        // Do not overwrite a concurrent or unwind-produced status such as
-                        // Reverted/Consolidated. Only the row still owned as Processing may be
-                        // returned to Committed for catch-up rediscovery.
-                        tx.transition_batch_status(
-                            held.batch_info.hash,
-                            BatchStatus::Processing,
-                            BatchStatus::Committed,
-                        )
-                        .await?;
+            }
+        }
+        let provider = l2_client.root().clone();
+        let (unwind_result, outcome) = database
+            .tx_mut(move |tx| {
+                let canonical_applied = canonical_applied.clone();
+                let provider = provider.clone();
+                async move {
+                    // Resolve origins before unwind deletes the rows. Pending attributes alone are
+                    // not evidence that any of their deposits reached the canonical Engine chain.
+                    let mut affected_parent: Option<BlockInfo> = None;
+                    let mut affected_queue_index: Option<u64> = None;
+                    for witness in canonical_applied {
+                        for hash in &witness.block.l1_messages {
+                            let messages = match tx
+                                .get_n_l1_messages(
+                                    Some(scroll_db::L1MessageKey::from_transaction_hash(*hash)),
+                                    1,
+                                )
+                                .await
+                            {
+                                Ok(messages) => messages,
+                                Err(scroll_db::DatabaseError::L1MessageNotFound(_)) => continue,
+                                Err(error) => return Err(error.into()),
+                            };
+                            if let Some(message) = messages
+                                .first()
+                                .filter(|message| message.l1_block_number > ancestor)
+                            {
+                                if affected_parent
+                                    .is_none_or(|parent| witness.parent.number < parent.number)
+                                {
+                                    affected_parent = Some(witness.parent);
+                                }
+                                affected_queue_index = Some(
+                                    affected_queue_index
+                                        .map_or(message.transaction.queue_index, |index| {
+                                            index.min(message.transaction.queue_index)
+                                        }),
+                                );
+                            }
+                        }
                     }
-                    HeldReorgOutcome::Invalidated { batch_info: held.batch_info, reason }
-                } else {
-                    HeldReorgOutcome::Survived { batch_info: held.batch_info }
-                };
+                    let mut unwind_result = tx.unwind(ancestor).await?;
+                    if let Some(number) = unwind_result.l2_head_block_number {
+                        if affected_parent.is_none_or(|parent| number < parent.number) {
+                            let block = provider
+                                .get_block_by_number(number.into())
+                                .await?
+                                .ok_or(ChainOrchestratorError::L2BlockNotFoundInL2Client(number))?;
+                            affected_parent = Some(BlockInfo::from(&block.header));
+                        }
+                    }
+                    if let Some(head) = affected_parent {
+                        tx.purge_l1_message_to_l2_block_mappings(Some(
+                            head.number.saturating_add(1),
+                        ))
+                        .await?;
+                        tx.set_l2_head_block_number(head.number).await?;
+                        unwind_result.l2_head_block_number = Some(head.number);
+                        if let Some(index) = affected_queue_index {
+                            unwind_result.queue_index =
+                                Some(unwind_result.queue_index.map_or(index, |old| old.min(index)));
+                        }
+                    }
+                    if let Some(expected) = transition_expected {
+                        let safe = unwind_result.l2_safe_block_info.unwrap_or(expected.safe);
+                        let head = affected_parent.unwrap_or({
+                            if expected.head.number <= safe.number {
+                                safe
+                            } else {
+                                expected.head
+                            }
+                        });
+                        let transition = PendingFrontierTransition {
+                            expected,
+                            target: StoredForkchoiceState { head, safe, ..expected },
+                        };
+                        // Validation rejects an affected parent below retained safe/finalized and
+                        // rolls back the unwind, mappings and intent together.
+                        if affected_parent.is_some() && head.number < expected.head.number {
+                            tx.set_required_head_rewind(transition).await?;
+                        } else {
+                            tx.set_pending_frontier_transition(transition).await?;
+                        }
+                    }
+                    let Some(held) = held else {
+                        return Ok::<_, ChainOrchestratorError>((
+                            unwind_result,
+                            HeldReorgOutcome::NoHeldBatch,
+                        ))
+                    };
 
-                Ok((unwind_result, outcome))
+                    let stored = tx.get_batch_by_index(held.batch_info.index).await?;
+                    let surviving_row = stored.as_ref().filter(|batch| {
+                        batch.hash == held.batch_info.hash && batch.block_number <= ancestor
+                    });
+                    let finalization_invalid = held.target_status.is_finalized() &&
+                        surviving_row.is_some_and(|batch| {
+                            batch.finalized_block_number.is_none_or(|number| number > ancestor)
+                        });
+                    let invalid_reason = match stored.as_ref() {
+                        None => Some("batch row removed or reverted"),
+                        Some(batch) if batch.hash != held.batch_info.hash => {
+                            Some("batch hash changed")
+                        }
+                        Some(batch) if batch.block_number > ancestor => {
+                            Some("batch commit reverted")
+                        }
+                        Some(_) if finalization_invalid => Some("batch finalization reverted"),
+                        Some(_) => None,
+                    };
+
+                    let outcome = if let Some(reason) = invalid_reason {
+                        if finalization_invalid {
+                            // Do not overwrite a concurrent or unwind-produced status such as
+                            // Reverted/Consolidated. Only the row still owned as Processing may be
+                            // returned to Committed for catch-up rediscovery.
+                            tx.transition_batch_status(
+                                held.batch_info.hash,
+                                BatchStatus::Processing,
+                                BatchStatus::Committed,
+                            )
+                            .await?;
+                        }
+                        HeldReorgOutcome::Invalidated { batch_info: held.batch_info, reason }
+                    } else {
+                        HeldReorgOutcome::Survived { batch_info: held.batch_info }
+                    };
+
+                    Ok((unwind_result, outcome))
+                }
             })
             .await?;
 
@@ -436,6 +549,7 @@ async fn reconcile_and_consolidate<L2P, EC>(
     engine: &mut Engine<EC>,
     database: &Database,
     batch: &BatchDerivationResult,
+    applied_blocks: &mut Vec<AppliedBlockWitness>,
     head_selection: HeadSelection,
 ) -> Result<ConsolidatedBatch, AttemptFailure>
 where
@@ -497,6 +611,20 @@ where
         AttemptFailure::fatal("reconcileBatch", outcome, error)
     })?;
     let target_status = reconciliation.target_status;
+    let mut reusable = Vec::new();
+    let mut parent = frontier;
+    for action in &reconciliation.actions {
+        match action {
+            BlockConsolidationAction::Skip(block) => parent = block.block_info,
+            BlockConsolidationAction::UpdateFcs(block) => {
+                if !block.l1_messages.is_empty() {
+                    reusable.push((parent, block));
+                }
+                parent = block.block_info;
+            }
+            BlockConsolidationAction::Reorg(_) => break,
+        }
+    }
     let aggregated = reconciliation.aggregate_actions();
 
     let mut block_outcomes = Vec::new();
@@ -521,6 +649,13 @@ where
                         .await
                         .map_err(engine_request_failure(batch_info, FCU_METHOD))?;
                     classify_checked_fcu(response, batch_info, Some(target.number))?;
+                    applied_blocks.retain(|old| old.block.block_info.number <= target.number);
+                    for (parent, block) in reusable
+                        .iter()
+                        .filter(|(_, block)| block.block_info.number <= target.number)
+                    {
+                        remember_applied_block(applied_blocks, *parent, block);
+                    }
                 }
                 l2_head_updated |= head.is_some();
                 expected_parent = target;
@@ -610,6 +745,7 @@ where
                     .map_err(engine_request_failure(batch_info, FCU_METHOD))?;
                 classify_checked_fcu(final_fcu, batch_info, Some(block_info.block_info.number))?;
                 l2_head_updated = true;
+                remember_applied_block(applied_blocks, expected_parent, &block_info);
 
                 expected_parent = block_info.block_info;
                 reorg_results.push(block_info.clone());
@@ -2431,6 +2567,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retry_reusing_a_partially_rebuilt_batch_clears_old_deposit_mappings() {
+        use rollup_node_primitives::L1MessageEnvelope;
+
+        let database = setup_test_db().await;
+        insert_batch(&database, 1, 10, None).await;
+        let stale = dogeos_protocol_types::TxL1Message {
+            queue_index: 0,
+            gas_limit: 100_000,
+            to: Address::repeat_byte(0x33),
+            value: U256::from(1_000),
+            sender: Address::repeat_byte(0x44),
+            input: Bytes::new(),
+        };
+        database
+            .insert_l1_message(L1MessageEnvelope::new(stale, 1, Some(SAFE + 1), None))
+            .await
+            .unwrap();
+        let derived =
+            derived_batch(1, vec![(DERIVED_BASE_FEE, vec![]), (DERIVED_BASE_FEE, vec![])]);
+        let asserter = Asserter::new();
+        push_safe_block(&asserter);
+        push_absent_block(&asserter);
+        push_absent_block(&asserter);
+        push_safe_block(&asserter);
+        let first = push_matching_empty_block(&asserter, &derived.attributes[0]);
+        let second =
+            push_matching_empty_block_on(&asserter, &derived.attributes[1], first, SAFE + 2);
+        push_tags(&asserter, second, second, info(SAFE, 0x11));
+        let provider = absent_block_provider(asserter);
+        let client = Arc::new(ScriptedEngineClient::new());
+        let built = ExecutionPayloadV1 { block_hash: first.hash, ..payload(SAFE + 1) };
+        script_rebuild(&client, built);
+        client
+            .push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Syncing, None)));
+        // The retry finds both canonical blocks already matching, so no Reorg action remains.
+        client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Valid, None)));
+        client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Valid, None)));
+        let mut engine = engine_at_safe(client.clone());
+        let mut driver = DerivationDriver::default();
+        driver.hold_batch(derived);
+        driver.wait_for_attempt().await;
+        let held = driver.run_attempt(&provider, &mut engine, &database).await;
+        assert!(matches!(held, AttemptStep::Held), "{held:?}");
+        assert_eq!(*engine.fcs().head_block_info(), first);
+        assert_eq!(
+            database.get_n_l1_messages(None, 1).await.unwrap()[0].l2_block_number,
+            Some(SAFE + 1)
+        );
+        assert!(database.get_l2_block_and_batch_info_by_hash(first.hash).await.unwrap().is_none());
+        make_attempt_due(&mut driver);
+        driver.wait_for_attempt().await;
+        let completed = driver.run_attempt(&provider, &mut engine, &database).await;
+        let AttemptStep::Completed(completed) = completed else { panic!("{completed:?}") };
+        assert!(completed
+            .block_outcomes
+            .iter()
+            .all(|b| matches!(b, BlockConsolidationOutcome::UpdateFcs(_))));
+        assert_eq!(client.new_payload_calls(), 1, "retry must reuse both blocks");
+        assert_eq!(client.get_payload_calls(), 1);
+        assert_eq!(
+            database.get_n_l1_messages(None, 1).await.unwrap()[0].l2_block_number,
+            None,
+            "the reused first block no longer contains the old deposit"
+        );
+        assert_eq!(database.get_latest_safe_l2_info().await.unwrap().0, second);
+        assert_eq!(*engine.fcs().safe_block_info(), second);
+        assert!(client.is_drained());
+    }
+
+    #[tokio::test]
     async fn held_batch_blocks_next_pipeline_result() {
         let mut driver = DerivationDriver::default();
         let mut pipeline = VecDeque::from([batch(2, BatchStatus::Consolidated)]);
@@ -2538,7 +2744,10 @@ mod tests {
             AttemptStep::Held
         ));
 
-        let (_, outcome) = driver.unwind_and_revalidate(&database, 5, None).await.unwrap();
+        let (_, outcome) = driver
+            .unwind_and_revalidate(&database, 5, None, &absent_block_provider(Asserter::new()))
+            .await
+            .unwrap();
         assert!(matches!(
             outcome,
             HeldReorgOutcome::Invalidated { batch_info: BatchInfo { index: 1, .. }, .. }
@@ -2559,7 +2768,10 @@ mod tests {
         driver.hold_batch(batch(1, BatchStatus::Consolidated));
         driver.cancel_attempt();
 
-        let (_, outcome) = driver.unwind_and_revalidate(&database, 5, None).await.unwrap();
+        let (_, outcome) = driver
+            .unwind_and_revalidate(&database, 5, None, &absent_block_provider(Asserter::new()))
+            .await
+            .unwrap();
         assert!(matches!(outcome, HeldReorgOutcome::Survived { .. }));
         assert!(!driver.can_accept_batch());
         assert!(
@@ -2585,8 +2797,15 @@ mod tests {
         let expected = StoredForkchoiceState { head: engine_head, safe: engine_head, finalized };
         let mut driver = DerivationDriver::default();
 
-        let (_, outcome) =
-            driver.unwind_and_revalidate(&database, 5, Some(expected)).await.unwrap();
+        let (_, outcome) = driver
+            .unwind_and_revalidate(
+                &database,
+                5,
+                Some(expected),
+                &absent_block_provider(Asserter::new()),
+            )
+            .await
+            .unwrap();
         assert!(matches!(outcome, HeldReorgOutcome::NoHeldBatch));
         let pending = database
             .get_pending_frontier_transition()
@@ -2632,7 +2851,10 @@ mod tests {
         let mut driver = DerivationDriver::default();
         driver.hold_batch(batch(1, BatchStatus::Finalized));
 
-        let (_, outcome) = driver.unwind_and_revalidate(&database, 5, None).await.unwrap();
+        let (_, outcome) = driver
+            .unwind_and_revalidate(&database, 5, None, &absent_block_provider(Asserter::new()))
+            .await
+            .unwrap();
         assert!(matches!(outcome, HeldReorgOutcome::Invalidated { .. }));
         assert_eq!(
             database.get_batch_status_by_hash(B256::repeat_byte(1)).await.unwrap(),
@@ -2662,7 +2884,10 @@ mod tests {
         driver.hold_batch(batch(1, BatchStatus::Finalized));
         driver.cancel_attempt();
 
-        let (_, outcome) = driver.unwind_and_revalidate(&database, 5, None).await.unwrap();
+        let (_, outcome) = driver
+            .unwind_and_revalidate(&database, 5, None, &absent_block_provider(Asserter::new()))
+            .await
+            .unwrap();
         assert!(matches!(outcome, HeldReorgOutcome::Invalidated { .. }));
         assert_eq!(
             database.get_batch_status_by_hash(B256::repeat_byte(1)).await.unwrap(),

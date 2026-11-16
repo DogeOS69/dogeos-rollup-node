@@ -4,7 +4,7 @@
 use alloy_eips::Encodable2718;
 use alloy_primitives::{bytes::Bytes, keccak256, B256};
 use alloy_provider::Provider;
-use alloy_rpc_types_engine::{ExecutionPayloadV1, PayloadStatusEnum};
+use alloy_rpc_types_engine::ExecutionPayloadV1;
 use dogeos_hardforks::DogeosHardforks;
 use dogeos_protocol_types::{ScrollTxEnvelope, TxL1Message};
 use dogeos_reth_primitives::DogeosBlock;
@@ -667,7 +667,8 @@ impl<
     async fn unwind_and_revalidate_held_batch(
         &mut self,
         ancestor: u64,
-    ) -> Result<(UnwindResult, HeldReorgOutcome), ChainOrchestratorError> {
+    ) -> Result<(UnwindResult, HeldReorgOutcome, Vec<ScrollTxEnvelope>), ChainOrchestratorError>
+    {
         // A held block import may depend on L1 messages that the unwind removes.
         self.blocked_import = None;
         frontier::ensure_database_frontier(
@@ -680,9 +681,18 @@ impl<
         let expected = frontier::stored_forkchoice(self.engine.fcs());
         let (unwind_result, outcome) = self
             .derivation_driver
-            .unwind_and_revalidate(&self.database, ancestor, Some(expected))
+            .unwind_and_revalidate(&self.database, ancestor, Some(expected), &*self.l2_client)
             .await
             .map_err(ChainOrchestratorError::frontier_recovery)?;
+        // The intent is already durable, but the Engine still exposes the old canonical
+        // suffix. Collect before FCU: after rewind Reth may no longer serve it by number.
+        let reverted_transactions = if let Some(head) = unwind_result.l2_head_block_number {
+            self.collect_reverted_txs_in_range(head.saturating_add(1), expected.head.number)
+                .await
+                .map_err(ChainOrchestratorError::frontier_recovery)?
+        } else {
+            Vec::new()
+        };
         frontier::apply_pending_frontier_transition(
             &*self.l2_client,
             &mut self.engine,
@@ -708,7 +718,7 @@ impl<
             ),
         }
 
-        Ok((unwind_result, outcome))
+        Ok((unwind_result, outcome, reverted_transactions))
     }
 
     /// Meters L1 reorg handling.
@@ -832,43 +842,17 @@ impl<
         block_number: u64,
     ) -> Result<Option<ChainOrchestratorEvent>, ChainOrchestratorError> {
         self.derivation_driver.cancel_attempt();
-        let (unwind_result, held_outcome) =
+        let (unwind_result, held_outcome, reverted_transactions) =
             self.unwind_and_revalidate_held_batch(block_number).await?;
         let UnwindResult { l1_block_number, queue_index, l2_head_block_number, l2_safe_block_info } =
             unwind_result;
 
-        let (l2_head_block_info, reverted_transactions) =
-            if let Some(block_number) = l2_head_block_number {
-                // Fetch the block hash of the new L2 head block.
-                let block_hash = self
-                    .l2_client
-                    .get_block_by_number(block_number.into())
-                    .full()
-                    .await
-                    .map_err(ChainOrchestratorError::frontier_recovery)?
-                    .ok_or(ChainOrchestratorError::L2BlockNotFoundInL2Client(block_number))
-                    .map_err(ChainOrchestratorError::frontier_recovery)?
-                    .header
-                    .hash_slow();
-
-                // Cancel the inflight payload building job if the head has changed.
-                if let Some(s) = self.sequencer.as_mut() {
-                    s.cancel_payload_building_job();
-                };
-
-                // Collect transactions of reverted blocks from l2 client.
-                let reverted_transactions = self
-                    .collect_reverted_txs_in_range(
-                        block_number.saturating_add(1),
-                        self.engine.fcs().head_block_info().number,
-                    )
-                    .await
-                    .map_err(ChainOrchestratorError::frontier_recovery)?;
-
-                (Some(BlockInfo { number: block_number, hash: block_hash }), reverted_transactions)
-            } else {
-                (None, Vec::new())
-            };
+        let l2_head_block_info = l2_head_block_number.map(|_| {
+            if let Some(sequencer) = self.sequencer.as_mut() {
+                sequencer.cancel_payload_building_job();
+            }
+            *self.engine.fcs().head_block_info()
+        });
 
         // If the L1 reorg is before the origin of the inflight payload building job, cancel it.
         if Some(l1_block_number) <
@@ -880,21 +864,6 @@ impl<
             if let Some(s) = self.sequencer.as_mut() {
                 s.cancel_payload_building_job();
             };
-        }
-
-        // The safe transition was durably applied by `unwind_and_revalidate_held_batch`. The
-        // unsafe head remains a separate, recoverable startup concern.
-        if l2_head_block_info.is_some() {
-            let response = self
-                .engine
-                .update_fcs_checked(l2_head_block_info, None, None)
-                .await
-                .map_err(ChainOrchestratorError::frontier_recovery)?;
-            if !matches!(response.payload_status.status, PayloadStatusEnum::Valid) {
-                return Err(ChainOrchestratorError::FrontierTransitionStatus(
-                    response.payload_status.status,
-                ))
-            }
         }
 
         // Add all reverted transactions to the transaction pool.
@@ -2774,6 +2743,273 @@ mod run_loop_policy_tests {
 
         let _ = shutdown_tx.send(());
         assert!(run_task.await.unwrap().is_ok());
+    }
+
+    /// The first block has reached newPayload + head FCU, but the second block holds before
+    /// the outcome transaction. Its executed deposit therefore has no database mapping yet.
+    #[tokio::test]
+    async fn administrative_unwind_repairs_partially_applied_deposit_batch() {
+        use alloy_eips::eip2718::Encodable2718;
+        use dogeos_protocol_types::TxL1Message;
+        use rollup_node_primitives::L1MessageEnvelope;
+
+        for case in ["syncing", "timeout", "stale", "surviving", "rejected", "collection_error"] {
+            let survives = case == "surviving";
+            let repairs_head = !matches!(case, "stale" | "surviving");
+            let database = Arc::new(setup_test_db().await);
+            let batch_info = BatchInfo::new(1, B256::repeat_byte(1));
+            database
+                .insert_batch(BatchCommitData {
+                    hash: batch_info.hash,
+                    index: 1,
+                    block_number: if survives { 3 } else { 10 },
+                    block_timestamp: 0,
+                    calldata: Arc::new(Bytes::new()),
+                    blob_versioned_hash: None,
+                    finalized_block_number: None,
+                    reverted_block_number: None,
+                })
+                .await
+                .unwrap();
+            database.update_batch_status(batch_info.hash, BatchStatus::Processing).await.unwrap();
+            let deposit = TxL1Message {
+                queue_index: 0,
+                gas_limit: 100_000,
+                to: Address::repeat_byte(0x33),
+                value: U256::from(1_000),
+                sender: Address::repeat_byte(0x44),
+                input: Bytes::new(),
+            };
+            database
+                .insert_l1_message(L1MessageEnvelope::new(
+                    deposit.clone(),
+                    if survives { 3 } else { 9 },
+                    None,
+                    None,
+                ))
+                .await
+                .unwrap();
+            let encoded = Bytes::from(deposit.encoded_2718());
+            let derived = BatchDerivationResult {
+                attributes: [vec![encoded.clone()], vec![]]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(offset, transactions)| DerivedAttributes {
+                        block_number: SAFE + 1 + offset as u64,
+                        base_fee: U256::ZERO,
+                        attributes: ScrollPayloadAttributes {
+                            transactions: Some(transactions),
+                            ..Default::default()
+                        },
+                    })
+                    .collect(),
+                batch_info,
+                skipped_l1_messages: vec![],
+                target_status: BatchStatus::Consolidated,
+            };
+            let client = Arc::new(ScriptedEngineClient::new());
+            client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(
+                PayloadStatusEnum::Valid,
+                Some(PayloadId::new([7; 8])),
+            )));
+            let first = ExecutionPayloadV1 { transactions: vec![encoded], ..payload(SAFE + 1) };
+            let first_info = BlockInfo::new(first.block_number, first.block_hash);
+            client.push_get_payload(ScriptedResponse::Ok(first));
+            client.push_new_payload(ScriptedResponse::Ok(PayloadStatus {
+                status: PayloadStatusEnum::Valid,
+                latest_valid_hash: None,
+            }));
+            client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(
+                PayloadStatusEnum::Valid,
+                None,
+            )));
+            client.push_fork_choice_updated(if case == "timeout" {
+                ScriptedResponse::RequestTimeout
+            } else {
+                ScriptedResponse::Ok(fcu(PayloadStatusEnum::Syncing, None))
+            });
+            let asserter = Asserter::new();
+            push_attempt(&asserter);
+            asserter.push_success(&Option::<()>::None);
+            // Canonical verification excludes a witnessed block already replaced by a fork.
+            push_block(&asserter, if case == "stale" { info(SAFE + 1, 0x66) } else { first_info });
+            if repairs_head {
+                if case == "collection_error" {
+                    asserter.push_success(&Option::<()>::None);
+                } else {
+                    // Collect the old suffix before the Engine can rewind it.
+                    push_block(&asserter, first_info);
+                }
+                if matches!(case, "syncing" | "timeout") {
+                    for block in [info(SAFE, 0x11), info(SAFE, 0x11), info(0, 0)] {
+                        push_block(&asserter, block);
+                    }
+                }
+            }
+            let (mut orchestrator, _handle, _notifications) =
+                test_orchestrator(database.clone(), client.clone(), asserter, derived).await;
+            orchestrator.derivation_driver.wait_for_attempt().await;
+            let step = orchestrator
+                .derivation_driver
+                .run_attempt(&orchestrator.l2_client, &mut orchestrator.engine, &database)
+                .await;
+            assert!(matches!(step, AttemptStep::Held), "expected a real hold: {step:?}");
+            assert_eq!(*orchestrator.engine.fcs().head_block_info(), first_info);
+            assert_eq!(client.new_payload_calls(), 1);
+            assert_eq!(client.fork_choice_inputs()[1].0.head_block_hash, first_info.hash);
+            assert!(database
+                .get_l2_block_and_batch_info_by_hash(first_info.hash)
+                .await
+                .unwrap()
+                .is_none());
+            assert_eq!(database.get_n_l1_messages(None, 1).await.unwrap()[0].l2_block_number, None);
+            assert_eq!(
+                database.get_batch_status_by_hash(batch_info.hash).await.unwrap(),
+                Some(BatchStatus::Processing)
+            );
+
+            let preserved_head = if case == "stale" { info(SAFE + 20, 0x55) } else { first_info };
+            if case == "stale" {
+                orchestrator.engine = Engine::new(
+                    client.clone(),
+                    ForkchoiceState::new(preserved_head, info(SAFE, 0x11), info(0, 0)),
+                );
+            }
+            if repairs_head && case != "collection_error" {
+                client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(
+                    if case == "rejected" {
+                        PayloadStatusEnum::Syncing
+                    } else {
+                        PayloadStatusEnum::Valid
+                    },
+                    None,
+                )));
+            }
+            let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+            let result = orchestrator
+                .handle_command(ChainOrchestratorCommand::RevertToL1Block((5, response_tx)))
+                .await;
+            if matches!(case, "rejected" | "collection_error") {
+                assert!(result.is_err(), "{case}: rewind must fail-stop");
+                assert!(response_rx.await.is_err(), "no successful command reply");
+                let required = database.get_required_head_rewind().await.unwrap().unwrap();
+                assert_eq!(required.target.head, info(SAFE, 0x11));
+                assert_eq!(required.expected.head, first_info);
+                assert_eq!(
+                    database.get_pending_frontier_transition().await.unwrap(),
+                    Some(required)
+                );
+                assert_eq!(database.get_l2_head_block_number().await.unwrap(), SAFE);
+                assert!(database.get_n_l1_messages(None, 1).await.unwrap().is_empty());
+                assert!(database.get_batch_by_index(1).await.unwrap().is_none());
+                assert_eq!(*orchestrator.engine.fcs().head_block_info(), first_info);
+                assert!(!orchestrator.derivation_driver.is_attempt_scheduled());
+                assert_eq!(
+                    client.fork_choice_updated_calls(),
+                    if case == "rejected" { 4 } else { 3 },
+                    "collection failure must precede any rewind FCU"
+                );
+                assert!(client.is_drained());
+                continue;
+            }
+            result.unwrap();
+            assert!(response_rx.await.unwrap());
+            assert_eq!(orchestrator.derivation_driver.can_accept_batch(), !survives);
+            assert_eq!(orchestrator.derivation_driver.is_attempt_scheduled(), survives);
+            assert_eq!(database.get_batch_by_index(1).await.unwrap().is_some(), survives);
+            assert_eq!(
+                database.get_n_l1_messages(None, 1).await.unwrap().len(),
+                usize::from(survives)
+            );
+            assert_eq!(client.new_payload_calls(), 1, "rewind must not retry or consolidate");
+            let inputs = client.fork_choice_inputs();
+            let repairs = &inputs[3..];
+            assert_eq!(
+                repairs.len(),
+                usize::from(repairs_head),
+                "{case}: only a still-canonical deposit with a removed origin requires rewind"
+            );
+            if repairs_head {
+                assert!(!repairs[0].1);
+                assert_eq!(
+                    repairs[0].0.head_block_hash,
+                    info(SAFE, 0x11).hash,
+                    "canonical head must exclude the accepted deposit block"
+                );
+                assert_eq!(repairs[0].0.safe_block_hash, info(SAFE, 0x11).hash);
+                assert_eq!(repairs[0].0.finalized_block_hash, info(0, 0).hash);
+            }
+            assert_eq!(
+                *orchestrator.engine.fcs().head_block_info(),
+                if repairs_head { info(SAFE, 0x11) } else { preserved_head }
+            );
+            assert!(database.get_required_head_rewind().await.unwrap().is_none());
+            assert!(client.is_drained());
+            assert_eq!(*orchestrator.engine.fcs().safe_block_info(), info(SAFE, 0x11));
+            assert_eq!(*orchestrator.engine.fcs().finalized_block_info(), info(0, 0));
+        }
+    }
+
+    /// Unexecuted attributes are not evidence that the Engine's independent unsafe head used
+    /// their deposits. Both invalidating and surviving the slot must preserve that head.
+    #[tokio::test]
+    async fn administrative_unwind_of_unexecuted_hold_preserves_independent_head() {
+        for survives in [false, true] {
+            let database = Arc::new(setup_test_db().await);
+            let batch_info = BatchInfo::new(1, B256::repeat_byte(1));
+            database
+                .insert_batch(BatchCommitData {
+                    hash: batch_info.hash,
+                    index: 1,
+                    block_number: if survives { 3 } else { 10 },
+                    block_timestamp: 0,
+                    calldata: Arc::new(Bytes::new()),
+                    blob_versioned_hash: None,
+                    finalized_block_number: None,
+                    reverted_block_number: None,
+                })
+                .await
+                .unwrap();
+            let client = Arc::new(ScriptedEngineClient::new());
+            let asserter = startup_asserter();
+            let higher_head = info(SAFE + 20, 0x55);
+            for block in [higher_head, info(SAFE, 0x11), info(0, 0)] {
+                push_block(&asserter, block);
+            }
+            let (mut orchestrator, _handle, _notifications) = test_orchestrator(
+                database.clone(),
+                client.clone(),
+                asserter,
+                BatchDerivationResult {
+                    attributes: vec![DerivedAttributes {
+                        block_number: SAFE + 1,
+                        base_fee: U256::ZERO,
+                        attributes: ScrollPayloadAttributes {
+                            transactions: Some(vec![]),
+                            ..Default::default()
+                        },
+                    }],
+                    batch_info,
+                    skipped_l1_messages: vec![],
+                    target_status: BatchStatus::Consolidated,
+                },
+            )
+            .await;
+            orchestrator.engine = Engine::new(
+                client.clone(),
+                ForkchoiceState::new(higher_head, info(SAFE, 0x11), info(0, 0)),
+            );
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            orchestrator
+                .handle_command(ChainOrchestratorCommand::RevertToL1Block((5, tx)))
+                .await
+                .unwrap();
+            assert!(rx.await.unwrap());
+            assert_eq!(client.fork_choice_inputs(), vec![], "unexecuted work must not rewind Reth");
+            assert_eq!(*orchestrator.engine.fcs().head_block_info(), higher_head);
+            assert_eq!(orchestrator.derivation_driver.can_accept_batch(), !survives);
+            assert_eq!(orchestrator.derivation_driver.is_attempt_scheduled(), survives);
+        }
     }
 
     #[tokio::test]

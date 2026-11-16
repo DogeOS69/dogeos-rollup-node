@@ -1,6 +1,8 @@
 use super::{models, ConfirmedFrontierTransition, DatabaseError, PendingFrontierTransition};
 use crate::{
-    frontier_transition_types::{CONFIRMED_FRONTIER_KEY, FRONTIER_TRANSITION_KEY},
+    frontier_transition_types::{
+        CONFIRMED_FRONTIER_KEY, FRONTIER_TRANSITION_KEY, REQUIRED_HEAD_REWIND_KEY,
+    },
     ReadConnectionProvider, WriteConnectionProvider,
 };
 
@@ -38,6 +40,13 @@ async fn read_frontier_transition<T: ReadConnectionProvider + Sync + ?Sized>(
 pub trait DatabaseWriteOperations {
     /// Store the single pending Engine forkchoice transition.
     async fn set_pending_frontier_transition(
+        &self,
+        transition: PendingFrontierTransition,
+    ) -> Result<(), DatabaseError>;
+
+    /// Store an L1-invalidated head rewind that follower startup must replay exactly.
+    /// The companion witness is bound to this exact transition and replaced atomically with it.
+    async fn set_required_head_rewind(
         &self,
         transition: PendingFrontierTransition,
     ) -> Result<(), DatabaseError>;
@@ -280,6 +289,10 @@ impl<T: WriteConnectionProvider + ?Sized + Sync> DatabaseWriteOperations for T {
         if transition.expected == transition.target {
             return Ok(())
         }
+        // Ordinary replacements must not inherit a previous mandatory rewind's policy.
+        models::metadata::Entity::delete_by_id(REQUIRED_HEAD_REWIND_KEY)
+            .exec(self.get_connection())
+            .await?;
         let transition: models::metadata::ActiveModel = Metadata {
             key: FRONTIER_TRANSITION_KEY.to_owned(),
             value: serde_json::to_string(&transition)?,
@@ -287,6 +300,33 @@ impl<T: WriteConnectionProvider + ?Sized + Sync> DatabaseWriteOperations for T {
         .into();
         models::metadata::Entity::insert(transition)
             .on_conflict(OnConflict::column(Column::Key).update_column(Column::Value).to_owned())
+            .exec_without_returning(self.get_connection())
+            .await?;
+        Ok(())
+    }
+
+    async fn set_required_head_rewind(
+        &self,
+        transition: PendingFrontierTransition,
+    ) -> Result<(), DatabaseError> {
+        transition.validate()?;
+        if transition.target.head.number >= transition.expected.head.number {
+            return Err(DatabaseError::InvalidFrontierTransition(
+                "required head rewind must lower the head",
+            ))
+        }
+        self.set_pending_frontier_transition(transition).await?;
+        let row: models::metadata::ActiveModel = Metadata {
+            key: REQUIRED_HEAD_REWIND_KEY.to_owned(),
+            value: serde_json::to_string(&transition)?,
+        }
+        .into();
+        models::metadata::Entity::insert(row)
+            .on_conflict(
+                OnConflict::column(models::metadata::Column::Key)
+                    .update_column(models::metadata::Column::Value)
+                    .to_owned(),
+            )
             .exec_without_returning(self.get_connection())
             .await?;
         Ok(())
@@ -342,7 +382,11 @@ impl<T: WriteConnectionProvider + ?Sized + Sync> DatabaseWriteOperations for T {
                 .exec_without_returning(self.get_connection())
                 .await?;
         }
-        models::metadata::Entity::delete_by_id(FRONTIER_TRANSITION_KEY)
+        models::metadata::Entity::delete_many()
+            .filter(
+                models::metadata::Column::Key
+                    .is_in([FRONTIER_TRANSITION_KEY, REQUIRED_HEAD_REWIND_KEY]),
+            )
             .exec(self.get_connection())
             .await?;
         Ok(())
@@ -1071,8 +1115,25 @@ impl<T: WriteConnectionProvider + ?Sized + Sync> DatabaseWriteOperations for T {
         &self,
         outcome: BatchConsolidationOutcome,
     ) -> Result<(), DatabaseError> {
-        if let Some(block_info) = outcome.updated_l2_head() {
-            self.set_l2_head_block_number(block_info.number).await?;
+        if !outcome.blocks.is_empty() {
+            // Every covered block is authoritative, including reused blocks on a retry after
+            // an earlier attempt rebuilt part of the batch without committing its outcome.
+            let mut replaced = Condition::any().add(
+                models::l1_message::Column::L2BlockNumber
+                    .is_in(outcome.blocks.iter().map(|block| block.block_info.number as i64)),
+            );
+            if let Some(block_info) = outcome.updated_l2_head() {
+                // A changed head also discards its old unsafe suffix. Pure reuse leaves any
+                // independent higher unsafe blocks and their deposit mappings intact.
+                replaced = replaced
+                    .add(models::l1_message::Column::L2BlockNumber.gt(block_info.number as i64));
+                self.set_l2_head_block_number(block_info.number).await?;
+            }
+            models::l1_message::Entity::update_many()
+                .col_expr(models::l1_message::Column::L2BlockNumber, Expr::value(None::<i64>))
+                .filter(replaced)
+                .exec(self.get_connection())
+                .await?;
         }
         self.insert_blocks(
             outcome.blocks.iter().map(|b| b.block_info).collect(),
@@ -1198,6 +1259,11 @@ pub trait DatabaseReadOperations {
     async fn get_confirmed_frontier_transition(
         &self,
     ) -> Result<Option<ConfirmedFrontierTransition>, DatabaseError>;
+
+    /// Mandatory head rewind witness, only when it matches the exact current pending intent.
+    async fn get_required_head_rewind(
+        &self,
+    ) -> Result<Option<PendingFrontierTransition>, DatabaseError>;
 
     /// Highest non-reverted L2 block in a finalized batch, or genesis.
     async fn get_latest_finalized_l2_info(&self) -> Result<BlockInfo, DatabaseError>;
@@ -1332,6 +1398,16 @@ impl<T: ReadConnectionProvider + Sync + ?Sized> DatabaseReadOperations for T {
             .await?
             .ok_or(DatabaseError::MissingSafeL2Frontier)?;
         Ok(row.block_info())
+    }
+
+    async fn get_required_head_rewind(
+        &self,
+    ) -> Result<Option<PendingFrontierTransition>, DatabaseError> {
+        let witness = read_frontier_transition(self, REQUIRED_HEAD_REWIND_KEY).await?;
+        let pending = self.get_pending_frontier_transition().await?;
+        Ok(witness.filter(|value| {
+            Some(*value) == pending && value.target.head.number < value.expected.head.number
+        }))
     }
 
     async fn get_pending_frontier_transition(

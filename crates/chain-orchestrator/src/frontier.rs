@@ -311,6 +311,7 @@ where
         // Reth may have lost the unsafe head a saved move names. Replay the move's safe and
         // finalized blocks on the newest block Reth kept instead of failing on every restart.
         if let Some(mut transition) = database.get_pending_frontier_transition().await? {
+            let required_rewind = database.get_required_head_rewind().await? == Some(transition);
             let head = transition.target.head;
             if provider.get_block(head.number.into()).await?.map(|b| BlockInfo::from(&b.header)) !=
                 Some(head)
@@ -319,13 +320,17 @@ where
                     kept_head(provider, transition.target.safe, head.number).await?;
                 if transition.target == transition.expected {
                     database.clear_pending_frontier_transition().await?;
+                } else if required_rewind {
+                    database.set_required_head_rewind(transition).await?;
                 } else {
                     database.set_pending_frontier_transition(transition).await?;
                 }
-            } else if let Some(engine_head) =
+            } else if let Some(engine_head) = if required_rewind {
+                None
+            } else {
                 kept_engine_head(provider, head_selection, *engine.fcs().head_block_info(), head)
                     .await?
-            {
+            } {
                 // A follower's saved move may name a head far below Reth's (for example one saved
                 // by an earlier startup that timed out); replaying it would make Reth unwind.
                 transition.target.head = engine_head;
@@ -1154,6 +1159,123 @@ mod tests {
         let sent: Vec<_> =
             client.fork_choice_inputs().iter().map(|(fcs, _)| fcs.head_block_hash).collect();
         assert_eq!(sent, vec![stored.hash]);
+    }
+
+    #[tokio::test]
+    async fn required_head_rewind_replays_after_reopen_and_missing_target_on_follower() {
+        use scroll_db::DatabaseConnectionProvider;
+        for missing_target in [false, true] {
+            let original = setup_test_db().await;
+            let path = original.tmp_dir().unwrap().path().join("test.db");
+            let (genesis_block, genesis) = rpc_block(0, B256::ZERO, 0xf0);
+            let (safe_block, safe) = rpc_block(100, genesis.hash, 0xa1);
+            let (kept_block, kept) = rpc_block(103, safe.hash, 0xb1);
+            let (_, lost) = rpc_block(104, kept.hash, 0xb2);
+            let (tip_block, tip) = rpc_block(106, B256::repeat_byte(0x52), 0xc1);
+            seed_frontier(&original, genesis, safe).await;
+            let target_head = if missing_target { lost } else { kept };
+            original.set_l2_head_block_number(target_head.number).await.unwrap();
+            let expected = StoredForkchoiceState { head: tip, safe, finalized: genesis };
+            original
+                .set_required_head_rewind(PendingFrontierTransition {
+                    expected,
+                    target: StoredForkchoiceState { head: target_head, ..expected },
+                })
+                .await
+                .unwrap();
+            original.inner().get_connection().clone().close().await.unwrap();
+            let database = Database::new(path.to_str().unwrap()).await.unwrap();
+            let asserter = Asserter::new();
+            push_tags(&asserter, &tip_block, &safe_block, &genesis_block);
+            if missing_target {
+                asserter.push_success(&Option::<RpcBlock<ScrollRpcTransaction>>::None);
+                asserter.push_success(&Some(safe_block.clone()));
+                asserter.push_success(&Option::<RpcBlock<ScrollRpcTransaction>>::None);
+            }
+            asserter.push_success(&Some(kept_block.clone()));
+            push_tags(&asserter, &kept_block, &safe_block, &genesis_block);
+            // Recovery's final head selection must keep the repaired head, not re-advance it.
+            asserter.push_success(&Some(safe_block.clone()));
+            if missing_target {
+                asserter.push_success(&Option::<RpcBlock<ScrollRpcTransaction>>::None);
+            }
+            asserter.push_success(&Some(kept_block.clone()));
+            let (provider, client, mut engine) =
+                mock_engine(asserter, ForkchoiceState::new(tip, safe, genesis));
+            client.push_fork_choice_updated(ScriptedResponse::Ok(valid_fcu()));
+            recover_database_frontier(
+                &provider,
+                &mut engine,
+                &database,
+                HeadSelection::KeepEngineHead,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                client
+                    .fork_choice_inputs()
+                    .iter()
+                    .map(|(state, _)| state.head_block_hash)
+                    .collect::<Vec<_>>(),
+                vec![kept.hash],
+                "mandatory rewind cannot be rewritten upward or re-advanced"
+            );
+            assert_eq!(*engine.fcs().head_block_info(), kept);
+            assert_eq!(database.get_l2_head_block_number().await.unwrap(), kept.number);
+            assert_eq!(database.get_pending_frontier_transition().await.unwrap(), None);
+            assert_eq!(database.get_required_head_rewind().await.unwrap(), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_rewind_rejection_retains_target_on_follower() {
+        let database = setup_test_db().await;
+        let (genesis_block, genesis) = rpc_block(0, B256::ZERO, 0xf0);
+        let (safe_block, safe) = rpc_block(100, genesis.hash, 0xa1);
+        let (stored_block, stored) = rpc_block(STORED_HEAD, B256::repeat_byte(0x51), 0xb1);
+        let (tip_block, tip) = rpc_block(RETH_TIP, B256::repeat_byte(0x52), 0xc1);
+        seed_frontier(&database, genesis, safe).await;
+        database.set_l2_head_block_number(STORED_HEAD).await.unwrap();
+        let expected = StoredForkchoiceState { head: tip, safe, finalized: genesis };
+        let transition = PendingFrontierTransition {
+            expected,
+            target: StoredForkchoiceState { head: stored, ..expected },
+        };
+        database.set_required_head_rewind(transition).await.unwrap();
+        let asserter = Asserter::new();
+        push_tags(&asserter, &tip_block, &safe_block, &genesis_block);
+        // Also satisfy the old follower's rewrite path so red is a semantic assertion failure.
+        for block in [
+            &stored_block,
+            &stored_block,
+            &tip_block,
+            &safe_block,
+            &stored_block,
+            &stored_block,
+            &tip_block,
+        ] {
+            asserter.push_success(&Some(block.clone()));
+        }
+        let (provider, client, mut engine) =
+            mock_engine(asserter, ForkchoiceState::new(tip, safe, genesis));
+        client.push_fork_choice_updated(ScriptedResponse::Ok(ForkchoiceUpdated {
+            payload_status: PayloadStatus {
+                status: PayloadStatusEnum::Syncing,
+                latest_valid_hash: None,
+            },
+            payload_id: None,
+        }));
+        let result = recover_database_frontier(
+            &provider,
+            &mut engine,
+            &database,
+            HeadSelection::KeepEngineHead,
+        )
+        .await;
+        assert!(result.is_err(), "an explicit rejected rewind must fail-stop, got {result:?}");
+        assert_eq!(client.fork_choice_inputs()[0].0.head_block_hash, stored.hash);
+        assert_eq!(database.get_pending_frontier_transition().await.unwrap(), Some(transition));
+        assert_eq!(*engine.fcs().head_block_info(), tip);
     }
 
     /// A move saved by an earlier startup (for example one whose forkchoice update timed out)

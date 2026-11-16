@@ -483,7 +483,7 @@ async fn rg49_admin_revert_unwinds_the_database_only_together_with_the_watcher_r
 // checks that the update reached the Engine, so it cannot pass by never making the call. L1
 // reorgs, batch reverts, finalization and the administrative revert are fixed: they save the
 // move first, fail with `FrontierTransitionStatus`, which stops the run loop, and keep the saved
-// move so a restart replays it. `UpdateFcsHead` is not fixed yet.
+// move so a restart replays it. `UpdateFcsHead` confirms the provider before its DB commit.
 
 /// A scripted Engine client whose forkchoice updates answer `INVALID`. Several answers are queued
 /// so that a fix which retries or falls back to a second forkchoice update reaches the assertion
@@ -696,35 +696,436 @@ async fn rg49_admin_revert_replies_success_only_if_the_engine_accepted_the_new_s
     assert_eq!(orchestrator.engine.fcs().safe_block_info().number, 10);
 }
 
-/// `UpdateFcsHead`: the admin moves the head from L2 block 5 to block 8. The Engine answers
-/// `INVALID` and keeps head at block 5. The command still stores head 8 in the database and
-/// replies.
+/// A rejected administrative head update must neither mutate local state nor acknowledge it.
 #[tokio::test]
-#[ignore = "RG-49: UpdateFcsHead drops an INVALID forkchoice answer, stores the head and replies success"]
 async fn rg49_update_fcs_head_replies_success_only_if_the_engine_accepted_the_head() {
+    for status in [
+        PayloadStatusEnum::Invalid { validation_error: "rejected by the test Engine".into() },
+        PayloadStatusEnum::Syncing,
+    ] {
+        let (mut orchestrator, client, asserter) = admin_head_fixture().await;
+        let database = orchestrator.database.clone();
+        let previous = orchestrator.engine.fcs().clone();
+        client.push_fork_choice_updated(fcu_response(status.clone()));
+        let mut events = orchestrator.event_listener();
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let result = orchestrator
+            .handle_command(ChainOrchestratorCommand::UpdateFcsHead((info(4, 4), reply_tx)))
+            .await;
+
+        assert_eq!(client.fork_choice_updated_calls(), 1, "the update reached the Engine");
+        assert!(
+            matches!(&result, Err(ChainOrchestratorError::FrontierTransitionStatus(actual)) if actual == &status),
+            "got {result:?}"
+        );
+        assert!(result.unwrap_err().is_frontier_fatal());
+        assert!(reply_rx.await.is_err(), "a rejected update must not reply success");
+        assert_eq!(orchestrator.engine.fcs(), &previous);
+        assert_admin_db_unchanged(&database).await;
+        assert!(events.next().now_or_never().is_none(), "no success event");
+        assert!(asserter.read_q().is_empty());
+    }
+}
+
+fn fcu_response(
+    status: PayloadStatusEnum,
+) -> ScriptedResponse<alloy_rpc_types_engine::ForkchoiceUpdated> {
+    ScriptedResponse::Ok(alloy_rpc_types_engine::ForkchoiceUpdated {
+        payload_status: alloy_rpc_types_engine::PayloadStatus { status, latest_valid_hash: None },
+        payload_id: None,
+    })
+}
+
+async fn admin_head_fixture(
+) -> (TestOrchestrator<ScriptedEngineClient>, Arc<ScriptedEngineClient>, Asserter) {
     let database = Arc::new(setup_test_db().await);
-    let engine_client = engine_rejecting_forkchoice();
+    database.set_l2_head_block_number(5).await.unwrap();
+    let message = L1MessageEnvelope::new(deposit(0), 1, Some(5), None);
+    database.insert_l1_message(message).await.unwrap();
+    let client = Arc::new(ScriptedEngineClient::new());
     let mut orchestrator = orchestrator_with_engine(
-        database.clone(),
+        database,
         ForkchoiceState::new(info(5, 5), info(0, 0), info(0, 0)),
         0,
         Probes::default(),
-        engine_client.clone(),
+        client.clone(),
     )
     .await;
+    let asserter = Asserter::new();
+    // Collect the reverted block before FCU; no pool reinsertion may precede confirmation.
+    push_admin_block(&asserter, info(5, 5));
+    orchestrator.l2_client = Arc::new(
+        ProviderBuilder::<_, _, Scroll>::default().connect_mocked_client(asserter.clone()),
+    );
+    (orchestrator, client, asserter)
+}
 
+async fn assert_admin_db_unchanged(database: &Database) {
+    assert_eq!(database.get_l2_head_block_number().await.unwrap(), 5);
+    let messages =
+        database.get_n_l1_messages(Some(L1MessageKey::from_queue_index(0)), 1).await.unwrap();
+    assert_eq!(messages[0].l2_block_number, Some(5), "do not purge mappings before confirmation");
+    assert!(database.get_pending_frontier_transition().await.unwrap().is_none());
+    assert!(database.get_confirmed_frontier_transition().await.unwrap().is_none());
+}
+
+fn push_admin_block(asserter: &Asserter, block: BlockInfo) {
+    use alloy_rpc_types_eth::{Block, Header};
+    use dogeos_rpc_types::ScrollRpcTransaction;
+    // Provider observations are independent of the Engine's candidate cache.
+    let mut header: Header = Header::default();
+    header.inner.number = block.number;
+    header.hash = block.hash;
+    asserter.push_success(&Some(Block::<ScrollRpcTransaction>::empty(header)));
+}
+
+fn push_admin_tags(asserter: &Asserter, head: BlockInfo) {
+    for block in [head, info(0, 0), info(0, 0)] {
+        push_admin_block(asserter, block);
+    }
+}
+
+#[tokio::test]
+async fn rg49_update_fcs_head_rejects_pending_frontier_before_any_side_effect() {
+    let database = Arc::new(setup_test_db().await);
+    let genesis = info(0, 0xa0);
+    database.insert_genesis_block(genesis.hash).await.unwrap();
+    database.set_l2_head_block_number(10).await.unwrap();
+    for (index, number) in [(0, 5), (1, 10)] {
+        database
+            .insert_l1_message(L1MessageEnvelope::new(deposit(index), 1, Some(number), None))
+            .await
+            .unwrap();
+    }
+    let previous = ForkchoiceState::new(info(10, 10), genesis, genesis);
+    let expected = frontier::stored_forkchoice(&previous);
+    let pending = PendingFrontierTransition {
+        expected,
+        target: StoredForkchoiceState { safe: info(5, 5), ..expected },
+    };
+    let batch = BatchCommitData {
+        hash: B256::repeat_byte(0xb1),
+        index: 1,
+        block_number: 10,
+        block_timestamp: 1_010,
+        calldata: Arc::new(Default::default()),
+        blob_versioned_hash: None,
+        finalized_block_number: None,
+        reverted_block_number: None,
+    };
+    database.insert_batch(batch.clone()).await.unwrap();
+    let batch_info = (&batch).into();
+    // Consolidation committed safe 5 and its journal before the Engine accepted the move.
+    database
+        .tx_mut(move |tx| async move {
+            tx.insert_blocks((1..=5).map(|n| info(n, n as u8)).collect(), batch_info).await?;
+            tx.set_pending_frontier_transition(pending).await
+        })
+        .await
+        .unwrap();
+    let safe = database.get_latest_safe_l2_info().await.unwrap();
+    assert_eq!(safe.0, info(5, 5));
+    let mappings = database.get_n_l1_messages(None, 10).await.unwrap();
+    let confirmed = database.get_confirmed_frontier_transition().await.unwrap();
+    let client = Arc::new(ScriptedEngineClient::new());
+    let mut orchestrator = orchestrator_with_engine(
+        database.clone(),
+        previous.clone(),
+        0,
+        Probes::default(),
+        client.clone(),
+    )
+    .await;
+    let asserter = Asserter::new();
+    // Without the guard, the old path can confirm head 4 with cached safe at genesis,
+    // then incorrectly commit DB head 4 below DB safe 5. Do not fail on mock exhaustion.
+    for number in 5..=10 {
+        push_admin_block(&asserter, info(number, number as u8));
+    }
+    client.push_fork_choice_updated(fcu_response(PayloadStatusEnum::Valid));
+    for block in [info(4, 4), genesis, genesis] {
+        push_admin_block(&asserter, block);
+    }
+    orchestrator.l2_client = Arc::new(
+        ProviderBuilder::<_, _, Scroll>::default().connect_mocked_client(asserter.clone()),
+    );
+    let mut events = orchestrator.event_listener();
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     let result = orchestrator
-        .handle_command(ChainOrchestratorCommand::UpdateFcsHead((info(8, 8), reply_tx)))
+        .handle_command(ChainOrchestratorCommand::UpdateFcsHead((info(4, 4), reply_tx)))
         .await;
+    assert!(
+        matches!(&result, Err(ChainOrchestratorError::PendingFrontierTransition)),
+        "{result:?}"
+    );
+    let error = result.unwrap_err();
+    assert!(!error.is_frontier_fatal());
+    assert!(orchestrator.handle_outcome(Err(error)).is_ok(), "the run loop must continue");
+    assert_eq!(client.fork_choice_updated_calls(), 0);
+    assert_eq!(asserter.read_q().len(), 9, "no provider reads or pool reinsertion");
+    assert_eq!(orchestrator.engine.fcs(), &previous);
+    assert_eq!(database.get_l2_head_block_number().await.unwrap(), 10);
+    assert_eq!(database.get_latest_safe_l2_info().await.unwrap(), safe);
+    assert_eq!(database.get_n_l1_messages(None, 10).await.unwrap(), mappings);
+    assert_eq!(database.get_pending_frontier_transition().await.unwrap(), Some(pending));
+    assert_eq!(database.get_confirmed_frontier_transition().await.unwrap(), confirmed);
+    assert!(reply_rx.await.is_err(), "no success reply");
+    assert!(events.next().now_or_never().is_none(), "no success event");
+}
 
-    assert!(engine_client.fork_choice_updated_calls() >= 1, "the update reached the Engine");
-    if result.is_ok() && reply_rx.await.is_ok() {
-        assert_eq!(
-            orchestrator.engine.fcs().head_block_info().number,
-            8,
-            "the admin caller is told the head moved to 8 (database head {}), but the Engine kept head 5",
-            database.get_l2_head_block_number().await.unwrap()
+#[tokio::test]
+async fn rg49_update_fcs_head_valid_requires_exact_provider_confirmation() {
+    for observed in [info(5, 5), info(4, 0x44), info(6, 6)] {
+        let (mut orchestrator, client, asserter) = admin_head_fixture().await;
+        let database = orchestrator.database.clone();
+        client.push_fork_choice_updated(fcu_response(PayloadStatusEnum::Valid));
+        push_admin_tags(&asserter, observed);
+        let mut events = orchestrator.event_listener();
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let result = orchestrator
+            .handle_command(ChainOrchestratorCommand::UpdateFcsHead((info(4, 4), reply_tx)))
+            .await;
+        assert!(
+            matches!(&result, Err(ChainOrchestratorError::FrontierTransitionUnconfirmed { .. })),
+            "{result:?}"
         );
+        assert!(result.unwrap_err().is_frontier_fatal());
+        assert!(reply_rx.await.is_err());
+        assert_eq!(*orchestrator.engine.fcs().head_block_info(), observed);
+        assert_admin_db_unchanged(&database).await;
+        assert!(events.next().now_or_never().is_none());
+        assert_eq!(client.fork_choice_updated_calls(), 1);
+        assert!(asserter.read_q().is_empty(), "confirmation reads were consumed");
     }
+}
+
+#[tokio::test]
+async fn rg49_update_fcs_head_confirmed_success_commits_then_notifies_and_replies() {
+    let (mut orchestrator, client, asserter) = admin_head_fixture().await;
+    asserter.write_q().clear(); // an advance has no reverted blocks to collect
+    client.push_fork_choice_updated(fcu_response(PayloadStatusEnum::Valid));
+    push_admin_tags(&asserter, info(8, 8));
+    let mut events = orchestrator.event_listener();
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    orchestrator
+        .handle_command(ChainOrchestratorCommand::UpdateFcsHead((info(8, 8), reply_tx)))
+        .await
+        .unwrap();
+    reply_rx.await.unwrap();
+    assert!(
+        matches!(events.next().await, Some(ChainOrchestratorEvent::FcsHeadUpdated(head)) if head == info(8, 8))
+    );
+    assert_eq!(*orchestrator.engine.fcs().head_block_info(), info(8, 8));
+    assert_eq!(orchestrator.database.get_l2_head_block_number().await.unwrap(), 8);
+    let messages = orchestrator
+        .database
+        .get_n_l1_messages(Some(L1MessageKey::from_queue_index(0)), 1)
+        .await
+        .unwrap();
+    assert_eq!(messages[0].l2_block_number, Some(5));
+    assert!(orchestrator.database.get_confirmed_frontier_transition().await.unwrap().is_none());
+    assert_eq!(client.fork_choice_updated_calls(), 1);
+    assert!(asserter.read_q().is_empty());
+}
+
+#[tokio::test]
+async fn rg49_update_fcs_head_timeout_is_fatal_without_local_commit_or_success() {
+    let (mut orchestrator, client, asserter) = admin_head_fixture().await;
+    let previous = orchestrator.engine.fcs().clone();
+    client.push_fork_choice_updated(ScriptedResponse::RequestTimeout);
+    let mut events = orchestrator.event_listener();
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    let result = orchestrator
+        .handle_command(ChainOrchestratorCommand::UpdateFcsHead((info(4, 4), reply_tx)))
+        .await;
+    let error = result.unwrap_err();
+    assert!(error.is_frontier_fatal(), "{error:?}");
+    assert!(error.is_engine_unavailable(), "{error:?}");
+    assert!(reply_rx.await.is_err());
+    assert_eq!(orchestrator.engine.fcs(), &previous, "no candidate cached on ambiguity");
+    assert_admin_db_unchanged(&orchestrator.database).await;
+    assert!(events.next().now_or_never().is_none());
+    assert_eq!(client.fork_choice_updated_calls(), 1);
+    assert!(asserter.read_q().is_empty());
+}
+
+#[tokio::test]
+async fn rg49_update_fcs_head_failed_readback_is_fatal_without_caching_candidate() {
+    let (mut orchestrator, client, asserter) = admin_head_fixture().await;
+    let previous = orchestrator.engine.fcs().clone();
+    client.push_fork_choice_updated(fcu_response(PayloadStatusEnum::Valid));
+    asserter.push_failure_msg("provider unavailable after FCU");
+    let mut events = orchestrator.event_listener();
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    let result = orchestrator
+        .handle_command(ChainOrchestratorCommand::UpdateFcsHead((info(4, 4), reply_tx)))
+        .await;
+    assert!(result.unwrap_err().is_frontier_fatal());
+    assert!(reply_rx.await.is_err());
+    assert_eq!(orchestrator.engine.fcs(), &previous);
+    assert_admin_db_unchanged(&orchestrator.database).await;
+    assert!(events.next().now_or_never().is_none());
+    assert_eq!(client.fork_choice_updated_calls(), 1);
+    assert!(asserter.read_q().is_empty());
+}
+
+/// The execution node may have applied an unanswered command. Restart follows #46's existing
+/// DB-authoritative repair, without a durable guarantee to replay the requested admin intent.
+#[tokio::test]
+async fn rg49_update_fcs_head_ambiguous_application_recovers_from_database_on_restart() {
+    use scroll_db::DatabaseConnectionProvider;
+    let (mut orchestrator, client, asserter) = admin_head_fixture().await;
+    let database = orchestrator.database.clone();
+    database.insert_genesis_block(info(0, 0).hash).await.unwrap();
+    let path = database.tmp_dir().unwrap().path().join("test.db");
+    // The provider reports head 4 on restart despite the unanswered FCU.
+    client.push_fork_choice_updated(ScriptedResponse::RequestTimeout);
+    let mut events = orchestrator.event_listener();
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    let result = orchestrator
+        .handle_command(ChainOrchestratorCommand::UpdateFcsHead((info(4, 4), reply_tx)))
+        .await;
+    assert!(result.unwrap_err().is_frontier_fatal());
+    assert!(reply_rx.await.is_err());
+    assert!(events.next().now_or_never().is_none());
+    assert!(asserter.read_q().is_empty());
+    assert_admin_db_unchanged(&database).await;
+    database.inner().get_connection().clone().close().await.unwrap();
+    let reopened = Database::new(path.to_str().unwrap()).await.unwrap();
+    assert_admin_db_unchanged(&reopened).await;
+    // The previous DB head is still available. Startup restores it; it does not replay the
+    // failed admin intent, transaction reinsertion or notification.
+    push_admin_tags(&asserter, info(4, 4));
+    push_admin_block(&asserter, info(0, 0));
+    push_admin_block(&asserter, info(5, 5));
+    push_admin_tags(&asserter, info(5, 5));
+    client.push_fork_choice_updated(fcu_response(PayloadStatusEnum::Valid));
+    let mut restarted_engine =
+        Engine::new(client.clone(), ForkchoiceState::from_genesis(B256::ZERO));
+    frontier::recover_database_frontier(
+        &*orchestrator.l2_client,
+        &mut restarted_engine,
+        &reopened,
+        frontier::HeadSelection::StoredHead,
+    )
+    .await
+    .unwrap();
+    assert_eq!(*restarted_engine.fcs().head_block_info(), info(5, 5));
+    assert_eq!(reopened.get_l2_head_block_number().await.unwrap(), 5);
+    assert!(reopened.get_pending_frontier_transition().await.unwrap().is_none());
+    assert_eq!(client.fork_choice_updated_calls(), 2);
+    assert!(asserter.read_q().is_empty());
+}
+
+#[tokio::test]
+async fn rg49_update_fcs_head_failure_stops_the_real_run_loop() {
+    for response in [
+        fcu_response(PayloadStatusEnum::Invalid { validation_error: "rejected".into() }),
+        fcu_response(PayloadStatusEnum::Syncing),
+        ScriptedResponse::RequestTimeout,
+    ] {
+        let (mut orchestrator, client, asserter) = admin_head_fixture().await;
+        let database = orchestrator.database.clone();
+        database.insert_genesis_block(B256::ZERO).await.unwrap();
+        // The normal startup must complete before the queued command reaches the Engine.
+        asserter.write_q().clear();
+        push_admin_tags(&asserter, info(5, 5));
+        push_admin_block(&asserter, info(0, 0));
+        push_admin_block(&asserter, info(5, 5));
+        push_admin_block(&asserter, info(5, 5)); // the command collects the reverted suffix
+        client.push_fork_choice_updated(response);
+        let (commands, receiver) = mpsc::unbounded_channel();
+        orchestrator.handle_rx = receiver;
+        let (reply, reply_rx) = tokio::sync::oneshot::channel();
+        commands.send(ChainOrchestratorCommand::UpdateFcsHead((info(4, 4), reply))).unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            orchestrator.run_until_shutdown(std::future::pending()),
+        )
+        .await
+        .expect("the failed command must stop the run loop without a shutdown signal");
+        assert!(result.unwrap_err().is_frontier_fatal());
+        assert!(reply_rx.await.is_err());
+        assert_eq!(database.get_l2_head_block_number().await.unwrap(), 5);
+        let messages =
+            database.get_n_l1_messages(Some(L1MessageKey::from_queue_index(0)), 1).await.unwrap();
+        assert_eq!(messages[0].l2_block_number, Some(5));
+        assert_eq!(client.fork_choice_updated_calls(), 1, "startup did not reject first");
+        assert!(asserter.read_q().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn rg49_update_fcs_head_success_reinserts_only_reverted_user_transactions() {
+    use alloy_consensus::{transaction::Recovered, SignableTransaction, TxLegacy};
+    use alloy_primitives::Signature;
+    use alloy_rpc_types_eth::{Block, BlockTransactions, Header, Transaction};
+    use dogeos_rpc_types::ScrollRpcTransaction;
+
+    let (mut orchestrator, client, asserter) = admin_head_fixture().await;
+    asserter.write_q().clear();
+    let user_tx = ScrollTxEnvelope::Legacy(
+        TxLegacy { gas_limit: 21_000, gas_price: 17, ..Default::default() }
+            .into_signed(Signature::test_signature()),
+    );
+    let transactions = [user_tx, deposit(0).into()]
+        .into_iter()
+        .map(|tx| ScrollRpcTransaction {
+            inner: Transaction {
+                inner: Recovered::new_unchecked(tx, Address::repeat_byte(0x11)),
+                block_hash: Some(info(5, 5).hash),
+                block_number: Some(5),
+                transaction_index: None,
+                effective_gas_price: Some(17),
+            },
+        })
+        .collect();
+    let mut header: Header = Header::default();
+    header.inner.number = 5;
+    header.hash = info(5, 5).hash;
+    asserter.push_success(&Some(Block::new(header, BlockTransactions::Full(transactions))));
+    client.push_fork_choice_updated(fcu_response(PayloadStatusEnum::Valid));
+    push_admin_tags(&asserter, info(4, 4));
+    // Only the user transaction may consume a sendRawTransaction response after tag reads.
+    asserter.push_success(&B256::repeat_byte(0x55));
+    asserter.push_failure_msg("an L1 message must not be reinserted into the pool");
+    let mut events = orchestrator.event_listener();
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    orchestrator
+        .handle_command(ChainOrchestratorCommand::UpdateFcsHead((info(4, 4), reply_tx)))
+        .await
+        .unwrap();
+    reply_rx.await.unwrap();
+    assert!(
+        matches!(events.next().await, Some(ChainOrchestratorEvent::FcsHeadUpdated(head)) if head == info(4, 4))
+    );
+    assert_eq!(orchestrator.database.get_l2_head_block_number().await.unwrap(), 4);
+    assert_eq!(asserter.read_q().len(), 1, "exactly one user transaction was reinserted");
+    assert_eq!(client.fork_choice_updated_calls(), 1);
+}
+
+#[tokio::test]
+async fn rg49_update_fcs_head_local_validation_error_remains_nonfatal() {
+    let (mut orchestrator, client, asserter) = admin_head_fixture().await;
+    let previous = ForkchoiceState::new(info(5, 5), info(5, 5), info(0, 0));
+    orchestrator.engine.replace_fcs_from_provider(previous.clone());
+    let mut events = orchestrator.event_listener();
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    let result = orchestrator
+        .handle_command(ChainOrchestratorCommand::UpdateFcsHead((info(4, 4), reply_tx)))
+        .await;
+    let error = result.unwrap_err();
+    assert!(!error.is_frontier_fatal(), "local validation must preserve the run loop: {error:?}");
+    assert!(matches!(
+        error,
+        ChainOrchestratorError::EngineError(scroll_engine::EngineError::FcsError(
+            scroll_engine::FcsError::HeadBelowSafe
+        ))
+    ));
+    assert_eq!(client.fork_choice_updated_calls(), 0);
+    assert!(reply_rx.await.is_err());
+    assert_eq!(orchestrator.engine.fcs(), &previous);
+    assert_admin_db_unchanged(&orchestrator.database).await;
+    assert!(events.next().now_or_never().is_none());
+    assert!(asserter.read_q().is_empty());
 }

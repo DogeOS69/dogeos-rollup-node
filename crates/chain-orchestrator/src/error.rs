@@ -17,6 +17,9 @@ pub enum ChainOrchestratorError {
     /// Recovery errors must stop processing, including database and RPC failures.
     #[error("frontier recovery failed: {0}")]
     FrontierRecovery(#[source] Box<Self>),
+    /// Consolidation may have committed only part of the unsafe chain; restart before proceeding.
+    #[error("chain consolidation failed: {0}")]
+    ChainConsolidation(#[source] Box<Self>),
     /// A database frontier conflicts with an unexplained Engine tag.
     #[error("conflicting {tag} frontier: database={target}, Engine={observed}")]
     FrontierConflict {
@@ -218,6 +221,11 @@ impl CanRetry for ChainOrchestratorError {
 }
 
 impl ChainOrchestratorError {
+    /// Returns true when the run loop must stop rather than resume partially applied work.
+    pub(crate) const fn is_fatal(&self) -> bool {
+        self.is_frontier_fatal() || matches!(self, Self::ChainConsolidation(_))
+    }
+
     /// Keep all failures within frontier recovery fail-stop, including journal I/O errors.
     pub(crate) fn frontier_recovery(error: impl Into<Self>) -> Self {
         let error = error.into();

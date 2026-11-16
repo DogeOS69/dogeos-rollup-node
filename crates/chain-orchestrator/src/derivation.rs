@@ -389,6 +389,18 @@ impl DerivationDriver {
                         canonical_applied.iter().map(|witness| witness.block.clone()).collect(),
                     )
                     .await?;
+                    // Follower recovery retains mappings only through the stored unsafe head.
+                    // Cover this canonical evidence before unwind; an affected lower parent
+                    // still wins below, and a higher stored head must not be lowered here.
+                    if let Some(number) = canonical_applied
+                        .iter()
+                        .map(|witness| witness.block.block_info.number)
+                        .max()
+                    {
+                        if number > tx.get_l2_head_block_number().await? {
+                            tx.set_l2_head_block_number(number).await?;
+                        }
+                    }
                     let mut unwind_result = tx.unwind(ancestor).await?;
                     if let Some(number) = unwind_result.l2_head_block_number {
                         if affected_parent.is_none_or(|parent| number < parent.number) {
@@ -696,6 +708,25 @@ where
                         .map_err(engine_request_failure(batch_info, FCU_METHOD))?;
                     classify_checked_fcu(response, batch_info, Some(expected_parent.number))?;
                     remember_applied_prefix(applied_blocks, &reusable, expected_parent);
+                    // This preparatory ancestor move can cut the canonical head. Clean its
+                    // discarded suffix now, before a build can hold and a later import can
+                    // establish fresh higher mappings. UpdateFcs only advances/equal-switches;
+                    // the rebuilt head below extends this confirmed parent by one block.
+                    database
+                        .tx_mut(move |tx| async move {
+                            tx.purge_l1_message_to_l2_block_mappings(Some(
+                                expected_parent.number.saturating_add(1),
+                            ))
+                            .await?;
+                            if tx.get_l2_head_block_number().await? > expected_parent.number {
+                                tx.set_l2_head_block_number(expected_parent.number).await?;
+                            }
+                            Ok::<_, ChainOrchestratorError>(())
+                        })
+                        .await
+                        .map_err(|error| {
+                            AttemptFailure::fatal("persistPreparatoryHead", "ERROR", error)
+                        })?;
                 }
                 let build_response = engine
                     .build_payload(Some(expected_parent), attributes.attributes.clone())
@@ -2725,7 +2756,15 @@ mod tests {
 
     #[tokio::test]
     async fn preparatory_fcu_prunes_superseded_witnesses_only_after_checked_success() {
-        for case in ["valid", "syncing", "timeout", "connection_lost", "transport", "invalid"] {
+        for case in [
+            "valid",
+            "valid_lagging",
+            "syncing",
+            "timeout",
+            "connection_lost",
+            "transport",
+            "invalid",
+        ] {
             let database = setup_test_db().await;
             insert_batch(&database, 1, 10, None).await;
             let derived =
@@ -2747,7 +2786,8 @@ mod tests {
                 )),
                 _ => ScriptedResponse::Ok(fcu(PayloadStatusEnum::Valid, None)),
             });
-            if case == "valid" {
+            let succeeded = case.starts_with("valid");
+            if succeeded {
                 client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(
                     PayloadStatusEnum::Syncing,
                     None,
@@ -2755,6 +2795,24 @@ mod tests {
             }
             let higher_head = info(SAFE + 10, 0x55);
             let safe = info(SAFE, 0x11);
+            let stored_head = if case == "valid_lagging" { SAFE } else { higher_head.number };
+            database.set_l2_head_block_number(stored_head).await.unwrap();
+            for (queue_index, number) in
+                [SAFE, first.number, higher_head.number].into_iter().enumerate()
+            {
+                database
+                    .insert_l1_message(rollup_node_primitives::L1MessageEnvelope::new(
+                        dogeos_protocol_types::TxL1Message {
+                            queue_index: queue_index as u64,
+                            ..Default::default()
+                        },
+                        1,
+                        Some(number),
+                        None,
+                    ))
+                    .await
+                    .unwrap();
+            }
             let mut engine =
                 Engine::new(client.clone(), ForkchoiceState::new(higher_head, safe, safe));
             let mut driver = DerivationDriver::default();
@@ -2777,7 +2835,7 @@ mod tests {
                 assert!(matches!(step, AttemptStep::Held), "{step:?}");
             }
             let witnesses = &driver.pending.as_ref().unwrap().applied_blocks;
-            if case == "valid" {
+            if succeeded {
                 assert!(witnesses.is_empty(), "successful parent FCU discards the old suffix");
             } else {
                 assert_eq!(witnesses.len(), 1, "{case}: unsuccessful FCU must retain evidence");
@@ -2785,7 +2843,23 @@ mod tests {
             }
             assert_eq!(
                 *engine.fcs().head_block_info(),
-                if case == "valid" { first } else { higher_head }
+                if succeeded { first } else { higher_head }
+            );
+            assert_eq!(
+                database.get_l2_head_block_number().await.unwrap(),
+                if succeeded { stored_head.min(first.number) } else { stored_head },
+                "{case}: clamp only after checked success, never raise a lagging counter"
+            );
+            assert_eq!(
+                database
+                    .get_n_l1_messages(None, 3)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|message| message.l2_block_number)
+                    .collect::<Vec<_>>(),
+                vec![Some(SAFE), Some(first.number), (!succeeded).then_some(higher_head.number)],
+                "{case}: preserve the parent/prefix; failed FCUs must leave the suffix intact"
             );
             assert_eq!(client.get_payload_calls(), 0);
             assert_eq!(client.new_payload_calls(), 0);
@@ -2799,7 +2873,7 @@ mod tests {
         use alloy_eips::Encodable2718;
         use rollup_node_primitives::L1MessageEnvelope;
 
-        for case in ["lower_parent", "noncanonical", "rollback"] {
+        for case in ["lower_parent", "noncanonical", "rollback", "higher_stored_head"] {
             let database = setup_test_db().await;
             insert_batch(&database, 1, 10, None).await;
             database
@@ -2820,7 +2894,11 @@ mod tests {
                 database
                     .insert_l1_message(L1MessageEnvelope::new(
                         message.clone(),
-                        if case == "noncanonical" || index == 2 { 3 } else { 9 },
+                        if matches!(case, "noncanonical" | "higher_stored_head") || index == 2 {
+                            3
+                        } else {
+                            9
+                        },
                         (index == 0).then_some(SAFE + 1),
                         None,
                     ))
@@ -2883,7 +2961,8 @@ mod tests {
             assert_eq!(client.new_payload_calls(), 1);
             assert!(client.is_drained());
             database.set_latest_l1_block_number(20).await.unwrap();
-            database.set_l2_head_block_number(second.number).await.unwrap();
+            let stored_head = if case == "higher_stored_head" { second.number + 10 } else { SAFE };
+            database.set_l2_head_block_number(stored_head).await.unwrap();
             // Retaining safe101 makes the required rewind to100 invalid. The failed intent
             // must roll back materialization, origin deletion, metadata and batch invalidation.
             let retained_safe = if case == "rollback" {
@@ -2899,7 +2978,7 @@ mod tests {
                 &asserter,
                 if case == "noncanonical" { info(second.number, 0x66) } else { second },
             );
-            if case != "noncanonical" {
+            if matches!(case, "lower_parent" | "rollback") {
                 // The durable deposit in101 selects parent100, below the held witness's parent101.
                 push_canonical_block(&asserter, safe);
             }
@@ -2930,7 +3009,11 @@ mod tests {
                 );
                 assert_eq!(mappings, vec![Some(first.number), None, None]);
                 assert_eq!(database.get_latest_l1_block_number().await.unwrap(), 20);
-                assert_eq!(database.get_l2_head_block_number().await.unwrap(), second.number);
+                assert_eq!(
+                    database.get_l2_head_block_number().await.unwrap(),
+                    stored_head,
+                    "the witness coverage write must roll back with the rejected intent"
+                );
                 assert_eq!(
                     database.get_batch_status_by_hash(B256::repeat_byte(1)).await.unwrap(),
                     Some(BatchStatus::Processing)
@@ -2944,9 +3027,21 @@ mod tests {
                 assert!(matches!(outcome, HeldReorgOutcome::Invalidated { .. }));
                 assert!(driver.can_accept_batch());
                 assert!(database.get_batch_by_index(1).await.unwrap().is_none());
-                if case == "noncanonical" {
-                    assert_eq!(mappings, vec![Some(first.number), None, None]);
+                if matches!(case, "noncanonical" | "higher_stored_head") {
+                    assert_eq!(
+                        mappings,
+                        if case == "noncanonical" {
+                            vec![Some(first.number), None, None]
+                        } else {
+                            vec![Some(first.number), Some(second.number), Some(second.number)]
+                        }
+                    );
                     assert_eq!(unwind.l2_head_block_number, None);
+                    assert_eq!(
+                        database.get_l2_head_block_number().await.unwrap(),
+                        stored_head,
+                        "stale witnesses cannot raise coverage; materialization cannot lower it"
+                    );
                     assert!(database.get_pending_frontier_transition().await.unwrap().is_none());
                 } else {
                     assert_eq!(unwind.l2_head_block_number, Some(SAFE));

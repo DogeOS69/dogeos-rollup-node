@@ -139,7 +139,8 @@ pub struct BatchConsolidationOutcome {
     pub skipped_l1_messages: Vec<u64>,
     /// The target status of the batch after consolidation.
     pub target_status: BatchStatus,
-    /// Is the l2 head block number updated.
+    /// Whether consolidation changed the Engine head, discarding any suffix above the batch tip.
+    /// Advancing database head metadata to an already-canonical tip does not set this flag.
     pub l2_head_updated: bool,
 }
 
@@ -169,7 +170,7 @@ impl BatchConsolidationOutcome {
         self.skipped_l1_messages = skipped;
     }
 
-    /// Returns the updated L2 head block info if consolidation updated it.
+    /// Returns the batch tip if consolidation changed the Engine head.
     pub fn updated_l2_head(&self) -> Option<BlockInfo> {
         self.l2_head_updated
             .then(|| self.blocks.last().expect("must have at least one block").block_info)

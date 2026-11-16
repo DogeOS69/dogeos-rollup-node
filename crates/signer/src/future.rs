@@ -26,6 +26,15 @@ pub fn sign_block(
     block: DogeosBlock,
     signer: Arc<dyn alloy_signer::Signer + Send + Sync>,
 ) -> SignerFuture {
+    sign_block_in_generation(block, signer, 0)
+}
+
+/// Signs a block, preserving its owning generation through every retry.
+pub(crate) fn sign_block_in_generation(
+    block: DogeosBlock,
+    signer: Arc<dyn alloy_signer::Signer + Send + Sync>,
+    generation: u64,
+) -> SignerFuture {
     Box::pin(async move {
         // TODO: Are we happy to sign the hash directly or do we want to use EIP-191
         // (`signer.sign_message`)?
@@ -34,7 +43,9 @@ pub fn sign_block(
         let mut delay = FIRST_RETRY_DELAY;
         loop {
             match tokio::time::timeout(ATTEMPT_TIMEOUT, signer.sign_hash(&hash)).await {
-                Ok(Ok(signature)) => return SignerEvent::SignedBlock { block, signature },
+                Ok(Ok(signature)) => {
+                    return SignerEvent::SignedBlock { block, signature, generation }
+                }
                 Ok(Err(err)) => {
                     tracing::error!(target: "scroll::signer", number, ?err, ?delay, "Failed to sign block, retrying");
                 }

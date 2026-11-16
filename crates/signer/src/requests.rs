@@ -4,5 +4,10 @@ use dogeos_reth_primitives::DogeosBlock;
 #[derive(Debug)]
 pub enum SignerRequest {
     /// Request to sign a block.
-    SignBlock(DogeosBlock),
+    SignBlock {
+        /// The block to sign.
+        block: DogeosBlock,
+        /// The orchestrator generation that owns this request.
+        generation: u64,
+    },
 }

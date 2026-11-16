@@ -26,13 +26,23 @@ impl SignerHandle {
         Self { request_tx, event_rx, address }
     }
 
-    /// Sends a request to sign a block.
+    /// Sends a request to sign a block in generation zero.
+    /// Use [`Self::sign_block_in_generation`] when the caller tracks chain ownership.
     pub fn sign_block(
         &self,
         block: dogeos_reth_primitives::DogeosBlock,
     ) -> Result<(), SignerError> {
+        self.sign_block_in_generation(block, 0)
+    }
+
+    /// Sends a request tagged with the generation that owns the block.
+    pub fn sign_block_in_generation(
+        &self,
+        block: dogeos_reth_primitives::DogeosBlock,
+        generation: u64,
+    ) -> Result<(), SignerError> {
         self.request_tx
-            .send(SignerRequest::SignBlock(block))
+            .send(SignerRequest::SignBlock { block, generation })
             .map_err(|_| SignerError::RequestChannelClosed)?;
         Ok(())
     }

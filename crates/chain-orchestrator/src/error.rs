@@ -11,12 +11,18 @@ use scroll_engine::EngineError;
 /// A type that represents an error that occurred in the chain orchestrator.
 #[derive(Debug, thiserror::Error)]
 pub enum ChainOrchestratorError {
+    /// An administrative head update must wait for the durable frontier transition to finish.
+    #[error("cannot update forkchoice head while a frontier transition is pending")]
+    PendingFrontierTransition,
     /// The execution provider did not expose all latest/safe/finalized tags needed for recovery.
     #[error("execution provider is missing latest, safe, or finalized forkchoice tags")]
     MissingEngineForkchoiceTags,
     /// Recovery errors must stop processing, including database and RPC failures.
     #[error("frontier recovery failed: {0}")]
     FrontierRecovery(#[source] Box<Self>),
+    /// Consolidation may have committed only part of the unsafe chain; restart before proceeding.
+    #[error("chain consolidation failed: {0}")]
+    ChainConsolidation(#[source] Box<Self>),
     /// A database frontier conflicts with an unexplained Engine tag.
     #[error("conflicting {tag} frontier: database={target}, Engine={observed}")]
     FrontierConflict {
@@ -218,6 +224,11 @@ impl CanRetry for ChainOrchestratorError {
 }
 
 impl ChainOrchestratorError {
+    /// Returns true when the run loop must stop rather than resume partially applied work.
+    pub(crate) const fn is_fatal(&self) -> bool {
+        self.is_frontier_fatal() || matches!(self, Self::ChainConsolidation(_))
+    }
+
     /// Keep all failures within frontier recovery fail-stop, including journal I/O errors.
     pub(crate) fn frontier_recovery(error: impl Into<Self>) -> Self {
         let error = error.into();

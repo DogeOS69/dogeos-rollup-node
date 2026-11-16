@@ -9,10 +9,10 @@
 //! Each test name starts with the RG key of the row it pins.
 //!
 //! RG-46 asserts that finalized conflicts roll back the database unwind, and the RG-49 forkchoice
-//! tests for unwinds, reverts and finalization assert the fixed behaviour. Other passing tests
-//! document behaviour that is not fixed; when a row is fixed, change the matching assertion
-//! instead of deleting the test. Tests marked `#[ignore]` assert the intended behaviour, fail
-//! today and carry the reason in the ignore message; run them with `--ignored`.
+//! tests for stale signatures, unwinds, reverts and finalization assert the fixed behaviour. Other
+//! passing tests document behaviour that is not fixed; when a row is fixed, change the matching
+//! assertion instead of deleting the test. Tests marked `#[ignore]` assert the intended behaviour,
+//! fail today and carry the reason in the ignore message; run them with `--ignored`.
 
 use super::*;
 use alloy_primitives::{Address, U256};
@@ -338,81 +338,348 @@ async fn rg46_finalized_conflict_rolls_back_l1_unwind() {
     }
 }
 
-/// RG-49 (rollup-node issue #30): block signing is asynchronous, and the orchestrator has no way to
-/// tell that an unwind happened between the sign request and the signed result.
-///
-/// The chain has L2 blocks 1..=5. Block 4 executed the L1 message from L1 block 5, and block 5 is
-/// waiting for its signature. An L1 reorg to block 3 deletes the message, so the database head
-/// moves back to L2 block 3 and block 5 belongs to a chain that no longer exists. The signed result
-/// for block 5 then arrives. `handle_signer_event` persists it as the new head, stores its
-/// signature and announces the block to the network.
-///
-/// The unwind is applied through `Database::unwind`, the operation `handle_l1_reorg` runs first.
-/// The rest of `handle_l1_reorg` (L2 client lookup and forkchoice update) does not touch the signer
-/// path, so it is left out.
-///
-/// Passes today and documents the defect. The fix in the issue tags each sign request with an
-/// unwind generation and drops results from an older generation. Once the signer API carries that
-/// tag, change the assertions to expect the head to stay at 3, no signature and no announcement.
+/// Captures a request through the production submission path and delays its signed result.
+fn pending_signature<EC: ScrollEngineApi + Unpin + Send + Sync + 'static>(
+    orchestrator: &mut TestOrchestrator<EC>,
+    block: DogeosBlock,
+) -> SignerEvent {
+    let (request_tx, mut requests) = mpsc::unbounded_channel();
+    let (_events, event_rx) = mpsc::unbounded_channel();
+    orchestrator.signer = Some(SignerHandle::new(request_tx, event_rx.into(), Address::ZERO));
+    orchestrator.request_block_signature(block).unwrap();
+    let rollup_node_signer::SignerRequest::SignBlock { block, generation } =
+        requests.try_recv().unwrap();
+    SignerEvent::SignedBlock {
+        block,
+        generation,
+        signature: alloy_primitives::Signature::test_signature(),
+    }
+}
+
+fn signing_block(number: u64) -> DogeosBlock {
+    DogeosBlock {
+        header: alloy_consensus::Header { number, ..Default::default() },
+        ..Default::default()
+    }
+}
+
+fn push_signing_readback(asserter: &Asserter, block: &DogeosBlock) {
+    let mut rpc_block =
+        alloy_rpc_types_eth::Block::<dogeos_rpc_types::ScrollRpcTransaction>::default();
+    rpc_block.header.inner = block.header.clone();
+    rpc_block.header.hash = block.hash_slow();
+    asserter.push_success(&Some(rpc_block));
+}
+
+fn accepting_engine() -> Arc<ScriptedEngineClient> {
+    let engine = Arc::new(ScriptedEngineClient::new());
+    engine.push_fork_choice_updated(ScriptedResponse::Ok(
+        alloy_rpc_types_engine::ForkchoiceUpdated {
+            payload_status: alloy_rpc_types_engine::PayloadStatus {
+                status: alloy_rpc_types_engine::PayloadStatusEnum::Valid,
+                latest_valid_hash: None,
+            },
+            payload_id: None,
+        },
+    ));
+    engine
+}
+
+/// RG-49: both L1 reorg entry points reject orphan results before they can overwrite the
+/// rewound head, persist, notify or announce, while preserving signatures for the retained chain.
 #[tokio::test]
-async fn rg49_signed_block_requested_before_an_unwind_is_still_persisted_and_announced() {
+async fn rg49_signed_block_requested_before_an_unwind_is_discarded() {
+    for administrative in [false, true] {
+        let database = Arc::new(setup_test_db().await);
+        database.insert_genesis_block(B256::ZERO).await.unwrap();
+        let (announced_tx, mut announced_rx) = mpsc::unbounded_channel();
+        let engine = accepting_engine();
+        let mut orchestrator = orchestrator_with_engine(
+            database.clone(),
+            ForkchoiceState::new(info(5, 5), info(0, 0), info(0, 0)),
+            0,
+            Probes { announced: Some(announced_tx), ..Default::default() },
+            engine.clone(),
+        )
+        .await;
+
+        // Block 4 executed deposit 0 from L1 block 5. Block 5 is waiting to be signed.
+        orchestrator.handle_l1_message(deposit(0), info(5, 5)).await.unwrap();
+        database
+            .update_l1_messages_from_l2_blocks(vec![L2BlockInfoWithL1Messages {
+                block_info: info(4, 4),
+                l1_messages: vec![deposit(0).tx_hash()],
+            }])
+            .await
+            .unwrap();
+        database.set_l2_head_block_number(4).await.unwrap();
+        let orphan = signing_block(5);
+        let stale = pending_signature(&mut orchestrator, orphan.clone());
+        // Both a strict ancestor and the future rewound tip are already awaiting signatures.
+        let preserved = [signing_block(2), signing_block(3)].map(|block| {
+            let pending = pending_signature(&mut orchestrator, block.clone());
+            (block, pending)
+        });
+        let asserter = Asserter::new();
+        // Rewound head lookup, then collection of the two reverted blocks' transactions.
+        for number in [3, 4, 5] {
+            push_signing_readback(&asserter, &signing_block(number));
+        }
+        // The durable head rewind also requires exact post-FCU tag confirmation.
+        push_admin_tags(&asserter, BlockInfo::new(3, signing_block(3).hash_slow()));
+        orchestrator.l2_client = Arc::new(
+            ProviderBuilder::<_, _, Scroll>::default().connect_mocked_client(asserter.clone()),
+        );
+        if administrative {
+            let (reply, response) = tokio::sync::oneshot::channel();
+            orchestrator
+                .handle_command(ChainOrchestratorCommand::RevertToL1Block((3, reply)))
+                .await
+                .unwrap();
+            assert!(response.await.unwrap());
+        } else {
+            assert!(matches!(
+                orchestrator.handle_l1_reorg(3).await.unwrap(),
+                Some(ChainOrchestratorEvent::L1Reorg {
+                    l2_head_block_info: Some(BlockInfo { number: 3, .. }),
+                    ..
+                })
+            ));
+        }
+        assert_eq!(engine.fork_choice_updated_calls(), 1);
+        assert_eq!(database.get_l2_head_block_number().await.unwrap(), 3);
+        assert!(asserter.read_q().is_empty());
+        let mut events = orchestrator.event_listener();
+
+        // No readback response is queued: stale ownership must be checked before even the RPC.
+        let result = orchestrator.handle_signer_event(stale).await;
+        assert!(matches!(result, Ok(None)), "{result:?}");
+        orchestrator.handle_outcome(result).unwrap();
+        assert_eq!(database.get_l2_head_block_number().await.unwrap(), 3);
+        assert!(database.get_signature(orphan.hash_slow()).await.unwrap().is_none());
+        assert!(events.next().now_or_never().is_none());
+        // A channel round trip drains preceding network messages without a timing-based sleep.
+        let _ = orchestrator.network.handle().event_listener().await;
+        assert!(announced_rx.try_recv().is_err());
+
+        // The older generation must not lose signatures for the preserved prefix or
+        // matching tip. Canonical readback accepts them without regressing the DB head.
+        for (block, pending) in preserved {
+            let SignerEvent::SignedBlock { generation, .. } = &pending;
+            assert_ne!(*generation, orchestrator.signing_generation);
+            push_signing_readback(&asserter, &block);
+            let result = orchestrator.handle_signer_event(pending).await;
+            assert!(matches!(result, Ok(Some(ChainOrchestratorEvent::SignedBlock { .. }))));
+            orchestrator.handle_outcome(result).unwrap();
+            assert_eq!(database.get_l2_head_block_number().await.unwrap(), 3);
+            assert_eq!(
+                database.get_signature(block.hash_slow()).await.unwrap(),
+                Some(alloy_primitives::Signature::test_signature())
+            );
+            assert!(matches!(events.next().await,
+                Some(ChainOrchestratorEvent::SignedBlock { block: signed, .. }) if signed == block));
+            let _ = orchestrator.network.handle().event_listener().await;
+            assert_eq!(announced_rx.try_recv().unwrap().0, block);
+            assert!(announced_rx.try_recv().is_err());
+        }
+
+        // Signing in the new generation still advances, persists, announces and notifies.
+        let replacement = signing_block(4);
+        let current = pending_signature(&mut orchestrator, replacement.clone());
+        push_signing_readback(&asserter, &replacement);
+        let result = orchestrator.handle_signer_event(current).await;
+        assert!(matches!(result, Ok(Some(ChainOrchestratorEvent::SignedBlock { .. }))));
+        orchestrator.handle_outcome(result).unwrap();
+        assert_eq!(database.get_l2_head_block_number().await.unwrap(), 4);
+        assert!(database.get_signature(replacement.hash_slow()).await.unwrap().is_some());
+        assert!(matches!(events.next().await, Some(ChainOrchestratorEvent::SignedBlock { .. })));
+        let _ = orchestrator.network.handle().event_listener().await;
+        assert_eq!(announced_rx.try_recv().unwrap().0, replacement);
+        assert!(announced_rx.try_recv().is_err());
+    }
+}
+
+/// A same-generation result may be orphaned by peer sync or derived reconciliation. Canonical
+/// absence, replacement and a failed readback all fail closed before any observable side effect.
+#[tokio::test]
+async fn rg49_signed_block_requires_successful_canonical_readback() {
+    for readback in ["missing", "replacement", "error"] {
+        let database = Arc::new(setup_test_db().await);
+        database.set_l2_head_block_number(3).await.unwrap();
+        let (announced_tx, mut announced_rx) = mpsc::unbounded_channel();
+        let mut orchestrator = orchestrator_probed(
+            database.clone(),
+            ForkchoiceState::from_genesis(B256::ZERO),
+            0,
+            Probes { announced: Some(announced_tx), ..Default::default() },
+        )
+        .await;
+        let block = signing_block(4);
+        let result = pending_signature(&mut orchestrator, block.clone());
+        let asserter = Asserter::new();
+        match readback {
+            "missing" => asserter.push_success(&Option::<()>::None),
+            "replacement" => {
+                let mut replacement = block.clone();
+                replacement.header.extra_data = Bytes::from_static(b"replacement").into();
+                push_signing_readback(&asserter, &replacement);
+            }
+            "error" => asserter.push_failure_msg("readback unavailable"),
+            _ => unreachable!(),
+        }
+        orchestrator.l2_client =
+            Arc::new(ProviderBuilder::<_, _, Scroll>::default().connect_mocked_client(asserter));
+        let mut events = orchestrator.event_listener();
+        let outcome = orchestrator.handle_signer_event(result).await;
+        if readback == "error" {
+            assert!(outcome.as_ref().unwrap_err().is_frontier_fatal());
+            assert!(orchestrator.handle_outcome(outcome).unwrap_err().is_frontier_fatal());
+        } else {
+            assert!(matches!(outcome, Ok(None)), "{outcome:?}");
+            orchestrator.handle_outcome(outcome).unwrap();
+        }
+        assert_eq!(database.get_l2_head_block_number().await.unwrap(), 3);
+        assert!(database.get_signature(block.hash_slow()).await.unwrap().is_none());
+        assert!(events.next().now_or_never().is_none());
+        let _ = orchestrator.network.handle().event_listener().await;
+        assert!(announced_rx.try_recv().is_err());
+    }
+}
+
+/// A canonical ancestor can finish signing after an import advanced the persisted head. Its
+/// signature is still useful, but acceptance must not move that newer head backwards.
+#[tokio::test]
+async fn rg49_delayed_canonical_signature_preserves_newer_database_head() {
     let database = Arc::new(setup_test_db().await);
     let (announced_tx, mut announced_rx) = mpsc::unbounded_channel();
-    let orchestrator = orchestrator_probed(
+    let mut orchestrator = orchestrator_probed(
         database.clone(),
         ForkchoiceState::from_genesis(B256::ZERO),
         0,
         Probes { announced: Some(announced_tx), ..Default::default() },
     )
     .await;
+    let block = signing_block(4);
+    let result = pending_signature(&mut orchestrator, block.clone());
+    database.set_l2_head_block_number(8).await.unwrap();
+    let asserter = Asserter::new();
+    push_signing_readback(&asserter, &block);
+    orchestrator.l2_client =
+        Arc::new(ProviderBuilder::<_, _, Scroll>::default().connect_mocked_client(asserter));
+    let mut events = orchestrator.event_listener();
+    let result = orchestrator.handle_signer_event(result).await;
+    assert!(matches!(result, Ok(Some(ChainOrchestratorEvent::SignedBlock { .. }))));
+    orchestrator.handle_outcome(result).unwrap();
+    assert_eq!(database.get_l2_head_block_number().await.unwrap(), 8);
+    assert!(database.get_signature(block.hash_slow()).await.unwrap().is_some());
+    assert!(matches!(events.next().await, Some(ChainOrchestratorEvent::SignedBlock { .. })));
+    let _ = orchestrator.network.handle().event_listener().await;
+    assert_eq!(announced_rx.try_recv().unwrap().0, block);
+}
 
-    // Block 4 executed deposit 0 from L1 block 5. The head marker is at block 4 and block 5 is in
-    // flight for signing.
-    orchestrator.handle_l1_message(deposit(0), info(5, 5)).await.unwrap();
-    database
-        .update_l1_messages_from_l2_blocks(vec![L2BlockInfoWithL1Messages {
-            block_info: info(4, 4),
-            l1_messages: vec![deposit(0).tx_hash()],
-        }])
-        .await
-        .unwrap();
-    database.set_l2_head_block_number(4).await.unwrap();
+/// Reverting safe batches while retaining the unsafe head must keep its pending signatures.
+#[tokio::test]
+async fn rg49_safe_only_batch_revert_preserves_pending_signatures() {
+    let database = Arc::new(setup_test_db().await);
+    seed_two_committed_batches(&database).await;
+    database.insert_genesis_block(B256::ZERO).await.unwrap();
+    database.set_l2_head_block_number(10).await.unwrap();
+    let mut orchestrator = orchestrator_with_engine(
+        database.clone(),
+        ForkchoiceState::new(info(10, 10), info(10, 10), info(0, 0)),
+        0,
+        Probes::default(),
+        accepting_engine(),
+    )
+    .await;
+    let block = signing_block(11);
+    let pending = pending_signature(&mut orchestrator, block.clone());
+    let generation = orchestrator.signing_generation;
+    let asserter = Asserter::new();
+    // The post-revert tags retain the unsafe head and only lower safe.
+    for info in [info(10, 10), info(5, 5), info(0, 0)] {
+        let mut rpc_block =
+            alloy_rpc_types_eth::Block::<dogeos_rpc_types::ScrollRpcTransaction>::default();
+        rpc_block.header.inner.number = info.number;
+        rpc_block.header.hash = info.hash;
+        asserter.push_success(&Some(rpc_block));
+    }
+    push_signing_readback(&asserter, &block);
+    orchestrator.l2_client =
+        Arc::new(ProviderBuilder::<_, _, Scroll>::default().connect_mocked_client(asserter));
+    assert!(matches!(
+        orchestrator.handle_batch_revert(2, 2, info(30, 30)).await.unwrap(),
+        Some(ChainOrchestratorEvent::BatchReverted { .. })
+    ));
+    assert_eq!(orchestrator.signing_generation, generation);
+    assert!(matches!(
+        orchestrator.handle_signer_event(pending).await.unwrap(),
+        Some(ChainOrchestratorEvent::SignedBlock { .. })
+    ));
+    assert_eq!(database.get_l2_head_block_number().await.unwrap(), 11);
+    assert!(database.get_signature(block.hash_slow()).await.unwrap().is_some());
+}
 
-    // The unwind removes deposit 0, so the head falls back to the block before it.
-    let unwind = database.unwind(3).await.unwrap();
-    assert_eq!(unwind.l2_head_block_number, Some(3));
-    assert_eq!(database.get_l2_head_block_number().await.unwrap(), 3);
-
-    // The signer now delivers the result requested before the unwind.
-    let block = DogeosBlock {
-        header: alloy_consensus::Header { number: 5, ..Default::default() },
-        ..Default::default()
-    };
-    let hash = block.hash_slow();
-    let signature = alloy_primitives::Signature::new(U256::from(1), U256::from(2), false);
-    let event = orchestrator
-        .handle_signer_event(SignerEvent::SignedBlock { block: block.clone(), signature })
-        .await
-        .unwrap();
-
-    // Current behaviour: the stale result is accepted in full.
-    assert!(
-        matches!(event, Some(ChainOrchestratorEvent::SignedBlock { .. })),
-        "the stale signed block is turned into a SignedBlock event, got {event:?}"
-    );
-    assert_eq!(
-        database.get_l2_head_block_number().await.unwrap(),
-        5,
-        "the head marker jumps from the unwound head 3 to the stale block 5"
-    );
-    assert_eq!(database.get_signature(hash).await.unwrap(), Some(signature));
-    // The network probe forwards announcements from a separate task.
-    let (announced, announced_signature) =
-        tokio::time::timeout(std::time::Duration::from_secs(5), announced_rx.recv())
+/// Administrative head rewinds (including same-height replacements) revoke queued results.
+#[tokio::test]
+async fn rg49_administrative_head_rewind_discards_pending_signatures() {
+    for replacement in [info(3, 3), info(4, 44)] {
+        let block = signing_block(4);
+        let previous_head = BlockInfo { number: 4, hash: block.hash_slow() };
+        let database = Arc::new(setup_test_db().await);
+        database.set_l2_head_block_number(4).await.unwrap();
+        let mut orchestrator = orchestrator_with_engine(
+            database.clone(),
+            ForkchoiceState::new(previous_head, info(0, 0), info(0, 0)),
+            0,
+            Probes::default(),
+            accepting_engine(),
+        )
+        .await;
+        // The queued result belongs to the actual old head, including its hash. A same-height
+        // replacement must revoke it just as a lower head does.
+        let pending = pending_signature(&mut orchestrator, block.clone());
+        let SignerEvent::SignedBlock { generation, .. } = &pending;
+        let generation = *generation;
+        let asserter = Asserter::new();
+        if replacement.number < 4 {
+            push_signing_readback(&asserter, &block);
+        }
+        // A checked administrative FCU reads back latest, safe and finalized. The standalone
+        // signing guard must discard the stale result without consuming these queued responses.
+        for info in [replacement, info(0, 0), info(0, 0)] {
+            let mut rpc_block =
+                alloy_rpc_types_eth::Block::<dogeos_rpc_types::ScrollRpcTransaction>::default();
+            rpc_block.header.inner.number = info.number;
+            rpc_block.header.hash = info.hash;
+            asserter.push_success(&Some(rpc_block));
+        }
+        orchestrator.l2_client = Arc::new(
+            ProviderBuilder::<_, _, Scroll>::default().connect_mocked_client(asserter.clone()),
+        );
+        let (reply, response) = tokio::sync::oneshot::channel();
+        orchestrator
+            .handle_command(ChainOrchestratorCommand::UpdateFcsHead((replacement, reply)))
             .await
-            .expect("the network announcement should arrive")
-            .expect("the announcement channel should remain open");
-    assert_eq!((announced.header.number, announced_signature), (5, signature));
+            .unwrap();
+        response.await.unwrap();
+        assert_eq!(
+            orchestrator.signing_generation,
+            generation + 1,
+            "administrative head replacement must advance the signing generation: {replacement:?}"
+        );
+        // Unchecked FCU leaves the tag responses queued; checked FCU consumes them. Neither
+        // path may read the provider while discarding this stale event.
+        let queued_responses = asserter.read_q().len();
+        assert!(orchestrator.handle_signer_event(pending).await.unwrap().is_none());
+        assert_eq!(
+            asserter.read_q().len(),
+            queued_responses,
+            "discarding a stale signature must not read the provider: {replacement:?}"
+        );
+        assert_eq!(database.get_l2_head_block_number().await.unwrap(), replacement.number);
+        assert!(database.get_signature(block.hash_slow()).await.unwrap().is_none());
+    }
 }
 
 /// RG-49: the administrative `RevertToL1Block` command is not atomic. It unwinds the database
@@ -483,7 +750,7 @@ async fn rg49_admin_revert_unwinds_the_database_only_together_with_the_watcher_r
 // checks that the update reached the Engine, so it cannot pass by never making the call. L1
 // reorgs, batch reverts, finalization and the administrative revert are fixed: they save the
 // move first, fail with `FrontierTransitionStatus`, which stops the run loop, and keep the saved
-// move so a restart replays it. `UpdateFcsHead` is not fixed yet.
+// move so a restart replays it. `UpdateFcsHead` confirms the provider before its DB commit.
 
 /// A scripted Engine client whose forkchoice updates answer `INVALID`. Several answers are queued
 /// so that a fix which retries or falls back to a second forkchoice update reaches the assertion
@@ -696,35 +963,436 @@ async fn rg49_admin_revert_replies_success_only_if_the_engine_accepted_the_new_s
     assert_eq!(orchestrator.engine.fcs().safe_block_info().number, 10);
 }
 
-/// `UpdateFcsHead`: the admin moves the head from L2 block 5 to block 8. The Engine answers
-/// `INVALID` and keeps head at block 5. The command still stores head 8 in the database and
-/// replies.
+/// A rejected administrative head update must neither mutate local state nor acknowledge it.
 #[tokio::test]
-#[ignore = "RG-49: UpdateFcsHead drops an INVALID forkchoice answer, stores the head and replies success"]
 async fn rg49_update_fcs_head_replies_success_only_if_the_engine_accepted_the_head() {
+    for status in [
+        PayloadStatusEnum::Invalid { validation_error: "rejected by the test Engine".into() },
+        PayloadStatusEnum::Syncing,
+    ] {
+        let (mut orchestrator, client, asserter) = admin_head_fixture().await;
+        let database = orchestrator.database.clone();
+        let previous = orchestrator.engine.fcs().clone();
+        client.push_fork_choice_updated(fcu_response(status.clone()));
+        let mut events = orchestrator.event_listener();
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let result = orchestrator
+            .handle_command(ChainOrchestratorCommand::UpdateFcsHead((info(4, 4), reply_tx)))
+            .await;
+
+        assert_eq!(client.fork_choice_updated_calls(), 1, "the update reached the Engine");
+        assert!(
+            matches!(&result, Err(ChainOrchestratorError::FrontierTransitionStatus(actual)) if actual == &status),
+            "got {result:?}"
+        );
+        assert!(result.unwrap_err().is_frontier_fatal());
+        assert!(reply_rx.await.is_err(), "a rejected update must not reply success");
+        assert_eq!(orchestrator.engine.fcs(), &previous);
+        assert_admin_db_unchanged(&database).await;
+        assert!(events.next().now_or_never().is_none(), "no success event");
+        assert!(asserter.read_q().is_empty());
+    }
+}
+
+fn fcu_response(
+    status: PayloadStatusEnum,
+) -> ScriptedResponse<alloy_rpc_types_engine::ForkchoiceUpdated> {
+    ScriptedResponse::Ok(alloy_rpc_types_engine::ForkchoiceUpdated {
+        payload_status: alloy_rpc_types_engine::PayloadStatus { status, latest_valid_hash: None },
+        payload_id: None,
+    })
+}
+
+async fn admin_head_fixture(
+) -> (TestOrchestrator<ScriptedEngineClient>, Arc<ScriptedEngineClient>, Asserter) {
     let database = Arc::new(setup_test_db().await);
-    let engine_client = engine_rejecting_forkchoice();
+    database.set_l2_head_block_number(5).await.unwrap();
+    let message = L1MessageEnvelope::new(deposit(0), 1, Some(5), None);
+    database.insert_l1_message(message).await.unwrap();
+    let client = Arc::new(ScriptedEngineClient::new());
     let mut orchestrator = orchestrator_with_engine(
-        database.clone(),
+        database,
         ForkchoiceState::new(info(5, 5), info(0, 0), info(0, 0)),
         0,
         Probes::default(),
-        engine_client.clone(),
+        client.clone(),
     )
     .await;
+    let asserter = Asserter::new();
+    // Collect the reverted block before FCU; no pool reinsertion may precede confirmation.
+    push_admin_block(&asserter, info(5, 5));
+    orchestrator.l2_client = Arc::new(
+        ProviderBuilder::<_, _, Scroll>::default().connect_mocked_client(asserter.clone()),
+    );
+    (orchestrator, client, asserter)
+}
 
+async fn assert_admin_db_unchanged(database: &Database) {
+    assert_eq!(database.get_l2_head_block_number().await.unwrap(), 5);
+    let messages =
+        database.get_n_l1_messages(Some(L1MessageKey::from_queue_index(0)), 1).await.unwrap();
+    assert_eq!(messages[0].l2_block_number, Some(5), "do not purge mappings before confirmation");
+    assert!(database.get_pending_frontier_transition().await.unwrap().is_none());
+    assert!(database.get_confirmed_frontier_transition().await.unwrap().is_none());
+}
+
+fn push_admin_block(asserter: &Asserter, block: BlockInfo) {
+    use alloy_rpc_types_eth::{Block, Header};
+    use dogeos_rpc_types::ScrollRpcTransaction;
+    // Provider observations are independent of the Engine's candidate cache.
+    let mut header: Header = Header::default();
+    header.inner.number = block.number;
+    header.hash = block.hash;
+    asserter.push_success(&Some(Block::<ScrollRpcTransaction>::empty(header)));
+}
+
+fn push_admin_tags(asserter: &Asserter, head: BlockInfo) {
+    for block in [head, info(0, 0), info(0, 0)] {
+        push_admin_block(asserter, block);
+    }
+}
+
+#[tokio::test]
+async fn rg49_update_fcs_head_rejects_pending_frontier_before_any_side_effect() {
+    let database = Arc::new(setup_test_db().await);
+    let genesis = info(0, 0xa0);
+    database.insert_genesis_block(genesis.hash).await.unwrap();
+    database.set_l2_head_block_number(10).await.unwrap();
+    for (index, number) in [(0, 5), (1, 10)] {
+        database
+            .insert_l1_message(L1MessageEnvelope::new(deposit(index), 1, Some(number), None))
+            .await
+            .unwrap();
+    }
+    let previous = ForkchoiceState::new(info(10, 10), genesis, genesis);
+    let expected = frontier::stored_forkchoice(&previous);
+    let pending = PendingFrontierTransition {
+        expected,
+        target: StoredForkchoiceState { safe: info(5, 5), ..expected },
+    };
+    let batch = BatchCommitData {
+        hash: B256::repeat_byte(0xb1),
+        index: 1,
+        block_number: 10,
+        block_timestamp: 1_010,
+        calldata: Arc::new(Default::default()),
+        blob_versioned_hash: None,
+        finalized_block_number: None,
+        reverted_block_number: None,
+    };
+    database.insert_batch(batch.clone()).await.unwrap();
+    let batch_info = (&batch).into();
+    // Consolidation committed safe 5 and its journal before the Engine accepted the move.
+    database
+        .tx_mut(move |tx| async move {
+            tx.insert_blocks((1..=5).map(|n| info(n, n as u8)).collect(), batch_info).await?;
+            tx.set_pending_frontier_transition(pending).await
+        })
+        .await
+        .unwrap();
+    let safe = database.get_latest_safe_l2_info().await.unwrap();
+    assert_eq!(safe.0, info(5, 5));
+    let mappings = database.get_n_l1_messages(None, 10).await.unwrap();
+    let confirmed = database.get_confirmed_frontier_transition().await.unwrap();
+    let client = Arc::new(ScriptedEngineClient::new());
+    let mut orchestrator = orchestrator_with_engine(
+        database.clone(),
+        previous.clone(),
+        0,
+        Probes::default(),
+        client.clone(),
+    )
+    .await;
+    let asserter = Asserter::new();
+    // Without the guard, the old path can confirm head 4 with cached safe at genesis,
+    // then incorrectly commit DB head 4 below DB safe 5. Do not fail on mock exhaustion.
+    for number in 5..=10 {
+        push_admin_block(&asserter, info(number, number as u8));
+    }
+    client.push_fork_choice_updated(fcu_response(PayloadStatusEnum::Valid));
+    for block in [info(4, 4), genesis, genesis] {
+        push_admin_block(&asserter, block);
+    }
+    orchestrator.l2_client = Arc::new(
+        ProviderBuilder::<_, _, Scroll>::default().connect_mocked_client(asserter.clone()),
+    );
+    let mut events = orchestrator.event_listener();
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     let result = orchestrator
-        .handle_command(ChainOrchestratorCommand::UpdateFcsHead((info(8, 8), reply_tx)))
+        .handle_command(ChainOrchestratorCommand::UpdateFcsHead((info(4, 4), reply_tx)))
         .await;
+    assert!(
+        matches!(&result, Err(ChainOrchestratorError::PendingFrontierTransition)),
+        "{result:?}"
+    );
+    let error = result.unwrap_err();
+    assert!(!error.is_frontier_fatal());
+    assert!(orchestrator.handle_outcome(Err(error)).is_ok(), "the run loop must continue");
+    assert_eq!(client.fork_choice_updated_calls(), 0);
+    assert_eq!(asserter.read_q().len(), 9, "no provider reads or pool reinsertion");
+    assert_eq!(orchestrator.engine.fcs(), &previous);
+    assert_eq!(database.get_l2_head_block_number().await.unwrap(), 10);
+    assert_eq!(database.get_latest_safe_l2_info().await.unwrap(), safe);
+    assert_eq!(database.get_n_l1_messages(None, 10).await.unwrap(), mappings);
+    assert_eq!(database.get_pending_frontier_transition().await.unwrap(), Some(pending));
+    assert_eq!(database.get_confirmed_frontier_transition().await.unwrap(), confirmed);
+    assert!(reply_rx.await.is_err(), "no success reply");
+    assert!(events.next().now_or_never().is_none(), "no success event");
+}
 
-    assert!(engine_client.fork_choice_updated_calls() >= 1, "the update reached the Engine");
-    if result.is_ok() && reply_rx.await.is_ok() {
-        assert_eq!(
-            orchestrator.engine.fcs().head_block_info().number,
-            8,
-            "the admin caller is told the head moved to 8 (database head {}), but the Engine kept head 5",
-            database.get_l2_head_block_number().await.unwrap()
+#[tokio::test]
+async fn rg49_update_fcs_head_valid_requires_exact_provider_confirmation() {
+    for observed in [info(5, 5), info(4, 0x44), info(6, 6)] {
+        let (mut orchestrator, client, asserter) = admin_head_fixture().await;
+        let database = orchestrator.database.clone();
+        client.push_fork_choice_updated(fcu_response(PayloadStatusEnum::Valid));
+        push_admin_tags(&asserter, observed);
+        let mut events = orchestrator.event_listener();
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let result = orchestrator
+            .handle_command(ChainOrchestratorCommand::UpdateFcsHead((info(4, 4), reply_tx)))
+            .await;
+        assert!(
+            matches!(&result, Err(ChainOrchestratorError::FrontierTransitionUnconfirmed { .. })),
+            "{result:?}"
         );
+        assert!(result.unwrap_err().is_frontier_fatal());
+        assert!(reply_rx.await.is_err());
+        assert_eq!(*orchestrator.engine.fcs().head_block_info(), observed);
+        assert_admin_db_unchanged(&database).await;
+        assert!(events.next().now_or_never().is_none());
+        assert_eq!(client.fork_choice_updated_calls(), 1);
+        assert!(asserter.read_q().is_empty(), "confirmation reads were consumed");
     }
+}
+
+#[tokio::test]
+async fn rg49_update_fcs_head_confirmed_success_commits_then_notifies_and_replies() {
+    let (mut orchestrator, client, asserter) = admin_head_fixture().await;
+    asserter.write_q().clear(); // an advance has no reverted blocks to collect
+    client.push_fork_choice_updated(fcu_response(PayloadStatusEnum::Valid));
+    push_admin_tags(&asserter, info(8, 8));
+    let mut events = orchestrator.event_listener();
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    orchestrator
+        .handle_command(ChainOrchestratorCommand::UpdateFcsHead((info(8, 8), reply_tx)))
+        .await
+        .unwrap();
+    reply_rx.await.unwrap();
+    assert!(
+        matches!(events.next().await, Some(ChainOrchestratorEvent::FcsHeadUpdated(head)) if head == info(8, 8))
+    );
+    assert_eq!(*orchestrator.engine.fcs().head_block_info(), info(8, 8));
+    assert_eq!(orchestrator.database.get_l2_head_block_number().await.unwrap(), 8);
+    let messages = orchestrator
+        .database
+        .get_n_l1_messages(Some(L1MessageKey::from_queue_index(0)), 1)
+        .await
+        .unwrap();
+    assert_eq!(messages[0].l2_block_number, Some(5));
+    assert!(orchestrator.database.get_confirmed_frontier_transition().await.unwrap().is_none());
+    assert_eq!(client.fork_choice_updated_calls(), 1);
+    assert!(asserter.read_q().is_empty());
+}
+
+#[tokio::test]
+async fn rg49_update_fcs_head_timeout_is_fatal_without_local_commit_or_success() {
+    let (mut orchestrator, client, asserter) = admin_head_fixture().await;
+    let previous = orchestrator.engine.fcs().clone();
+    client.push_fork_choice_updated(ScriptedResponse::RequestTimeout);
+    let mut events = orchestrator.event_listener();
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    let result = orchestrator
+        .handle_command(ChainOrchestratorCommand::UpdateFcsHead((info(4, 4), reply_tx)))
+        .await;
+    let error = result.unwrap_err();
+    assert!(error.is_frontier_fatal(), "{error:?}");
+    assert!(error.is_engine_unavailable(), "{error:?}");
+    assert!(reply_rx.await.is_err());
+    assert_eq!(orchestrator.engine.fcs(), &previous, "no candidate cached on ambiguity");
+    assert_admin_db_unchanged(&orchestrator.database).await;
+    assert!(events.next().now_or_never().is_none());
+    assert_eq!(client.fork_choice_updated_calls(), 1);
+    assert!(asserter.read_q().is_empty());
+}
+
+#[tokio::test]
+async fn rg49_update_fcs_head_failed_readback_is_fatal_without_caching_candidate() {
+    let (mut orchestrator, client, asserter) = admin_head_fixture().await;
+    let previous = orchestrator.engine.fcs().clone();
+    client.push_fork_choice_updated(fcu_response(PayloadStatusEnum::Valid));
+    asserter.push_failure_msg("provider unavailable after FCU");
+    let mut events = orchestrator.event_listener();
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    let result = orchestrator
+        .handle_command(ChainOrchestratorCommand::UpdateFcsHead((info(4, 4), reply_tx)))
+        .await;
+    assert!(result.unwrap_err().is_frontier_fatal());
+    assert!(reply_rx.await.is_err());
+    assert_eq!(orchestrator.engine.fcs(), &previous);
+    assert_admin_db_unchanged(&orchestrator.database).await;
+    assert!(events.next().now_or_never().is_none());
+    assert_eq!(client.fork_choice_updated_calls(), 1);
+    assert!(asserter.read_q().is_empty());
+}
+
+/// The execution node may have applied an unanswered command. Restart follows #46's existing
+/// DB-authoritative repair, without a durable guarantee to replay the requested admin intent.
+#[tokio::test]
+async fn rg49_update_fcs_head_ambiguous_application_recovers_from_database_on_restart() {
+    use scroll_db::DatabaseConnectionProvider;
+    let (mut orchestrator, client, asserter) = admin_head_fixture().await;
+    let database = orchestrator.database.clone();
+    database.insert_genesis_block(info(0, 0).hash).await.unwrap();
+    let path = database.tmp_dir().unwrap().path().join("test.db");
+    // The provider reports head 4 on restart despite the unanswered FCU.
+    client.push_fork_choice_updated(ScriptedResponse::RequestTimeout);
+    let mut events = orchestrator.event_listener();
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    let result = orchestrator
+        .handle_command(ChainOrchestratorCommand::UpdateFcsHead((info(4, 4), reply_tx)))
+        .await;
+    assert!(result.unwrap_err().is_frontier_fatal());
+    assert!(reply_rx.await.is_err());
+    assert!(events.next().now_or_never().is_none());
+    assert!(asserter.read_q().is_empty());
+    assert_admin_db_unchanged(&database).await;
+    database.inner().get_connection().clone().close().await.unwrap();
+    let reopened = Database::new(path.to_str().unwrap()).await.unwrap();
+    assert_admin_db_unchanged(&reopened).await;
+    // The previous DB head is still available. Startup restores it; it does not replay the
+    // failed admin intent, transaction reinsertion or notification.
+    push_admin_tags(&asserter, info(4, 4));
+    push_admin_block(&asserter, info(0, 0));
+    push_admin_block(&asserter, info(5, 5));
+    push_admin_tags(&asserter, info(5, 5));
+    client.push_fork_choice_updated(fcu_response(PayloadStatusEnum::Valid));
+    let mut restarted_engine =
+        Engine::new(client.clone(), ForkchoiceState::from_genesis(B256::ZERO));
+    frontier::recover_database_frontier(
+        &*orchestrator.l2_client,
+        &mut restarted_engine,
+        &reopened,
+        frontier::HeadSelection::StoredHead,
+    )
+    .await
+    .unwrap();
+    assert_eq!(*restarted_engine.fcs().head_block_info(), info(5, 5));
+    assert_eq!(reopened.get_l2_head_block_number().await.unwrap(), 5);
+    assert!(reopened.get_pending_frontier_transition().await.unwrap().is_none());
+    assert_eq!(client.fork_choice_updated_calls(), 2);
+    assert!(asserter.read_q().is_empty());
+}
+
+#[tokio::test]
+async fn rg49_update_fcs_head_failure_stops_the_real_run_loop() {
+    for response in [
+        fcu_response(PayloadStatusEnum::Invalid { validation_error: "rejected".into() }),
+        fcu_response(PayloadStatusEnum::Syncing),
+        ScriptedResponse::RequestTimeout,
+    ] {
+        let (mut orchestrator, client, asserter) = admin_head_fixture().await;
+        let database = orchestrator.database.clone();
+        database.insert_genesis_block(B256::ZERO).await.unwrap();
+        // The normal startup must complete before the queued command reaches the Engine.
+        asserter.write_q().clear();
+        push_admin_tags(&asserter, info(5, 5));
+        push_admin_block(&asserter, info(0, 0));
+        push_admin_block(&asserter, info(5, 5));
+        push_admin_block(&asserter, info(5, 5)); // the command collects the reverted suffix
+        client.push_fork_choice_updated(response);
+        let (commands, receiver) = mpsc::unbounded_channel();
+        orchestrator.handle_rx = receiver;
+        let (reply, reply_rx) = tokio::sync::oneshot::channel();
+        commands.send(ChainOrchestratorCommand::UpdateFcsHead((info(4, 4), reply))).unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            orchestrator.run_until_shutdown(std::future::pending()),
+        )
+        .await
+        .expect("the failed command must stop the run loop without a shutdown signal");
+        assert!(result.unwrap_err().is_frontier_fatal());
+        assert!(reply_rx.await.is_err());
+        assert_eq!(database.get_l2_head_block_number().await.unwrap(), 5);
+        let messages =
+            database.get_n_l1_messages(Some(L1MessageKey::from_queue_index(0)), 1).await.unwrap();
+        assert_eq!(messages[0].l2_block_number, Some(5));
+        assert_eq!(client.fork_choice_updated_calls(), 1, "startup did not reject first");
+        assert!(asserter.read_q().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn rg49_update_fcs_head_success_reinserts_only_reverted_user_transactions() {
+    use alloy_consensus::{transaction::Recovered, SignableTransaction, TxLegacy};
+    use alloy_primitives::Signature;
+    use alloy_rpc_types_eth::{Block, BlockTransactions, Header, Transaction};
+    use dogeos_rpc_types::ScrollRpcTransaction;
+
+    let (mut orchestrator, client, asserter) = admin_head_fixture().await;
+    asserter.write_q().clear();
+    let user_tx = ScrollTxEnvelope::Legacy(
+        TxLegacy { gas_limit: 21_000, gas_price: 17, ..Default::default() }
+            .into_signed(Signature::test_signature()),
+    );
+    let transactions = [user_tx, deposit(0).into()]
+        .into_iter()
+        .map(|tx| ScrollRpcTransaction {
+            inner: Transaction {
+                inner: Recovered::new_unchecked(tx, Address::repeat_byte(0x11)),
+                block_hash: Some(info(5, 5).hash),
+                block_number: Some(5),
+                transaction_index: None,
+                effective_gas_price: Some(17),
+            },
+        })
+        .collect();
+    let mut header: Header = Header::default();
+    header.inner.number = 5;
+    header.hash = info(5, 5).hash;
+    asserter.push_success(&Some(Block::new(header, BlockTransactions::Full(transactions))));
+    client.push_fork_choice_updated(fcu_response(PayloadStatusEnum::Valid));
+    push_admin_tags(&asserter, info(4, 4));
+    // Only the user transaction may consume a sendRawTransaction response after tag reads.
+    asserter.push_success(&B256::repeat_byte(0x55));
+    asserter.push_failure_msg("an L1 message must not be reinserted into the pool");
+    let mut events = orchestrator.event_listener();
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    orchestrator
+        .handle_command(ChainOrchestratorCommand::UpdateFcsHead((info(4, 4), reply_tx)))
+        .await
+        .unwrap();
+    reply_rx.await.unwrap();
+    assert!(
+        matches!(events.next().await, Some(ChainOrchestratorEvent::FcsHeadUpdated(head)) if head == info(4, 4))
+    );
+    assert_eq!(orchestrator.database.get_l2_head_block_number().await.unwrap(), 4);
+    assert_eq!(asserter.read_q().len(), 1, "exactly one user transaction was reinserted");
+    assert_eq!(client.fork_choice_updated_calls(), 1);
+}
+
+#[tokio::test]
+async fn rg49_update_fcs_head_local_validation_error_remains_nonfatal() {
+    let (mut orchestrator, client, asserter) = admin_head_fixture().await;
+    let previous = ForkchoiceState::new(info(5, 5), info(5, 5), info(0, 0));
+    orchestrator.engine.replace_fcs_from_provider(previous.clone());
+    let mut events = orchestrator.event_listener();
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    let result = orchestrator
+        .handle_command(ChainOrchestratorCommand::UpdateFcsHead((info(4, 4), reply_tx)))
+        .await;
+    let error = result.unwrap_err();
+    assert!(!error.is_frontier_fatal(), "local validation must preserve the run loop: {error:?}");
+    assert!(matches!(
+        error,
+        ChainOrchestratorError::EngineError(scroll_engine::EngineError::FcsError(
+            scroll_engine::FcsError::HeadBelowSafe
+        ))
+    ));
+    assert_eq!(client.fork_choice_updated_calls(), 0);
+    assert!(reply_rx.await.is_err());
+    assert_eq!(orchestrator.engine.fcs(), &previous);
+    assert_admin_db_unchanged(&orchestrator.database).await;
+    assert!(events.next().now_or_never().is_none());
+    assert!(asserter.read_q().is_empty());
 }

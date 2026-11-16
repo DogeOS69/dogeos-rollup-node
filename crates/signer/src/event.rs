@@ -6,6 +6,8 @@ use dogeos_reth_primitives::DogeosBlock;
 pub enum SignerEvent {
     /// A block has been signed by the signer.
     SignedBlock {
+        /// The orchestrator generation that submitted the request.
+        generation: u64,
         /// The signed block.
         block: DogeosBlock,
         /// The signature of the block.

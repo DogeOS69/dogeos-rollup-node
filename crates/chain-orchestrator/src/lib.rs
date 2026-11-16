@@ -133,6 +133,8 @@ pub struct ChainOrchestrator<
     sequencer: Option<Sequencer<L1MP, ChainSpec>>,
     /// The signer used to sign messages.
     signer: Option<SignerHandle>,
+    /// Invalidates signing results submitted before a canonical rewind.
+    signing_generation: u64,
     /// The derivation pipeline used to derive L2 blocks from batches.
     derivation_pipeline: DerivationPipeline,
     /// Owns the single derived result being reconciled or held for Engine sync.
@@ -198,6 +200,7 @@ impl<
                 engine,
                 sequencer,
                 signer,
+                signing_generation: 0,
                 derivation_pipeline,
                 derivation_driver: DerivationDriver::new(head_selection),
                 head_selection,
@@ -414,6 +417,17 @@ impl<
         Ok(())
     }
 
+    /// Submits a block under the current canonical-chain ownership generation.
+    fn request_block_signature(
+        &self,
+        block: DogeosBlock,
+    ) -> Result<(), rollup_node_signer::SignerError> {
+        self.signer
+            .as_ref()
+            .expect("signer must be present")
+            .sign_block_in_generation(block, self.signing_generation)
+    }
+
     /// Handles an event from the signer.
     async fn handle_signer_event(
         &self,
@@ -421,11 +435,38 @@ impl<
     ) -> Result<Option<ChainOrchestratorEvent>, ChainOrchestratorError> {
         tracing::info!(target: "scroll::chain_orchestrator", ?event, "Handling signer event");
         match event {
-            SignerEvent::SignedBlock { block, signature } => {
+            SignerEvent::SignedBlock { block, signature, generation } => {
                 let hash = block.hash_slow();
+                let head = self.engine.fcs().head_block_info();
+                // A pre-rewind result cannot extend or replace the rewound local tip, even
+                // if the provider still exposes the old chain. Retained prefix signatures
+                // remain useful and must pass the canonical readback below.
+                if generation != self.signing_generation &&
+                    (block.header.number > head.number ||
+                        (block.header.number == head.number && hash != head.hash))
+                {
+                    tracing::debug!(target: "scroll::chain_orchestrator", generation, current_generation = self.signing_generation, "Discarding signed block outside the retained chain after a rewind");
+                    return Ok(None);
+                }
+                // Imports, optimistic sync and derived reconciliation can replace the chain
+                // without an explicit unwind. Check canonical identity as well as ownership.
+                // An unavailable provider leaves the canonical frontier unresolved. Fail-stop
+                // rather than silently consume an unchecked signature and continue sequencing.
+                let canonical = self
+                    .l2_client
+                    .get_block_by_number(block.header.number.into())
+                    .await
+                    .map_err(ChainOrchestratorError::frontier_recovery)?;
+                if canonical.as_ref().map(|block| block.header.hash) != Some(hash) {
+                    tracing::debug!(target: "scroll::chain_orchestrator", number = block.header.number, ?hash, "Discarding signed block that is no longer canonical");
+                    return Ok(None);
+                }
                 self.database
                     .tx_mut(move |tx| async move {
-                        tx.set_l2_head_block_number(block.header.number).await?;
+                        // A peer import may already have persisted a newer canonical head.
+                        if block.header.number > tx.get_l2_head_block_number().await? {
+                            tx.set_l2_head_block_number(block.header.number).await?;
+                        }
                         tx.insert_signature(hash, signature).await
                     })
                     .await?;
@@ -494,10 +535,7 @@ impl<
                     self.database
                         .update_l1_messages_from_l2_blocks(vec![block_info.clone()])
                         .await?;
-                    self.signer
-                        .as_mut()
-                        .expect("signer must be present")
-                        .sign_block(block.clone())?;
+                    self.request_block_signature(block.clone())?;
                     return Ok(Some(ChainOrchestratorEvent::BlockSequenced(block)));
                 }
                 return Ok(Some(ChainOrchestratorEvent::BlockBuildingSkipped));
@@ -572,6 +610,10 @@ impl<
                         self.engine.fcs().head_block_info().number,
                     )
                     .await?;
+                let previous_head = self.engine.fcs().head_block_info();
+                if head != *previous_head && head.number <= previous_head.number {
+                    self.invalidate_pending_signatures();
+                }
                 self.engine.update_fcs(Some(head), None, None).await?;
                 self.database
                     .tx_mut(move |tx| async move {
@@ -662,6 +704,13 @@ impl<
         }
     }
 
+    /// Results already queued by the signer must also be invalidated; cancelling futures alone
+    /// cannot prevent them from being persisted and announced.
+    const fn invalidate_pending_signatures(&mut self) {
+        self.signing_generation =
+            self.signing_generation.checked_add(1).expect("signing generation exhausted");
+    }
+
     /// Atomically unwinds and decides only the owned held result. Pipeline results that have not
     /// yet yielded remain the separately tracked issue #32 and are outside this branch's scope.
     async fn unwind_and_revalidate_held_batch(
@@ -683,6 +732,8 @@ impl<
             .unwind_and_revalidate(&self.database, ancestor, Some(expected))
             .await
             .map_err(ChainOrchestratorError::frontier_recovery)?;
+        // The unwind is durable even if the subsequent Engine repair fails.
+        self.invalidate_pending_signatures();
         frontier::apply_pending_frontier_transition(
             &*self.l2_client,
             &mut self.engine,
@@ -1094,6 +1145,11 @@ impl<
             .await
             .map_err(ChainOrchestratorError::frontier_recovery)?;
 
+        // A safe-only revert preserves the unsafe chain and its pending signatures. If the
+        // journal replaces the head as well, invalidate results before applying that move.
+        if expected.head.number <= safe_block_info.number && expected.head != safe_block_info {
+            self.invalidate_pending_signatures();
+        }
         tracing::info!(target: "scroll::chain_orchestrator", ?safe_block_info, "Applying durable safe frontier after batch revert");
         frontier::apply_pending_frontier_transition(
             &*self.l2_client,

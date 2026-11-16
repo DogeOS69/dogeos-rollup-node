@@ -253,17 +253,22 @@ where
                         }
                         Err(observe_error) => return Err(observe_error),
                     }
-                    if !confirms_target(
+                    match confirms_target(
                         provider,
                         transition.target,
                         stored_forkchoice(engine.fcs()),
                         rewinds_head,
                     )
-                    .await?
+                    .await
                     {
-                        return Err(ChainOrchestratorError::EngineError(source))
+                        Ok(true) => break,
+                        Ok(false) => return Err(ChainOrchestratorError::EngineError(source)),
+                        Err(confirm_error) if source.is_engine_unavailable() => {
+                            tracing::warn!(target: "scroll::chain_orchestrator", error = ?confirm_error, "Could not confirm forkchoice ancestry after an unanswered Engine request");
+                            return Err(ChainOrchestratorError::EngineError(source))
+                        }
+                        Err(confirm_error) => return Err(confirm_error),
                     }
-                    break
                 }
                 Err(source) => return Err(ChainOrchestratorError::EngineError(source)),
             }
@@ -685,6 +690,70 @@ mod tests {
                 StoredForkchoiceState { head: transition.target.head, ..transition.expected }
             );
             assert_eq!(database.get_pending_frontier_transition().await.unwrap(), Some(transition));
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_confirmation_lookup_after_transport_error_preserves_retry_classification() {
+        for (response, unavailable) in
+            [(ScriptedResponse::RequestTimeout, true), (ScriptedResponse::TransportFailure, false)]
+        {
+            for failed_lookup in 0..2 {
+                let (database, blocks, mut transition) = ancestor_transition().await;
+                transition.expected.head = transition.target.head;
+                database.set_pending_frontier_transition(transition).await.unwrap();
+                let observed = StoredForkchoiceState {
+                    head: BlockInfo::from(&blocks[3].header),
+                    ..transition.target
+                };
+                let asserter = Asserter::new();
+                push_tags(&asserter, &blocks[3], &blocks[2], &blocks[1]);
+                if failed_lookup == 1 {
+                    asserter.push_success(&Some(blocks[2].clone()));
+                }
+                // Tag readback succeeds; fail either endpoint of the canonical ancestry proof.
+                asserter.push_failure_msg("canonical confirmation lookup failed");
+                let (provider, client, mut engine) = mock_engine(
+                    asserter,
+                    ForkchoiceState::new(
+                        transition.expected.head,
+                        transition.expected.safe,
+                        transition.expected.finalized,
+                    ),
+                );
+                client.push_fork_choice_updated(response.clone());
+                let error = apply_pending_frontier_transition(&provider, &mut engine, &database)
+                    .await
+                    .unwrap_err();
+                assert_eq!(
+                    database.get_pending_frontier_transition().await.unwrap(),
+                    Some(transition)
+                );
+                assert_eq!(stored_forkchoice(engine.fcs()), observed);
+                assert_eq!(client.fork_choice_updated_calls(), 1);
+                assert_eq!(
+                    error.is_engine_unavailable(),
+                    unavailable,
+                    "{failed_lookup}: {error:?}"
+                );
+                let ChainOrchestratorError::FrontierRecovery(source) = &error else {
+                    panic!("expected frontier recovery error: {error:?}");
+                };
+                if unavailable {
+                    assert!(
+                        matches!(
+                            source.as_ref(),
+                            ChainOrchestratorError::EngineError(EngineError::TransportError(_))
+                        ),
+                        "{error:?}"
+                    );
+                } else {
+                    assert!(
+                        matches!(source.as_ref(), ChainOrchestratorError::RpcError(_)),
+                        "{error:?}"
+                    );
+                }
+            }
         }
     }
 

@@ -11962,6 +11962,7 @@ dependencies = [
  "dogeos-rpc-types",
  "eyre",
  "futures",
+ "hyper 1.10.1",
  "jsonrpsee",
  "metrics",
  "metrics-derive",

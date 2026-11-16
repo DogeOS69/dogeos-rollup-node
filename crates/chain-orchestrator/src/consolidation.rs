@@ -18,7 +18,7 @@ pub(crate) async fn reconcile_batch<L2P: Provider<Scroll>>(
     batch: &BatchDerivationResult,
     frontier: BlockInfo,
 ) -> Result<BatchReconciliationResult, ChainOrchestratorError> {
-    validate_block_sequence(batch, frontier.number)?;
+    validate_block_sequence(batch, frontier.number).map_err(|error| *error)?;
 
     let mut futures = FuturesOrdered::new();
     for attributes in &batch.attributes {
@@ -93,7 +93,7 @@ pub(crate) async fn reconcile_batch<L2P: Provider<Scroll>>(
 fn validate_block_sequence(
     batch: &BatchDerivationResult,
     frontier_block_number: u64,
-) -> Result<(), ChainOrchestratorError> {
+) -> Result<(), Box<ChainOrchestratorError>> {
     let mut previous_block_number = None;
 
     for (attribute_index, attributes) in batch.attributes.iter().enumerate() {
@@ -107,12 +107,12 @@ fn validate_block_sequence(
         };
 
         if invalid {
-            return Err(ChainOrchestratorError::InvalidDerivedBlockSequence {
+            return Err(Box::new(ChainOrchestratorError::InvalidDerivedBlockSequence {
                 batch_info: batch.batch_info,
                 attribute_index,
                 previous_block_number: anchor,
                 actual_block_number: attributes.block_number,
-            })
+            }))
         }
         previous_block_number = Some(attributes.block_number);
     }
@@ -389,7 +389,7 @@ mod tests {
         ] {
             let error = validate_block_sequence(&sequence_batch(&numbers), frontier).unwrap_err();
             assert!(matches!(
-                error,
+                *error,
                 ChainOrchestratorError::InvalidDerivedBlockSequence {
                     attribute_index: actual_index,
                     previous_block_number,

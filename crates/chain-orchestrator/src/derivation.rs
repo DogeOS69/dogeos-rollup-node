@@ -1104,6 +1104,7 @@ mod tests {
             push_safe_block(&asserter);
             push_absent_block(&asserter);
         }
+        push_tags(&asserter, info(SAFE + 1, 0x22), info(SAFE + 1, 0x22), info(SAFE, 0x11));
         let provider = absent_block_provider(asserter);
         let mut driver = DerivationDriver::default();
         driver.hold_batch(batch(1, BatchStatus::Consolidated));
@@ -1181,6 +1182,12 @@ mod tests {
         push_safe_block(&asserter);
         let rpc_header = RpcHeader::from_consensus(existing_header.seal_slow(), None, None);
         asserter.push_success(&Some(RpcBlock::<ScrollRpcTransaction, _>::empty(rpc_header)));
+        push_tags(
+            &asserter,
+            expected,
+            expected,
+            if target_status.is_finalized() { expected } else { info(SAFE, 0x11) },
+        );
         let provider = absent_block_provider(asserter);
 
         // The mock returns the DA-specified block if reconciliation requests a rebuild.
@@ -1364,6 +1371,7 @@ mod tests {
         push_absent_block(&asserter);
         push_safe_block(&asserter);
         let canonical = push_matching_empty_block(&asserter, &derived.attributes[0]);
+        push_tags(&asserter, canonical, canonical, info(SAFE, 0x11));
         let provider = absent_block_provider(asserter);
         let mut driver = DerivationDriver::default();
         driver.hold_batch(derived);
@@ -1406,6 +1414,9 @@ mod tests {
             if already_safe {
                 push_matching_empty_block(&asserter, &derived.attributes[0]);
                 database.insert_blocks(vec![canonical], derived.batch_info).await.unwrap();
+            }
+            if !already_safe {
+                push_tags(&asserter, canonical, canonical, info(SAFE, 0x11));
             }
             let provider = absent_block_provider(asserter);
             let client = Arc::new(ScriptedEngineClient::new());
@@ -1532,7 +1543,7 @@ mod tests {
         push_absent_block(&asserter);
         // Even a matching later block belongs to the discarded suffix and must be rebuilt.
         push_matching_empty_block_on(&asserter, &derived.attributes[2], prefix, SAFE + 3);
-        let provider = absent_block_provider(asserter);
+        let provider = absent_block_provider(asserter.clone());
 
         let client = Arc::new(ScriptedEngineClient::new());
         client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Valid, None)));
@@ -1555,6 +1566,7 @@ mod tests {
             )));
         }
         client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Valid, None)));
+        push_tags(&asserter, parent, parent, info(SAFE, 0x11));
         let mut engine = engine_at_safe(client.clone());
         let mut driver = DerivationDriver::default();
         driver.hold_batch(derived);
@@ -1604,6 +1616,7 @@ mod tests {
         push_absent_block(&asserter);
         push_safe_block(&asserter);
         let canonical = push_matching_empty_block(&asserter, &derived.attributes[0]);
+        push_tags(&asserter, canonical, canonical, info(SAFE, 0x11));
         let provider = absent_block_provider(asserter);
 
         let client = Arc::new(ScriptedEngineClient::new());
@@ -2022,11 +2035,15 @@ mod tests {
             // Recovery proves the lagging tag is an ancestor of the database safe block.
             push_canonical_block(&asserter, ancestor);
             push_canonical_block(&asserter, canonical);
+            if reth_on_a {
+                push_tags(&asserter, block_a, block_a, genesis);
+            }
             // Then the attempt checks the safe block and reconciles batch 2 on top of it.
             push_canonical_block(&asserter, block_a);
             let child =
                 push_matching_empty_block_on(&asserter, &derived.attributes[0], block_a, SAFE + 1);
             push_absent_block(&asserter);
+            push_tags(&asserter, info(SAFE + 2, 0x22), info(SAFE + 2, 0x22), genesis);
             let provider = absent_block_provider(asserter);
             let client = Arc::new(ScriptedEngineClient::new());
             for _ in 0..2 {
@@ -2109,6 +2126,7 @@ mod tests {
         let asserter = Asserter::new();
         push_safe_block(&asserter);
         push_absent_block(&asserter);
+        push_tags(&asserter, info(SAFE + 1, 0x22), info(SAFE + 1, 0x22), info(SAFE, 0x11));
         let provider = absent_block_provider(asserter);
         let mut driver = DerivationDriver::default();
         driver.hold_batch(batch(2, BatchStatus::Consolidated));
@@ -2169,6 +2187,7 @@ mod tests {
         let asserter = Asserter::new();
         push_safe_block(&asserter);
         let canonical = push_matching_empty_block(&asserter, &derived.attributes[0]);
+        push_tags(&asserter, canonical, canonical, info(SAFE, 0x11));
         let provider = absent_block_provider(asserter);
         let client = Arc::new(ScriptedEngineClient::new());
         client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Valid, None)));
@@ -2366,6 +2385,7 @@ mod tests {
         push_safe_block(&asserter);
         push_absent_block(&asserter);
         push_absent_block(&asserter);
+        push_tags(&asserter, info(SAFE + 2, 0x22), info(SAFE + 2, 0x22), info(SAFE, 0x11));
         let provider = absent_block_provider(asserter);
         let mut driver = DerivationDriver::default();
         driver.hold_batch(derived);
@@ -2577,7 +2597,10 @@ mod tests {
         assert_eq!(pending.target.safe, database_safe);
         assert!(database.get_batch_by_index(1).await.unwrap().is_none());
 
-        let provider = forkchoice_provider(expected);
+        let asserter = Asserter::new();
+        push_tags(&asserter, expected.head, expected.safe, expected.finalized);
+        push_tags(&asserter, pending.target.head, pending.target.safe, pending.target.finalized);
+        let provider = absent_block_provider(asserter);
         let client = Arc::new(ScriptedEngineClient::new());
         client.push_fork_choice_updated(ScriptedResponse::TransportFailure);
         client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Valid, None)));

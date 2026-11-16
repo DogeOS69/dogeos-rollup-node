@@ -2477,6 +2477,10 @@ mod run_loop_policy_tests {
         let asserter = startup_asserter();
         push_attempt(&asserter);
         push_attempt(&asserter);
+        // Explicit public tags after the batch's durable move.
+        for block in [info(SAFE + 1, 0x22), info(SAFE + 1, 0x22), info(0, 0)] {
+            push_block(&asserter, block);
+        }
         let (mut orchestrator, handle, notification_tx) = test_orchestrator(
             database.clone(),
             engine_client.clone(),
@@ -2688,6 +2692,17 @@ mod run_loop_policy_tests {
         let asserter = startup_asserter();
         push_attempt(&asserter);
         push_attempt(&asserter);
+        // Explicit public tags after the batch's durable move and the queued rewind.
+        for block in [
+            info(SAFE + 1, 0x22),
+            info(SAFE + 1, 0x22),
+            info(0, 0),
+            info(SAFE + 1, 0x22),
+            info(SAFE, 0x11),
+            info(0, 0),
+        ] {
+            push_block(&asserter, block);
+        }
         let (mut orchestrator, _handle, notification_tx) = test_orchestrator(
             database.clone(),
             engine_client.clone(),

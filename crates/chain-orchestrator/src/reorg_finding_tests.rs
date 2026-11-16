@@ -786,6 +786,94 @@ fn push_admin_tags(asserter: &Asserter, head: BlockInfo) {
 }
 
 #[tokio::test]
+async fn rg49_update_fcs_head_rejects_pending_frontier_before_any_side_effect() {
+    let database = Arc::new(setup_test_db().await);
+    let genesis = info(0, 0xa0);
+    database.insert_genesis_block(genesis.hash).await.unwrap();
+    database.set_l2_head_block_number(10).await.unwrap();
+    for (index, number) in [(0, 5), (1, 10)] {
+        database
+            .insert_l1_message(L1MessageEnvelope::new(deposit(index), 1, Some(number), None))
+            .await
+            .unwrap();
+    }
+    let previous = ForkchoiceState::new(info(10, 10), genesis, genesis);
+    let expected = frontier::stored_forkchoice(&previous);
+    let pending = PendingFrontierTransition {
+        expected,
+        target: StoredForkchoiceState { safe: info(5, 5), ..expected },
+    };
+    let batch = BatchCommitData {
+        hash: B256::repeat_byte(0xb1),
+        index: 1,
+        block_number: 10,
+        block_timestamp: 1_010,
+        calldata: Arc::new(Default::default()),
+        blob_versioned_hash: None,
+        finalized_block_number: None,
+        reverted_block_number: None,
+    };
+    database.insert_batch(batch.clone()).await.unwrap();
+    let batch_info = (&batch).into();
+    // Consolidation committed safe 5 and its journal before the Engine accepted the move.
+    database
+        .tx_mut(move |tx| async move {
+            tx.insert_blocks((1..=5).map(|n| info(n, n as u8)).collect(), batch_info).await?;
+            tx.set_pending_frontier_transition(pending).await
+        })
+        .await
+        .unwrap();
+    let safe = database.get_latest_safe_l2_info().await.unwrap();
+    assert_eq!(safe.0, info(5, 5));
+    let mappings = database.get_n_l1_messages(None, 10).await.unwrap();
+    let confirmed = database.get_confirmed_frontier_transition().await.unwrap();
+    let client = Arc::new(ScriptedEngineClient::new());
+    let mut orchestrator = orchestrator_with_engine(
+        database.clone(),
+        previous.clone(),
+        0,
+        Probes::default(),
+        client.clone(),
+    )
+    .await;
+    let asserter = Asserter::new();
+    // Without the guard, the old path can confirm head 4 with cached safe at genesis,
+    // then incorrectly commit DB head 4 below DB safe 5. Do not fail on mock exhaustion.
+    for number in 5..=10 {
+        push_admin_block(&asserter, info(number, number as u8));
+    }
+    client.push_fork_choice_updated(fcu_response(PayloadStatusEnum::Valid));
+    for block in [info(4, 4), genesis, genesis] {
+        push_admin_block(&asserter, block);
+    }
+    orchestrator.l2_client = Arc::new(
+        ProviderBuilder::<_, _, Scroll>::default().connect_mocked_client(asserter.clone()),
+    );
+    let mut events = orchestrator.event_listener();
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    let result = orchestrator
+        .handle_command(ChainOrchestratorCommand::UpdateFcsHead((info(4, 4), reply_tx)))
+        .await;
+    assert!(
+        matches!(&result, Err(ChainOrchestratorError::PendingFrontierTransition)),
+        "{result:?}"
+    );
+    let error = result.unwrap_err();
+    assert!(!error.is_frontier_fatal());
+    assert!(orchestrator.handle_outcome(Err(error)).is_ok(), "the run loop must continue");
+    assert_eq!(client.fork_choice_updated_calls(), 0);
+    assert_eq!(asserter.read_q().len(), 9, "no provider reads or pool reinsertion");
+    assert_eq!(orchestrator.engine.fcs(), &previous);
+    assert_eq!(database.get_l2_head_block_number().await.unwrap(), 10);
+    assert_eq!(database.get_latest_safe_l2_info().await.unwrap(), safe);
+    assert_eq!(database.get_n_l1_messages(None, 10).await.unwrap(), mappings);
+    assert_eq!(database.get_pending_frontier_transition().await.unwrap(), Some(pending));
+    assert_eq!(database.get_confirmed_frontier_transition().await.unwrap(), confirmed);
+    assert!(reply_rx.await.is_err(), "no success reply");
+    assert!(events.next().now_or_never().is_none(), "no success event");
+}
+
+#[tokio::test]
 async fn rg49_update_fcs_head_valid_requires_exact_provider_confirmation() {
     for observed in [info(5, 5), info(4, 0x44), info(6, 6)] {
         let (mut orchestrator, client, asserter) = admin_head_fixture().await;

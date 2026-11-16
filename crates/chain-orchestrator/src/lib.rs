@@ -565,6 +565,9 @@ impl<
                 let _ = tx.send(self.network.handle().clone());
             }
             ChainOrchestratorCommand::UpdateFcsHead((head, sender)) => {
+                if self.database.get_pending_frontier_transition().await?.is_some() {
+                    return Err(ChainOrchestratorError::PendingFrontierTransition)
+                }
                 // Collect transactions of reverted blocks from l2 client.
                 let reverted_transactions = self
                     .collect_reverted_txs_in_range(

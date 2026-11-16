@@ -17,6 +17,7 @@
 use super::*;
 use alloy_primitives::{Address, U256};
 use alloy_provider::ProviderBuilder;
+use alloy_rpc_types_engine::{ForkchoiceUpdated, PayloadId, PayloadStatus};
 use alloy_transport::mock::Asserter;
 use dogeos_chainspec::{DogeosChainSpec, DOGEOS_DEV};
 use dogeos_reth_consensus::DogeosConsensus;
@@ -24,6 +25,7 @@ use futures::FutureExt;
 use reth_network_api::noop::NoopNetwork;
 use reth_network_p2p::NoopFullBlockClient;
 use rollup_node_providers::{test_utils::MockL1Provider, ScrollRootProvider};
+use rollup_node_sequencer::{L1MessageInclusionMode, PayloadBuildingConfig, SequencerConfig};
 use rollup_node_watcher::L1WatcherCommand;
 use scroll_db::test_utils::setup_test_db;
 use scroll_engine::{
@@ -1049,6 +1051,156 @@ fn push_admin_tags(asserter: &Asserter, head: BlockInfo) {
     }
 }
 
+fn payload_build_response(id: PayloadId) -> ScriptedResponse<ForkchoiceUpdated> {
+    ScriptedResponse::Ok(ForkchoiceUpdated {
+        payload_status: PayloadStatus { status: PayloadStatusEnum::Valid, latest_valid_hash: None },
+        payload_id: Some(id),
+    })
+}
+
+/// Install a real job and initialize its timer before any administrative command or wait.
+async fn start_admin_payload_job(
+    orchestrator: &mut TestOrchestrator<ScriptedEngineClient>,
+    client: &ScriptedEngineClient,
+) -> PayloadId {
+    orchestrator.sequencer = Some(Sequencer::new(
+        Arc::new(MockL1Provider { db: orchestrator.database.clone(), blobs: Default::default() }),
+        SequencerConfig {
+            chain_spec: DOGEOS_DEV.clone(),
+            fee_recipient: Address::ZERO,
+            auto_start: false,
+            block_time: 100,
+            payload_building_duration: 10,
+            allow_empty_blocks: true,
+            payload_building_config: PayloadBuildingConfig {
+                block_gas_limit: 30_000_000,
+                max_l1_messages_per_block: 10,
+                l1_message_inclusion_mode: L1MessageInclusionMode::BlockDepth(0),
+            },
+        },
+    ));
+    let id = PayloadId::new([1; 8]);
+    client.push_fork_choice_updated(payload_build_response(id));
+    let sequencer = orchestrator.sequencer.as_mut().unwrap();
+    sequencer.start_payload_building(&mut orchestrator.engine).await.unwrap();
+    assert!(sequencer.next().now_or_never().is_none());
+    assert_eq!(
+        sequencer.payload_building_job().unwrap().parent(),
+        *orchestrator.engine.fcs().head_block_info()
+    );
+    id
+}
+
+async fn assert_admin_payload_ready(
+    orchestrator: &mut TestOrchestrator<ScriptedEngineClient>,
+    id: PayloadId,
+) {
+    let sequencer = orchestrator.sequencer.as_mut().unwrap();
+    assert!(sequencer.payload_building_job().is_some(), "the valid job must survive");
+    let event =
+        tokio::time::timeout(std::time::Duration::from_secs(1), sequencer.next()).await.unwrap();
+    assert!(matches!(event, Some(SequencerEvent::PayloadReady(actual)) if actual == id));
+}
+
+async fn assert_admin_head_cancels_payload_job(head: BlockInfo) {
+    for had_job in [true, false] {
+        let (mut orchestrator, client, asserter) = admin_head_fixture().await;
+        if head.number == 5 {
+            asserter.write_q().clear(); // same-height replacement has no reverted suffix
+        }
+        start_admin_payload_job(&mut orchestrator, &client).await;
+        if had_job {
+            // The job is already ready when the command runs, but has not emitted its event.
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        } else {
+            // Exercise a configured sequencer with no job, too.
+            orchestrator.sequencer.as_mut().unwrap().cancel_payload_building_job();
+        }
+        let (request_tx, mut requests) = mpsc::unbounded_channel();
+        let (_event_tx, event_rx) = mpsc::unbounded_channel();
+        orchestrator.signer = Some(SignerHandle::new(request_tx, event_rx.into(), Address::ZERO));
+        client.push_fork_choice_updated(fcu_response(PayloadStatusEnum::Valid));
+        push_admin_tags(&asserter, head);
+        let mut events = orchestrator.event_listener();
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        orchestrator
+            .handle_command(ChainOrchestratorCommand::UpdateFcsHead((head, reply_tx)))
+            .await
+            .unwrap();
+        reply_rx.await.unwrap();
+
+        let sequencer = orchestrator.sequencer.as_mut().unwrap();
+        assert!(sequencer.payload_building_job().is_none(), "old-head job must be cancelled");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), sequencer.next())
+                .await
+                .is_err(),
+            "the real sequencer must not emit the old PayloadReady"
+        );
+        if had_job {
+            assert_eq!(events.next().await, Some(ChainOrchestratorEvent::BlockBuildingSkipped));
+        }
+        assert_eq!(events.next().await, Some(ChainOrchestratorEvent::FcsHeadUpdated(head)));
+        assert!(events.next().now_or_never().is_none(), "no spurious skipped event");
+        assert_eq!(*orchestrator.engine.fcs().head_block_info(), head);
+        assert_eq!(orchestrator.database.get_l2_head_block_number().await.unwrap(), head.number);
+        assert_eq!(client.fork_choice_updated_calls(), 2, "only initial build and admin FCU");
+        assert_eq!(client.get_payload_calls(), 0, "no stale payload finalization");
+        assert_eq!(client.new_payload_calls(), 0);
+        assert!(requests.try_recv().is_err(), "no stale signature request");
+        assert!(client.is_drained());
+        assert!(asserter.read_q().is_empty());
+
+        if had_job {
+            let fresh_id = PayloadId::new([2; 8]);
+            client.push_fork_choice_updated(payload_build_response(fresh_id));
+            orchestrator.handle_command(ChainOrchestratorCommand::BuildBlock).await.unwrap();
+            assert_eq!(
+                orchestrator.sequencer.as_ref().unwrap().payload_building_job().unwrap().parent(),
+                head
+            );
+            let (input, has_attributes) = client.fork_choice_inputs().last().copied().unwrap();
+            assert_eq!(input.head_block_hash, head.hash);
+            assert!(has_attributes, "fresh build must reach the Engine on the new head");
+            assert_admin_payload_ready(&mut orchestrator, fresh_id).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn rg49_update_fcs_head_rewind_cancels_payload_job() {
+    assert_admin_head_cancels_payload_job(info(4, 4)).await;
+}
+
+#[tokio::test]
+async fn rg49_update_fcs_head_replacement_cancels_payload_job() {
+    assert_admin_head_cancels_payload_job(info(5, 0x55)).await;
+}
+
+#[tokio::test]
+async fn rg49_update_fcs_head_same_head_preserves_payload_job() {
+    let (mut orchestrator, client, asserter) = admin_head_fixture().await;
+    asserter.write_q().clear();
+    let id = start_admin_payload_job(&mut orchestrator, &client).await;
+    let generation = orchestrator.signing_generation;
+    client.push_fork_choice_updated(fcu_response(PayloadStatusEnum::Valid));
+    push_admin_tags(&asserter, info(5, 5));
+    let mut events = orchestrator.event_listener();
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    orchestrator
+        .handle_command(ChainOrchestratorCommand::UpdateFcsHead((info(5, 5), reply_tx)))
+        .await
+        .unwrap();
+    reply_rx.await.unwrap();
+    assert_eq!(events.next().await, Some(ChainOrchestratorEvent::FcsHeadUpdated(info(5, 5))));
+    assert!(events.next().now_or_never().is_none(), "no skipped event for a valid job");
+    assert_eq!(orchestrator.signing_generation, generation);
+    assert_admin_payload_ready(&mut orchestrator, id).await;
+    assert_admin_db_unchanged(&orchestrator.database).await;
+    assert_eq!(client.fork_choice_updated_calls(), 2);
+    assert!(asserter.read_q().is_empty());
+}
+
 #[tokio::test]
 async fn rg49_update_fcs_head_rejects_pending_frontier_before_any_side_effect() {
     let database = Arc::new(setup_test_db().await);
@@ -1106,13 +1258,14 @@ async fn rg49_update_fcs_head_rejects_pending_frontier_before_any_side_effect() 
     for number in 5..=10 {
         push_admin_block(&asserter, info(number, number as u8));
     }
-    client.push_fork_choice_updated(fcu_response(PayloadStatusEnum::Valid));
     for block in [info(4, 4), genesis, genesis] {
         push_admin_block(&asserter, block);
     }
     orchestrator.l2_client = Arc::new(
         ProviderBuilder::<_, _, Scroll>::default().connect_mocked_client(asserter.clone()),
     );
+    let id = start_admin_payload_job(&mut orchestrator, &client).await;
+    client.push_fork_choice_updated(fcu_response(PayloadStatusEnum::Valid));
     let mut events = orchestrator.event_listener();
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     let result = orchestrator
@@ -1125,7 +1278,7 @@ async fn rg49_update_fcs_head_rejects_pending_frontier_before_any_side_effect() 
     let error = result.unwrap_err();
     assert!(!error.is_frontier_fatal());
     assert!(orchestrator.handle_outcome(Err(error)).is_ok(), "the run loop must continue");
-    assert_eq!(client.fork_choice_updated_calls(), 0);
+    assert_eq!(client.fork_choice_updated_calls(), 1, "only the existing payload build");
     assert_eq!(asserter.read_q().len(), 9, "no provider reads or pool reinsertion");
     assert_eq!(orchestrator.engine.fcs(), &previous);
     assert_eq!(database.get_l2_head_block_number().await.unwrap(), 10);
@@ -1135,6 +1288,7 @@ async fn rg49_update_fcs_head_rejects_pending_frontier_before_any_side_effect() 
     assert_eq!(database.get_confirmed_frontier_transition().await.unwrap(), confirmed);
     assert!(reply_rx.await.is_err(), "no success reply");
     assert!(events.next().now_or_never().is_none(), "no success event");
+    assert_admin_payload_ready(&mut orchestrator, id).await;
 }
 
 #[tokio::test]
@@ -1373,6 +1527,7 @@ async fn rg49_update_fcs_head_local_validation_error_remains_nonfatal() {
     let (mut orchestrator, client, asserter) = admin_head_fixture().await;
     let previous = ForkchoiceState::new(info(5, 5), info(5, 5), info(0, 0));
     orchestrator.engine.replace_fcs_from_provider(previous.clone());
+    let id = start_admin_payload_job(&mut orchestrator, &client).await;
     let mut events = orchestrator.event_listener();
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     let result = orchestrator
@@ -1386,10 +1541,11 @@ async fn rg49_update_fcs_head_local_validation_error_remains_nonfatal() {
             scroll_engine::FcsError::HeadBelowSafe
         ))
     ));
-    assert_eq!(client.fork_choice_updated_calls(), 0);
+    assert_eq!(client.fork_choice_updated_calls(), 1, "only the existing payload build");
     assert!(reply_rx.await.is_err());
     assert_eq!(orchestrator.engine.fcs(), &previous);
     assert_admin_db_unchanged(&orchestrator.database).await;
     assert!(events.next().now_or_never().is_none());
     assert!(asserter.read_q().is_empty());
+    assert_admin_payload_ready(&mut orchestrator, id).await;
 }

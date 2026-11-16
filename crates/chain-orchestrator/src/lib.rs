@@ -560,7 +560,7 @@ impl<
                     // timer and manual triggers race (issue #38). The only
                     // production sender serializes on BlockSequenced or
                     // BlockBuildingSkipped, which the in-flight job emits when
-                    // it completes. Cancellation emits no outcome, as before.
+                    // it completes. Replacing the job here emits no separate outcome.
                     if sequencer
                         .payload_building_job()
                         .is_some_and(|job| job.parent() == *self.engine.fcs().head_block_info())
@@ -614,7 +614,8 @@ impl<
                     )
                     .await?;
                 let previous_head = self.engine.fcs().head_block_info();
-                if head != *previous_head && head.number <= previous_head.number {
+                let is_head_rewind = head != *previous_head && head.number <= previous_head.number;
+                if is_head_rewind {
                     self.invalidate_pending_signatures();
                 }
                 // VALID updates the Engine cache optimistically; retain the last observation
@@ -658,6 +659,20 @@ impl<
                     })
                     .await
                     .map_err(ChainOrchestratorError::frontier_recovery)?;
+
+                // The command is confirmed and committed before cancelling work on the old
+                // head. The run loop cannot poll the sequencer while this command is awaited.
+                if is_head_rewind {
+                    if let Some(sequencer) = self.sequencer.as_mut() {
+                        let had_job = sequencer.payload_building_job().is_some();
+                        sequencer.cancel_payload_building_job();
+                        if had_job {
+                            self.metric_handler.finish_block_building_recording(None);
+                            // Release manual builders waiting for this job's terminal event.
+                            self.notify(ChainOrchestratorEvent::BlockBuildingSkipped);
+                        }
+                    }
+                }
 
                 // Add all reverted transactions to the transaction pool.
                 self.reinsert_txs_into_pool(reverted_transactions).await;

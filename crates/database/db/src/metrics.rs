@@ -17,6 +17,9 @@ pub(crate) struct DatabaseMetrics {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, EnumIter)]
 pub(crate) enum DatabaseOperation {
     // Write operations
+    SetPendingFrontierTransition,
+    SetRequiredHeadRewind,
+    ClearPendingFrontierTransition,
     InsertL1BlockInfo,
     RemoveL1BlockInfoLeq,
     DeleteBatchFinalizationGtBlockNumber,
@@ -37,6 +40,7 @@ pub(crate) enum DatabaseOperation {
     DeleteBatchesGtBlockNumber,
     DeleteBatchesGtBatchIndex,
     InsertL1Message,
+    RecomputeL1MessageQueueHashes,
     UpdateSkippedL1Messages,
     DeleteL1MessagesGt,
     PrepareOnStartup,
@@ -55,6 +59,10 @@ pub(crate) enum DatabaseOperation {
     InsertSignatures,
     InsertSignature,
     // Read operations
+    GetPendingFrontierTransition,
+    GetRequiredHeadRewind,
+    GetConfirmedFrontierTransition,
+    GetLatestFinalizedL2Info,
     GetBatchByIndex,
     GetBatchByHash,
     GetBatchStatusByHash,
@@ -79,6 +87,10 @@ impl DatabaseOperation {
     /// Returns the str representation of the [`DatabaseOperation`].
     pub(crate) const fn as_str(&self) -> &'static str {
         match self {
+            Self::SetRequiredHeadRewind => "set_required_head_rewind",
+            Self::GetRequiredHeadRewind => "get_required_head_rewind",
+            Self::SetPendingFrontierTransition => "set_pending_frontier_transition",
+            Self::ClearPendingFrontierTransition => "clear_pending_frontier_transition",
             Self::InsertL1BlockInfo => "insert_l1_block_info",
             Self::RemoveL1BlockInfoLeq => "remove_l1_block_info_leq",
             Self::DeleteBatchFinalizationGtBlockNumber => {
@@ -109,6 +121,7 @@ impl DatabaseOperation {
             Self::DeleteBatchesGtBlockNumber => "delete_batches_gt_block_number",
             Self::DeleteBatchesGtBatchIndex => "delete_batches_gt_batch_index",
             Self::InsertL1Message => "insert_l1_message",
+            Self::RecomputeL1MessageQueueHashes => "recompute_l1_message_queue_hashes",
             Self::UpdateSkippedL1Messages => "update_skipped_l1_messages",
             Self::DeleteL1MessagesGt => "delete_l1_messages_gt",
             Self::PrepareOnStartup => "prepare_on_startup",
@@ -126,6 +139,9 @@ impl DatabaseOperation {
             Self::Unwind => "unwind",
             Self::InsertSignatures => "insert_signatures",
             Self::InsertSignature => "insert_signature",
+            Self::GetConfirmedFrontierTransition => "get_confirmed_frontier_transition",
+            Self::GetLatestFinalizedL2Info => "get_latest_finalized_l2_info",
+            Self::GetPendingFrontierTransition => "get_pending_frontier_transition",
             Self::GetBatchByIndex => "get_batch_by_index",
             Self::GetBatchByHash => "get_batch_by_hash",
             Self::GetBatchStatusByHash => "get_batch_status_by_hash",

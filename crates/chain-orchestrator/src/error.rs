@@ -1,15 +1,49 @@
 use alloy_json_rpc::RpcError;
 use alloy_primitives::B256;
+use alloy_rpc_types_engine::PayloadStatusEnum;
 use alloy_transport::TransportErrorKind;
 use rollup_node_primitives::{BatchInfo, BlockInfo};
 use rollup_node_sequencer::SequencerError;
 use rollup_node_signer::SignerError;
-use scroll_db::{CanRetry, DatabaseError, L1MessageKey};
+use scroll_db::{CanRetry, DatabaseError, L1MessageKey, StoredForkchoiceState};
 use scroll_engine::EngineError;
 
 /// A type that represents an error that occurred in the chain orchestrator.
 #[derive(Debug, thiserror::Error)]
 pub enum ChainOrchestratorError {
+    /// An administrative head update must wait for the durable frontier transition to finish.
+    #[error("cannot update forkchoice head while a frontier transition is pending")]
+    PendingFrontierTransition,
+    /// The execution provider did not expose all latest/safe/finalized tags needed for recovery.
+    #[error("execution provider is missing latest, safe, or finalized forkchoice tags")]
+    MissingEngineForkchoiceTags,
+    /// Recovery errors must stop processing, including database and RPC failures.
+    #[error("frontier recovery failed: {0}")]
+    FrontierRecovery(#[source] Box<Self>),
+    /// Consolidation may have committed only part of the unsafe chain; restart before proceeding.
+    #[error("chain consolidation failed: {0}")]
+    ChainConsolidation(#[source] Box<Self>),
+    /// A database frontier conflicts with an unexplained Engine tag.
+    #[error("conflicting {tag} frontier: database={target}, Engine={observed}")]
+    FrontierConflict {
+        /// The forkchoice tag being checked.
+        tag: &'static str,
+        /// The database-backed target.
+        target: BlockInfo,
+        /// The Engine's observed block.
+        observed: BlockInfo,
+    },
+    /// The Engine did not accept a frontier update.
+    #[error("Engine returned {0} during frontier update")]
+    FrontierTransitionStatus(PayloadStatusEnum),
+    /// A VALID response did not apply the durable frontier within the bounded attempt.
+    #[error("Engine did not apply frontier after VALID: target={target:?}, observed={observed:?}")]
+    FrontierTransitionUnconfirmed {
+        /// The durable target that was not confirmed.
+        target: Box<StoredForkchoiceState>,
+        /// The last forkchoice actually read from the provider.
+        observed: Box<StoredForkchoiceState>,
+    },
     /// An error occurred while interacting with the database.
     #[error("database error occurred: {0}")]
     DatabaseError(#[from] DatabaseError),
@@ -40,6 +74,10 @@ pub enum ChainOrchestratorError {
     /// missing.
     #[error("L1 message queue gap detected at index {0}, previous L1 message not found")]
     L1MessageQueueGap(u64),
+    /// The legacy queue hash is computed, but the stored message before index {0} has none, so
+    /// the legacy chain cannot continue (the startup recompute should have filled it).
+    #[error("L1 message {0}: the previous message has no legacy queue hash")]
+    MissingLegacyQueueHash(u64),
     /// An inconsistency was detected when trying to consolidate the chain.
     #[error("Chain inconsistency detected")]
     ChainInconsistency,
@@ -60,6 +98,20 @@ pub enum ChainOrchestratorError {
     /// A gap was detected in batch commit events: the previous batch before index {0} is missing.
     #[error("Batch commit gap detected at index {0}, previous batch commit not found")]
     BatchCommitGap(u64),
+    /// A derived batch does not continue immediately after the persisted consolidation frontier.
+    #[error(
+        "Derived batch {batch_info:?} has a non-contiguous block at attribute index {attribute_index}: block {actual_block_number} does not immediately follow block {previous_block_number}"
+    )]
+    InvalidDerivedBlockSequence {
+        /// The batch containing the invalid block sequence.
+        batch_info: BatchInfo,
+        /// The position of the invalid block attributes within the batch.
+        attribute_index: usize,
+        /// The persisted frontier or preceding derived block number.
+        previous_block_number: u64,
+        /// The block number supplied by the committed batch.
+        actual_block_number: u64,
+    },
     /// An error occurred while making a network request.
     #[error("Network request error: {0}")]
     NetworkRequestError(#[from] reth_network_p2p::error::RequestError),
@@ -125,7 +177,7 @@ pub enum ChainOrchestratorError {
         /// The latest hash the Engine considers valid.
         latest_valid_hash: Option<B256>,
         /// The Engine validation detail.
-        validation_error: String,
+        validation_error: Box<str>,
     },
     /// A rebuilt payload differs from the data derived from its batch.
     #[error("Rebuilt payload mismatch for batch {batch_info:?} at block {block_number}: {reason}")]
@@ -161,19 +213,6 @@ pub enum ChainOrchestratorError {
         /// Reth's canonical block at the database's safe height, if it has one.
         reth_canonical: Option<BlockInfo>,
     },
-    /// The forkchoice update that moves the Engine to the database's blocks after an L1 reorg or
-    /// a batch revert failed or was rejected, so the Engine and the database disagree.
-    #[error("Forkchoice update after {operation} failed, Engine safe block {engine_safe:?} does not follow database safe block {db_safe:?}: {reason}")]
-    UnwindForkchoiceUpdateFailed {
-        /// The operation that changed the database.
-        operation: &'static str,
-        /// The safe block the database moved to, if it changed.
-        db_safe: Option<BlockInfo>,
-        /// The Engine's safe block after the failed update.
-        engine_safe: BlockInfo,
-        /// The Engine error or `INVALID` validation detail.
-        reason: String,
-    },
     /// An error occurred while handling rollup node primitives.
     #[error("An error occurred while handling rollup node primitives: {0}")]
     RollupNodePrimitiveError(rollup_node_primitives::RollupNodePrimitiveError),
@@ -185,5 +224,45 @@ impl CanRetry for ChainOrchestratorError {
             Self::DatabaseError(err) => err.can_retry(),
             _ => false,
         }
+    }
+}
+
+impl ChainOrchestratorError {
+    /// Returns true when the run loop must stop rather than resume partially applied work.
+    pub(crate) const fn is_fatal(&self) -> bool {
+        self.is_frontier_fatal() || matches!(self, Self::ChainConsolidation(_))
+    }
+
+    /// Keep all failures within frontier recovery fail-stop, including journal I/O errors.
+    pub(crate) fn frontier_recovery(error: impl Into<Self>) -> Self {
+        let error = error.into();
+        if error.is_frontier_fatal() {
+            error
+        } else {
+            Self::FrontierRecovery(Box::new(error))
+        }
+    }
+
+    /// Returns true if the error is an Engine request that got no answer (see
+    /// [`scroll_engine::EngineError::is_engine_unavailable`]), also inside frontier recovery.
+    pub(crate) fn is_engine_unavailable(&self) -> bool {
+        match self {
+            Self::EngineError(error) => error.is_engine_unavailable(),
+            Self::FrontierRecovery(error) => error.is_engine_unavailable(),
+            _ => false,
+        }
+    }
+
+    /// Returns true when continuing the run loop could process work against an unresolved Engine
+    /// frontier.
+    pub(crate) const fn is_frontier_fatal(&self) -> bool {
+        matches!(
+            self,
+            Self::MissingEngineForkchoiceTags |
+                Self::FrontierRecovery(_) |
+                Self::FrontierConflict { .. } |
+                Self::FrontierTransitionUnconfirmed { .. } |
+                Self::FrontierTransitionStatus(_)
+        )
     }
 }

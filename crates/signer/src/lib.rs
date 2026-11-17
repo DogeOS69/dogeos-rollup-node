@@ -21,6 +21,7 @@ mod event;
 pub use event::SignerEvent;
 
 mod future;
+use future::sign_block_in_generation;
 pub use future::{sign_block, SignerFuture};
 
 mod handle;
@@ -82,12 +83,12 @@ impl Signer {
             tokio::select! {
                 Some(request) = self.requests.next() => {
                     match request {
-                        SignerRequest::SignBlock(block) => {
+                        SignerRequest::SignBlock { block, generation } => {
                             let signer = self.signer.clone();
                             let metric = self.metrics.clone();
                             let future = Box::pin(async move {
                                 let now = Instant::now();
-                                let res = sign_block(block, signer).await;
+                                let res = sign_block_in_generation(block, signer, generation).await;
                                 metric.signing_duration.record(now.elapsed().as_secs_f64());
                                 res
                             });
@@ -155,7 +156,10 @@ mod tests {
         // Test receiving an event
         let event = handle.next().await.unwrap();
         let (event_block, signature) = match event {
-            SignerEvent::SignedBlock { block, signature } => (block, signature),
+            SignerEvent::SignedBlock { block, signature, generation } => {
+                assert_eq!(generation, 0);
+                (block, signature)
+            }
         };
         let hash = sig_encode_hash(&event_block);
         let recovered_address = signature.recover_address_from_prehash(&hash).unwrap();
@@ -216,17 +220,18 @@ mod tests {
         let key = PrivateKeySigner::random();
         let mut handle = Signer::spawn(FailsFirst::new(key.clone(), &first, 2));
         let start = tokio::time::Instant::now();
-        handle.sign_block(first.clone()).unwrap();
-        handle.sign_block(second.clone()).unwrap();
+        handle.sign_block_in_generation(first.clone(), 7).unwrap();
+        handle.sign_block_in_generation(second.clone(), 8).unwrap();
 
         // The second block signs at once but must not overtake the first. The first call for
         // the first block times out, the retry returns an error, and the next retry signs it.
-        for expected in [first, second] {
+        for (expected, expected_generation) in [(first, 7), (second, 8)] {
             let event = tokio::time::timeout(Duration::from_secs(60), handle.next())
                 .await
                 .expect("block was never signed")
                 .unwrap();
-            let SignerEvent::SignedBlock { block, signature } = event;
+            let SignerEvent::SignedBlock { block, signature, generation } = event;
+            assert_eq!(generation, expected_generation);
             assert_eq!(block, expected);
             let hash = sig_encode_hash(&block);
             assert_eq!(signature.recover_address_from_prehash(&hash).unwrap(), key.address());

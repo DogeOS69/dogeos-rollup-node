@@ -31,7 +31,7 @@ pub fn decode_v7(blob: &[u8]) -> Result<Batch, DecodingError> {
 
     // check version.
     let version = from_be_bytes_slice_and_advance_buf!(u8, buf);
-    if !(7..=11).contains(&version) {
+    if !(7..=12).contains(&version) {
         return Err(DecodingError::UnsupportedCodecVersion(version))
     }
 
@@ -323,7 +323,7 @@ mod tests {
         for fixture in ["blob_v7_uncompressed.bin", "blob_v7_compressed.bin"] {
             let mut blob = read_to_bytes(format!("./testdata/{fixture}"))?.to_vec();
             let expected = decode_v7(&blob)?.data;
-            for version in 7..=11 {
+            for version in 7..=12 {
                 // The first byte of each field element is reserved padding.
                 blob[1] = version;
                 let batch = decode_v7(&blob)?;
@@ -338,7 +338,7 @@ mod tests {
     fn test_should_reject_unsupported_v7_format_versions() -> eyre::Result<()> {
         for fixture in ["blob_v7_uncompressed.bin", "blob_v7_compressed.bin"] {
             let mut blob = read_to_bytes(format!("./testdata/{fixture}"))?.to_vec();
-            for version in [6, 12] {
+            for version in [6, 13] {
                 blob[1] = version;
                 assert!(
                     matches!(

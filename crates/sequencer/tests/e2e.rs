@@ -202,6 +202,7 @@ async fn can_build_blocks() {
         l1_block_number: 1,
         l2_block_number: None,
         queue_hash: None,
+        legacy_queue_hash: None,
         transaction: TxL1Message {
             queue_index: 0,
             gas_limit: 21000,
@@ -310,6 +311,7 @@ async fn can_build_blocks_with_delayed_l1_messages() {
             input: vec![].into(),
         },
         queue_hash: None,
+        legacy_queue_hash: None,
     };
     drop(wallet_lock);
     let l1_message_hash = l1_message.transaction.tx_hash();
@@ -436,6 +438,7 @@ async fn can_build_blocks_with_finalized_l1_messages() {
         l1_block_number: 2, // <= 2 (finalized block)
         l2_block_number: None,
         queue_hash: None,
+        legacy_queue_hash: None,
         transaction: TxL1Message {
             queue_index: 0,
             gas_limit: 21000,
@@ -451,6 +454,7 @@ async fn can_build_blocks_with_finalized_l1_messages() {
         l1_block_number: 3, // > 2 (finalized block)
         l2_block_number: None,
         queue_hash: None,
+        legacy_queue_hash: None,
         transaction: TxL1Message {
             queue_index: 1,
             gas_limit: 21000,
@@ -966,6 +970,7 @@ async fn should_limit_l1_message_cumulative_gas() {
             l1_block_number: 1,
             l2_block_number: None,
             queue_hash: None,
+            legacy_queue_hash: None,
             transaction: TxL1Message {
                 queue_index: 0,
                 gas_limit: SCROLL_GAS_LIMIT / 2,
@@ -979,6 +984,7 @@ async fn should_limit_l1_message_cumulative_gas() {
             l1_block_number: 1,
             l2_block_number: None,
             queue_hash: None,
+            legacy_queue_hash: None,
             transaction: TxL1Message {
                 queue_index: 1,
                 gas_limit: SCROLL_GAS_LIMIT / 2 + 1,
@@ -1090,6 +1096,7 @@ async fn should_not_add_skipped_messages() {
             l1_block_number: 1,
             l2_block_number: None,
             queue_hash: None,
+            legacy_queue_hash: None,
             transaction: TxL1Message {
                 queue_index: 0,
                 gas_limit: 100_000,
@@ -1103,6 +1110,7 @@ async fn should_not_add_skipped_messages() {
             l1_block_number: 1,
             l2_block_number: None,
             queue_hash: None,
+            legacy_queue_hash: None,
             transaction: TxL1Message {
                 queue_index: 1,
                 gas_limit: 100_000,
@@ -1116,6 +1124,7 @@ async fn should_not_add_skipped_messages() {
             l1_block_number: 1,
             l2_block_number: None,
             queue_hash: None,
+            legacy_queue_hash: None,
             transaction: TxL1Message {
                 queue_index: 2,
                 gas_limit: 100_000,
@@ -1129,6 +1138,7 @@ async fn should_not_add_skipped_messages() {
             l1_block_number: 1,
             l2_block_number: None,
             queue_hash: None,
+            legacy_queue_hash: None,
             transaction: TxL1Message {
                 queue_index: 3,
                 gas_limit: 100_000,

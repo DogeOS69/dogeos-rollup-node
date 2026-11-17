@@ -51,6 +51,12 @@ pub use node::{
     consensus::ConsensusUpdate,
 };
 
+mod queue_hash;
+pub use queue_hash::{
+    fold_legacy_queue_hash, fold_queue_hash, uses_legacy_queue_hash,
+    FIRST_FULL_WIDTH_QUEUE_HASH_CODEC_VERSION,
+};
+
 mod signature;
 pub use signature::sig_encode_hash;
 

@@ -1,23 +1,60 @@
-use super::{models, DatabaseError};
-use crate::{ReadConnectionProvider, WriteConnectionProvider};
+use super::{models, ConfirmedFrontierTransition, DatabaseError, PendingFrontierTransition};
+use crate::{
+    frontier_transition_types::{
+        CONFIRMED_FRONTIER_KEY, FRONTIER_TRANSITION_KEY, REQUIRED_HEAD_REWIND_KEY,
+    },
+    ReadConnectionProvider, WriteConnectionProvider,
+};
 
 use alloy_primitives::{Bytes, Signature, B256};
 use dogeos_reth_engine::BlockDataHint;
 use rollup_node_primitives::{
-    BatchCommitData, BatchConsolidationOutcome, BatchInfo, BatchStatus, BlockInfo,
-    L1BlockStartupInfo, L1MessageEnvelope, L2BlockInfoWithL1Messages, Metadata,
+    fold_legacy_queue_hash, fold_queue_hash, uses_legacy_queue_hash, BatchCommitData,
+    BatchConsolidationOutcome, BatchInfo, BatchStatus, BlockInfo, L1BlockStartupInfo,
+    L1MessageEnvelope, L2BlockInfoWithL1Messages, Metadata,
 };
 use sea_orm::{
     sea_query::{CaseStatement, Expr, OnConflict},
-    ColumnTrait, Condition, DbErr, EntityTrait, QueryFilter, QueryOrder, QuerySelect,
+    ColumnTrait, Condition, DbErr, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Value,
 };
 use std::fmt;
+
+async fn read_frontier_transition<T: ReadConnectionProvider + Sync + ?Sized>(
+    connection: &T,
+    key: &str,
+) -> Result<Option<PendingFrontierTransition>, DatabaseError> {
+    models::metadata::Entity::find_by_id(key)
+        .one(connection.get_connection())
+        .await?
+        .map(|row| {
+            let transition: PendingFrontierTransition = serde_json::from_str(&row.value)?;
+            transition.validate()?;
+            Ok(transition)
+        })
+        .transpose()
+}
 
 /// The [`DatabaseWriteOperations`] trait provides write methods for interacting with the
 /// database.
 #[async_trait::async_trait]
 #[auto_impl::auto_impl(Arc)]
 pub trait DatabaseWriteOperations {
+    /// Store the single pending Engine forkchoice transition.
+    async fn set_pending_frontier_transition(
+        &self,
+        transition: PendingFrontierTransition,
+    ) -> Result<(), DatabaseError>;
+
+    /// Store an L1-invalidated head rewind that follower startup must replay exactly.
+    /// The companion witness is bound to this exact transition and replaced atomically with it.
+    async fn set_required_head_rewind(
+        &self,
+        transition: PendingFrontierTransition,
+    ) -> Result<(), DatabaseError>;
+
+    /// Acknowledge the pending transition, retaining its recovery witness in the same transaction.
+    async fn clear_pending_frontier_transition(&self) -> Result<(), DatabaseError>;
+
     /// Insert a [`BlockInfo`] representing an L1 block into the database.
     async fn insert_l1_block_info(&self, block_info: BlockInfo) -> Result<(), DatabaseError>;
 
@@ -121,6 +158,22 @@ pub trait DatabaseWriteOperations {
     /// Insert an [`L1MessageEnvelope`] into the database.
     async fn insert_l1_message(&self, l1_message: L1MessageEnvelope) -> Result<(), DatabaseError>;
 
+    /// Recomputes both queue hash columns of every stored L1 message, unless the metadata marker
+    /// says they were last computed under this exact rule set (start index, legacy on or off).
+    /// Messages below `l1_v2_message_queue_start_index` have no queue hash; the legacy (masked)
+    /// column is filled only if `with_legacy` is set. Returns the number of messages rewritten,
+    /// or `None` if the hashes were already current.
+    ///
+    /// Runs at startup on every network, so a database written under another rule (testnet nodes
+    /// stored the masked hash in `queue_hash` before the full-width rule) matches the node's live
+    /// rule. It is atomic: on error (a gap in the stored queue) nothing is changed. It loads the
+    /// affected rows into memory and updates them one by one; that is a one-off per rule set.
+    async fn recompute_l1_message_queue_hashes(
+        &self,
+        l1_v2_message_queue_start_index: u64,
+        with_legacy: bool,
+    ) -> Result<Option<u64>, DatabaseError>;
+
     /// Sets the `skipped` column to true for the provided list of L1 messages queue indexes.
     async fn update_skipped_l1_messages(&self, indexes: Vec<u64>) -> Result<(), DatabaseError>;
 
@@ -151,20 +204,20 @@ pub trait DatabaseWriteOperations {
         batch_info: BatchInfo,
     ) -> Result<(), DatabaseError>;
 
-    /// Insert the genesis block into the database.
+    /// Replace the database genesis row with the canonical genesis hash.
     async fn insert_genesis_block(&self, genesis_hash: B256) -> Result<(), DatabaseError>;
 
     /// Delete any genesis-height (block 0) rows whose hash does not match the chain's genesis
     /// hash, returning how many were removed. The static dev migration seeds the Scroll dev
-    /// genesis row; the real genesis is inserted by `reconcile_genesis_block` (the insert cannot
-    /// overwrite — its conflict key includes the hash), and the seeded row would otherwise shadow
-    /// the real one nondeterministically in highest-block queries such as
+    /// genesis row, and an older release inserted the real genesis beside it; the seeded row
+    /// would otherwise shadow the real one nondeterministically in highest-block queries such as
     /// `get_latest_safe_l2_info`, presenting as a same-height different-hash safe divergence.
     ///
     /// This primitive has no floor: it removes the LAST height-0 row too, leaving `l2_block`
     /// without a genesis — the state [`DatabaseError::GenesisMissing`] reports and
-    /// `get_latest_safe_l2_info` panics on. Production callers must pair it with
-    /// `insert_genesis_block` in the same transaction, as [`Self::reconcile_genesis_block`] does.
+    /// `get_latest_safe_l2_info` fails on with [`DatabaseError::MissingSafeL2Frontier`]. Production
+    /// callers must pair it with `insert_genesis_block` in the same transaction, as
+    /// [`Self::reconcile_genesis_block`] does.
     async fn delete_mismatched_genesis_blocks(
         &self,
         genesis_hash: B256,
@@ -243,6 +296,119 @@ pub trait DatabaseWriteOperations {
 
 #[async_trait::async_trait]
 impl<T: WriteConnectionProvider + ?Sized + Sync> DatabaseWriteOperations for T {
+    async fn set_pending_frontier_transition(
+        &self,
+        transition: PendingFrontierTransition,
+    ) -> Result<(), DatabaseError> {
+        use models::metadata::Column;
+
+        transition.validate()?;
+        if transition.expected == transition.target {
+            return Ok(())
+        }
+        // Ordinary replacements must not inherit a previous mandatory rewind's policy.
+        models::metadata::Entity::delete_by_id(REQUIRED_HEAD_REWIND_KEY)
+            .exec(self.get_connection())
+            .await?;
+        let transition: models::metadata::ActiveModel = Metadata {
+            key: FRONTIER_TRANSITION_KEY.to_owned(),
+            value: serde_json::to_string(&transition)?,
+        }
+        .into();
+        models::metadata::Entity::insert(transition)
+            .on_conflict(OnConflict::column(Column::Key).update_column(Column::Value).to_owned())
+            .exec_without_returning(self.get_connection())
+            .await?;
+        Ok(())
+    }
+
+    async fn set_required_head_rewind(
+        &self,
+        transition: PendingFrontierTransition,
+    ) -> Result<(), DatabaseError> {
+        transition.validate()?;
+        if transition.target.head.number >= transition.expected.head.number {
+            return Err(DatabaseError::InvalidFrontierTransition(
+                "required head rewind must lower the head",
+            ))
+        }
+        self.set_pending_frontier_transition(transition).await?;
+        let row: models::metadata::ActiveModel = Metadata {
+            key: REQUIRED_HEAD_REWIND_KEY.to_owned(),
+            value: serde_json::to_string(&transition)?,
+        }
+        .into();
+        models::metadata::Entity::insert(row)
+            .on_conflict(
+                OnConflict::column(models::metadata::Column::Key)
+                    .update_column(models::metadata::Column::Value)
+                    .to_owned(),
+            )
+            .exec_without_returning(self.get_connection())
+            .await?;
+        Ok(())
+    }
+
+    async fn clear_pending_frontier_transition(&self) -> Result<(), DatabaseError> {
+        if let Some(transition) = self.get_pending_frontier_transition().await? {
+            let mut confirmed = ConfirmedFrontierTransition::acknowledge(
+                transition,
+                self.get_confirmed_frontier_transition().await?,
+            )?;
+            // Only finalized canonical blocks are permanently covered by normal ancestry
+            // recovery. Height alone cannot prune an old fork: even a later finalized-tag
+            // acknowledgement may be lost along with the safe-tag writes.
+            let finalized = transition.target.finalized;
+            let mut retained = Vec::new();
+            for block in confirmed.previous_safe {
+                if block == finalized {
+                    continue
+                }
+                let canonical_finalized = if block.number < finalized.number {
+                    models::l2_block::Entity::find()
+                        .inner_join(models::batch_commit::Entity)
+                        .filter(models::l2_block::Column::BlockHash.eq(block.hash.to_vec()))
+                        .filter(models::l2_block::Column::Reverted.eq(false))
+                        .filter(
+                            models::batch_commit::Column::Status
+                                .eq(BatchStatus::Finalized.as_str()),
+                        )
+                        .filter(models::batch_commit::Column::RevertedBlockNumber.is_null())
+                        .one(self.get_connection())
+                        .await?
+                        .is_some_and(|row| row.block_info() == block)
+                } else {
+                    false
+                };
+                if !canonical_finalized {
+                    retained.push(block);
+                }
+            }
+            confirmed.previous_safe = retained;
+            let row: models::metadata::ActiveModel = Metadata {
+                key: CONFIRMED_FRONTIER_KEY.to_owned(),
+                value: serde_json::to_string(&confirmed)?,
+            }
+            .into();
+            models::metadata::Entity::insert(row)
+                .on_conflict(
+                    OnConflict::column(models::metadata::Column::Key)
+                        .update_column(models::metadata::Column::Value)
+                        .to_owned(),
+                )
+                .exec_without_returning(self.get_connection())
+                .await?;
+        }
+        models::metadata::Entity::delete_many()
+            .filter(
+                models::metadata::Column::Key
+                    .is_in([FRONTIER_TRANSITION_KEY, REQUIRED_HEAD_REWIND_KEY]),
+            )
+            .exec(self.get_connection())
+            .await?;
+        Ok(())
+    }
+
     async fn insert_l1_block_info(&self, block_info: BlockInfo) -> Result<(), DatabaseError> {
         tracing::trace!(target: "scroll::db", %block_info, "Inserting L1 block info into database.");
         let finalized_l1_block_number = self.get_finalized_l1_block_number().await?;
@@ -556,14 +722,7 @@ impl<T: WriteConnectionProvider + ?Sized + Sync> DatabaseWriteOperations for T {
             .one(self.get_connection())
             .await?;
 
-        if let Some(batch) = batch {
-            let finalized_block_info = models::l2_block::Entity::find()
-                .filter(models::l2_block::Column::BatchHash.eq(batch.hash.clone()))
-                .order_by_desc(models::l2_block::Column::BlockNumber)
-                .one(self.get_connection())
-                .await?
-                .map(|block| block.block_info())
-                .expect("Finalized batch must have at least one L2 block.");
+        if batch.is_some() {
             models::batch_commit::Entity::update_many()
                 .filter(filter)
                 .col_expr(
@@ -573,7 +732,7 @@ impl<T: WriteConnectionProvider + ?Sized + Sync> DatabaseWriteOperations for T {
                 .exec(self.get_connection())
                 .await?;
 
-            Ok(Some(finalized_block_info))
+            Ok(Some(self.get_latest_finalized_l2_info().await?))
         } else {
             Ok(None)
         }
@@ -687,6 +846,89 @@ impl<T: WriteConnectionProvider + ?Sized + Sync> DatabaseWriteOperations for T {
         }
     }
 
+    async fn recompute_l1_message_queue_hashes(
+        &self,
+        l1_v2_message_queue_start_index: u64,
+        with_legacy: bool,
+    ) -> Result<Option<u64>, DatabaseError> {
+        // Bump the version when the stored rule changes.
+        const QUEUE_HASH_RULE_KEY: &str = "l1_message_queue_hash_rule";
+        let rule = format!("v1;start={l1_v2_message_queue_start_index};legacy={with_legacy}");
+
+        let current = models::metadata::Entity::find()
+            .filter(models::metadata::Column::Key.eq(QUEUE_HASH_RULE_KEY))
+            .one(self.get_connection())
+            .await?;
+        if current.is_some_and(|m| m.value == rule) {
+            return Ok(None)
+        }
+
+        // Clear both columns first so no intermediate value trips the unique indexes.
+        models::l1_message::Entity::update_many()
+            .col_expr(models::l1_message::Column::QueueHash, Expr::value(Value::Bytes(None)))
+            .col_expr(models::l1_message::Column::LegacyQueueHash, Expr::value(Value::Bytes(None)))
+            .exec(self.get_connection())
+            .await?;
+
+        let rows = models::l1_message::Entity::find()
+            .filter(
+                models::l1_message::Column::QueueIndex.gte(l1_v2_message_queue_start_index as i64),
+            )
+            .order_by_asc(models::l1_message::Column::QueueIndex)
+            .all(self.get_connection())
+            .await?;
+
+        let mut previous: Option<(i64, B256, B256)> = None;
+        let mut rewritten = 0u64;
+        for row in rows {
+            let queue_index = row.queue_index;
+            let (prev_full, prev_legacy) = match previous {
+                None if queue_index == l1_v2_message_queue_start_index as i64 => {
+                    (B256::ZERO, B256::ZERO)
+                }
+                Some((index, full, legacy)) if index + 1 == queue_index => (full, legacy),
+                // A gap: the live path rejects it, so the stored chain cannot continue here.
+                _ => {
+                    return Err(DatabaseError::L1MessageNotFound(L1MessageKey::QueueIndex(
+                        queue_index as u64 - 1,
+                    )))
+                }
+            };
+            let tx_hash = B256::from_slice(&row.hash);
+            let full = fold_queue_hash(prev_full, tx_hash);
+            let legacy = fold_legacy_queue_hash(prev_legacy, tx_hash);
+
+            models::l1_message::Entity::update_many()
+                .col_expr(
+                    models::l1_message::Column::QueueHash,
+                    Expr::value(Value::Bytes(Some(Box::new(full.to_vec())))),
+                )
+                .col_expr(
+                    models::l1_message::Column::LegacyQueueHash,
+                    Expr::value(Value::Bytes(with_legacy.then(|| Box::new(legacy.to_vec())))),
+                )
+                .filter(models::l1_message::Column::QueueIndex.eq(queue_index))
+                .exec(self.get_connection())
+                .await?;
+
+            previous = Some((queue_index, full, legacy));
+            rewritten += 1;
+        }
+
+        let metadata: models::metadata::ActiveModel =
+            Metadata { key: QUEUE_HASH_RULE_KEY.to_string(), value: rule }.into();
+        models::metadata::Entity::insert(metadata)
+            .on_conflict(
+                OnConflict::column(models::metadata::Column::Key)
+                    .update_column(models::metadata::Column::Value)
+                    .to_owned(),
+            )
+            .exec(self.get_connection())
+            .await?;
+
+        Ok(Some(rewritten))
+    }
+
     async fn update_skipped_l1_messages(&self, indexes: Vec<u64>) -> Result<(), DatabaseError> {
         Ok(models::l1_message::Entity::update_many()
             .col_expr(models::l1_message::Column::Skipped, Expr::value(true))
@@ -794,6 +1036,10 @@ impl<T: WriteConnectionProvider + ?Sized + Sync> DatabaseWriteOperations for T {
     }
 
     async fn insert_genesis_block(&self, genesis_hash: B256) -> Result<(), DatabaseError> {
+        models::l2_block::Entity::delete_many()
+            .filter(models::l2_block::Column::BlockNumber.eq(0))
+            .exec(self.get_connection())
+            .await?;
         let genesis_block = BlockInfo::new(0, genesis_hash);
         let genesis_batch = BatchInfo::new(0, B256::ZERO);
         self.insert_blocks(vec![genesis_block], genesis_batch).await
@@ -969,8 +1215,31 @@ impl<T: WriteConnectionProvider + ?Sized + Sync> DatabaseWriteOperations for T {
         &self,
         outcome: BatchConsolidationOutcome,
     ) -> Result<(), DatabaseError> {
-        if let Some(block_info) = outcome.updated_l2_head() {
-            self.set_l2_head_block_number(block_info.number).await?;
+        if !outcome.blocks.is_empty() {
+            // Every covered block is authoritative, including reused blocks on a retry after
+            // an earlier attempt rebuilt part of the batch without committing its outcome.
+            let mut replaced = Condition::any().add(
+                models::l1_message::Column::L2BlockNumber
+                    .is_in(outcome.blocks.iter().map(|block| block.block_info.number as i64)),
+            );
+            if let Some(block_info) = outcome.updated_l2_head() {
+                // A changed head also discards its old unsafe suffix. Pure reuse leaves any
+                // independent higher unsafe blocks and their deposit mappings intact.
+                replaced = replaced
+                    .add(models::l1_message::Column::L2BlockNumber.gt(block_info.number as i64));
+                self.set_l2_head_block_number(block_info.number).await?;
+            } else if let Some(tip) = outcome.blocks.last() {
+                // Reusing canonical blocks can catch up DB metadata without changing the
+                // Engine head or discarding its independent higher canonical suffix.
+                if tip.block_info.number > self.get_l2_head_block_number().await? {
+                    self.set_l2_head_block_number(tip.block_info.number).await?;
+                }
+            }
+            models::l1_message::Entity::update_many()
+                .col_expr(models::l1_message::Column::L2BlockNumber, Expr::value(None::<i64>))
+                .filter(replaced)
+                .exec(self.get_connection())
+                .await?;
         }
         self.insert_blocks(
             outcome.blocks.iter().map(|b| b.block_info).collect(),
@@ -1092,6 +1361,23 @@ impl<T: WriteConnectionProvider + ?Sized + Sync> DatabaseWriteOperations for T {
 #[async_trait::async_trait]
 #[auto_impl::auto_impl(Arc)]
 pub trait DatabaseReadOperations {
+    /// Acknowledged transitions' safe-tag evidence; Engine acknowledgement is not an fsync.
+    async fn get_confirmed_frontier_transition(
+        &self,
+    ) -> Result<Option<ConfirmedFrontierTransition>, DatabaseError>;
+
+    /// Mandatory head rewind witness, only when it matches the exact current pending intent.
+    async fn get_required_head_rewind(
+        &self,
+    ) -> Result<Option<PendingFrontierTransition>, DatabaseError>;
+
+    /// Highest non-reverted L2 block in a finalized batch, or genesis.
+    async fn get_latest_finalized_l2_info(&self) -> Result<BlockInfo, DatabaseError>;
+    /// Return the pending Engine forkchoice transition, if one exists.
+    async fn get_pending_frontier_transition(
+        &self,
+    ) -> Result<Option<PendingFrontierTransition>, DatabaseError>;
+
     /// Get a [`BatchCommitData`] from the database by its batch index.
     async fn get_batch_by_index(
         &self,
@@ -1185,6 +1471,57 @@ pub trait DatabaseReadOperations {
 
 #[async_trait::async_trait]
 impl<T: ReadConnectionProvider + Sync + ?Sized> DatabaseReadOperations for T {
+    async fn get_confirmed_frontier_transition(
+        &self,
+    ) -> Result<Option<ConfirmedFrontierTransition>, DatabaseError> {
+        models::metadata::Entity::find_by_id(CONFIRMED_FRONTIER_KEY)
+            .one(self.get_connection())
+            .await?
+            .map(|row| {
+                let confirmed: ConfirmedFrontierTransition = serde_json::from_str(&row.value)?;
+                confirmed.validate()?;
+                Ok(confirmed)
+            })
+            .transpose()
+    }
+
+    async fn get_latest_finalized_l2_info(&self) -> Result<BlockInfo, DatabaseError> {
+        let row = models::l2_block::Entity::find()
+            .left_join(models::batch_commit::Entity)
+            .filter(models::l2_block::Column::Reverted.eq(false))
+            .filter(
+                Condition::any().add(models::l2_block::Column::BlockNumber.eq(0)).add(
+                    Condition::all()
+                        .add(
+                            models::batch_commit::Column::Status
+                                .eq(BatchStatus::Finalized.as_str()),
+                        )
+                        .add(models::batch_commit::Column::RevertedBlockNumber.is_null()),
+                ),
+            )
+            .order_by_desc(models::l2_block::Column::BlockNumber)
+            .one(self.get_connection())
+            .await?
+            .ok_or(DatabaseError::MissingSafeL2Frontier)?;
+        Ok(row.block_info())
+    }
+
+    async fn get_required_head_rewind(
+        &self,
+    ) -> Result<Option<PendingFrontierTransition>, DatabaseError> {
+        let witness = read_frontier_transition(self, REQUIRED_HEAD_REWIND_KEY).await?;
+        let pending = self.get_pending_frontier_transition().await?;
+        Ok(witness.filter(|value| {
+            Some(*value) == pending && value.target.head.number < value.expected.head.number
+        }))
+    }
+
+    async fn get_pending_frontier_transition(
+        &self,
+    ) -> Result<Option<PendingFrontierTransition>, DatabaseError> {
+        read_frontier_transition(self, FRONTIER_TRANSITION_KEY).await
+    }
+
     async fn get_batch_by_index(
         &self,
         batch_index: u64,
@@ -1385,17 +1722,20 @@ impl<T: ReadConnectionProvider + Sync + ?Sized> DatabaseReadOperations for T {
             }
             // Provides n L1 messages with increasing queue index starting from the message with
             // the provided queue hash.
-            Some(L1MessageKey::QueueHash(ref h)) => {
-                // Lookup message by queue hash.
+            Some(
+                ref key @ (L1MessageKey::QueueHash(ref h) | L1MessageKey::LegacyQueueHash(ref h)),
+            ) => {
+                // Lookup message by queue hash, in the column of the key's rule.
+                let column = if matches!(key, L1MessageKey::LegacyQueueHash(_)) {
+                    models::l1_message::Column::LegacyQueueHash
+                } else {
+                    models::l1_message::Column::QueueHash
+                };
                 let record = models::l1_message::Entity::find()
-                    .filter(
-                        Condition::all()
-                            .add(models::l1_message::Column::QueueHash.is_not_null())
-                            .add(models::l1_message::Column::QueueHash.eq(h.to_vec())),
-                    )
+                    .filter(Condition::all().add(column.is_not_null()).add(column.eq(h.to_vec())))
                     .one(self.get_connection())
                     .await?
-                    .ok_or_else(|| DatabaseError::L1MessageNotFound(L1MessageKey::QueueHash(*h)))?;
+                    .ok_or_else(|| DatabaseError::L1MessageNotFound(key.clone()))?;
                 // Yield n messages starting from the found queue index.
                 Ok(models::l1_message::Entity::find()
                     .filter(models::l1_message::Column::QueueIndex.gte(record.queue_index))
@@ -1596,7 +1936,7 @@ impl<T: ReadConnectionProvider + Sync + ?Sized> DatabaseReadOperations for T {
             .order_by_desc(models::l2_block::Column::BlockNumber)
             .one(self.get_connection())
             .await?
-            .expect("there should always be at least the genesis block in the database");
+            .ok_or(DatabaseError::MissingSafeL2Frontier)?;
 
         Ok((safe_block.block_info(), safe_block.batch_info()))
     }
@@ -1665,8 +2005,11 @@ impl<T: ReadConnectionProvider + Sync + ?Sized> DatabaseReadOperations for T {
 pub enum L1MessageKey {
     /// The queue index of the message.
     QueueIndex(u64),
-    /// The queue hash of the message.
+    /// The full-width queue hash of the message.
     QueueHash(B256),
+    /// The legacy (masked) queue hash of the message. Testnet-only; see
+    /// [`rollup_node_primitives::fold_legacy_queue_hash`].
+    LegacyQueueHash(B256),
     /// The transaction hash of the message.
     TransactionHash(B256),
     /// Start from the first message for the provided block number.
@@ -1684,6 +2027,16 @@ impl L1MessageKey {
     /// Create a new [`L1MessageKey`] from a queue hash.
     pub const fn from_queue_hash(hash: B256) -> Self {
         Self::QueueHash(hash)
+    }
+
+    /// Create a new [`L1MessageKey`] from the queue hash a committed batch of the given codec
+    /// version names: the legacy (masked) hash below codec 12, the full-width hash from 12 on.
+    pub const fn from_batch_queue_hash(hash: B256, batch_codec_version: u8) -> Self {
+        if uses_legacy_queue_hash(batch_codec_version) {
+            Self::LegacyQueueHash(hash)
+        } else {
+            Self::QueueHash(hash)
+        }
     }
 
     /// Create a new [`L1MessageKey`] from a transaction hash.
@@ -1720,6 +2073,7 @@ impl fmt::Display for L1MessageKey {
         match self {
             Self::QueueIndex(index) => write!(f, "QueueIndex({index})"),
             Self::QueueHash(hash) => write!(f, "QueueHash({hash:#x})"),
+            Self::LegacyQueueHash(hash) => write!(f, "LegacyQueueHash({hash:#x})"),
             Self::TransactionHash(hash) => write!(f, "TransactionHash({hash:#x})"),
             Self::BlockNumber(number) => write!(f, "BlockNumber({number})"),
             Self::NotIncluded(start) => match start {

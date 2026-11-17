@@ -478,6 +478,7 @@ mod recovery_tests {
                     l1_block_number: 1,
                     l2_block_number: None,
                     queue_hash: None,
+                    legacy_queue_hash: None,
                 })
                 .await
                 .unwrap();

@@ -3,8 +3,8 @@ use crate::{
     error::DatabaseError,
     metrics::{DatabaseMetrics, DatabaseOperation, DatabaseOperationMetrics},
     service::{query::DatabaseQuery, retry::Retry, DatabaseService, DatabaseServiceError},
-    DatabaseConnectionProvider, DatabaseReadOperations, DatabaseWriteOperations, L1MessageKey,
-    UnwindResult,
+    ConfirmedFrontierTransition, DatabaseConnectionProvider, DatabaseReadOperations,
+    DatabaseWriteOperations, L1MessageKey, PendingFrontierTransition, UnwindResult,
 };
 use alloy_primitives::{Signature, B256};
 use dogeos_reth_engine::BlockDataHint;
@@ -148,6 +148,36 @@ macro_rules! metered {
 
 #[async_trait::async_trait]
 impl DatabaseWriteOperations for Database {
+    async fn set_pending_frontier_transition(
+        &self,
+        transition: PendingFrontierTransition,
+    ) -> Result<(), DatabaseError> {
+        metered!(
+            DatabaseOperation::SetPendingFrontierTransition,
+            self,
+            tx_mut(move |tx| async move { tx.set_pending_frontier_transition(transition).await })
+        )
+    }
+
+    async fn set_required_head_rewind(
+        &self,
+        transition: PendingFrontierTransition,
+    ) -> Result<(), DatabaseError> {
+        metered!(
+            DatabaseOperation::SetRequiredHeadRewind,
+            self,
+            tx_mut(move |tx| async move { tx.set_required_head_rewind(transition).await })
+        )
+    }
+
+    async fn clear_pending_frontier_transition(&self) -> Result<(), DatabaseError> {
+        metered!(
+            DatabaseOperation::ClearPendingFrontierTransition,
+            self,
+            tx_mut(move |tx| async move { tx.clear_pending_frontier_transition().await })
+        )
+    }
+
     async fn insert_l1_block_info(&self, block_info: BlockInfo) -> Result<(), DatabaseError> {
         metered!(
             DatabaseOperation::InsertL1BlockInfo,
@@ -378,6 +408,21 @@ impl DatabaseWriteOperations for Database {
         )
     }
 
+    async fn recompute_l1_message_queue_hashes(
+        &self,
+        l1_v2_message_queue_start_index: u64,
+        with_legacy: bool,
+    ) -> Result<Option<u64>, DatabaseError> {
+        metered!(
+            DatabaseOperation::RecomputeL1MessageQueueHashes,
+            self,
+            tx_mut(move |tx| async move {
+                tx.recompute_l1_message_queue_hashes(l1_v2_message_queue_start_index, with_legacy)
+                    .await
+            })
+        )
+    }
+
     async fn update_skipped_l1_messages(&self, indexes: Vec<u64>) -> Result<(), DatabaseError> {
         metered!(
             DatabaseOperation::UpdateSkippedL1Messages,
@@ -574,6 +619,44 @@ impl DatabaseWriteOperations for Database {
 
 #[async_trait::async_trait]
 impl DatabaseReadOperations for Database {
+    async fn get_confirmed_frontier_transition(
+        &self,
+    ) -> Result<Option<ConfirmedFrontierTransition>, DatabaseError> {
+        metered!(
+            DatabaseOperation::GetConfirmedFrontierTransition,
+            self,
+            tx(|tx| async move { tx.get_confirmed_frontier_transition().await })
+        )
+    }
+
+    async fn get_required_head_rewind(
+        &self,
+    ) -> Result<Option<PendingFrontierTransition>, DatabaseError> {
+        metered!(
+            DatabaseOperation::GetRequiredHeadRewind,
+            self,
+            tx(|tx| async move { tx.get_required_head_rewind().await })
+        )
+    }
+
+    async fn get_latest_finalized_l2_info(&self) -> Result<BlockInfo, DatabaseError> {
+        metered!(
+            DatabaseOperation::GetLatestFinalizedL2Info,
+            self,
+            tx(|tx| async move { tx.get_latest_finalized_l2_info().await })
+        )
+    }
+
+    async fn get_pending_frontier_transition(
+        &self,
+    ) -> Result<Option<PendingFrontierTransition>, DatabaseError> {
+        metered!(
+            DatabaseOperation::GetPendingFrontierTransition,
+            self,
+            tx(|tx| async move { tx.get_pending_frontier_transition().await })
+        )
+    }
+
     async fn get_batch_by_index(
         &self,
         batch_index: u64,
@@ -910,7 +993,456 @@ mod test {
     use rollup_node_primitives::{
         BatchCommitData, BatchInfo, BlockInfo, L1MessageEnvelope, L2BlockInfoWithL1Messages,
     };
-    use sea_orm::{ConnectionTrait, EntityTrait, Statement};
+    use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Statement};
+
+    /// Replacement coverage is authoritative even when a retry only reuses canonical blocks.
+    #[tokio::test]
+    async fn consolidation_replaces_deposit_mappings_only_in_covered_blocks_and_discarded_tail() {
+        use rollup_node_primitives::BatchStatus;
+
+        for (database_head, head_updated) in [(9, false), (9, true), (12, false), (12, true)] {
+            for include_deposits in [false, true] {
+                let db = setup_test_db().await;
+                let batch_info = BatchInfo::new(1, B256::repeat_byte(1));
+                db.insert_batch(BatchCommitData {
+                    hash: batch_info.hash,
+                    index: 1,
+                    block_number: 10,
+                    block_timestamp: 0,
+                    calldata: Arc::new(Bytes::new()),
+                    blob_versioned_hash: None,
+                    finalized_block_number: None,
+                    reverted_block_number: None,
+                })
+                .await
+                .unwrap();
+                // Safe prefix, removed deposit, moved deposit, retained deposit, unsafe tail.
+                let old_heights = [9, 10, 10, 11, 12];
+                let mut hashes = Vec::new();
+                for (index, height) in old_heights.into_iter().enumerate() {
+                    let transaction = TxL1Message {
+                        queue_index: index as u64,
+                        gas_limit: 100_000,
+                        to: Default::default(),
+                        value: Default::default(),
+                        sender: Default::default(),
+                        input: Bytes::new(),
+                    };
+                    hashes.push(transaction.tx_hash());
+                    db.insert_l1_message(L1MessageEnvelope::new(
+                        transaction,
+                        1,
+                        Some(height),
+                        None,
+                    ))
+                    .await
+                    .unwrap();
+                }
+                db.set_l2_head_block_number(database_head).await.unwrap();
+                let mut outcome = BatchConsolidationOutcome::new(
+                    batch_info,
+                    BatchStatus::Consolidated,
+                    head_updated,
+                );
+                for height in [10, 11] {
+                    outcome.push_block(L2BlockInfoWithL1Messages {
+                        block_info: BlockInfo::new(height, B256::repeat_byte(height as u8)),
+                        l1_messages: if include_deposits && height == 11 {
+                            vec![hashes[2], hashes[3]]
+                        } else {
+                            vec![]
+                        },
+                    });
+                }
+                let expected = vec![
+                    Some(9),
+                    None,
+                    include_deposits.then_some(11),
+                    include_deposits.then_some(11),
+                    (!head_updated).then_some(12),
+                ];
+                for _ in 0..2 {
+                    db.insert_batch_consolidation_outcome(outcome.clone()).await.unwrap();
+                    let actual = db
+                        .get_n_l1_messages(None, 10)
+                        .await
+                        .unwrap()
+                        .into_iter()
+                        .map(|m| m.l2_block_number)
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        actual, expected,
+                        "database_head={database_head}, head_updated={head_updated}, include_deposits={include_deposits}"
+                    );
+                    assert_eq!(
+                        db.get_l2_head_block_number().await.unwrap(),
+                        if head_updated { 11 } else { database_head.max(11) }
+                    );
+                }
+                // Empty outcomes carry no mapping coverage, including an empty replay.
+                for empty_head_updated in [false, true] {
+                    db.insert_batch_consolidation_outcome(BatchConsolidationOutcome::new(
+                        batch_info,
+                        BatchStatus::Consolidated,
+                        empty_head_updated,
+                    ))
+                    .await
+                    .unwrap();
+                    let actual = db
+                        .get_n_l1_messages(None, 10)
+                        .await
+                        .unwrap()
+                        .into_iter()
+                        .map(|m| m.l2_block_number)
+                        .collect::<Vec<_>>();
+                    assert_eq!(actual, expected);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn consolidation_mapping_replacement_rolls_back_when_frontier_intent_fails() {
+        use crate::StoredForkchoiceState;
+        use rollup_node_primitives::BatchStatus;
+
+        for head_updated in [false, true] {
+            let db = setup_test_db().await;
+            let batch_info = BatchInfo::new(1, B256::repeat_byte(1));
+            db.insert_batch(BatchCommitData {
+                hash: batch_info.hash,
+                index: 1,
+                block_number: 10,
+                block_timestamp: 0,
+                calldata: Arc::new(Bytes::new()),
+                blob_versioned_hash: None,
+                finalized_block_number: None,
+                reverted_block_number: None,
+            })
+            .await
+            .unwrap();
+            let transaction = TxL1Message {
+                queue_index: 0,
+                gas_limit: 100_000,
+                to: Default::default(),
+                value: Default::default(),
+                sender: Default::default(),
+                input: Bytes::new(),
+            };
+            db.insert_l1_message(L1MessageEnvelope::new(transaction, 1, Some(2), None))
+                .await
+                .unwrap();
+            let database_head = if head_updated { 3 } else { 1 };
+            db.set_l2_head_block_number(database_head).await.unwrap();
+            let tip = BlockInfo::new(2, B256::repeat_byte(2));
+            let expected = StoredForkchoiceState { head: tip, safe: tip, finalized: tip };
+            let error = db
+                .tx_mut(move |tx| async move {
+                    let mut outcome = BatchConsolidationOutcome::new(
+                        batch_info,
+                        BatchStatus::Consolidated,
+                        head_updated,
+                    );
+                    outcome.push_block(L2BlockInfoWithL1Messages {
+                        block_info: tip,
+                        l1_messages: vec![],
+                    });
+                    tx.insert_batch_consolidation_outcome(outcome).await?;
+                    assert_eq!(tx.get_n_l1_messages(None, 1).await?[0].l2_block_number, None);
+                    // The later intent write rejects a finalized rewind, just as in the derivation
+                    // caller.
+                    tx.set_pending_frontier_transition(PendingFrontierTransition {
+                        expected,
+                        target: StoredForkchoiceState {
+                            finalized: BlockInfo::new(1, B256::repeat_byte(1)),
+                            ..expected
+                        },
+                    })
+                    .await
+                })
+                .await
+                .unwrap_err();
+            assert!(matches!(error, DatabaseError::InvalidFrontierTransition(_)));
+            assert_eq!(db.get_n_l1_messages(None, 1).await.unwrap()[0].l2_block_number, Some(2));
+            assert_eq!(db.get_l2_head_block_number().await.unwrap(), database_head);
+            assert_eq!(
+                db.get_batch_status_by_hash(batch_info.hash).await.unwrap(),
+                Some(BatchStatus::Committed)
+            );
+            assert!(db.get_l2_block_and_batch_info_by_hash(tip.hash).await.unwrap().is_none());
+            assert!(db.get_pending_frontier_transition().await.unwrap().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn required_head_rewind_witness_is_atomic_persistent_and_cleared_with_its_intent() {
+        use crate::StoredForkchoiceState;
+
+        let original = setup_test_db().await;
+        let path = original.tmp_dir().unwrap().path().join("test.db");
+        let block = |number| BlockInfo::new(number, B256::repeat_byte(number as u8));
+        let expected =
+            StoredForkchoiceState { head: block(5), safe: block(1), finalized: block(0) };
+        let rewind = PendingFrontierTransition {
+            expected,
+            target: StoredForkchoiceState { head: block(2), ..expected },
+        };
+        let failed = original
+            .tx_mut(move |tx| async move {
+                tx.set_required_head_rewind(rewind).await?;
+                Err::<(), _>(DatabaseError::MissingSafeL2Frontier)
+            })
+            .await;
+        assert!(failed.is_err());
+        assert_eq!(original.get_pending_frontier_transition().await.unwrap(), None);
+        assert_eq!(original.get_required_head_rewind().await.unwrap(), None);
+        original.set_required_head_rewind(rewind).await.unwrap();
+        original.inner().get_connection().clone().close().await.unwrap();
+        let db = Database::new(path.to_str().unwrap()).await.unwrap();
+        assert_eq!(db.get_required_head_rewind().await.unwrap(), Some(rewind));
+        assert_eq!(db.get_pending_frontier_transition().await.unwrap(), Some(rewind));
+
+        // A failed replacement must preserve both the old marker and the exact old intent.
+        let replacement = PendingFrontierTransition {
+            expected,
+            target: StoredForkchoiceState { head: block(3), ..expected },
+        };
+        let failed = db
+            .tx_mut(move |tx| async move {
+                tx.set_pending_frontier_transition(replacement).await?;
+                Err::<(), _>(DatabaseError::MissingSafeL2Frontier)
+            })
+            .await;
+        assert!(failed.is_err());
+        assert_eq!(db.get_required_head_rewind().await.unwrap(), Some(rewind));
+        assert_eq!(db.get_pending_frontier_transition().await.unwrap(), Some(rewind));
+        db.set_pending_frontier_transition(replacement).await.unwrap();
+        assert_eq!(db.get_required_head_rewind().await.unwrap(), None);
+        // Reusing the exact earlier transition later must not resurrect its old marker.
+        db.set_pending_frontier_transition(rewind).await.unwrap();
+        assert_eq!(db.get_required_head_rewind().await.unwrap(), None);
+        db.set_required_head_rewind(rewind).await.unwrap();
+        db.clear_pending_frontier_transition().await.unwrap();
+        assert_eq!(db.get_pending_frontier_transition().await.unwrap(), None);
+        assert_eq!(db.get_required_head_rewind().await.unwrap(), None);
+        db.set_pending_frontier_transition(rewind).await.unwrap();
+        assert_eq!(db.get_required_head_rewind().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn frontier_journal_is_atomic_and_survives_database_reopen() {
+        use crate::StoredForkchoiceState;
+
+        let original = setup_test_db().await;
+        let path = original.tmp_dir().unwrap().path().join("test.db");
+        let db = &original;
+        let block = BlockInfo::new(1, B256::repeat_byte(1));
+        let expected = StoredForkchoiceState { head: block, safe: block, finalized: block };
+        let transition = PendingFrontierTransition {
+            expected,
+            target: StoredForkchoiceState {
+                head: BlockInfo::new(2, B256::repeat_byte(2)),
+                ..expected
+            },
+        };
+        db.set_l2_head_block_number(1).await.unwrap();
+        let error = db
+            .tx_mut(move |tx| async move {
+                tx.set_l2_head_block_number(2).await.unwrap();
+                tx.set_pending_frontier_transition(transition).await.unwrap();
+                Err::<(), _>(DatabaseError::MissingSafeL2Frontier)
+            })
+            .await;
+        assert!(error.is_err());
+        assert_eq!(db.get_l2_head_block_number().await.unwrap(), 1);
+        assert_eq!(db.get_pending_frontier_transition().await.unwrap(), None);
+
+        db.tx_mut(move |tx| async move {
+            tx.set_l2_head_block_number(2).await.unwrap();
+            tx.set_pending_frontier_transition(transition).await
+        })
+        .await
+        .unwrap();
+        db.inner().get_connection().clone().close().await.unwrap();
+        let db = Database::new(path.to_str().unwrap()).await.unwrap();
+        assert_eq!(db.get_pending_frontier_transition().await.unwrap(), Some(transition));
+        let updated = PendingFrontierTransition {
+            target: StoredForkchoiceState { safe: transition.target.head, ..transition.target },
+            ..transition
+        };
+        db.set_pending_frontier_transition(updated).await.unwrap();
+        assert_eq!(db.get_pending_frontier_transition().await.unwrap(), Some(updated));
+        db.clear_pending_frontier_transition().await.unwrap();
+        assert_eq!(db.get_pending_frontier_transition().await.unwrap(), None);
+        assert_eq!(db.get_l2_head_block_number().await.unwrap(), 2);
+        db.inner().get_connection().clone().close().await.unwrap();
+        drop(db);
+        let db = Database::new(path.to_str().unwrap()).await.unwrap();
+        assert_eq!(db.get_pending_frontier_transition().await.unwrap(), None);
+        assert_eq!(
+            db.get_confirmed_frontier_transition().await.unwrap().unwrap().transition,
+            updated
+        );
+    }
+
+    #[tokio::test]
+    async fn acknowledged_safe_history_upgrades_atomically_and_survives_reopen() {
+        use crate::{frontier_transition_types::CONFIRMED_FRONTIER_KEY, StoredForkchoiceState};
+        use rollup_node_primitives::Metadata;
+
+        let original = setup_test_db().await;
+        let block = |number| BlockInfo::new(number, B256::repeat_byte(number as u8));
+        let state =
+            |safe| StoredForkchoiceState { head: block(5), safe: block(safe), finalized: block(0) };
+        let first = PendingFrontierTransition { expected: state(3), target: state(2) };
+        // Upgrade a real old-format record, which contains only expected/target.
+        let row: models::metadata::ActiveModel = Metadata {
+            key: CONFIRMED_FRONTIER_KEY.into(),
+            value: serde_json::to_string(&first).unwrap(),
+        }
+        .into();
+        models::metadata::Entity::insert(row)
+            .exec(original.inner().get_connection())
+            .await
+            .unwrap();
+        let legacy = original.get_confirmed_frontier_transition().await.unwrap().unwrap();
+        assert_eq!(legacy.transition, first);
+        assert_eq!(legacy.safe_starts().collect::<Vec<_>>(), [block(3)]);
+
+        let second = PendingFrontierTransition { expected: state(2), target: state(1) };
+        original.set_pending_frontier_transition(second).await.unwrap();
+        let result = original
+            .tx_mut(|tx| async move {
+                tx.clear_pending_frontier_transition().await?;
+                Err::<(), _>(DatabaseError::MissingSafeL2Frontier)
+            })
+            .await;
+        assert!(result.is_err());
+        assert_eq!(original.get_pending_frontier_transition().await.unwrap(), Some(second));
+        assert_eq!(original.get_confirmed_frontier_transition().await.unwrap(), Some(legacy));
+        original.clear_pending_frontier_transition().await.unwrap();
+
+        // A head-only acknowledgement must not erase either rewind's evidence.
+        let head_only = PendingFrontierTransition {
+            expected: state(1),
+            target: StoredForkchoiceState { head: block(4), ..state(1) },
+        };
+        original.set_pending_frontier_transition(head_only).await.unwrap();
+        original.clear_pending_frontier_transition().await.unwrap();
+        let path = original.tmp_dir().unwrap().path().join("test.db");
+        original.inner().get_connection().clone().close().await.unwrap();
+        let db = Database::new(path.to_str().unwrap()).await.unwrap();
+        assert_eq!(db.get_pending_frontier_transition().await.unwrap(), None);
+        let confirmed = db.get_confirmed_frontier_transition().await.unwrap().unwrap();
+        for number in 1..=3 {
+            assert!(confirmed.safe_starts().any(|start| start == block(number)));
+        }
+
+        // Duplicate recovery acknowledgements do not grow the history.
+        let repair = PendingFrontierTransition { expected: state(3), target: head_only.target };
+        db.set_pending_frontier_transition(repair).await.unwrap();
+        db.clear_pending_frontier_transition().await.unwrap();
+        let repaired = db.get_confirmed_frontier_transition().await.unwrap().unwrap();
+        db.set_pending_frontier_transition(repair).await.unwrap();
+        db.clear_pending_frontier_transition().await.unwrap();
+        assert_eq!(db.get_confirmed_frontier_transition().await.unwrap(), Some(repaired));
+
+        // Canonical finalized starts can be pruned; a height alone is not sufficient.
+        db.insert_blocks(vec![block(1), block(2), block(3)], BatchInfo::new(0, B256::ZERO))
+            .await
+            .unwrap();
+        db.update_batch_status(B256::ZERO, rollup_node_primitives::BatchStatus::Finalized)
+            .await
+            .unwrap();
+        for number in [2, 3] {
+            let expected =
+                db.get_confirmed_frontier_transition().await.unwrap().unwrap().transition.target;
+            let target = StoredForkchoiceState { finalized: block(number), ..state(number) };
+            db.set_pending_frontier_transition(PendingFrontierTransition { expected, target })
+                .await
+                .unwrap();
+            db.clear_pending_frontier_transition().await.unwrap();
+            let starts = db
+                .get_confirmed_frontier_transition()
+                .await
+                .unwrap()
+                .unwrap()
+                .safe_starts()
+                .collect::<Vec<_>>();
+            // The latest expected safe remains part of the transition itself.
+            assert_eq!(starts, if number == 2 { vec![block(1), block(3)] } else { vec![block(2)] });
+        }
+    }
+
+    #[tokio::test]
+    async fn corrupt_confirmed_history_does_not_acknowledge_pending_transition() {
+        use crate::{frontier_transition_types::CONFIRMED_FRONTIER_KEY, StoredForkchoiceState};
+        use rollup_node_primitives::Metadata;
+
+        let db = setup_test_db().await;
+        let block = |number| BlockInfo::new(number, B256::repeat_byte(number as u8));
+        let expected =
+            StoredForkchoiceState { head: block(3), safe: block(3), finalized: block(1) };
+        let transition = PendingFrontierTransition {
+            expected,
+            target: StoredForkchoiceState { safe: block(2), ..expected },
+        };
+        db.set_pending_frontier_transition(transition).await.unwrap();
+        let mut invalid = serde_json::to_value(transition).unwrap();
+        invalid["previous_safe"] = serde_json::json!([expected.safe]);
+        for value in ["{".to_owned(), invalid.to_string()] {
+            let row: models::metadata::ActiveModel =
+                Metadata { key: CONFIRMED_FRONTIER_KEY.into(), value }.into();
+            models::metadata::Entity::insert(row).exec(db.inner().get_connection()).await.unwrap();
+            assert!(db.get_confirmed_frontier_transition().await.is_err());
+            assert!(db.clear_pending_frontier_transition().await.is_err());
+            assert_eq!(db.get_pending_frontier_transition().await.unwrap(), Some(transition));
+            models::metadata::Entity::delete_by_id(CONFIRMED_FRONTIER_KEY)
+                .exec(db.inner().get_connection())
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_frontier_journal_is_rejected_on_write_read_and_acknowledgement() {
+        use crate::{frontier_transition_types::FRONTIER_TRANSITION_KEY, StoredForkchoiceState};
+        use rollup_node_primitives::Metadata;
+        let db = setup_test_db().await;
+        let low = BlockInfo::new(1, B256::repeat_byte(1));
+        let high = BlockInfo::new(2, B256::repeat_byte(2));
+        let valid = StoredForkchoiceState { head: high, safe: high, finalized: low };
+        let invalid_states = [
+            StoredForkchoiceState { head: low, ..valid },
+            StoredForkchoiceState { safe: low, finalized: high, ..valid },
+            StoredForkchoiceState { safe: BlockInfo::new(2, B256::repeat_byte(3)), ..valid },
+            StoredForkchoiceState { finalized: BlockInfo::new(1, B256::repeat_byte(3)), ..valid },
+        ];
+        let mut rows = vec![("{".to_owned(), false), (r#"{"kind":"unknown"}"#.to_owned(), false)];
+        for invalid in invalid_states {
+            let transition = PendingFrontierTransition { expected: valid, target: invalid };
+            assert!(matches!(
+                db.set_pending_frontier_transition(transition).await,
+                Err(DatabaseError::InvalidFrontierTransition(_))
+            ));
+            rows.push((serde_json::to_string(&transition).unwrap(), true));
+        }
+        for (value, invalid_state) in rows {
+            let row: models::metadata::ActiveModel =
+                Metadata { key: FRONTIER_TRANSITION_KEY.into(), value }.into();
+            models::metadata::Entity::insert(row).exec(db.inner().get_connection()).await.unwrap();
+            assert!(matches!(
+                (invalid_state, db.get_pending_frontier_transition().await),
+                (true, Err(DatabaseError::InvalidFrontierTransition(_))) |
+                    (false, Err(DatabaseError::MetadataSerdeError(_)))
+            ));
+            assert!(db.clear_pending_frontier_transition().await.is_err());
+            models::metadata::Entity::delete_by_id(FRONTIER_TRANSITION_KEY)
+                .exec(db.inner().get_connection())
+                .await
+                .unwrap();
+        }
+    }
 
     #[tokio::test]
     async fn test_database_round_trip_batch_commit() {
@@ -1248,7 +1780,7 @@ mod test {
         let db = setup_test_db().await;
 
         // Generate unstructured bytes.
-        let mut bytes = [0u8; 2048];
+        let mut bytes = [0u8; 10240];
         rand::rng().fill(bytes.as_mut_slice());
         let mut u = Unstructured::new(&bytes);
 
@@ -1390,6 +1922,33 @@ mod test {
         // Should return the highest safe block (block 201)
         let latest_safe = db.get_latest_safe_l2_info().await.unwrap();
         assert_eq!(latest_safe, (safe_block_2, batch_info));
+    }
+
+    #[tokio::test]
+    async fn insert_genesis_block_replaces_the_migration_seed() {
+        let db = setup_test_db().await;
+        let canonical_hash = B256::repeat_byte(0x42);
+
+        db.insert_genesis_block(canonical_hash).await.unwrap();
+
+        let genesis_rows = models::l2_block::Entity::find()
+            .filter(models::l2_block::Column::BlockNumber.eq(0))
+            .all(db.inner().get_connection())
+            .await
+            .unwrap();
+        assert_eq!(genesis_rows.len(), 1);
+        assert_eq!(genesis_rows[0].block_info(), BlockInfo::new(0, canonical_hash));
+    }
+
+    #[tokio::test]
+    async fn missing_safe_l2_frontier_is_an_error() {
+        let db = setup_test_db().await;
+        models::l2_block::Entity::delete_many().exec(db.inner().get_connection()).await.unwrap();
+
+        assert!(matches!(
+            db.get_latest_safe_l2_info().await,
+            Err(DatabaseError::MissingSafeL2Frontier)
+        ));
     }
 
     #[tokio::test]
@@ -1624,17 +2183,19 @@ mod test {
         }
     }
 
-    /// The static dev migration seeds the Scroll dev genesis row; a custom
-    /// chain's real genesis is inserted separately and CANNOT overwrite it
-    /// (the insert's conflict key includes the hash). The startup
-    /// reconciliation must delete the mismatched row so highest-block
-    /// queries — the safe head among them — are deterministic.
+    /// The static dev migration seeds the Scroll dev genesis row; an older
+    /// release inserted a custom chain's real genesis beside it (the insert's
+    /// conflict key includes the hash). The startup reconciliation must delete
+    /// the mismatched row so highest-block queries — the safe head among them —
+    /// are deterministic.
     #[tokio::test]
     async fn mismatched_genesis_rows_are_reconciled() {
         let db = setup_test_db().await;
         // Two rows now sit at height 0: the migration's Scroll dev genesis
         // and this "custom chain" genesis.
-        db.insert_genesis_block(B256::ZERO).await.unwrap();
+        db.insert_blocks(vec![BlockInfo::new(0, B256::ZERO)], BatchInfo::new(0, B256::ZERO))
+            .await
+            .unwrap();
         assert_eq!(
             db.delete_mismatched_genesis_blocks(B256::ZERO).await.unwrap(),
             1,
@@ -1695,7 +2256,9 @@ mod test {
         let db = setup_test_db().await;
         // Both height-0 rows, exactly as the older startup left them, under
         // history that has already advanced past genesis.
-        db.insert_genesis_block(B256::ZERO).await.unwrap();
+        db.insert_blocks(vec![BlockInfo::new(0, B256::ZERO)], BatchInfo::new(0, B256::ZERO))
+            .await
+            .unwrap();
         db.set_l2_head_block_number(7).await.unwrap();
 
         assert_eq!(
@@ -1812,7 +2375,9 @@ mod test {
     #[tokio::test]
     async fn fresh_database_reconciles_a_legacy_genesis_duplicate() {
         let db = setup_test_db().await;
-        db.insert_genesis_block(B256::ZERO).await.unwrap();
+        db.insert_blocks(vec![BlockInfo::new(0, B256::ZERO)], BatchInfo::new(0, B256::ZERO))
+            .await
+            .unwrap();
         assert_eq!(db.get_l2_head_block_number().await.unwrap(), 0);
 
         assert_eq!(
@@ -1884,5 +2449,493 @@ mod test {
             db.reconcile_genesis_block(B256::ZERO, seeded_test_genesis()).await,
             Err(DatabaseError::GenesisMismatch { .. })
         ));
+    }
+
+    /// A database written before the legacy column existed holds Scroll's masked hashes in
+    /// `queue_hash` (testnet nodes before the full-width rule). The schema migration adds the
+    /// legacy column, and the startup recompute moves the masked chain there and writes the
+    /// full-width chain to `queue_hash`, once.
+    #[tokio::test]
+    async fn queue_hash_migration_on_an_existing_database() {
+        use rollup_node_primitives::{fold_legacy_queue_hash, fold_queue_hash};
+        use scroll_migration::{Migrator, MigratorTrait, ScrollDevMigrationInfo};
+
+        let (db, messages, full, legacy) = old_queue_hash_database().await;
+        let inner = db.inner();
+        let conn = inner.get_connection();
+
+        // The new image: schema migration, then the startup recompute.
+        Migrator::<ScrollDevMigrationInfo>::up(conn, None).await.unwrap();
+        // The added column is SQL NULL on existing rows, never a zero value.
+        assert_eq!(legacy_queue_hash_null_count(&db).await, 4);
+        assert_eq!(db.recompute_l1_message_queue_hashes(0, true).await.unwrap(), Some(4));
+        assert_eq!(legacy_queue_hash_null_count(&db).await, 0);
+        // Once per rule set.
+        assert_eq!(db.recompute_l1_message_queue_hashes(0, true).await.unwrap(), None);
+
+        let stored =
+            db.get_n_l1_messages(Some(L1MessageKey::from_queue_index(0)), 10).await.unwrap();
+        assert_eq!(stored.iter().map(|m| m.transaction.clone()).collect::<Vec<_>>(), messages);
+        assert_eq!(stored.iter().map(|m| m.queue_hash.unwrap()).collect::<Vec<_>>(), full);
+        assert_eq!(stored.iter().map(|m| m.legacy_queue_hash.unwrap()).collect::<Vec<_>>(), legacy);
+
+        // A batch below codec 12 finds its messages by the masked hash, one from 12 by the full
+        // one; neither hash is found in the other rule's column.
+        let after = |key| {
+            let db = &db;
+            async move { db.get_n_l1_messages(Some(key), 2).await }
+        };
+        assert_eq!(
+            after(L1MessageKey::from_batch_queue_hash(legacy[1], 11)).await.unwrap(),
+            stored[1..3]
+        );
+        assert_eq!(
+            after(L1MessageKey::from_batch_queue_hash(full[1], 12)).await.unwrap(),
+            stored[1..3]
+        );
+        assert!(after(L1MessageKey::from_batch_queue_hash(legacy[1], 12)).await.is_err());
+        assert!(after(L1MessageKey::from_batch_queue_hash(full[1], 11)).await.is_err());
+
+        // A rule change rewrites again: without the legacy chain, its column is cleared.
+        assert_eq!(db.recompute_l1_message_queue_hashes(0, false).await.unwrap(), Some(4));
+        let stored =
+            db.get_n_l1_messages(Some(L1MessageKey::from_queue_index(0)), 10).await.unwrap();
+        assert!(stored.iter().all(|m| m.legacy_queue_hash.is_none()));
+        assert_eq!(legacy_queue_hash_null_count(&db).await, 4);
+        assert_eq!(stored.iter().map(|m| m.queue_hash.unwrap()).collect::<Vec<_>>(), full);
+
+        // Messages below the V2 start index have no queue hash; the chain starts at the index.
+        assert_eq!(db.recompute_l1_message_queue_hashes(2, true).await.unwrap(), Some(2));
+        let stored =
+            db.get_n_l1_messages(Some(L1MessageKey::from_queue_index(0)), 10).await.unwrap();
+        assert!(stored[..2]
+            .iter()
+            .all(|m| m.queue_hash.is_none() && m.legacy_queue_hash.is_none()));
+        assert_eq!(stored[2].queue_hash, Some(fold_queue_hash(B256::ZERO, messages[2].tx_hash())));
+        assert_eq!(
+            stored[3].legacy_queue_hash,
+            Some(fold_legacy_queue_hash(
+                fold_legacy_queue_hash(B256::ZERO, messages[2].tx_hash()),
+                messages[3].tx_hash()
+            ))
+        );
+    }
+
+    /// Seed the pre-upgrade schema exactly as an old node would, before the legacy column.
+    async fn old_queue_hash_database() -> (Database, Vec<TxL1Message>, Vec<B256>, Vec<B256>) {
+        use rollup_node_primitives::{fold_legacy_queue_hash, fold_queue_hash};
+        use scroll_migration::{Migrator, MigratorTrait, ScrollDevMigrationInfo};
+
+        let dir = tempfile::Builder::new().prefix("scroll-test-").tempdir().unwrap();
+        let db = Database::test(dir).await.unwrap();
+        let inner = db.inner();
+        let conn = inner.get_connection();
+        // Every migration before the legacy column.
+        let before = Migrator::<ScrollDevMigrationInfo>::migrations().len() as u32 - 1;
+        Migrator::<ScrollDevMigrationInfo>::up(conn, Some(before)).await.unwrap();
+
+        let messages: Vec<TxL1Message> = (0..4u64)
+            .map(|queue_index| TxL1Message {
+                queue_index,
+                gas_limit: 100_000 + queue_index,
+                value: alloy_primitives::U256::from(queue_index),
+                ..Default::default()
+            })
+            .collect();
+        let (mut full, mut legacy) = (Vec::new(), Vec::new());
+        let (mut prev_full, mut prev_legacy) = (B256::ZERO, B256::ZERO);
+        for message in &messages {
+            prev_full = fold_queue_hash(prev_full, message.tx_hash());
+            prev_legacy = fold_legacy_queue_hash(prev_legacy, message.tx_hash());
+            full.push(prev_full);
+            legacy.push(prev_legacy);
+            // The old node stored the masked hash in `queue_hash`.
+            let hex = |bytes: &[u8]| alloy_primitives::hex::encode(bytes);
+            conn.execute_unprepared(&format!(
+                "INSERT INTO l1_message (queue_index, queue_hash, hash, l1_block_number, \
+                 l2_block_number, gas_limit, \"to\", value, sender, input, skipped) VALUES \
+                 ({}, X'{}', X'{}', {}, NULL, '{}', X'{}', X'{}', X'{}', X'', 0)",
+                message.queue_index,
+                hex(prev_legacy.as_slice()),
+                hex(message.tx_hash().as_slice()),
+                message.queue_index + 1,
+                message.gas_limit,
+                hex(message.to.as_slice()),
+                hex(&message.value.to_le_bytes::<32>()),
+                hex(message.sender.as_slice()),
+            ))
+            .await
+            .unwrap();
+        }
+
+        (db, messages, full, legacy)
+    }
+
+    /// `SQLite` commits DDL before the migrator records success. Retry either interrupted up.
+    #[tokio::test]
+    async fn queue_hash_migration_recovers_partial_up() {
+        use scroll_migration::{Migrator, MigratorTrait, ScrollDevMigrationInfo};
+
+        for index_exists in [false, true] {
+            let (db, messages, _, legacy) = old_queue_hash_database().await;
+            let inner = db.inner();
+            let conn = inner.get_connection();
+            let before = Migrator::<ScrollDevMigrationInfo>::get_applied_migrations(conn)
+                .await
+                .unwrap()
+                .len();
+            conn.execute_unprepared(
+                "ALTER TABLE l1_message ADD COLUMN legacy_queue_hash BLOB NULL",
+            )
+            .await
+            .unwrap();
+            if index_exists {
+                conn.execute_unprepared("CREATE UNIQUE INDEX idx_l1_message_legacy_queue_hash ON l1_message (legacy_queue_hash)").await.unwrap();
+            }
+            // Preserve even a partially populated column rather than overwriting it on retry.
+            conn.execute(Statement::from_sql_and_values(
+                conn.get_database_backend(),
+                "UPDATE l1_message SET legacy_queue_hash = ? WHERE queue_index = 0",
+                [legacy[0].to_vec().into()],
+            ))
+            .await
+            .unwrap();
+            let stored =
+                db.get_n_l1_messages(Some(L1MessageKey::from_queue_index(0)), 10).await.unwrap();
+
+            Migrator::<ScrollDevMigrationInfo>::up(conn, None).await.unwrap();
+            assert_eq!(
+                Migrator::<ScrollDevMigrationInfo>::get_applied_migrations(conn)
+                    .await
+                    .unwrap()
+                    .len(),
+                before + 1
+            );
+            assert!(Migrator::<ScrollDevMigrationInfo>::get_pending_migrations(conn)
+                .await
+                .unwrap()
+                .is_empty());
+            assert_eq!(
+                db.get_n_l1_messages(Some(L1MessageKey::from_queue_index(0)), 10).await.unwrap(),
+                stored
+            );
+            assert_eq!(stored.iter().map(|m| m.transaction.clone()).collect::<Vec<_>>(), messages);
+            assert_eq!(stored.iter().map(|m| m.queue_hash.unwrap()).collect::<Vec<_>>(), legacy);
+            assert_eq!(stored[0].legacy_queue_hash, Some(legacy[0]));
+            assert_eq!(legacy_queue_hash_null_count(&db).await, 3);
+            // Check actual constraint behavior, without the database service's retry loop.
+            assert!(conn.execute_unprepared("UPDATE l1_message SET legacy_queue_hash = (SELECT legacy_queue_hash FROM l1_message WHERE queue_index = 0) WHERE queue_index = 1").await.is_err());
+            conn.execute_unprepared("UPDATE l1_message SET legacy_queue_hash = NULL")
+                .await
+                .unwrap();
+            assert_eq!(legacy_queue_hash_null_count(&db).await, 4);
+            Migrator::<ScrollDevMigrationInfo>::up(conn, None).await.unwrap();
+        }
+    }
+
+    /// An old partial upgrade can leave an empty legacy column beside a trusted marker.
+    #[tokio::test]
+    async fn queue_hash_migration_partial_up_invalidates_stale_marker() {
+        use scroll_migration::{Migrator, MigratorTrait, ScrollDevMigrationInfo};
+        use sea_orm::sqlx::{Executor, Row};
+
+        for index_exists in [false, true] {
+            let (db, messages, full, legacy) = old_queue_hash_database().await;
+            let inner = db.inner();
+            let conn = inner.get_connection();
+            Migrator::<ScrollDevMigrationInfo>::up(conn, None).await.unwrap();
+            assert_eq!(db.recompute_l1_message_queue_hashes(0, true).await.unwrap(), Some(4));
+            let marker = queue_hash_rule_marker(&db).await.unwrap();
+            assert_eq!(marker, "v1;start=0;legacy=true");
+            // Hold a connection with the old schema cached while down uses the rest of the
+            // pool. This makes the stale-schema fixture race deterministic.
+            let mut fixture_conn = conn.get_sqlite_connection_pool().acquire().await.unwrap();
+            let columns: Vec<String> =
+                sea_orm::sqlx::query_scalar("SELECT name FROM pragma_table_info('l1_message')")
+                    .fetch_all(&mut *fixture_conn)
+                    .await
+                    .unwrap();
+            assert!(columns.iter().any(|name| name == "legacy_queue_hash"));
+            Migrator::<ScrollDevMigrationInfo>::down(conn, Some(1)).await.unwrap();
+            // Old down dropped the column but retained the matching completion marker.
+            conn.execute(Statement::from_sql_and_values(
+                conn.get_database_backend(),
+                "INSERT INTO metadata (key, value) VALUES ('l1_message_queue_hash_rule', ?)",
+                [marker.clone().into()],
+            ))
+            .await
+            .unwrap();
+            // Old up committed DDL without invalidating the marker or recording success.
+            // Refresh this connection's schema before preparing ADD COLUMN: SQLite can reject
+            // it against the cached pre-down schema before checking the schema version.
+            let columns = sea_orm::sqlx::query("PRAGMA table_info(l1_message)")
+                .fetch_all(&mut *fixture_conn)
+                .await
+                .unwrap();
+            assert!(columns
+                .iter()
+                .all(|column| column.get::<String, _>("name") != "legacy_queue_hash"));
+            fixture_conn
+                .execute("ALTER TABLE l1_message ADD COLUMN legacy_queue_hash BLOB NULL")
+                .await
+                .unwrap();
+            if index_exists {
+                fixture_conn.execute("CREATE UNIQUE INDEX idx_l1_message_legacy_queue_hash ON l1_message (legacy_queue_hash)").await.unwrap();
+            }
+            drop(fixture_conn);
+            assert_eq!(
+                Migrator::<ScrollDevMigrationInfo>::get_pending_migrations(conn)
+                    .await
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert_eq!(queue_hash_rule_marker(&db).await, Some(marker.clone()));
+            assert_eq!(legacy_queue_hash_null_count(&db).await, 4);
+            let before =
+                db.get_n_l1_messages(Some(L1MessageKey::from_queue_index(0)), 10).await.unwrap();
+            assert_eq!(before.iter().map(|m| m.transaction.clone()).collect::<Vec<_>>(), messages);
+            assert_eq!(before.iter().map(|m| m.queue_hash.unwrap()).collect::<Vec<_>>(), full);
+
+            Migrator::<ScrollDevMigrationInfo>::up(conn, None).await.unwrap();
+            assert!(queue_hash_rule_marker(&db).await.is_none());
+            assert!(Migrator::<ScrollDevMigrationInfo>::get_pending_migrations(conn)
+                .await
+                .unwrap()
+                .is_empty());
+            assert_eq!(
+                db.get_n_l1_messages(Some(L1MessageKey::from_queue_index(0)), 10).await.unwrap(),
+                before
+            );
+            assert_eq!(legacy_queue_hash_null_count(&db).await, 4);
+            assert_eq!(db.recompute_l1_message_queue_hashes(0, true).await.unwrap(), Some(4));
+            let stored =
+                db.get_n_l1_messages(Some(L1MessageKey::from_queue_index(0)), 10).await.unwrap();
+            assert_eq!(stored.iter().map(|m| m.transaction.clone()).collect::<Vec<_>>(), messages);
+            assert_eq!(stored.iter().map(|m| m.queue_hash.unwrap()).collect::<Vec<_>>(), full);
+            assert_eq!(
+                stored.iter().map(|m| m.legacy_queue_hash.unwrap()).collect::<Vec<_>>(),
+                legacy
+            );
+            for (hash, codec) in [(legacy[1], 11), (full[1], 12)] {
+                assert_eq!(
+                    db.get_n_l1_messages(Some(L1MessageKey::from_batch_queue_hash(hash, codec)), 2)
+                        .await
+                        .unwrap(),
+                    stored[1..3]
+                );
+            }
+            assert_eq!(db.recompute_l1_message_queue_hashes(0, true).await.unwrap(), None);
+            // Once applied, ordinary startup migration checks must preserve the trusted marker.
+            Migrator::<ScrollDevMigrationInfo>::up(conn, None).await.unwrap();
+            assert_eq!(queue_hash_rule_marker(&db).await, Some(marker));
+            assert_eq!(db.recompute_l1_message_queue_hashes(0, true).await.unwrap(), None);
+        }
+    }
+
+    /// A downgrade destroys the legacy chain, so its completion marker cannot survive it.
+    #[tokio::test]
+    async fn queue_hash_migration_down_up_recomputes() {
+        use scroll_migration::{Migrator, MigratorTrait, ScrollDevMigrationInfo};
+
+        // Resume down with no DDL applied, only the index dropped, or the column also dropped.
+        for dropped_steps in 0..=2 {
+            let (db, _, full, legacy) = old_queue_hash_database().await;
+            let inner = db.inner();
+            let conn = inner.get_connection();
+            Migrator::<ScrollDevMigrationInfo>::up(conn, None).await.unwrap();
+            assert_eq!(db.recompute_l1_message_queue_hashes(0, true).await.unwrap(), Some(4));
+            let stored =
+                db.get_n_l1_messages(Some(L1MessageKey::from_queue_index(0)), 10).await.unwrap();
+            assert!(queue_hash_rule_marker(&db).await.is_some());
+            if dropped_steps >= 1 {
+                conn.execute_unprepared("DROP INDEX idx_l1_message_legacy_queue_hash")
+                    .await
+                    .unwrap();
+            }
+            if dropped_steps >= 2 {
+                conn.execute_unprepared("ALTER TABLE l1_message DROP COLUMN legacy_queue_hash")
+                    .await
+                    .unwrap();
+            }
+            Migrator::<ScrollDevMigrationInfo>::down(conn, Some(1)).await.unwrap();
+            assert!(queue_hash_rule_marker(&db).await.is_none());
+            Migrator::<ScrollDevMigrationInfo>::up(conn, None).await.unwrap();
+            assert_eq!(legacy_queue_hash_null_count(&db).await, 4);
+            assert_eq!(db.recompute_l1_message_queue_hashes(0, true).await.unwrap(), Some(4));
+            assert_eq!(
+                db.get_n_l1_messages(Some(L1MessageKey::from_queue_index(0)), 10).await.unwrap(),
+                stored
+            );
+            assert_eq!(db.recompute_l1_message_queue_hashes(0, true).await.unwrap(), None);
+            for (hash, codec) in [(legacy[1], 8), (full[1], 12)] {
+                assert_eq!(
+                    db.get_n_l1_messages(Some(L1MessageKey::from_batch_queue_hash(hash, codec)), 2)
+                        .await
+                        .unwrap(),
+                    stored[1..3]
+                );
+            }
+        }
+    }
+
+    /// If `SQLite` rejects destructive DDL, the marker must already be gone before retrying.
+    #[tokio::test]
+    async fn queue_hash_migration_down_invalidates_before_ddl() {
+        use scroll_migration::{Migrator, MigratorTrait, ScrollDevMigrationInfo};
+
+        let (db, _, _, _) = old_queue_hash_database().await;
+        let inner = db.inner();
+        let conn = inner.get_connection();
+        Migrator::<ScrollDevMigrationInfo>::up(conn, None).await.unwrap();
+        db.recompute_l1_message_queue_hashes(0, true).await.unwrap();
+        assert!(queue_hash_rule_marker(&db).await.is_some());
+        // SQLite refuses DROP COLUMN while a view still references it.
+        conn.execute_unprepared(
+            "CREATE VIEW legacy_hashes AS SELECT legacy_queue_hash FROM l1_message",
+        )
+        .await
+        .unwrap();
+        assert!(Migrator::<ScrollDevMigrationInfo>::down(conn, Some(1)).await.is_err());
+        assert!(queue_hash_rule_marker(&db).await.is_none());
+        conn.execute_unprepared("DROP VIEW legacy_hashes").await.unwrap();
+        Migrator::<ScrollDevMigrationInfo>::down(conn, Some(1)).await.unwrap();
+        Migrator::<ScrollDevMigrationInfo>::up(conn, None).await.unwrap();
+        assert_eq!(db.recompute_l1_message_queue_hashes(0, true).await.unwrap(), Some(4));
+    }
+
+    /// Old buggy downgrades could leave a trusted marker beside a missing legacy column.
+    #[tokio::test]
+    async fn queue_hash_migration_recreation_invalidates_stale_marker() {
+        use scroll_migration::{Migrator, MigratorTrait, ScrollDevMigrationInfo};
+
+        let (db, _, _, _) = old_queue_hash_database().await;
+        let inner = db.inner();
+        let conn = inner.get_connection();
+        Migrator::<ScrollDevMigrationInfo>::up(conn, None).await.unwrap();
+        assert_eq!(db.recompute_l1_message_queue_hashes(0, true).await.unwrap(), Some(4));
+        let stored =
+            db.get_n_l1_messages(Some(L1MessageKey::from_queue_index(0)), 10).await.unwrap();
+        let marker = queue_hash_rule_marker(&db).await.unwrap();
+        Migrator::<ScrollDevMigrationInfo>::down(conn, Some(1)).await.unwrap();
+        // Reproduce the old down behavior regardless of whether down now deletes the marker.
+        conn.execute(Statement::from_sql_and_values(
+            conn.get_database_backend(),
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES ('l1_message_queue_hash_rule', ?)",
+            [marker.into()],
+        ))
+        .await
+        .unwrap();
+        // If invalidation fails, up must not have created a newly empty column yet.
+        conn.execute_unprepared(
+            "CREATE TRIGGER block_rule_invalidation BEFORE DELETE ON metadata \
+             WHEN OLD.key = 'l1_message_queue_hash_rule' BEGIN \
+             SELECT RAISE(FAIL, 'blocked rule invalidation'); END",
+        )
+        .await
+        .unwrap();
+        assert!(Migrator::<ScrollDevMigrationInfo>::up(conn, None).await.is_err());
+        assert!(!scroll_migration::SchemaManager::new(conn)
+            .has_column("l1_message", "legacy_queue_hash")
+            .await
+            .unwrap());
+        assert!(queue_hash_rule_marker(&db).await.is_some());
+        conn.execute_unprepared("DROP TRIGGER block_rule_invalidation").await.unwrap();
+        Migrator::<ScrollDevMigrationInfo>::up(conn, None).await.unwrap();
+        assert!(queue_hash_rule_marker(&db).await.is_none());
+        assert_eq!(legacy_queue_hash_null_count(&db).await, 4);
+        assert_eq!(db.recompute_l1_message_queue_hashes(0, true).await.unwrap(), Some(4));
+        assert_eq!(
+            db.get_n_l1_messages(Some(L1MessageKey::from_queue_index(0)), 10).await.unwrap(),
+            stored
+        );
+    }
+
+    async fn queue_hash_rule_marker(db: &Database) -> Option<String> {
+        models::metadata::Entity::find_by_id("l1_message_queue_hash_rule")
+            .one(db.inner().get_connection())
+            .await
+            .unwrap()
+            .map(|m| m.value)
+    }
+
+    /// Rows whose `legacy_queue_hash` is SQL NULL (as opposed to a stored zero value).
+    async fn legacy_queue_hash_null_count(db: &Database) -> i64 {
+        let inner = db.inner();
+        let row = inner
+            .get_connection()
+            .query_one(Statement::from_string(
+                sea_orm::DatabaseBackend::Sqlite,
+                "SELECT COUNT(*) AS n FROM l1_message WHERE legacy_queue_hash IS NULL",
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        row.try_get("", "n").unwrap()
+    }
+
+    /// Where the legacy chain is never computed (`TsukiV2` at genesis, e.g. mainnet), every
+    /// message is stored with a NULL legacy hash. The unique index allows any number of NULLs,
+    /// so consecutive messages all land.
+    #[tokio::test]
+    async fn messages_without_a_legacy_queue_hash_store_null_and_all_land() {
+        use rollup_node_primitives::fold_queue_hash;
+
+        let db = setup_test_db().await;
+        let mut full = B256::ZERO;
+        for queue_index in 0..6u64 {
+            let message = TxL1Message { queue_index, gas_limit: 21_000, ..Default::default() };
+            full = fold_queue_hash(full, message.tx_hash());
+            let envelope = L1MessageEnvelope::new(message, 1, None, Some(full));
+            assert_eq!(envelope.legacy_queue_hash, None);
+            // Bounded, so a constraint error retried by the service fails the test, not hangs it.
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                db.insert_l1_message(envelope),
+            )
+            .await
+            .expect("insert must not spin on a constraint error")
+            .unwrap();
+        }
+        let stored =
+            db.get_n_l1_messages(Some(L1MessageKey::from_queue_index(0)), 10).await.unwrap();
+        assert_eq!(stored.len(), 6);
+        assert!(stored.iter().all(|m| m.legacy_queue_hash.is_none()));
+        assert_eq!(legacy_queue_hash_null_count(&db).await, 6);
+
+        // The startup recompute without the legacy chain also leaves NULLs.
+        assert_eq!(db.recompute_l1_message_queue_hashes(0, false).await.unwrap(), Some(6));
+        assert_eq!(legacy_queue_hash_null_count(&db).await, 6);
+    }
+
+    /// A recompute that fails (a gap in the stored queue) changes nothing: both columns and the
+    /// metadata marker stay as they were, and the node refuses to start instead of half-writing.
+    #[tokio::test]
+    async fn a_failed_queue_hash_recompute_changes_nothing() {
+        let db = setup_test_db().await;
+        for queue_index in [0u64, 1, 3] {
+            let message = TxL1Message { queue_index, gas_limit: 21_000, ..Default::default() };
+            let marker = B256::repeat_byte(queue_index as u8 + 1);
+            db.insert_l1_message(
+                L1MessageEnvelope::new(message, 1, None, Some(marker))
+                    .with_legacy_queue_hash(Some(marker)),
+            )
+            .await
+            .unwrap();
+        }
+        let before =
+            db.get_n_l1_messages(Some(L1MessageKey::from_queue_index(0)), 10).await.unwrap();
+
+        let err = db.recompute_l1_message_queue_hashes(0, true).await.unwrap_err();
+        assert!(
+            matches!(err, DatabaseError::L1MessageNotFound(L1MessageKey::QueueIndex(2))),
+            "{err:?}"
+        );
+        assert_eq!(
+            db.get_n_l1_messages(Some(L1MessageKey::from_queue_index(0)), 10).await.unwrap(),
+            before
+        );
+        // No marker was written, so the next start tries again.
+        assert!(db.recompute_l1_message_queue_hashes(0, true).await.is_err());
     }
 }

@@ -30,7 +30,7 @@ use rollup_node_chain_orchestrator::{
     ChainOrchestrator, ChainOrchestratorConfig, ChainOrchestratorHandle, Consensus, NoopConsensus,
     SystemContractConsensus,
 };
-use rollup_node_primitives::{BlockInfo, NodeConfig};
+use rollup_node_primitives::NodeConfig;
 use rollup_node_providers::{
     BlobProvidersBuilder, FullL1Provider, L1MessageProvider, SystemContractProvider,
 };
@@ -39,8 +39,7 @@ use rollup_node_sequencer::{
 };
 use rollup_node_watcher::{L1Watcher, L1WatcherCommand};
 use scroll_db::{
-    Database, DatabaseConnectionProvider, DatabaseError, DatabaseMaintenance,
-    DatabaseReadOperations, DatabaseWriteOperations,
+    Database, DatabaseConnectionProvider, DatabaseMaintenance, DatabaseWriteOperations,
 };
 use scroll_derivation_pipeline::DerivationPipeline;
 use scroll_engine::{
@@ -386,58 +385,43 @@ impl ScrollRollupNodeConfig {
             );
         }
 
-        let chain_spec_fcs = || {
-            ForkchoiceState::head_from_chain_spec(chain_spec.clone())
-                .expect("failed to derive forkchoice state from chain spec")
-        };
-        let mut fcs =
-            ForkchoiceState::from_provider(&l2_provider).await.unwrap_or_else(chain_spec_fcs);
-
-        let (l1_block_startup_info, mut l2_head_block_number) = db
-            .tx_mut(move |tx| async move {
-                // On startup we replay the latest batch of blocks from the database as such we set
-                // the safe block hash to the latest block hash associated with the
-                // previous consolidated batch in the database.
-                let l1_block_startup_info = tx.prepare_l1_watcher_start_info().await?;
-
-                let l2_head_block_number = tx.get_l2_head_block_number().await?;
-
-                Ok::<_, DatabaseError>((l1_block_startup_info, l2_head_block_number))
-            })
-            .await?;
-
-        // Loop to find the latest block that we have in the EN and purge L1 message mappings to
-        // account for the startup block
-        //
-        // This is necessary as there is an edge case in which the EN may not have persisted the
-        // latest block.
-        let finalized_block_number = fcs.finalized_block_info().number;
-        while l2_head_block_number > finalized_block_number {
-            tracing::info!(target: "scroll::node::args", ?l2_head_block_number, "Checking for L2 head block in EN");
-
-            // Check if the block exists in the EN and update the forkchoice state and L2 head block
-            // number
-            if let Some(block) = l2_provider
-                .get_block(l2_head_block_number.into())
-                .full()
-                .await?
-                .map(|b| b.into_consensus().map_transactions(|tx| tx.inner.into_inner()))
-            {
-                tracing::info!(target: "scroll::node::args", ?l2_head_block_number, "Found L2 head block in EN");
-                let block_info: BlockInfo = (&block).into();
-                fcs.update(Some(block_info), None, None)?;
-                db.tx_mut(move |tx| async move {
-                    tx.set_l2_head_block_number(l2_head_block_number).await?;
-                    tx.purge_l1_message_to_l2_block_mappings(Some(l2_head_block_number + 1)).await
-                })
-                .await?;
-                break;
-            }
-
-            // Decrement the L2 head block number and try again
-            tracing::info!(target: "scroll::node::args", ?l2_head_block_number, "L2 head block not found in EN, decrementing");
-            l2_head_block_number -= 1;
+        // L1 message queue hashes. Batches below codec 12 name their L1 messages by Scroll's
+        // masked (legacy) queue hash, codec 12 (TsukiV2) and later by the full-width hash.
+        // Testnet-only: the legacy chain is computed only where TsukiV2 activates after genesis
+        // (Chikyu, whose pre-TsukiV2 batches carry masked hashes); mainnet activates TsukiV2 at
+        // genesis, so its legacy column stays NULL (the recompute below runs everywhere, but there
+        // it only rewrites the full-width chain under the current rule). Added by
+        // dogeos-rollup-node #107; remove when no supported network has batches below codec
+        // 12.
+        let l1_v2_message_queue_start_index =
+            l1_v2_message_queue_start_index(chain_spec.chain().named());
+        let with_legacy_queue_hash = with_legacy_queue_hash(chain_spec.as_ref());
+        // Rewrite stored hashes once when the rule set changes (e.g. the first start of this
+        // image on a database that holds masked hashes in `queue_hash`).
+        if let Some(rewritten @ 1..) = db
+            .recompute_l1_message_queue_hashes(
+                l1_v2_message_queue_start_index,
+                with_legacy_queue_hash,
+            )
+            .await
+            .map_err(|err| eyre::eyre!("failed to recompute L1 message queue hashes: {err}"))?
+        {
+            tracing::info!(
+                target: "scroll::node::args",
+                rewritten,
+                l1_v2_message_queue_start_index,
+                with_legacy_queue_hash,
+                "Recomputed L1 message queue hashes"
+            );
         }
+
+        // Preserve provider errors. A failed tag lookup is not evidence of a fresh chain.
+        let fcs = ForkchoiceState::try_from_provider(&l2_provider)
+            .await?
+            .ok_or_else(|| eyre::eyre!("execution provider is missing forkchoice tags"))?;
+        let l1_block_startup_info = db.prepare_l1_watcher_start_info().await?;
+        // The orchestrator recovers safe/finalized before selecting and confirming the persisted
+        // unsafe head. Lowering the local head here could otherwise make head < old Engine safe.
 
         let chain_spec = Arc::new(chain_spec.clone());
 
@@ -568,12 +552,11 @@ impl ScrollRollupNodeConfig {
                 .expect("failed to fetch block client"),
             Arc::new(DogeosConsensus),
         );
-        let l1_v2_message_queue_start_index =
-            l1_v2_message_queue_start_index(chain_spec.chain().named());
         let config: ChainOrchestratorConfig<Arc<CS>> = ChainOrchestratorConfig::new(
             chain_spec,
             self.chain_orchestrator_args.optimistic_sync_trigger,
             l1_v2_message_queue_start_index,
+            with_legacy_queue_hash,
         );
 
         // Instantiate the derivation pipeline
@@ -1241,6 +1224,15 @@ const fn td_constant(chain: Option<NamedChain>) -> U128 {
     }
 }
 
+/// Whether the node computes the legacy (masked) queue hash of each L1 message: only where
+/// `TsukiV2` activates after genesis, so a chain may hold batches below codec 12 (testnet-only;
+/// see [`rollup_node_primitives::fold_legacy_queue_hash`]).
+fn with_legacy_queue_hash<CS: EthChainSpec<Header: BlockHeader> + DogeosHardforks>(
+    chain_spec: &CS,
+) -> bool {
+    !chain_spec.is_tsuki_v2_active_at_timestamp(chain_spec.genesis_header().timestamp())
+}
+
 /// The L1 message queue index at which queue hashes should be computed .
 const fn l1_v2_message_queue_start_index(chain: Option<NamedChain>) -> u64 {
     match chain {
@@ -1255,6 +1247,14 @@ mod tests {
     use super::*;
     use clap::{CommandFactory, Parser};
     use std::path::PathBuf;
+
+    #[test]
+    fn legacy_queue_hash_is_computed_only_where_tsuki_v2_follows_genesis() {
+        use dogeos_chainspec::{DOGEOS_CHIKYU, DOGEOS_DEV, DOGEOS_MAINNET};
+        assert!(with_legacy_queue_hash(DOGEOS_CHIKYU.as_ref()));
+        assert!(!with_legacy_queue_hash(DOGEOS_MAINNET.as_ref()));
+        assert!(!with_legacy_queue_hash(DOGEOS_DEV.as_ref()));
+    }
 
     /// The startup genesis reconciliation compares the chain spec's genesis
     /// against the height-0 rows, so it depends on knowing which genesis the

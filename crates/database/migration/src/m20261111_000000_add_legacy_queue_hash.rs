@@ -16,18 +16,28 @@ pub struct Migration;
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        manager
-            .alter_table(
-                Table::alter()
-                    .table(L1Message::Table)
-                    .add_column(binary_len_null(LegacyQueueHash::LegacyQueueHash, 32))
-                    .to_owned(),
-            )
-            .await?;
+        // SQLite DDL can persist before SeaORM records this migration as applied.
+        if !manager
+            .has_column(L1Message::Table.to_string(), LegacyQueueHash::LegacyQueueHash.to_string())
+            .await?
+        {
+            // An old/interrupted downgrade may have left a marker for the dropped chain.
+            // Invalidate before ADD: a crash must never pair it with a newly empty column.
+            invalidate_queue_hash_rule(manager).await?;
+            manager
+                .alter_table(
+                    Table::alter()
+                        .table(L1Message::Table)
+                        .add_column(binary_len_null(LegacyQueueHash::LegacyQueueHash, 32))
+                        .to_owned(),
+                )
+                .await?;
+        }
         manager
             .create_index(
                 Index::create()
-                    .name("idx_l1_message_legacy_queue_hash")
+                    .if_not_exists()
+                    .name(LEGACY_QUEUE_HASH_INDEX)
                     .table(L1Message::Table)
                     .col(LegacyQueueHash::LegacyQueueHash)
                     .unique()
@@ -37,23 +47,43 @@ impl MigrationTrait for Migration {
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        manager
-            .drop_index(
-                Index::drop()
-                    .name("idx_l1_message_legacy_queue_hash")
-                    .table(L1Message::Table)
-                    .to_owned(),
-            )
-            .await?;
-        manager
-            .alter_table(
-                Table::alter()
-                    .table(L1Message::Table)
-                    .drop_column(LegacyQueueHash::LegacyQueueHash)
-                    .to_owned(),
-            )
-            .await
+        // Forget completion before any destructive DDL, including on a resumed downgrade.
+        invalidate_queue_hash_rule(manager).await?;
+        if manager.has_index(L1Message::Table.to_string(), LEGACY_QUEUE_HASH_INDEX).await? {
+            manager
+                .drop_index(
+                    Index::drop().name(LEGACY_QUEUE_HASH_INDEX).table(L1Message::Table).to_owned(),
+                )
+                .await?;
+        }
+        if manager
+            .has_column(L1Message::Table.to_string(), LegacyQueueHash::LegacyQueueHash.to_string())
+            .await?
+        {
+            manager
+                .alter_table(
+                    Table::alter()
+                        .table(L1Message::Table)
+                        .drop_column(LegacyQueueHash::LegacyQueueHash)
+                        .to_owned(),
+                )
+                .await?;
+        }
+        Ok(())
     }
+}
+
+const LEGACY_QUEUE_HASH_INDEX: &str = "idx_l1_message_legacy_queue_hash";
+
+async fn invalidate_queue_hash_rule(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    manager
+        .exec_stmt(
+            Query::delete()
+                .from_table(Alias::new("metadata"))
+                .and_where(Expr::col(Alias::new("key")).eq("l1_message_queue_hash_rule"))
+                .to_owned(),
+        )
+        .await
 }
 
 #[derive(DeriveIden)]

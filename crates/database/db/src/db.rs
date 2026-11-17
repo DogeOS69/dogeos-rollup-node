@@ -2460,47 +2460,9 @@ mod test {
         use rollup_node_primitives::{fold_legacy_queue_hash, fold_queue_hash};
         use scroll_migration::{Migrator, MigratorTrait, ScrollDevMigrationInfo};
 
-        let dir = tempfile::Builder::new().prefix("scroll-test-").tempdir().unwrap();
-        let db = Database::test(dir).await.unwrap();
+        let (db, messages, full, legacy) = old_queue_hash_database().await;
         let inner = db.inner();
         let conn = inner.get_connection();
-        // Every migration before the legacy column.
-        let before = Migrator::<ScrollDevMigrationInfo>::migrations().len() as u32 - 1;
-        Migrator::<ScrollDevMigrationInfo>::up(conn, Some(before)).await.unwrap();
-
-        let messages: Vec<TxL1Message> = (0..4u64)
-            .map(|queue_index| TxL1Message {
-                queue_index,
-                gas_limit: 100_000 + queue_index,
-                value: alloy_primitives::U256::from(queue_index),
-                ..Default::default()
-            })
-            .collect();
-        let (mut full, mut legacy) = (Vec::new(), Vec::new());
-        let (mut prev_full, mut prev_legacy) = (B256::ZERO, B256::ZERO);
-        for message in &messages {
-            prev_full = fold_queue_hash(prev_full, message.tx_hash());
-            prev_legacy = fold_legacy_queue_hash(prev_legacy, message.tx_hash());
-            full.push(prev_full);
-            legacy.push(prev_legacy);
-            // The old node stored the masked hash in `queue_hash`.
-            let hex = |bytes: &[u8]| alloy_primitives::hex::encode(bytes);
-            conn.execute_unprepared(&format!(
-                "INSERT INTO l1_message (queue_index, queue_hash, hash, l1_block_number, \
-                 l2_block_number, gas_limit, \"to\", value, sender, input, skipped) VALUES \
-                 ({}, X'{}', X'{}', {}, NULL, '{}', X'{}', X'{}', X'{}', X'', 0)",
-                message.queue_index,
-                hex(prev_legacy.as_slice()),
-                hex(message.tx_hash().as_slice()),
-                message.queue_index + 1,
-                message.gas_limit,
-                hex(message.to.as_slice()),
-                hex(&message.value.to_le_bytes::<32>()),
-                hex(message.sender.as_slice()),
-            ))
-            .await
-            .unwrap();
-        }
 
         // The new image: schema migration, then the startup recompute.
         Migrator::<ScrollDevMigrationInfo>::up(conn, None).await.unwrap();
@@ -2557,6 +2519,244 @@ mod test {
                 messages[3].tx_hash()
             ))
         );
+    }
+
+    /// Seed the pre-upgrade schema exactly as an old node would, before the legacy column.
+    async fn old_queue_hash_database() -> (Database, Vec<TxL1Message>, Vec<B256>, Vec<B256>) {
+        use rollup_node_primitives::{fold_legacy_queue_hash, fold_queue_hash};
+        use scroll_migration::{Migrator, MigratorTrait, ScrollDevMigrationInfo};
+
+        let dir = tempfile::Builder::new().prefix("scroll-test-").tempdir().unwrap();
+        let db = Database::test(dir).await.unwrap();
+        let inner = db.inner();
+        let conn = inner.get_connection();
+        // Every migration before the legacy column.
+        let before = Migrator::<ScrollDevMigrationInfo>::migrations().len() as u32 - 1;
+        Migrator::<ScrollDevMigrationInfo>::up(conn, Some(before)).await.unwrap();
+
+        let messages: Vec<TxL1Message> = (0..4u64)
+            .map(|queue_index| TxL1Message {
+                queue_index,
+                gas_limit: 100_000 + queue_index,
+                value: alloy_primitives::U256::from(queue_index),
+                ..Default::default()
+            })
+            .collect();
+        let (mut full, mut legacy) = (Vec::new(), Vec::new());
+        let (mut prev_full, mut prev_legacy) = (B256::ZERO, B256::ZERO);
+        for message in &messages {
+            prev_full = fold_queue_hash(prev_full, message.tx_hash());
+            prev_legacy = fold_legacy_queue_hash(prev_legacy, message.tx_hash());
+            full.push(prev_full);
+            legacy.push(prev_legacy);
+            // The old node stored the masked hash in `queue_hash`.
+            let hex = |bytes: &[u8]| alloy_primitives::hex::encode(bytes);
+            conn.execute_unprepared(&format!(
+                "INSERT INTO l1_message (queue_index, queue_hash, hash, l1_block_number, \
+                 l2_block_number, gas_limit, \"to\", value, sender, input, skipped) VALUES \
+                 ({}, X'{}', X'{}', {}, NULL, '{}', X'{}', X'{}', X'{}', X'', 0)",
+                message.queue_index,
+                hex(prev_legacy.as_slice()),
+                hex(message.tx_hash().as_slice()),
+                message.queue_index + 1,
+                message.gas_limit,
+                hex(message.to.as_slice()),
+                hex(&message.value.to_le_bytes::<32>()),
+                hex(message.sender.as_slice()),
+            ))
+            .await
+            .unwrap();
+        }
+
+        (db, messages, full, legacy)
+    }
+
+    /// `SQLite` commits DDL before the migrator records success. Retry either interrupted up.
+    #[tokio::test]
+    async fn queue_hash_migration_recovers_partial_up() {
+        use scroll_migration::{Migrator, MigratorTrait, ScrollDevMigrationInfo};
+
+        for index_exists in [false, true] {
+            let (db, messages, _, legacy) = old_queue_hash_database().await;
+            let inner = db.inner();
+            let conn = inner.get_connection();
+            let before = Migrator::<ScrollDevMigrationInfo>::get_applied_migrations(conn)
+                .await
+                .unwrap()
+                .len();
+            conn.execute_unprepared(
+                "ALTER TABLE l1_message ADD COLUMN legacy_queue_hash BLOB NULL",
+            )
+            .await
+            .unwrap();
+            if index_exists {
+                conn.execute_unprepared("CREATE UNIQUE INDEX idx_l1_message_legacy_queue_hash ON l1_message (legacy_queue_hash)").await.unwrap();
+            }
+            // Preserve even a partially populated column rather than overwriting it on retry.
+            conn.execute(Statement::from_sql_and_values(
+                conn.get_database_backend(),
+                "UPDATE l1_message SET legacy_queue_hash = ? WHERE queue_index = 0",
+                [legacy[0].to_vec().into()],
+            ))
+            .await
+            .unwrap();
+            let stored =
+                db.get_n_l1_messages(Some(L1MessageKey::from_queue_index(0)), 10).await.unwrap();
+
+            Migrator::<ScrollDevMigrationInfo>::up(conn, None).await.unwrap();
+            assert_eq!(
+                Migrator::<ScrollDevMigrationInfo>::get_applied_migrations(conn)
+                    .await
+                    .unwrap()
+                    .len(),
+                before + 1
+            );
+            assert!(Migrator::<ScrollDevMigrationInfo>::get_pending_migrations(conn)
+                .await
+                .unwrap()
+                .is_empty());
+            assert_eq!(
+                db.get_n_l1_messages(Some(L1MessageKey::from_queue_index(0)), 10).await.unwrap(),
+                stored
+            );
+            assert_eq!(stored.iter().map(|m| m.transaction.clone()).collect::<Vec<_>>(), messages);
+            assert_eq!(stored.iter().map(|m| m.queue_hash.unwrap()).collect::<Vec<_>>(), legacy);
+            assert_eq!(stored[0].legacy_queue_hash, Some(legacy[0]));
+            assert_eq!(legacy_queue_hash_null_count(&db).await, 3);
+            // Check actual constraint behavior, without the database service's retry loop.
+            assert!(conn.execute_unprepared("UPDATE l1_message SET legacy_queue_hash = (SELECT legacy_queue_hash FROM l1_message WHERE queue_index = 0) WHERE queue_index = 1").await.is_err());
+            conn.execute_unprepared("UPDATE l1_message SET legacy_queue_hash = NULL")
+                .await
+                .unwrap();
+            assert_eq!(legacy_queue_hash_null_count(&db).await, 4);
+            Migrator::<ScrollDevMigrationInfo>::up(conn, None).await.unwrap();
+        }
+    }
+
+    /// A downgrade destroys the legacy chain, so its completion marker cannot survive it.
+    #[tokio::test]
+    async fn queue_hash_migration_down_up_recomputes() {
+        use scroll_migration::{Migrator, MigratorTrait, ScrollDevMigrationInfo};
+
+        // Resume down with no DDL applied, only the index dropped, or the column also dropped.
+        for dropped_steps in 0..=2 {
+            let (db, _, full, legacy) = old_queue_hash_database().await;
+            let inner = db.inner();
+            let conn = inner.get_connection();
+            Migrator::<ScrollDevMigrationInfo>::up(conn, None).await.unwrap();
+            assert_eq!(db.recompute_l1_message_queue_hashes(0, true).await.unwrap(), Some(4));
+            let stored =
+                db.get_n_l1_messages(Some(L1MessageKey::from_queue_index(0)), 10).await.unwrap();
+            assert!(queue_hash_rule_marker(&db).await.is_some());
+            if dropped_steps >= 1 {
+                conn.execute_unprepared("DROP INDEX idx_l1_message_legacy_queue_hash")
+                    .await
+                    .unwrap();
+            }
+            if dropped_steps >= 2 {
+                conn.execute_unprepared("ALTER TABLE l1_message DROP COLUMN legacy_queue_hash")
+                    .await
+                    .unwrap();
+            }
+            Migrator::<ScrollDevMigrationInfo>::down(conn, Some(1)).await.unwrap();
+            assert!(queue_hash_rule_marker(&db).await.is_none());
+            Migrator::<ScrollDevMigrationInfo>::up(conn, None).await.unwrap();
+            assert_eq!(legacy_queue_hash_null_count(&db).await, 4);
+            assert_eq!(db.recompute_l1_message_queue_hashes(0, true).await.unwrap(), Some(4));
+            assert_eq!(
+                db.get_n_l1_messages(Some(L1MessageKey::from_queue_index(0)), 10).await.unwrap(),
+                stored
+            );
+            assert_eq!(db.recompute_l1_message_queue_hashes(0, true).await.unwrap(), None);
+            for (hash, codec) in [(legacy[1], 8), (full[1], 12)] {
+                assert_eq!(
+                    db.get_n_l1_messages(Some(L1MessageKey::from_batch_queue_hash(hash, codec)), 2)
+                        .await
+                        .unwrap(),
+                    stored[1..3]
+                );
+            }
+        }
+    }
+
+    /// If `SQLite` rejects destructive DDL, the marker must already be gone before retrying.
+    #[tokio::test]
+    async fn queue_hash_migration_down_invalidates_before_ddl() {
+        use scroll_migration::{Migrator, MigratorTrait, ScrollDevMigrationInfo};
+
+        let (db, _, _, _) = old_queue_hash_database().await;
+        let inner = db.inner();
+        let conn = inner.get_connection();
+        Migrator::<ScrollDevMigrationInfo>::up(conn, None).await.unwrap();
+        db.recompute_l1_message_queue_hashes(0, true).await.unwrap();
+        assert!(queue_hash_rule_marker(&db).await.is_some());
+        // SQLite refuses DROP COLUMN while a view still references it.
+        conn.execute_unprepared(
+            "CREATE VIEW legacy_hashes AS SELECT legacy_queue_hash FROM l1_message",
+        )
+        .await
+        .unwrap();
+        assert!(Migrator::<ScrollDevMigrationInfo>::down(conn, Some(1)).await.is_err());
+        assert!(queue_hash_rule_marker(&db).await.is_none());
+        conn.execute_unprepared("DROP VIEW legacy_hashes").await.unwrap();
+        Migrator::<ScrollDevMigrationInfo>::down(conn, Some(1)).await.unwrap();
+        Migrator::<ScrollDevMigrationInfo>::up(conn, None).await.unwrap();
+        assert_eq!(db.recompute_l1_message_queue_hashes(0, true).await.unwrap(), Some(4));
+    }
+
+    /// Old buggy downgrades could leave a trusted marker beside a missing legacy column.
+    #[tokio::test]
+    async fn queue_hash_migration_recreation_invalidates_stale_marker() {
+        use scroll_migration::{Migrator, MigratorTrait, ScrollDevMigrationInfo};
+
+        let (db, _, _, _) = old_queue_hash_database().await;
+        let inner = db.inner();
+        let conn = inner.get_connection();
+        Migrator::<ScrollDevMigrationInfo>::up(conn, None).await.unwrap();
+        assert_eq!(db.recompute_l1_message_queue_hashes(0, true).await.unwrap(), Some(4));
+        let stored =
+            db.get_n_l1_messages(Some(L1MessageKey::from_queue_index(0)), 10).await.unwrap();
+        let marker = queue_hash_rule_marker(&db).await.unwrap();
+        Migrator::<ScrollDevMigrationInfo>::down(conn, Some(1)).await.unwrap();
+        // Reproduce the old down behavior regardless of whether down now deletes the marker.
+        conn.execute(Statement::from_sql_and_values(
+            conn.get_database_backend(),
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES ('l1_message_queue_hash_rule', ?)",
+            [marker.into()],
+        ))
+        .await
+        .unwrap();
+        // If invalidation fails, up must not have created a newly empty column yet.
+        conn.execute_unprepared(
+            "CREATE TRIGGER block_rule_invalidation BEFORE DELETE ON metadata \
+             WHEN OLD.key = 'l1_message_queue_hash_rule' BEGIN \
+             SELECT RAISE(FAIL, 'blocked rule invalidation'); END",
+        )
+        .await
+        .unwrap();
+        assert!(Migrator::<ScrollDevMigrationInfo>::up(conn, None).await.is_err());
+        assert!(!scroll_migration::SchemaManager::new(conn)
+            .has_column("l1_message", "legacy_queue_hash")
+            .await
+            .unwrap());
+        assert!(queue_hash_rule_marker(&db).await.is_some());
+        conn.execute_unprepared("DROP TRIGGER block_rule_invalidation").await.unwrap();
+        Migrator::<ScrollDevMigrationInfo>::up(conn, None).await.unwrap();
+        assert!(queue_hash_rule_marker(&db).await.is_none());
+        assert_eq!(legacy_queue_hash_null_count(&db).await, 4);
+        assert_eq!(db.recompute_l1_message_queue_hashes(0, true).await.unwrap(), Some(4));
+        assert_eq!(
+            db.get_n_l1_messages(Some(L1MessageKey::from_queue_index(0)), 10).await.unwrap(),
+            stored
+        );
+    }
+
+    async fn queue_hash_rule_marker(db: &Database) -> Option<String> {
+        models::metadata::Entity::find_by_id("l1_message_queue_hash_rule")
+            .one(db.inner().get_connection())
+            .await
+            .unwrap()
+            .map(|m| m.value)
     }
 
     /// Rows whose `legacy_queue_hash` is SQL NULL (as opposed to a stored zero value).

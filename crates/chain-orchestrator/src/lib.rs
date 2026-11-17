@@ -2,21 +2,21 @@
 //! L2 p2p network.
 
 use alloy_eips::Encodable2718;
-use alloy_primitives::{bytes::Bytes, keccak256, B256};
+use alloy_primitives::{bytes::Bytes, B256};
 use alloy_provider::Provider;
 use alloy_rpc_types_engine::{ExecutionPayloadV1, PayloadStatusEnum};
 use dogeos_hardforks::DogeosHardforks;
 use dogeos_protocol_types::{ScrollTxEnvelope, TxL1Message};
 use dogeos_reth_primitives::DogeosBlock;
 use dogeos_rpc_types::Scroll;
-use futures::{stream, StreamExt, TryStreamExt};
+use futures::{stream, FutureExt, StreamExt, TryStreamExt};
 use reth_chainspec::EthChainSpec;
 use reth_network_api::{BlockDownloaderProvider, FullNetwork};
 use reth_network_p2p::{sync::SyncState as RethSyncState, FullBlockClient};
 use reth_tokio_util::{EventSender, EventStream};
 use rollup_node_primitives::{
-    BatchCommitData, BatchInfo, BatchStatus, BlockInfo, ChainImport, L1MessageEnvelope,
-    L2BlockInfoWithL1Messages,
+    fold_legacy_queue_hash, fold_queue_hash, BatchCommitData, BatchInfo, BatchStatus, BlockInfo,
+    ChainImport, L1MessageEnvelope, L2BlockInfoWithL1Messages,
 };
 use rollup_node_providers::L1MessageProvider;
 use rollup_node_sequencer::{Sequencer, SequencerError, SequencerEvent};
@@ -219,14 +219,32 @@ impl<
         mut self,
         mut shutdown: impl std::future::Future<Output = ()> + Unpin,
     ) -> Result<(), ChainOrchestratorError> {
+        if let Err(error) = self.run_loop(&mut shutdown).await {
+            // Selected handlers finish their work without cancellation. Shutdown may have
+            // arrived during an awaited RPC (whose service can already be stopping). Recheck
+            // only error exits: an Ok exit has already consumed the shutdown future, which
+            // need not support being polled again.
+            if (&mut shutdown).now_or_never().is_none() {
+                return Err(error)
+            }
+            tracing::debug!(target: "scroll::chain_orchestrator", %error, "Suppressing orchestrator error after shutdown was requested");
+        }
+        self.notify(ChainOrchestratorEvent::Shutdown);
+        Ok(())
+    }
+
+    /// Runs handlers to completion while retaining startup and derivation cancellation points.
+    async fn run_loop(
+        &mut self,
+        shutdown: &mut (impl std::future::Future<Output = ()> + Unpin),
+    ) -> Result<(), ChainOrchestratorError> {
         // The orchestrator is constructed while Reth is still launching its add-ons. Defer any
         // startup FCU until the spawned run task gets a turn; a safe rewind can require the Engine
         // service to process canonical-chain work that is not available from the constructor.
         tokio::task::yield_now().await;
         tokio::select! {
             biased;
-            _guard = &mut shutdown => {
-                self.notify(ChainOrchestratorEvent::Shutdown);
+            _guard = &mut *shutdown => {
                 return Ok(())
             }
             result = frontier::recover_database_frontier_retrying(
@@ -241,8 +259,7 @@ impl<
             tokio::select! {
                 biased;
 
-                _guard = &mut shutdown => {
-                    self.notify(ChainOrchestratorEvent::Shutdown);
+                _guard = &mut *shutdown => {
                     return Ok(())
                 }
                 () = self.derivation_driver.wait_for_attempt(), if self.derivation_driver.is_attempt_scheduled() => {
@@ -259,14 +276,13 @@ impl<
                         ));
                         tokio::select! {
                             biased;
-                            _guard = &mut shutdown => None,
+                            _guard = &mut *shutdown => None,
                             step = &mut attempt => Some(step),
                         }
                     };
                     metric.task_duration.record(started.elapsed().as_secs_f64());
 
                     let Some(step) = step else {
-                        self.notify(ChainOrchestratorEvent::Shutdown);
                         return Ok(())
                     };
 
@@ -1194,13 +1210,15 @@ impl<
         l1_block_info: BlockInfo,
     ) -> Result<Option<ChainOrchestratorEvent>, ChainOrchestratorError> {
         let event = ChainOrchestratorEvent::L1MessageCommitted(l1_message.queue_index);
-        let queue_hash = compute_l1_message_queue_hash(
+        let (queue_hash, legacy_queue_hash) = compute_l1_message_queue_hashes(
             &self.database,
             &l1_message,
             self.config.l1_v2_message_queue_start_index(),
+            self.config.with_legacy_queue_hash(),
         )
         .await?;
-        let l1_message = L1MessageEnvelope::new(l1_message, l1_block_info.number, None, queue_hash);
+        let l1_message = L1MessageEnvelope::new(l1_message, l1_block_info.number, None, queue_hash)
+            .with_legacy_queue_hash(legacy_queue_hash);
 
         // Perform a consistency check to ensure the previous L1 message exists in the database.
         self.database
@@ -1871,37 +1889,40 @@ const fn supersedes_blocked_import(
         )
 }
 
-/// Fold a transaction hash into the full 256-bit `DogeOS` message queue commitment.
-fn hash_msg_queue(rolling_hash: B256, tx_hash: B256) -> B256 {
-    let mut input = [0u8; 64];
-    input[..32].copy_from_slice(rolling_hash.as_slice());
-    input[32..].copy_from_slice(tx_hash.as_slice());
-    keccak256(input)
-}
-
-/// Compute the queue hash, preserving all 256 bits at every step.
-/// The first V2 message starts from zero; earlier messages have no queue hash.
-async fn compute_l1_message_queue_hash(
+/// Computes the full-width queue hash of an L1 message and, if `with_legacy` is set, its legacy
+/// (masked) queue hash. Each folds the previous message's hash of the same rule; the first V2
+/// message folds zero, and earlier messages have no queue hash.
+async fn compute_l1_message_queue_hashes(
     database: &Arc<Database>,
     l1_message: &TxL1Message,
     l1_v2_message_queue_start_index: u64,
-) -> Result<Option<alloy_primitives::FixedBytes<32>>, ChainOrchestratorError> {
-    let queue_hash = if l1_message.queue_index == l1_v2_message_queue_start_index {
-        Some(hash_msg_queue(B256::ZERO, l1_message.tx_hash()))
+    with_legacy: bool,
+) -> Result<(Option<B256>, Option<B256>), ChainOrchestratorError> {
+    let (previous, previous_legacy) = if l1_message.queue_index == l1_v2_message_queue_start_index {
+        (B256::ZERO, B256::ZERO)
     } else if l1_message.queue_index > l1_v2_message_queue_start_index {
         let index = l1_message.queue_index - 1;
         let previous = database
             .get_n_l1_messages(Some(L1MessageKey::from_queue_index(index)), 1)
             .await?
-            .first()
-            .map(|m| m.queue_hash)
-            .ok_or(DatabaseError::L1MessageNotFound(L1MessageKey::QueueIndex(index)))?
-            .unwrap_or_default();
-        Some(hash_msg_queue(previous, l1_message.tx_hash()))
+            .into_iter()
+            .next()
+            .ok_or(DatabaseError::L1MessageNotFound(L1MessageKey::QueueIndex(index)))?;
+        // A missing legacy hash would silently restart that chain from zero; refuse instead.
+        let previous_legacy = match previous.legacy_queue_hash {
+            Some(hash) => hash,
+            None if with_legacy => {
+                return Err(ChainOrchestratorError::MissingLegacyQueueHash(l1_message.queue_index))
+            }
+            None => B256::ZERO,
+        };
+        (previous.queue_hash.unwrap_or_default(), previous_legacy)
     } else {
-        None
+        return Ok((None, None))
     };
-    Ok(queue_hash)
+    let tx_hash = l1_message.tx_hash();
+    let legacy = with_legacy.then(|| fold_legacy_queue_hash(previous_legacy, tx_hash));
+    Ok((Some(fold_queue_hash(previous, tx_hash)), legacy))
 }
 
 #[cfg(test)]
@@ -2060,7 +2081,8 @@ mod run_loop_policy_tests {
             NoopFullBlockClient::<DogeosNetworkPrimitives>::default(),
             Arc::new(DogeosConsensus),
         ));
-        let config = ChainOrchestratorConfig::<DogeosChainSpec>::new(DOGEOS_DEV.clone(), 1, 0);
+        let config =
+            ChainOrchestratorConfig::<DogeosChainSpec>::new(DOGEOS_DEV.clone(), 1, 0, false);
         let (mut orchestrator, handle) = ChainOrchestrator::new(
             database,
             config,
@@ -2080,6 +2102,168 @@ mod run_loop_policy_tests {
         orchestrator.derivation_driver.hold_batch(derived);
 
         (orchestrator, handle, notification_tx)
+    }
+
+    #[tokio::test]
+    async fn shutdown_during_handler_rpc_wins_over_fatal_response() {
+        assert_handler_rpc_shutdown(true).await;
+    }
+
+    #[tokio::test]
+    async fn handler_rpc_failure_without_shutdown_remains_fatal() {
+        assert_handler_rpc_shutdown(false).await;
+    }
+
+    async fn assert_handler_rpc_shutdown(request_shutdown: bool) {
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::TcpListener,
+            sync::oneshot,
+        };
+
+        let database = Arc::new(setup_test_db().await);
+        let client = Arc::new(ScriptedEngineClient::new());
+        client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Valid, None)));
+        let (mut orchestrator, handle, _notifications) = test_orchestrator(
+            database.clone(),
+            client.clone(),
+            Asserter::new(),
+            BatchDerivationResult {
+                attributes: vec![],
+                batch_info: BatchInfo::new(1, B256::repeat_byte(1)),
+                skipped_l1_messages: vec![],
+                target_status: BatchStatus::Consolidated,
+            },
+        )
+        .await;
+        orchestrator.derivation_driver = DerivationDriver::default();
+        let events = orchestrator.event_listener();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        orchestrator.l2_client = Arc::new(
+            ProviderBuilder::<_, _, Scroll>::default()
+                .connect(&format!("http://{}", listener.local_addr().unwrap()))
+                .await
+                .unwrap(),
+        );
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let responses = startup_asserter();
+            responses.push_failure_msg("cache service task stopped");
+            let mut gate = Some((entered_tx, release_rx));
+            // Complete startup recovery, then hold the command's forkchoice readback.
+            for tag in ["latest", "safe", "finalized", "latest"] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut headers = Vec::new();
+                while !headers.ends_with(b"\r\n\r\n") {
+                    headers.push(socket.read_u8().await.unwrap());
+                }
+                let length: usize = std::str::from_utf8(&headers)
+                    .unwrap()
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    })
+                    .expect("RPC request has a content length");
+                let mut body = vec![0; length];
+                socket.read_exact(&mut body).await.unwrap();
+                let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(request["method"], "eth_getBlockByNumber");
+                assert_eq!(request["params"][0], tag);
+                if responses.read_q().len() == 1 {
+                    let (entered, release) = gate.take().unwrap();
+                    entered.send(()).unwrap();
+                    release.await.unwrap();
+                }
+                let response = alloy_json_rpc::Response {
+                    id: serde_json::from_value(request["id"].clone()).unwrap(),
+                    payload: responses.pop_response().unwrap(),
+                };
+                let body = serde_json::to_string(&response).unwrap();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        // A real oneshot panics if polled after completion, like GracefulShutdown.
+        let mut run = Box::pin(orchestrator.run_until_shutdown(shutdown_rx.map(drop)));
+        let (response_tx, response_rx) = oneshot::channel();
+        handle
+            .send_command(ChainOrchestratorCommand::UpdateFcsHead((info(SAFE, 0x11), response_tx)));
+        time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                result = &mut run => panic!("loop exited before the handler RPC: {result:?}"),
+                entered = entered_rx => entered.unwrap(),
+            }
+        })
+        .await
+        .expect("the selected handler must reach its RPC");
+        if request_shutdown {
+            shutdown_tx.send(()).unwrap();
+        }
+        // Even with shutdown ready, the selected handler must finish before the loop returns.
+        assert!(run.as_mut().now_or_never().is_none());
+        release_tx.send(()).unwrap();
+        let result = time::timeout(Duration::from_secs(5), run).await.unwrap();
+        time::timeout(Duration::from_secs(5), server).await.unwrap().unwrap();
+        let events =
+            time::timeout(Duration::from_secs(5), events.collect::<Vec<_>>()).await.unwrap();
+        if request_shutdown {
+            assert!(result.is_ok(), "shutdown must win over the in-flight RPC error: {result:?}");
+            assert_eq!(events, vec![ChainOrchestratorEvent::Shutdown]);
+        } else {
+            let error = result.unwrap_err();
+            assert!(error.is_frontier_fatal(), "{error:?}");
+            assert!(error.to_string().contains("cache service task stopped"), "{error:?}");
+            assert!(events.is_empty(), "no shutdown was requested: {events:?}");
+        }
+        assert!(response_rx.await.is_err(), "the failed command must not be acknowledged");
+        assert_eq!(client.fork_choice_updated_calls(), 1, "must not retry the failed handler");
+        assert_eq!(database.get_l2_head_block_number().await.unwrap(), SAFE);
+    }
+
+    #[tokio::test]
+    async fn shutdown_signal_is_consumed_once_at_startup_and_in_loop() {
+        for at_startup in [true, false] {
+            let (mut orchestrator, handle, _notifications) = test_orchestrator(
+                Arc::new(setup_test_db().await),
+                Arc::new(ScriptedEngineClient::new()),
+                startup_asserter(),
+                BatchDerivationResult {
+                    attributes: vec![],
+                    batch_info: BatchInfo::new(1, B256::repeat_byte(1)),
+                    skipped_l1_messages: vec![],
+                    target_status: BatchStatus::Consolidated,
+                },
+            )
+            .await;
+            orchestrator.derivation_driver = DerivationDriver::default();
+            let events = orchestrator.event_listener();
+            let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+            let run = orchestrator.run_until_shutdown(shutdown_rx.map(drop));
+            let run_task = if at_startup {
+                shutdown_tx.send(()).unwrap();
+                tokio::spawn(run)
+            } else {
+                let task = tokio::spawn(run);
+                time::timeout(Duration::from_secs(5), handle.status()).await.unwrap().unwrap();
+                shutdown_tx.send(()).unwrap();
+                task
+            };
+            assert!(time::timeout(Duration::from_secs(5), run_task)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_ok());
+            assert_eq!(events.collect::<Vec<_>>().await, vec![ChainOrchestratorEvent::Shutdown]);
+        }
     }
 
     #[tokio::test]
@@ -4063,6 +4247,9 @@ mod run_loop_policy_tests {
 
 #[cfg(test)]
 mod reorg_finding_tests;
+
+#[cfg(test)]
+mod queue_hash_tests;
 
 #[cfg(test)]
 mod sync_completion_tests;

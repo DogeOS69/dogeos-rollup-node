@@ -117,7 +117,7 @@ async fn orchestrator(
     let (notification_tx, notification_rx) = mpsc::channel(16);
     let (orchestrator, _handle) = ChainOrchestrator::new(
         database,
-        ChainOrchestratorConfig::new(DOGEOS_DEV.clone(), 1, 0),
+        ChainOrchestratorConfig::new(DOGEOS_DEV.clone(), 1, 0, false),
         block_client,
         ProviderBuilder::<_, _, Scroll>::default().connect_mocked_client(asserter),
         L1WatcherHandle::new(watcher_tx, notification_rx),

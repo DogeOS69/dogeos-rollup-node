@@ -11,8 +11,11 @@ pub struct L1MessageEnvelope {
     pub l1_block_number: u64,
     /// The L2 block number at which the L1 message was processed.
     pub l2_block_number: Option<u64>,
-    /// The queue hash for the message.
+    /// The full-width queue hash for the message.
     pub queue_hash: Option<B256>,
+    /// The legacy (masked) queue hash for the message. Testnet-only: set only on a chain whose
+    /// `TsukiV2` activates after genesis; see [`crate::fold_legacy_queue_hash`].
+    pub legacy_queue_hash: Option<B256>,
 }
 
 impl L1MessageEnvelope {
@@ -23,7 +26,13 @@ impl L1MessageEnvelope {
         l2_block_number: Option<u64>,
         queue_hash: Option<B256>,
     ) -> Self {
-        Self { l1_block_number, transaction, l2_block_number, queue_hash }
+        Self { l1_block_number, transaction, l2_block_number, queue_hash, legacy_queue_hash: None }
+    }
+
+    /// Sets the legacy (masked) queue hash.
+    pub const fn with_legacy_queue_hash(mut self, legacy_queue_hash: Option<B256>) -> Self {
+        self.legacy_queue_hash = legacy_queue_hash;
+        self
     }
 }
 
@@ -34,6 +43,7 @@ impl arbitrary::Arbitrary<'_> for L1MessageEnvelope {
             l1_block_number: u.arbitrary::<u32>()? as u64,
             l2_block_number: u.arbitrary::<Option<u32>>()?.map(|x| x as u64),
             queue_hash: Some(u.arbitrary::<B256>()?),
+            legacy_queue_hash: Some(u.arbitrary::<B256>()?),
             transaction: TxL1Message {
                 queue_index: u.arbitrary::<u32>()? as u64,
                 gas_limit: u.arbitrary()?,

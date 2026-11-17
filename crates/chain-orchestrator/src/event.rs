@@ -92,7 +92,8 @@ pub enum ChainOrchestratorEvent {
     BlockSequenced(DogeosBlock),
     /// Block building ended without a block: the built payload was empty and empty blocks are
     /// disabled, or finalizing the payload failed before the orchestrator accepted it for signing
-    /// or announcement (the orchestrator logs the failure).
+    /// or announcement (the orchestrator logs the failure), or an administrative head rewind
+    /// or replacement cancelled the in-flight job.
     BlockBuildingSkipped,
     /// A new block has been signed by the signer.
     SignedBlock {

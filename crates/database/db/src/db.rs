@@ -2637,6 +2637,7 @@ mod test {
     #[tokio::test]
     async fn queue_hash_migration_partial_up_invalidates_stale_marker() {
         use scroll_migration::{Migrator, MigratorTrait, ScrollDevMigrationInfo};
+        use sea_orm::sqlx::{Executor, Row};
 
         for index_exists in [false, true] {
             let (db, messages, full, legacy) = old_queue_hash_database().await;
@@ -2646,6 +2647,15 @@ mod test {
             assert_eq!(db.recompute_l1_message_queue_hashes(0, true).await.unwrap(), Some(4));
             let marker = queue_hash_rule_marker(&db).await.unwrap();
             assert_eq!(marker, "v1;start=0;legacy=true");
+            // Hold a connection with the old schema cached while down uses the rest of the
+            // pool. This makes the stale-schema fixture race deterministic.
+            let mut fixture_conn = conn.get_sqlite_connection_pool().acquire().await.unwrap();
+            let columns: Vec<String> =
+                sea_orm::sqlx::query_scalar("SELECT name FROM pragma_table_info('l1_message')")
+                    .fetch_all(&mut *fixture_conn)
+                    .await
+                    .unwrap();
+            assert!(columns.iter().any(|name| name == "legacy_queue_hash"));
             Migrator::<ScrollDevMigrationInfo>::down(conn, Some(1)).await.unwrap();
             // Old down dropped the column but retained the matching completion marker.
             conn.execute(Statement::from_sql_and_values(
@@ -2656,14 +2666,23 @@ mod test {
             .await
             .unwrap();
             // Old up committed DDL without invalidating the marker or recording success.
-            conn.execute_unprepared(
-                "ALTER TABLE l1_message ADD COLUMN legacy_queue_hash BLOB NULL",
-            )
-            .await
-            .unwrap();
+            // Refresh this connection's schema before preparing ADD COLUMN: SQLite can reject
+            // it against the cached pre-down schema before checking the schema version.
+            let columns = sea_orm::sqlx::query("PRAGMA table_info(l1_message)")
+                .fetch_all(&mut *fixture_conn)
+                .await
+                .unwrap();
+            assert!(columns
+                .iter()
+                .all(|column| column.get::<String, _>("name") != "legacy_queue_hash"));
+            fixture_conn
+                .execute("ALTER TABLE l1_message ADD COLUMN legacy_queue_hash BLOB NULL")
+                .await
+                .unwrap();
             if index_exists {
-                conn.execute_unprepared("CREATE UNIQUE INDEX idx_l1_message_legacy_queue_hash ON l1_message (legacy_queue_hash)").await.unwrap();
+                fixture_conn.execute("CREATE UNIQUE INDEX idx_l1_message_legacy_queue_hash ON l1_message (legacy_queue_hash)").await.unwrap();
             }
+            drop(fixture_conn);
             assert_eq!(
                 Migrator::<ScrollDevMigrationInfo>::get_pending_migrations(conn)
                     .await

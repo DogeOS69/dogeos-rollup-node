@@ -65,7 +65,7 @@ Ensure you have [Rust](https://www.rust-lang.org/tools/install) installed.
 
 The direct Reth dependencies use the DogeOS `reth` tag `tsuki-v0.14`
 (`005acc083ccad7c6d76b28e2da8cbe7593cc3a14`). The `dogeos-reth` component
-tag is `tsuki-v0.14` (`4788802d646dd177577f95d276122e0029ae5d23`);
+tag is `tsuki-v0.14.1` (`4bf42b2869d17ce8c24a48107ded223afa92d5b2`);
 `Cargo.lock` records the resolved graph.
 DogeOS REVM remains on `tsuki-v0.13`
 (`516ff663b2fb2503dba8ef6b0d667f16334ac05a`). Verify the locked sources with

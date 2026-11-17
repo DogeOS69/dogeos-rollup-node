@@ -18,7 +18,7 @@ pub enum SequencerError {
     /// Missing payload id after requesting a new payload.
     #[error("Missing payload id after requesting a new payload")]
     MissingPayloadId,
-    /// The Engine rejected a locally built payload in the final forkchoice update.
+    /// The Engine rejected a locally built payload in `newPayload` or the final forkchoice update.
     #[error(
         "Engine returned INVALID for sequenced block {block_info:?}: latest_valid_hash={latest_valid_hash:?}, validation_error={validation_error}"
     )]
@@ -33,6 +33,10 @@ pub enum SequencerError {
     /// The sequencer encountered an error when converting a payload into a scroll block.
     #[error("Encountered an error converting a payload into a scroll block")]
     PayloadError,
+    /// The engine did not validate the block it itself built when it was submitted with
+    /// `newPayload`.
+    #[error("New payload for the built payload was not VALID")]
+    NewPayloadNotValid,
     /// The engine did not adopt the forkchoice update for the block it itself built.
     #[error("Forkchoice update for the built payload was not VALID")]
     FcuNotValid,

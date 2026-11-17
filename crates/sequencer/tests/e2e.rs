@@ -2,8 +2,13 @@
 
 use alloy_consensus::{transaction::TxHashRef, BlockHeader};
 use alloy_primitives::{hex, Address, U256};
+use alloy_rpc_types_engine::{
+    ExecutionPayloadV1, ForkchoiceState as AlloyForkchoiceState, ForkchoiceUpdated, PayloadId,
+    PayloadStatus,
+};
 use dogeos_chainspec::DOGEOS_DEV;
 use dogeos_protocol_types::{ScrollTransaction, TxL1Message};
+use dogeos_reth_engine::ScrollPayloadAttributes;
 use dogeos_reth_evm::DEFAULT_BASE_FEE_OVERHEAD;
 use futures::stream::StreamExt;
 use reth_e2e_test_utils::transaction::TransactionTestContext;
@@ -21,7 +26,9 @@ use rollup_node_sequencer::{
 };
 use rollup_node_watcher::L1Notification;
 use scroll_db::{test_utils::setup_test_db, DatabaseWriteOperations};
-use scroll_engine::{Engine, ForkchoiceState, ScrollAuthApiEngineClient};
+use scroll_engine::{
+    Engine, ForkchoiceState, ScrollAuthApiEngineClient, ScrollEngineApi, ScrollEngineApiResult,
+};
 use std::{io::Write, path::PathBuf, sync::Arc};
 use tempfile::NamedTempFile;
 use tokio::{
@@ -1155,4 +1162,119 @@ async fn should_not_add_skipped_messages() {
         vec![2, 3]
     );
     assert_eq!(block.header.gas_used, 42_000);
+}
+
+/// Routes the build (a forkchoice update with attributes) and `getPayload` to `builder` and every
+/// other call to `target`, so `target` sees the built block only through what the sequencer sends.
+struct SplitEngineClient<E> {
+    builder: E,
+    target: E,
+}
+
+#[async_trait::async_trait]
+impl<E: ScrollEngineApi> ScrollEngineApi for SplitEngineClient<E> {
+    async fn new_payload_v1(
+        &self,
+        payload: ExecutionPayloadV1,
+    ) -> ScrollEngineApiResult<PayloadStatus> {
+        self.target.new_payload_v1(payload).await
+    }
+
+    async fn fork_choice_updated_v1(
+        &self,
+        fork_choice_state: AlloyForkchoiceState,
+        payload_attributes: Option<ScrollPayloadAttributes>,
+    ) -> ScrollEngineApiResult<ForkchoiceUpdated> {
+        if payload_attributes.is_some() {
+            self.builder.fork_choice_updated_v1(fork_choice_state, payload_attributes).await
+        } else {
+            self.target.fork_choice_updated_v1(fork_choice_state, None).await
+        }
+    }
+
+    async fn get_payload_v1(
+        &self,
+        payload_id: PayloadId,
+    ) -> ScrollEngineApiResult<ExecutionPayloadV1> {
+        self.builder.get_payload_v1(payload_id).await
+    }
+}
+
+/// `getPayload` does not insert the built block into the engine tree: reth forwards it from the
+/// payload builder asynchronously, unordered with respect to the forkchoice update the sequencer
+/// sends next. When the update wins, reth answers SYNCING for a head it does not know and the slot
+/// is skipped. This test makes the lost race deterministic by finalizing against a second, unpeered
+/// node that never receives that forwarding: the sequencer must hand over the block with
+/// `newPayload` itself, after which the engine executes it and adopts it as its head.
+#[tokio::test]
+async fn finalize_payload_building_hands_the_built_block_to_an_engine_that_has_not_seen_it() {
+    reth_tracing::init_test_tracing();
+
+    let (mut builder_nodes, _builder_dbs, _) = setup_engine(
+        default_test_scroll_rollup_node_config(),
+        1,
+        DOGEOS_DEV.clone(),
+        false,
+        false,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let (mut target_nodes, _target_dbs, _) = setup_engine(
+        default_test_scroll_rollup_node_config(),
+        1,
+        DOGEOS_DEV.clone(),
+        false,
+        false,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let builder = builder_nodes.pop().unwrap();
+    let target = target_nodes.pop().unwrap();
+
+    let genesis = BlockInfo { hash: target.inner.chain_spec().genesis_hash(), number: 0 };
+    let client = SplitEngineClient {
+        builder: ScrollAuthApiEngineClient::new(builder.inner.engine_http_client()),
+        target: ScrollAuthApiEngineClient::new(target.inner.engine_http_client()),
+    };
+    let mut engine = Engine::new(
+        Arc::new(client),
+        ForkchoiceState::new(genesis, Default::default(), Default::default()),
+    );
+
+    let database = Arc::new(setup_test_db().await);
+    database.set_latest_l1_block_number(0).await.unwrap();
+    let config = SequencerConfig {
+        chain_spec: target.inner.chain_spec(),
+        fee_recipient: Address::random(),
+        auto_start: false,
+        payload_building_config: PayloadBuildingConfig {
+            block_gas_limit: SCROLL_GAS_LIMIT,
+            max_l1_messages_per_block: 4,
+            l1_message_inclusion_mode: L1MessageInclusionMode::BlockDepth(0),
+        },
+        block_time: 1,
+        payload_building_duration: 0,
+        allow_empty_blocks: true,
+    };
+    let mut sequencer = Sequencer::new(database, config);
+
+    sequencer.start_payload_building(&mut engine).await.unwrap();
+    let SequencerEvent::PayloadReady(payload_id) = sequencer.next().await.unwrap() else {
+        panic!("expected a payload ready event");
+    };
+    let block = sequencer
+        .finalize_payload_building(payload_id, &mut engine)
+        .await
+        .expect("the target engine validates and adopts the block it was handed")
+        .expect("empty blocks are allowed");
+
+    // The mirror only advances on a VALID forkchoice update from the target engine.
+    assert_eq!(
+        *engine.fcs().head_block_info(),
+        BlockInfo { hash: block.header.hash_slow(), number: 1 }
+    );
 }

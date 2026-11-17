@@ -773,7 +773,8 @@ impl<
     async fn unwind_and_revalidate_held_batch(
         &mut self,
         ancestor: u64,
-    ) -> Result<(UnwindResult, HeldReorgOutcome), ChainOrchestratorError> {
+    ) -> Result<(UnwindResult, HeldReorgOutcome, Vec<ScrollTxEnvelope>), ChainOrchestratorError>
+    {
         // A held block import may depend on L1 messages that the unwind removes.
         self.blocked_import = None;
         frontier::ensure_database_frontier(
@@ -786,11 +787,20 @@ impl<
         let expected = frontier::stored_forkchoice(self.engine.fcs());
         let (unwind_result, outcome) = self
             .derivation_driver
-            .unwind_and_revalidate(&self.database, ancestor, Some(expected))
+            .unwind_and_revalidate(&self.database, ancestor, Some(expected), &*self.l2_client)
             .await
             .map_err(ChainOrchestratorError::frontier_recovery)?;
-        // The unwind is durable even if the subsequent Engine repair fails.
+        // The unwind is durable even if collecting the suffix or Engine repair fails.
         self.invalidate_pending_signatures();
+        // The intent is already durable, but the Engine still exposes the old canonical
+        // suffix. Collect before FCU: after rewind Reth may no longer serve it by number.
+        let reverted_transactions = if let Some(head) = unwind_result.l2_head_block_number {
+            self.collect_reverted_txs_in_range(head.saturating_add(1), expected.head.number)
+                .await
+                .map_err(ChainOrchestratorError::frontier_recovery)?
+        } else {
+            Vec::new()
+        };
         frontier::apply_pending_frontier_transition(
             &*self.l2_client,
             &mut self.engine,
@@ -816,7 +826,7 @@ impl<
             ),
         }
 
-        Ok((unwind_result, outcome))
+        Ok((unwind_result, outcome, reverted_transactions))
     }
 
     /// Meters L1 reorg handling.
@@ -940,43 +950,17 @@ impl<
         block_number: u64,
     ) -> Result<Option<ChainOrchestratorEvent>, ChainOrchestratorError> {
         self.derivation_driver.cancel_attempt();
-        let (unwind_result, held_outcome) =
+        let (unwind_result, held_outcome, reverted_transactions) =
             self.unwind_and_revalidate_held_batch(block_number).await?;
         let UnwindResult { l1_block_number, queue_index, l2_head_block_number, l2_safe_block_info } =
             unwind_result;
 
-        let (l2_head_block_info, reverted_transactions) =
-            if let Some(block_number) = l2_head_block_number {
-                // Fetch the block hash of the new L2 head block.
-                let block_hash = self
-                    .l2_client
-                    .get_block_by_number(block_number.into())
-                    .full()
-                    .await
-                    .map_err(ChainOrchestratorError::frontier_recovery)?
-                    .ok_or(ChainOrchestratorError::L2BlockNotFoundInL2Client(block_number))
-                    .map_err(ChainOrchestratorError::frontier_recovery)?
-                    .header
-                    .hash_slow();
-
-                // Cancel the inflight payload building job if the head has changed.
-                if let Some(s) = self.sequencer.as_mut() {
-                    s.cancel_payload_building_job();
-                };
-
-                // Collect transactions of reverted blocks from l2 client.
-                let reverted_transactions = self
-                    .collect_reverted_txs_in_range(
-                        block_number.saturating_add(1),
-                        self.engine.fcs().head_block_info().number,
-                    )
-                    .await
-                    .map_err(ChainOrchestratorError::frontier_recovery)?;
-
-                (Some(BlockInfo { number: block_number, hash: block_hash }), reverted_transactions)
-            } else {
-                (None, Vec::new())
-            };
+        let l2_head_block_info = l2_head_block_number.map(|_| {
+            if let Some(sequencer) = self.sequencer.as_mut() {
+                sequencer.cancel_payload_building_job();
+            }
+            *self.engine.fcs().head_block_info()
+        });
 
         // If the L1 reorg is before the origin of the inflight payload building job, cancel it.
         if Some(l1_block_number) <
@@ -988,21 +972,6 @@ impl<
             if let Some(s) = self.sequencer.as_mut() {
                 s.cancel_payload_building_job();
             };
-        }
-
-        // The safe transition was durably applied by `unwind_and_revalidate_held_batch`. The
-        // unsafe head remains a separate, recoverable startup concern.
-        if l2_head_block_info.is_some() {
-            let response = self
-                .engine
-                .update_fcs_checked(l2_head_block_info, None, None)
-                .await
-                .map_err(ChainOrchestratorError::frontier_recovery)?;
-            if !matches!(response.payload_status.status, PayloadStatusEnum::Valid) {
-                return Err(ChainOrchestratorError::FrontierTransitionStatus(
-                    response.payload_status.status,
-                ))
-            }
         }
 
         // Add all reverted transactions to the transaction pool.
@@ -2228,11 +2197,16 @@ mod run_loop_policy_tests {
 
     #[tokio::test]
     async fn sequencer_forkchoice_rejection_stops_or_skips_without_side_effects() {
-        for status in [
+        // The same verdicts, returned first by `newPayload` (which then stops before the
+        // forkchoice update) and then by the forkchoice update after a VALID `newPayload`.
+        for (rejected_by_new_payload, status) in [
             PayloadStatusEnum::Invalid { validation_error: "scripted invalid candidate".into() },
             PayloadStatusEnum::Syncing,
             PayloadStatusEnum::Accepted,
-        ] {
+        ]
+        .into_iter()
+        .flat_map(|status| [(true, status.clone()), (false, status)])
+        {
             let database = Arc::new(setup_test_db().await);
             database.insert_genesis_block(B256::ZERO).await.unwrap();
             database.set_l2_head_block_number(SAFE).await.unwrap();
@@ -2264,7 +2238,16 @@ mod run_loop_policy_tests {
                 Some(PayloadId::new([9; 8])),
             )));
             client.push_get_payload(ScriptedResponse::Ok(candidate_payload));
-            client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(status.clone(), None)));
+            if rejected_by_new_payload {
+                client.push_new_payload(ScriptedResponse::Ok(PayloadStatus::from_status(
+                    status.clone(),
+                )));
+            } else {
+                client.push_new_payload(ScriptedResponse::Ok(PayloadStatus::from_status(
+                    PayloadStatusEnum::Valid,
+                )));
+                client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(status.clone(), None)));
+            }
             let (mut orchestrator, _handle, _notifications) = test_orchestrator(
                 database.clone(),
                 client.clone(),
@@ -2336,7 +2319,12 @@ mod run_loop_policy_tests {
                 ));
                 drop(orchestrator);
             }
-            assert_eq!(client.fork_choice_updated_calls(), 2, "do not retry the candidate");
+            assert_eq!(client.new_payload_calls(), 1, "do not retry the candidate");
+            assert_eq!(
+                client.fork_choice_updated_calls(),
+                if rejected_by_new_payload { 1 } else { 2 },
+                "do not retry the candidate"
+            );
             assert_eq!(database.get_l2_head_block_number().await.unwrap(), SAFE);
             assert!(database.get_signature(candidate.hash).await.unwrap().is_none());
             assert_eq!(
@@ -2896,6 +2884,688 @@ mod run_loop_policy_tests {
         assert!(run_task.await.unwrap().is_ok());
     }
 
+    /// The first block has reached newPayload + head FCU, but the second block holds before
+    /// the outcome transaction. Its executed deposit therefore has no database mapping yet.
+    #[tokio::test]
+    async fn administrative_unwind_repairs_partially_applied_deposit_batch() {
+        use alloy_eips::eip2718::Encodable2718;
+        use dogeos_protocol_types::TxL1Message;
+        use rollup_node_primitives::L1MessageEnvelope;
+
+        for case in ["syncing", "timeout", "stale", "surviving", "rejected", "collection_error"] {
+            let survives = case == "surviving";
+            let repairs_head = !matches!(case, "stale" | "surviving");
+            let database = Arc::new(setup_test_db().await);
+            let batch_info = BatchInfo::new(1, B256::repeat_byte(1));
+            database
+                .insert_batch(BatchCommitData {
+                    hash: batch_info.hash,
+                    index: 1,
+                    block_number: if survives { 3 } else { 10 },
+                    block_timestamp: 0,
+                    calldata: Arc::new(Bytes::new()),
+                    blob_versioned_hash: None,
+                    finalized_block_number: None,
+                    reverted_block_number: None,
+                })
+                .await
+                .unwrap();
+            database.update_batch_status(batch_info.hash, BatchStatus::Processing).await.unwrap();
+            let deposit = TxL1Message {
+                queue_index: 0,
+                gas_limit: 100_000,
+                to: Address::repeat_byte(0x33),
+                value: U256::from(1_000),
+                sender: Address::repeat_byte(0x44),
+                input: Bytes::new(),
+            };
+            database
+                .insert_l1_message(L1MessageEnvelope::new(
+                    deposit.clone(),
+                    if survives { 3 } else { 9 },
+                    None,
+                    None,
+                ))
+                .await
+                .unwrap();
+            let encoded = Bytes::from(deposit.encoded_2718());
+            let derived = BatchDerivationResult {
+                attributes: [vec![encoded.clone()], vec![]]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(offset, transactions)| DerivedAttributes {
+                        block_number: SAFE + 1 + offset as u64,
+                        base_fee: U256::ZERO,
+                        attributes: ScrollPayloadAttributes {
+                            transactions: Some(transactions),
+                            ..Default::default()
+                        },
+                    })
+                    .collect(),
+                batch_info,
+                skipped_l1_messages: vec![],
+                target_status: BatchStatus::Consolidated,
+            };
+            let client = Arc::new(ScriptedEngineClient::new());
+            client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(
+                PayloadStatusEnum::Valid,
+                Some(PayloadId::new([7; 8])),
+            )));
+            let first = ExecutionPayloadV1 { transactions: vec![encoded], ..payload(SAFE + 1) };
+            let first_info = BlockInfo::new(first.block_number, first.block_hash);
+            client.push_get_payload(ScriptedResponse::Ok(first));
+            client.push_new_payload(ScriptedResponse::Ok(PayloadStatus {
+                status: PayloadStatusEnum::Valid,
+                latest_valid_hash: None,
+            }));
+            client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(
+                PayloadStatusEnum::Valid,
+                None,
+            )));
+            client.push_fork_choice_updated(if case == "timeout" {
+                ScriptedResponse::RequestTimeout
+            } else {
+                ScriptedResponse::Ok(fcu(PayloadStatusEnum::Syncing, None))
+            });
+            let asserter = Asserter::new();
+            push_attempt(&asserter);
+            asserter.push_success(&Option::<()>::None);
+            // Canonical verification excludes a witnessed block already replaced by a fork.
+            push_block(&asserter, if case == "stale" { info(SAFE + 1, 0x66) } else { first_info });
+            if repairs_head {
+                if case == "collection_error" {
+                    asserter.push_success(&Option::<()>::None);
+                } else {
+                    // Collect the old suffix before the Engine can rewind it.
+                    push_block(&asserter, first_info);
+                }
+                if matches!(case, "syncing" | "timeout") {
+                    for block in [info(SAFE, 0x11), info(SAFE, 0x11), info(0, 0)] {
+                        push_block(&asserter, block);
+                    }
+                }
+            }
+            let (mut orchestrator, _handle, _notifications) =
+                test_orchestrator(database.clone(), client.clone(), asserter.clone(), derived)
+                    .await;
+            orchestrator.derivation_driver.wait_for_attempt().await;
+            let step = orchestrator
+                .derivation_driver
+                .run_attempt(&orchestrator.l2_client, &mut orchestrator.engine, &database)
+                .await;
+            assert!(matches!(step, AttemptStep::Held), "expected a real hold: {step:?}");
+            assert_eq!(*orchestrator.engine.fcs().head_block_info(), first_info);
+            assert_eq!(client.new_payload_calls(), 1);
+            assert_eq!(client.fork_choice_inputs()[1].0.head_block_hash, first_info.hash);
+            assert!(database
+                .get_l2_block_and_batch_info_by_hash(first_info.hash)
+                .await
+                .unwrap()
+                .is_none());
+            assert_eq!(database.get_n_l1_messages(None, 1).await.unwrap()[0].l2_block_number, None);
+            assert_eq!(
+                database.get_batch_status_by_hash(batch_info.hash).await.unwrap(),
+                Some(BatchStatus::Processing)
+            );
+
+            let preserved_head = if case == "stale" { info(SAFE + 20, 0x55) } else { first_info };
+            if case == "stale" {
+                orchestrator.engine = Engine::new(
+                    client.clone(),
+                    ForkchoiceState::new(preserved_head, info(SAFE, 0x11), info(0, 0)),
+                );
+            }
+            if repairs_head && case != "collection_error" {
+                client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(
+                    if case == "rejected" {
+                        PayloadStatusEnum::Syncing
+                    } else {
+                        PayloadStatusEnum::Valid
+                    },
+                    None,
+                )));
+            }
+            // Capture a real signing request before the durable unwind. Its delayed reply
+            // must be revoked even when suffix collection fails before any repair FCU.
+            let (request_tx, mut requests) = mpsc::unbounded_channel();
+            let (_events, event_rx) = mpsc::unbounded_channel();
+            orchestrator.signer =
+                Some(SignerHandle::new(request_tx, event_rx.into(), Address::ZERO));
+            let mut signing_block = DogeosBlock::default();
+            signing_block.header.number = preserved_head.number + 1;
+            let signing_hash = signing_block.hash_slow();
+            orchestrator.request_block_signature(signing_block).unwrap();
+            let rollup_node_signer::SignerRequest::SignBlock { block, generation } =
+                requests.try_recv().unwrap();
+            let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+            let result = orchestrator
+                .handle_command(ChainOrchestratorCommand::RevertToL1Block((5, response_tx)))
+                .await;
+            assert_eq!(
+                orchestrator.signing_generation,
+                generation + 1,
+                "{case}: durable unwind must revoke signatures before fallible collection"
+            );
+            let persisted_head = database.get_l2_head_block_number().await.unwrap();
+            let queued_readbacks = asserter.read_q().len();
+            assert!(orchestrator
+                .handle_signer_event(SignerEvent::SignedBlock {
+                    block,
+                    generation,
+                    signature: alloy_primitives::Signature::test_signature(),
+                })
+                .await
+                .unwrap()
+                .is_none());
+            assert_eq!(asserter.read_q().len(), queued_readbacks, "{case}: no stale readback");
+            assert_eq!(database.get_l2_head_block_number().await.unwrap(), persisted_head);
+            assert!(database.get_signature(signing_hash).await.unwrap().is_none());
+            if matches!(case, "rejected" | "collection_error") {
+                assert!(result.unwrap_err().is_frontier_fatal(), "{case}: rewind must fail-stop");
+                assert!(response_rx.await.is_err(), "no successful command reply");
+                let required = database.get_required_head_rewind().await.unwrap().unwrap();
+                assert_eq!(required.target.head, info(SAFE, 0x11));
+                assert_eq!(required.expected.head, first_info);
+                assert_eq!(
+                    database.get_pending_frontier_transition().await.unwrap(),
+                    Some(required)
+                );
+                assert_eq!(database.get_l2_head_block_number().await.unwrap(), SAFE);
+                assert!(database.get_n_l1_messages(None, 1).await.unwrap().is_empty());
+                assert!(database.get_batch_by_index(1).await.unwrap().is_none());
+                assert_eq!(*orchestrator.engine.fcs().head_block_info(), first_info);
+                assert!(!orchestrator.derivation_driver.is_attempt_scheduled());
+                assert_eq!(
+                    client.fork_choice_updated_calls(),
+                    if case == "rejected" { 4 } else { 3 },
+                    "collection failure must precede any rewind FCU"
+                );
+                assert!(client.is_drained());
+                continue;
+            }
+            result.unwrap();
+            assert!(response_rx.await.unwrap());
+            assert_eq!(orchestrator.derivation_driver.can_accept_batch(), !survives);
+            assert_eq!(orchestrator.derivation_driver.is_attempt_scheduled(), survives);
+            assert_eq!(database.get_batch_by_index(1).await.unwrap().is_some(), survives);
+            assert_eq!(
+                database.get_n_l1_messages(None, 1).await.unwrap().len(),
+                usize::from(survives)
+            );
+            assert_eq!(client.new_payload_calls(), 1, "rewind must not retry or consolidate");
+            let inputs = client.fork_choice_inputs();
+            let repairs = &inputs[3..];
+            assert_eq!(
+                repairs.len(),
+                usize::from(repairs_head),
+                "{case}: only a still-canonical deposit with a removed origin requires rewind"
+            );
+            if repairs_head {
+                assert!(!repairs[0].1);
+                assert_eq!(
+                    repairs[0].0.head_block_hash,
+                    info(SAFE, 0x11).hash,
+                    "canonical head must exclude the accepted deposit block"
+                );
+                assert_eq!(repairs[0].0.safe_block_hash, info(SAFE, 0x11).hash);
+                assert_eq!(repairs[0].0.finalized_block_hash, info(0, 0).hash);
+            }
+            assert_eq!(
+                *orchestrator.engine.fcs().head_block_info(),
+                if repairs_head { info(SAFE, 0x11) } else { preserved_head }
+            );
+            assert!(database.get_required_head_rewind().await.unwrap().is_none());
+            assert!(client.is_drained());
+            assert_eq!(*orchestrator.engine.fcs().safe_block_info(), info(SAFE, 0x11));
+            assert_eq!(*orchestrator.engine.fcs().finalized_block_info(), info(0, 0));
+        }
+    }
+
+    #[tokio::test]
+    async fn administrative_unwind_repairs_successful_preparatory_fcu_deposit() {
+        for case in [
+            "syncing",
+            "timeout",
+            "stale",
+            "preparatory_syncing",
+            "preparatory_timeout",
+            "preparatory_connection_lost",
+            "preparatory_transport_failure",
+            "preparatory_invalid",
+        ] {
+            assert_administrative_preparatory_fcu(case).await;
+        }
+    }
+
+    async fn assert_administrative_preparatory_fcu(case: &str) {
+        use alloy_consensus::{transaction::Recovered, Header};
+        use alloy_primitives::Sealable;
+        use alloy_rpc_types_eth::{Block as RpcBlock, Header as RpcHeader};
+        use dogeos_rpc_types::ScrollRpcTransaction;
+
+        let preparatory_succeeded = !case.starts_with("preparatory_");
+        let repairs_head = preparatory_succeeded && case != "stale";
+        let database = Arc::new(setup_test_db().await);
+        let batch_info = BatchInfo::new(1, B256::repeat_byte(1));
+        database
+            .insert_batch(BatchCommitData {
+                hash: batch_info.hash,
+                index: 1,
+                block_number: 10,
+                block_timestamp: 0,
+                calldata: Arc::new(Bytes::new()),
+                blob_versioned_hash: None,
+                finalized_block_number: None,
+                reverted_block_number: None,
+            })
+            .await
+            .unwrap();
+        database.update_batch_status(batch_info.hash, BatchStatus::Processing).await.unwrap();
+        let safe = info(SAFE, 0x11);
+        let finalized = info(0, 0);
+        let higher_head = info(SAFE + 10, 0x55);
+        let deposit = TxL1Message {
+            queue_index: 0,
+            gas_limit: 100_000,
+            to: Address::repeat_byte(0x33),
+            value: U256::from(1_000),
+            sender: Address::repeat_byte(0x44),
+            input: Bytes::new(),
+        };
+        database
+            .insert_l1_message(L1MessageEnvelope::new(deposit.clone(), 9, None, None))
+            .await
+            .unwrap();
+        let derived = BatchDerivationResult {
+            attributes: [vec![Bytes::from(deposit.encoded_2718())], vec![]]
+                .into_iter()
+                .enumerate()
+                .map(|(offset, transactions)| DerivedAttributes {
+                    block_number: SAFE + 1 + offset as u64,
+                    base_fee: U256::ZERO,
+                    attributes: ScrollPayloadAttributes {
+                        transactions: Some(transactions),
+                        ..Default::default()
+                    },
+                })
+                .collect(),
+            batch_info,
+            skipped_l1_messages: vec![],
+            target_status: BatchStatus::Consolidated,
+        };
+        let header = Header {
+            parent_hash: safe.hash,
+            number: SAFE + 1,
+            base_fee_per_gas: Some(0),
+            ..Default::default()
+        }
+        .seal_slow();
+        let first = BlockInfo::new(SAFE + 1, header.hash());
+        let mut rpc_block = RpcBlock::empty(RpcHeader::from_consensus(header, None, None));
+        rpc_block.transactions = alloy_rpc_types_eth::BlockTransactions::Full(vec![
+            ScrollRpcTransaction::from_transaction(
+                Recovered::new_unchecked(deposit.clone().into(), deposit.sender),
+                Default::default(),
+            ),
+        ]);
+        let consensus =
+            rpc_block.clone().into_consensus().map_transactions(|tx| tx.inner.into_inner());
+        assert!(scroll_engine::block_matches_attributes(
+            &derived.attributes[0].attributes,
+            derived.attributes[0].base_fee,
+            &consensus
+        ));
+        assert_eq!(
+            L2BlockInfoWithL1Messages::from(&consensus).l1_messages,
+            vec![deposit.tx_hash()]
+        );
+
+        let asserter = Asserter::new();
+        push_block(&asserter, safe);
+        asserter.push_success(&Some(rpc_block.clone()));
+        asserter.push_success(&Option::<()>::None);
+        if preparatory_succeeded {
+            // Only a still-canonical witness may be materialized during unwind.
+            push_block(&asserter, if case == "stale" { info(first.number, 0x66) } else { first });
+        }
+        if repairs_head {
+            // Collect the discarded suffix, then confirm the exact repaired frontier.
+            asserter.push_success(&Some(rpc_block));
+            for block in [safe, safe, finalized] {
+                push_block(&asserter, block);
+            }
+        }
+        let client = Arc::new(ScriptedEngineClient::new());
+        client.push_fork_choice_updated(match case {
+            "preparatory_syncing" => ScriptedResponse::Ok(fcu(PayloadStatusEnum::Syncing, None)),
+            "preparatory_timeout" => ScriptedResponse::RequestTimeout,
+            "preparatory_connection_lost" => ScriptedResponse::ConnectionLost,
+            "preparatory_transport_failure" => ScriptedResponse::TransportFailure,
+            "preparatory_invalid" => ScriptedResponse::Ok(fcu(
+                PayloadStatusEnum::Invalid { validation_error: "preparatory FCU rejected".into() },
+                None,
+            )),
+            _ => ScriptedResponse::Ok(fcu(PayloadStatusEnum::Valid, None)),
+        });
+        if preparatory_succeeded {
+            client.push_fork_choice_updated(if case == "timeout" {
+                ScriptedResponse::RequestTimeout
+            } else {
+                ScriptedResponse::Ok(fcu(PayloadStatusEnum::Syncing, None))
+            });
+        }
+        let (mut orchestrator, _handle, _notifications) =
+            test_orchestrator(database.clone(), client.clone(), asserter, derived).await;
+        orchestrator.engine =
+            Engine::new(client.clone(), ForkchoiceState::new(higher_head, safe, finalized));
+        orchestrator.derivation_driver.wait_for_attempt().await;
+        let step = orchestrator
+            .derivation_driver
+            .run_attempt(&orchestrator.l2_client, &mut orchestrator.engine, &database)
+            .await;
+        if matches!(case, "preparatory_invalid" | "preparatory_transport_failure") {
+            assert!(matches!(step, AttemptStep::Fatal(_)), "expected rejected FCU: {step:?}");
+        } else {
+            assert!(matches!(step, AttemptStep::Held), "{case}: expected hold: {step:?}");
+        }
+        let adopted_head = if preparatory_succeeded { first } else { higher_head };
+        assert_eq!(*orchestrator.engine.fcs().head_block_info(), adopted_head);
+        assert_eq!(client.get_payload_calls(), 0);
+        assert_eq!(client.new_payload_calls(), 0);
+        let inputs = client.fork_choice_inputs();
+        let attempt_calls = if preparatory_succeeded { 2 } else { 1 };
+        assert_eq!(inputs.len(), attempt_calls);
+        assert_eq!(inputs[0].0.head_block_hash, first.hash);
+        assert!(!inputs[0].1, "first FCU is the preparatory head move");
+        if preparatory_succeeded {
+            assert_eq!(inputs[1].0.head_block_hash, first.hash);
+            assert!(inputs[1].1, "only the build FCU holds after preparatory success");
+        }
+        assert_eq!(database.get_n_l1_messages(None, 1).await.unwrap()[0].l2_block_number, None);
+        assert!(database.get_l2_block_and_batch_info_by_hash(first.hash).await.unwrap().is_none());
+
+        if repairs_head {
+            client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(
+                PayloadStatusEnum::Valid,
+                None,
+            )));
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        orchestrator
+            .handle_command(ChainOrchestratorCommand::RevertToL1Block((5, tx)))
+            .await
+            .expect("administrative command must complete, not fail on queue or RPC errors");
+        assert!(rx.await.unwrap());
+        assert!(database.get_n_l1_messages(None, 1).await.unwrap().is_empty());
+        assert!(database.get_batch_by_index(1).await.unwrap().is_none());
+        assert!(orchestrator.derivation_driver.can_accept_batch());
+        assert_eq!(*orchestrator.engine.fcs().safe_block_info(), safe);
+        assert_eq!(*orchestrator.engine.fcs().finalized_block_info(), finalized);
+        let inputs = client.fork_choice_inputs();
+        assert_eq!(
+            inputs.len(),
+            attempt_calls + usize::from(repairs_head),
+            "{case}: only a checked-success, still-canonical deposit requires repair"
+        );
+        if repairs_head {
+            assert_eq!(inputs[2].0.head_block_hash, safe.hash);
+            assert_eq!(inputs[2].0.safe_block_hash, safe.hash);
+            assert_eq!(inputs[2].0.finalized_block_hash, finalized.hash);
+            assert!(!inputs[2].1);
+        }
+        assert_eq!(
+            *orchestrator.engine.fcs().head_block_info(),
+            if repairs_head { safe } else { adopted_head }
+        );
+        assert!(database.get_pending_frontier_transition().await.unwrap().is_none());
+        assert!(database.get_required_head_rewind().await.unwrap().is_none());
+        assert!(client.is_drained());
+    }
+
+    #[tokio::test]
+    async fn restart_witness_follower_recovery_preserves_later_unwind_repair() {
+        let database = Arc::new(setup_test_db().await);
+        let batch_info = BatchInfo::new(1, B256::repeat_byte(1));
+        database
+            .insert_batch(BatchCommitData {
+                hash: batch_info.hash,
+                index: 1,
+                block_number: 110,
+                block_timestamp: 0,
+                calldata: Arc::new(Bytes::new()),
+                blob_versioned_hash: None,
+                finalized_block_number: None,
+                reverted_block_number: None,
+            })
+            .await
+            .unwrap();
+        database.update_batch_status(batch_info.hash, BatchStatus::Processing).await.unwrap();
+        database.set_latest_l1_block_number(120).await.unwrap();
+        let safe = info(SAFE, 0x11);
+        let finalized = info(0, 0);
+        let deposit = TxL1Message {
+            queue_index: 0,
+            gas_limit: 100_000,
+            to: Address::repeat_byte(0x33),
+            value: U256::from(1_000),
+            sender: Address::repeat_byte(0x44),
+            input: Bytes::new(),
+        };
+        database
+            .insert_l1_message(L1MessageEnvelope::new(deposit.clone(), 105, None, None))
+            .await
+            .unwrap();
+        let encoded = Bytes::from(deposit.encoded_2718());
+        let derived = BatchDerivationResult {
+            attributes: [vec![encoded.clone()], vec![]]
+                .into_iter()
+                .enumerate()
+                .map(|(offset, transactions)| DerivedAttributes {
+                    block_number: SAFE + 1 + offset as u64,
+                    base_fee: U256::ZERO,
+                    attributes: ScrollPayloadAttributes {
+                        transactions: Some(transactions),
+                        ..Default::default()
+                    },
+                })
+                .collect(),
+            batch_info,
+            skipped_l1_messages: vec![],
+            target_status: BatchStatus::Consolidated,
+        };
+        let first_payload = ExecutionPayloadV1 { transactions: vec![encoded], ..payload(SAFE + 1) };
+        let first = BlockInfo::new(first_payload.block_number, first_payload.block_hash);
+        let client = Arc::new(ScriptedEngineClient::new());
+        client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(
+            PayloadStatusEnum::Valid,
+            Some(PayloadId::new([7; 8])),
+        )));
+        client.push_get_payload(ScriptedResponse::Ok(first_payload));
+        client.push_new_payload(ScriptedResponse::Ok(PayloadStatus {
+            status: PayloadStatusEnum::Valid,
+            latest_valid_hash: None,
+        }));
+        client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Valid, None)));
+        client
+            .push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Syncing, None)));
+        let asserter = Asserter::new();
+        push_attempt(&asserter);
+        asserter.push_success(&Option::<()>::None);
+        // The first unwind verifies the applied deposit block is still canonical.
+        push_block(&asserter, first);
+        // Restart observes Engine101/safe100/finalized0, then verifies stored101 is retained.
+        for block in [first, safe, finalized, safe, first] {
+            push_block(&asserter, block);
+        }
+        // Prospective second-unwind repair: resolve parent100, collect suffix101, read repaired
+        // tags. These remain available if repair is skipped; missing repair cannot exhaust
+        // the fixture.
+        push_block(&asserter, safe);
+        push_block(&asserter, first);
+        for block in [safe, safe, finalized] {
+            push_block(&asserter, block);
+        }
+        let (mut orchestrator, _handle, _notifications) =
+            test_orchestrator(database.clone(), client.clone(), asserter, derived).await;
+        orchestrator.derivation_driver.wait_for_attempt().await;
+        let step = orchestrator
+            .derivation_driver
+            .run_attempt(&orchestrator.l2_client, &mut orchestrator.engine, &database)
+            .await;
+        assert!(matches!(step, AttemptStep::Held), "expected partial-build hold: {step:?}");
+        assert_eq!(*orchestrator.engine.fcs().head_block_info(), first);
+        assert_eq!(client.get_payload_calls(), 1);
+        assert_eq!(client.new_payload_calls(), 1);
+        assert_eq!(client.fork_choice_updated_calls(), 3);
+        assert_eq!(client.fork_choice_inputs()[1].0.head_block_hash, first.hash);
+        assert_eq!(database.get_n_l1_messages(None, 1).await.unwrap()[0].l2_block_number, None);
+        assert!(database.get_l2_block_and_batch_info_by_hash(first.hash).await.unwrap().is_none());
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        orchestrator
+            .handle_command(ChainOrchestratorCommand::RevertToL1Block((108, tx)))
+            .await
+            .expect("first administrative unwind must succeed");
+        assert!(rx.await.unwrap());
+        assert!(database.get_batch_by_index(1).await.unwrap().is_none());
+        assert!(orchestrator.derivation_driver.can_accept_batch(), "batch commit was removed");
+        let surviving = database.get_n_l1_messages(None, 1).await.unwrap();
+        assert_eq!(surviving.len(), 1);
+        assert_eq!(surviving[0].l1_block_number, 105);
+        assert_eq!(surviving[0].l2_block_number, Some(first.number));
+        assert_eq!(database.get_latest_safe_l2_info().await.unwrap().0, safe);
+        assert_eq!(
+            database.get_batch_status_by_hash(B256::ZERO).await.unwrap(),
+            Some(BatchStatus::Consolidated),
+            "materializing a deposit must not advance the surviving safe batch status"
+        );
+        assert!(database.get_l2_block_and_batch_info_by_hash(first.hash).await.unwrap().is_none());
+        assert_eq!(*orchestrator.engine.fcs().safe_block_info(), safe);
+        assert_eq!(*orchestrator.engine.fcs().finalized_block_info(), finalized);
+        assert_eq!(*orchestrator.engine.fcs().head_block_info(), first);
+        assert_eq!(client.fork_choice_updated_calls(), 3, "origin survives the first unwind");
+
+        // Drop all held-slot evidence to prove the next unwind uses only the durable mapping.
+        orchestrator.derivation_driver = DerivationDriver::default();
+        assert_eq!(database.get_latest_safe_l2_info().await.unwrap().0, safe);
+        assert!(database.get_pending_frontier_transition().await.unwrap().is_none());
+        assert!(database.get_required_head_rewind().await.unwrap().is_none());
+        assert_eq!(database.get_l2_head_block_number().await.unwrap(), first.number);
+        assert!(orchestrator.sync_state.l1().is_syncing());
+        // Fresh process cache starts without knowledge of101; startup must read real Engine tags.
+        orchestrator.engine =
+            Engine::new(client.clone(), ForkchoiceState::new(safe, safe, finalized));
+        orchestrator.head_selection = frontier::HeadSelection::KeepEngineHead;
+        frontier::recover_database_frontier(
+            &*orchestrator.l2_client,
+            &mut orchestrator.engine,
+            &database,
+            frontier::HeadSelection::KeepEngineHead,
+        )
+        .await
+        .expect("actual follower startup recovery must succeed");
+        assert_eq!(*orchestrator.engine.fcs().head_block_info(), first);
+        assert_eq!(*orchestrator.engine.fcs().safe_block_info(), safe);
+        assert_eq!(*orchestrator.engine.fcs().finalized_block_info(), finalized);
+        assert_eq!(database.get_l2_head_block_number().await.unwrap(), first.number);
+        assert_eq!(client.fork_choice_updated_calls(), 3, "recovery keeps the current Engine head");
+        assert!(orchestrator.derivation_driver.can_accept_batch());
+        assert!(orchestrator.sync_state.l1().is_syncing());
+        let surviving = database.get_n_l1_messages(None, 1).await.unwrap();
+        assert_eq!(surviving.len(), 1);
+        assert_eq!(surviving[0].l1_block_number, 105);
+
+        assert_eq!(surviving[0].l2_block_number, Some(first.number));
+        assert!(database.get_l2_block_and_batch_info_by_hash(first.hash).await.unwrap().is_none());
+
+        client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Valid, None)));
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        orchestrator
+            .handle_command(ChainOrchestratorCommand::RevertToL1Block((104, tx)))
+            .await
+            .expect("second administrative unwind must succeed, not fail on queue or RPC errors");
+        assert!(rx.await.unwrap());
+        assert_eq!(database.get_latest_l1_block_number().await.unwrap(), 104);
+        assert!(database.get_n_l1_messages(None, 1).await.unwrap().is_empty());
+        assert_eq!(*orchestrator.engine.fcs().safe_block_info(), safe);
+        assert_eq!(*orchestrator.engine.fcs().finalized_block_info(), finalized);
+        let inputs = client.fork_choice_inputs();
+        assert_eq!(inputs.len(), 4, "later removal of an executed origin requires a repair FCU even after batch invalidation");
+        assert_eq!(inputs[3].0.head_block_hash, safe.hash);
+        assert_eq!(inputs[3].0.safe_block_hash, safe.hash);
+        assert_eq!(inputs[3].0.finalized_block_hash, finalized.hash);
+        assert!(!inputs[3].1);
+        assert_eq!(*orchestrator.engine.fcs().head_block_info(), safe);
+        assert_eq!(database.get_l2_head_block_number().await.unwrap(), SAFE);
+        assert_eq!(database.get_latest_safe_l2_info().await.unwrap().0, safe);
+        assert_eq!(database.get_latest_finalized_l2_info().await.unwrap(), finalized);
+        assert!(database.get_pending_frontier_transition().await.unwrap().is_none());
+        assert!(database.get_required_head_rewind().await.unwrap().is_none());
+        assert!(client.is_drained());
+    }
+
+    /// Unexecuted attributes are not evidence that the Engine's independent unsafe head used
+    /// their deposits. Both invalidating and surviving the slot must preserve that head.
+    #[tokio::test]
+    async fn administrative_unwind_of_unexecuted_hold_preserves_independent_head() {
+        for survives in [false, true] {
+            let database = Arc::new(setup_test_db().await);
+            let batch_info = BatchInfo::new(1, B256::repeat_byte(1));
+            database
+                .insert_batch(BatchCommitData {
+                    hash: batch_info.hash,
+                    index: 1,
+                    block_number: if survives { 3 } else { 10 },
+                    block_timestamp: 0,
+                    calldata: Arc::new(Bytes::new()),
+                    blob_versioned_hash: None,
+                    finalized_block_number: None,
+                    reverted_block_number: None,
+                })
+                .await
+                .unwrap();
+            let client = Arc::new(ScriptedEngineClient::new());
+            let asserter = startup_asserter();
+            let higher_head = info(SAFE + 20, 0x55);
+            for block in [higher_head, info(SAFE, 0x11), info(0, 0)] {
+                push_block(&asserter, block);
+            }
+            let (mut orchestrator, _handle, _notifications) = test_orchestrator(
+                database.clone(),
+                client.clone(),
+                asserter,
+                BatchDerivationResult {
+                    attributes: vec![DerivedAttributes {
+                        block_number: SAFE + 1,
+                        base_fee: U256::ZERO,
+                        attributes: ScrollPayloadAttributes {
+                            transactions: Some(vec![]),
+                            ..Default::default()
+                        },
+                    }],
+                    batch_info,
+                    skipped_l1_messages: vec![],
+                    target_status: BatchStatus::Consolidated,
+                },
+            )
+            .await;
+            orchestrator.engine = Engine::new(
+                client.clone(),
+                ForkchoiceState::new(higher_head, info(SAFE, 0x11), info(0, 0)),
+            );
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            orchestrator
+                .handle_command(ChainOrchestratorCommand::RevertToL1Block((5, tx)))
+                .await
+                .unwrap();
+            assert!(rx.await.unwrap());
+            assert_eq!(client.fork_choice_inputs(), vec![], "unexecuted work must not rewind Reth");
+            assert_eq!(*orchestrator.engine.fcs().head_block_info(), higher_head);
+            assert_eq!(orchestrator.derivation_driver.can_accept_batch(), !survives);
+            assert_eq!(orchestrator.derivation_driver.is_attempt_scheduled(), survives);
+        }
+    }
+
     #[tokio::test]
     async fn administrative_unwind_without_frontier_change_skips_engine_update() {
         let database = Arc::new(setup_test_db().await);
@@ -3060,6 +3730,334 @@ mod run_loop_policy_tests {
         // The rejected move stays recorded, so a restart replays it before any other work.
         let pending = database.get_pending_frontier_transition().await.unwrap().unwrap();
         assert_eq!((pending.expected.safe, pending.target.safe), (block_b, block_a));
+    }
+
+    #[tokio::test]
+    async fn retry_suffix_import_during_l1_sync_clears_discarded_mapping() {
+        for high_stored_head in [false, true] {
+            assert_retry_suffix_import(false, high_stored_head).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_suffix_preserves_fresh_higher_import_after_head_cut() {
+        assert_retry_suffix_import(true, true).await;
+    }
+
+    /// Exercise the cut/hold through the driver, imports through the command handler, and retry
+    /// through fresh canonical reconciliation. The synced variant can map fresh higher deposits.
+    async fn assert_retry_suffix_import(independent_progress: bool, high_stored_head: bool) {
+        use alloy_consensus::transaction::Recovered;
+        use alloy_primitives::Sealable;
+        use alloy_rpc_types_eth::{Block as RpcBlock, Header as RpcHeader};
+        use dogeos_rpc_types::ScrollRpcTransaction;
+
+        fn empty_block(number: u64, parent: B256, base_fee: u64) -> DogeosBlock {
+            let mut block = DogeosBlock::default();
+            block.header.number = number;
+            block.header.parent_hash = parent;
+            block.header.base_fee_per_gas = Some(base_fee);
+            block.header.gas_limit = 30_000_000;
+            block
+        }
+        fn rpc_block(block: &DogeosBlock) -> RpcBlock<ScrollRpcTransaction> {
+            let mut rpc = RpcBlock::empty(RpcHeader::from_consensus(
+                block.header.clone().seal_slow(),
+                None,
+                None,
+            ));
+            rpc.transactions = alloy_rpc_types_eth::BlockTransactions::Full(vec![]);
+            rpc
+        }
+
+        let database = Arc::new(setup_test_db().await);
+        let batch_info = BatchInfo::new(1, B256::repeat_byte(1));
+        database
+            .insert_batch(BatchCommitData {
+                hash: batch_info.hash,
+                index: 1,
+                block_number: 10,
+                block_timestamp: 0,
+                calldata: Arc::new(Bytes::new()),
+                blob_versioned_hash: None,
+                finalized_block_number: None,
+                reverted_block_number: None,
+            })
+            .await
+            .unwrap();
+        database.update_batch_status(batch_info.hash, BatchStatus::Processing).await.unwrap();
+        database.set_latest_l1_block_number(30).await.unwrap();
+        let deposit = TxL1Message {
+            queue_index: 0,
+            gas_limit: 100_000,
+            to: Address::repeat_byte(0x33),
+            value: U256::from(1_000),
+            sender: Address::repeat_byte(0x44),
+            input: Bytes::new(),
+        };
+        database
+            .insert_l1_message(L1MessageEnvelope::new(deposit.clone(), 1, None, None))
+            .await
+            .unwrap();
+        let safe = info(SAFE, 0x11);
+        let finalized = info(0, 0);
+        // Coherent old canonical chain: both queried batch blocks exist but have wrong base fee.
+        let old_first = empty_block(SAFE + 1, safe.hash, 1);
+        let old_second = empty_block(SAFE + 2, old_first.hash_slow(), 1);
+        let old_third = empty_block(SAFE + 3, old_second.hash_slow(), 1);
+        let old_fourth = empty_block(SAFE + 4, old_third.hash_slow(), 1);
+        let mut old_fifth = empty_block(SAFE + 5, old_fourth.hash_slow(), 1);
+        old_fifth.body.transactions.push(deposit.clone().into());
+        let old_head = BlockInfo::from(&old_fifth);
+        let first_block = empty_block(SAFE + 1, safe.hash, 0);
+        let first = BlockInfo::from(&first_block);
+        let second_block = empty_block(SAFE + 2, first.hash, 0);
+        let second = BlockInfo::from(&second_block);
+        let mut imports = vec![second_block.clone()];
+        if independent_progress {
+            for number in SAFE + 3..=SAFE + 5 {
+                let mut block = empty_block(number, imports.last().unwrap().hash_slow(), 0);
+                if number == SAFE + 5 {
+                    // The same surviving deposit is validly re-included on the new chain.
+                    block.body.transactions.push(deposit.clone().into());
+                }
+                imports.push(block);
+            }
+        }
+        let final_head = BlockInfo::from(imports.last().unwrap());
+        let derived = BatchDerivationResult {
+            attributes: [SAFE + 1, SAFE + 2]
+                .into_iter()
+                .map(|block_number| DerivedAttributes {
+                    block_number,
+                    base_fee: U256::ZERO,
+                    attributes: ScrollPayloadAttributes {
+                        transactions: Some(vec![]),
+                        ..Default::default()
+                    },
+                })
+                .collect(),
+            batch_info,
+            skipped_l1_messages: vec![],
+            target_status: BatchStatus::Consolidated,
+        };
+        for (index, old) in [&old_first, &old_second].into_iter().enumerate() {
+            assert!(!scroll_engine::block_matches_attributes(
+                &derived.attributes[index].attributes,
+                U256::ZERO,
+                old
+            ));
+        }
+        for (index, new) in [&first_block, &second_block].into_iter().enumerate() {
+            assert!(scroll_engine::block_matches_attributes(
+                &derived.attributes[index].attributes,
+                U256::ZERO,
+                new
+            ));
+        }
+        let asserter = Asserter::new();
+        // Establish the lagging counter / higher mapping through actual follower consolidation.
+        for old in [&old_first, &old_second, &old_third, &old_fourth] {
+            asserter.push_success(&Some(rpc_block(old)));
+        }
+        let mut third_rpc = rpc_block(&old_fifth);
+        third_rpc.transactions = alloy_rpc_types_eth::BlockTransactions::Full(vec![
+            ScrollRpcTransaction::from_transaction(
+                Recovered::new_unchecked(deposit.clone().into(), deposit.sender),
+                Default::default(),
+            ),
+        ]);
+        asserter.push_success(&Some(third_rpc));
+        // First attempt: canonical safe and existing mismatching old blocks.
+        push_block(&asserter, safe);
+        for old in [&old_first, &old_second] {
+            asserter.push_success(&Some(rpc_block(old)));
+        }
+        // Retry after import: canonical safe and matching new blocks, then exact target tags.
+        push_block(&asserter, safe);
+        for new in [&first_block, &second_block] {
+            asserter.push_success(&Some(rpc_block(new)));
+        }
+        for tag in [final_head, second, finalized] {
+            push_block(&asserter, tag);
+        }
+        let client = Arc::new(ScriptedEngineClient::new());
+        // Preparatory rewind to100, build101, adopt101, then build102 holds.
+        client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Valid, None)));
+        client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(
+            PayloadStatusEnum::Valid,
+            Some(PayloadId::new([7; 8])),
+        )));
+        client.push_get_payload(ScriptedResponse::Ok(ExecutionPayloadV1::from_block_slow(
+            &first_block,
+        )));
+        client.push_new_payload(ScriptedResponse::Ok(PayloadStatus::from_status(
+            PayloadStatusEnum::Valid,
+        )));
+        client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Valid, None)));
+        client
+            .push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Syncing, None)));
+        // Each actual import extends the rebuilt prefix while the batch remains held.
+        for _ in &imports {
+            client.push_new_payload(ScriptedResponse::Ok(PayloadStatus::from_status(
+                PayloadStatusEnum::Valid,
+            )));
+            client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(
+                PayloadStatusEnum::Valid,
+                None,
+            )));
+        }
+        // Retry only acknowledges the committed safe frontier at102.
+        client.push_fork_choice_updated(ScriptedResponse::Ok(fcu(PayloadStatusEnum::Valid, None)));
+        let (mut orchestrator, _handle, _notifications) =
+            test_orchestrator(database.clone(), client.clone(), asserter, derived).await;
+        orchestrator.engine =
+            Engine::new(client.clone(), ForkchoiceState::new(old_head, safe, finalized));
+        orchestrator.sync_state.l2_mut().set_synced();
+        orchestrator.consolidate_chain().await.unwrap();
+        assert_eq!(database.get_l2_head_block_number().await.unwrap(), SAFE);
+        assert_eq!(
+            database.get_n_l1_messages(None, 1).await.unwrap()[0].l2_block_number,
+            Some(SAFE + 5)
+        );
+        assert_eq!(client.fork_choice_updated_calls(), 0);
+
+        if high_stored_head {
+            database.set_l2_head_block_number(old_head.number).await.unwrap();
+        }
+        if independent_progress {
+            assert!(orchestrator.sync_state.is_synced(), "L1 is already synced before the hold");
+        } else {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            orchestrator
+                .handle_command(ChainOrchestratorCommand::RevertToL1Block((20, tx)))
+                .await
+                .unwrap();
+            assert!(rx.await.unwrap(), "administrative rewind must acknowledge success");
+            assert_eq!(database.get_latest_l1_block_number().await.unwrap(), 20);
+            assert!(orchestrator.sync_state.l1().is_syncing());
+            assert_eq!(
+                orchestrator.derivation_driver.held_identity().unwrap().batch_info,
+                batch_info
+            );
+            assert!(orchestrator.derivation_driver.is_attempt_scheduled());
+            assert_eq!(*orchestrator.engine.fcs().head_block_info(), old_head);
+            assert_eq!(
+                database.get_n_l1_messages(None, 1).await.unwrap()[0].l2_block_number,
+                Some(SAFE + 5)
+            );
+            assert_eq!(
+                client.fork_choice_updated_calls(),
+                0,
+                "surviving origins require no rewind FCU"
+            );
+        }
+        orchestrator.derivation_driver.wait_for_attempt().await;
+        let held = orchestrator
+            .derivation_driver
+            .run_attempt(&orchestrator.l2_client, &mut orchestrator.engine, &database)
+            .await;
+        assert!(matches!(held, AttemptStep::Held), "first attempt must genuinely hold: {held:?}");
+        assert_eq!(*orchestrator.engine.fcs().head_block_info(), first);
+        assert_eq!(*orchestrator.engine.fcs().safe_block_info(), safe);
+        assert_eq!(database.get_l2_head_block_number().await.unwrap(), SAFE);
+        assert_eq!(
+            database.get_batch_status_by_hash(batch_info.hash).await.unwrap(),
+            Some(BatchStatus::Processing)
+        );
+        assert!(database.get_l2_block_and_batch_info_by_hash(first.hash).await.unwrap().is_none());
+        assert_eq!(database.get_n_l1_messages(None, 1).await.unwrap()[0].l2_block_number, None);
+        assert_eq!(client.fork_choice_updated_calls(), 4);
+        assert_eq!(client.get_payload_calls(), 1);
+        assert_eq!(client.new_payload_calls(), 1);
+        assert!(orchestrator.derivation_driver.is_attempt_scheduled());
+
+        for block in &imports {
+            let (response, rx) = tokio::sync::oneshot::channel();
+            orchestrator
+                .handle_command(ChainOrchestratorCommand::ImportBlock {
+                    block_with_peer: NewBlockWithPeer {
+                        block: block.clone(),
+                        peer_id: Default::default(),
+                        signature: alloy_primitives::Signature::new(U256::ZERO, U256::ZERO, false),
+                    },
+                    response,
+                })
+                .await
+                .unwrap();
+            let imported = rx.await.unwrap().expect("ImportBlock command must succeed");
+            assert!(imported.result.is_valid());
+            assert_eq!(imported.chain, vec![block.clone()]);
+            assert_eq!(*orchestrator.engine.fcs().head_block_info(), BlockInfo::from(block));
+            assert_eq!(*orchestrator.engine.fcs().safe_block_info(), safe);
+            assert_eq!(orchestrator.sync_state.l1().is_syncing(), !independent_progress);
+            assert!(!orchestrator.sync_state.l2().is_syncing());
+            assert!(orchestrator.derivation_driver.is_attempt_scheduled());
+            assert_eq!(
+                database.get_l2_head_block_number().await.unwrap(),
+                if independent_progress { block.number } else { SAFE }
+            );
+            assert_eq!(
+                database.get_n_l1_messages(None, 1).await.unwrap()[0].l2_block_number,
+                (independent_progress && block.number == SAFE + 5).then_some(SAFE + 5)
+            );
+        }
+        assert_eq!(client.fork_choice_updated_calls(), 4 + imports.len() as u64);
+        assert_eq!(client.new_payload_calls(), 1 + imports.len() as u64);
+
+        orchestrator.derivation_driver.wait_for_attempt().await;
+        let completed = orchestrator
+            .derivation_driver
+            .run_attempt(&orchestrator.l2_client, &mut orchestrator.engine, &database)
+            .await;
+        let AttemptStep::Completed(completed) = completed else {
+            panic!("retry must complete: {completed:?}")
+        };
+        assert!(completed.block_outcomes.iter().all(|outcome| matches!(
+            outcome,
+            rollup_node_primitives::BlockConsolidationOutcome::UpdateFcs(_)
+        )));
+        assert_eq!(
+            completed.batch_outcome.blocks.iter().map(|block| block.block_info).collect::<Vec<_>>(),
+            vec![first, second]
+        );
+        assert_eq!(client.get_payload_calls(), 1, "retry must not rebuild");
+        assert_eq!(client.new_payload_calls(), 1 + imports.len() as u64, "retry must not reimport");
+        assert_eq!(client.fork_choice_updated_calls(), 5 + imports.len() as u64);
+        let inputs = client.fork_choice_inputs();
+        let mut expected_inputs =
+            vec![(safe.hash, false), (safe.hash, true), (first.hash, false), (first.hash, true)];
+        expected_inputs.extend(imports.iter().map(|block| (block.hash_slow(), false)));
+        expected_inputs.push((final_head.hash, false));
+        assert_eq!(
+            inputs.iter().map(|(fcs, attrs)| (fcs.head_block_hash, *attrs)).collect::<Vec<_>>(),
+            expected_inputs
+        );
+        assert_eq!(inputs.last().unwrap().0.safe_block_hash, second.hash);
+        assert_eq!(inputs.last().unwrap().0.finalized_block_hash, finalized.hash);
+        assert!(client.is_drained());
+        assert!(orchestrator.derivation_driver.can_accept_batch());
+        assert_eq!(*orchestrator.engine.fcs().head_block_info(), final_head);
+        assert_eq!(*orchestrator.engine.fcs().safe_block_info(), second);
+        assert_eq!(*orchestrator.engine.fcs().finalized_block_info(), finalized);
+        assert_eq!(database.get_l2_head_block_number().await.unwrap(), final_head.number);
+        assert_eq!(database.get_latest_safe_l2_info().await.unwrap().0, second);
+        assert_eq!(
+            database.get_batch_status_by_hash(batch_info.hash).await.unwrap(),
+            Some(BatchStatus::Consolidated)
+        );
+        assert!(database.get_pending_frontier_transition().await.unwrap().is_none());
+        assert!(database.get_required_head_rewind().await.unwrap().is_none());
+        for block in [first, second] {
+            assert_eq!(
+                database.get_l2_block_and_batch_info_by_hash(block.hash).await.unwrap(),
+                Some((block, batch_info))
+            );
+        }
+        let final_mapping = database.get_n_l1_messages(None, 1).await.unwrap()[0].l2_block_number;
+        assert!(!completed.batch_outcome.l2_head_updated, "retry purely reuses canonical blocks");
+        assert_eq!(final_mapping, independent_progress.then_some(SAFE + 5),
+            "the cut must remove old evidence immediately, and reuse must retain fresh higher imports");
     }
 }
 

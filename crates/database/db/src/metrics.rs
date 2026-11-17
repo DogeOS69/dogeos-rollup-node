@@ -18,6 +18,7 @@ pub(crate) struct DatabaseMetrics {
 pub(crate) enum DatabaseOperation {
     // Write operations
     SetPendingFrontierTransition,
+    SetRequiredHeadRewind,
     ClearPendingFrontierTransition,
     InsertL1BlockInfo,
     RemoveL1BlockInfoLeq,
@@ -58,6 +59,7 @@ pub(crate) enum DatabaseOperation {
     InsertSignature,
     // Read operations
     GetPendingFrontierTransition,
+    GetRequiredHeadRewind,
     GetConfirmedFrontierTransition,
     GetLatestFinalizedL2Info,
     GetBatchByIndex,
@@ -84,6 +86,8 @@ impl DatabaseOperation {
     /// Returns the str representation of the [`DatabaseOperation`].
     pub(crate) const fn as_str(&self) -> &'static str {
         match self {
+            Self::SetRequiredHeadRewind => "set_required_head_rewind",
+            Self::GetRequiredHeadRewind => "get_required_head_rewind",
             Self::SetPendingFrontierTransition => "set_pending_frontier_transition",
             Self::ClearPendingFrontierTransition => "clear_pending_frontier_transition",
             Self::InsertL1BlockInfo => "insert_l1_block_info",

@@ -481,9 +481,10 @@ async fn rg48_gossip_path_closes_gap_and_engine_confirms_head() -> eyre::Result<
 /// Sequencer head confirmation, shown from its only reachable side.
 ///
 /// On the ordinary path a sequencer's forkchoice update for its own freshly built block is
-/// `VALID`: Reth inserts every built payload into the engine tree (`InsertExecutedBlock`) when
-/// `getPayload` resolves, before the payload is even returned, so `on_new_head` finds the block.
-/// The first part of this test observes that ordinary path on a real in-process node.
+/// `VALID`: the sequencer submits the block with `newPayload` first, so `on_new_head` finds it.
+/// (Reth also forwards every built payload to the engine tree as `InsertExecutedBlock`, but
+/// asynchronously and unordered with respect to the forkchoice update, so that alone is not
+/// enough.) The first part of this test observes that ordinary path on a real in-process node.
 ///
 /// CONTROLLED SETUP for the second part: the same production `import_block` command moves the
 /// sequencer-capable node's mirror to a head its Engine has not adopted (real `SYNCING` verdict,

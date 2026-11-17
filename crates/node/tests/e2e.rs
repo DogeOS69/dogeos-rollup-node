@@ -2519,6 +2519,132 @@ async fn signer_rotation() -> eyre::Result<()> {
     Ok(())
 }
 
+/// RG-216: the node restarts with reth's saved safe block one batch behind its database.
+///
+/// Arranged: after batch 2 is consolidated the node is stopped and reth's saved safe-block
+/// marker is set to the last block of batch 1, the state a safe update lost at shutdown leaves
+/// behind. Everything after the restart runs the production path.
+///
+/// Finalizing batch 2 on L1 must move the engine's finalized block to the end of batch 2, and
+/// the node must then derive and finalize the next batch. Before the startup reconciliation of
+/// the database and engine frontiers (#46), the engine kept safe at the end of batch 1 and the
+/// node stopped on the next batch.
+#[tokio::test]
+async fn rg216_finalization_after_restart_with_saved_safe_one_batch_behind() -> eyre::Result<()> {
+    use reth_db::{
+        tables,
+        transaction::{DbTx, DbTxMut},
+        Database,
+    };
+
+    reth_tracing::init_test_tracing();
+
+    async fn engine_block(fixture: &TestFixture, tag: BlockNumberOrTag) -> eyre::Result<u64> {
+        let node = fixture.nodes[0].as_ref().ok_or_else(|| eyre::eyre!("node 0 is down"))?;
+        let block = node.node.rpc.inner.eth_api().block_by_number(tag, false).await?;
+        Ok(block.map(|b| b.header.number).unwrap_or_default())
+    }
+
+    /// Waits up to 30 s for the engine's finalized block to reach `target`; returns the last
+    /// value seen.
+    async fn finalized_after_wait(fixture: &TestFixture, target: u64) -> eyre::Result<u64> {
+        let deadline = time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let finalized = engine_block(fixture, BlockNumberOrTag::Finalized).await?;
+            if finalized >= target || time::Instant::now() >= deadline {
+                return Ok(finalized);
+            }
+            time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    let mut fixture = TestFixture::builder().followers(1).build().await?;
+    let genesis_timestamp = DOGEOS_DEV.genesis_header().timestamp;
+    // Empty batches covering L2 blocks 1..=4, 5..=57 and 58..=60.
+    let batches =
+        [(1, 4, 18318207), (5, 53, 18318215), (58, 3, 18318230)].map(|(first, count, l1_block)| {
+            let timestamp = genesis_timestamp + first;
+            (B256::random(), empty_batch_calldata(first, count, timestamp), l1_block)
+        });
+    async fn commit(
+        fixture: &mut TestFixture,
+        index: u64,
+        (hash, calldata, l1_block): &(B256, Bytes, u64),
+    ) -> eyre::Result<()> {
+        fixture
+            .l1()
+            .commit_batch()
+            .at_block(BlockInfo { number: *l1_block, hash: B256::random() })
+            .hash(*hash)
+            .index(index)
+            .calldata(calldata.clone())
+            .send()
+            .await?;
+        fixture.expect_event().batch_consolidated().await
+    }
+    async fn finalize(
+        fixture: &mut TestFixture,
+        index: u64,
+        (hash, _, l1_block): &(B256, Bytes, u64),
+    ) -> eyre::Result<()> {
+        fixture
+            .l1()
+            .finalize_batch()
+            .at_block_number(*l1_block)
+            .hash(*hash)
+            .index(index)
+            .send()
+            .await?;
+        fixture.l1().finalize_l1_block(*l1_block).await
+    }
+
+    fixture.l1().sync().await?;
+    commit(&mut fixture, 1, &batches[0]).await?;
+    commit(&mut fixture, 2, &batches[1]).await?;
+    assert_eq!(fixture.get_status(0).await?.l2.fcs.safe_block_info().number, 57);
+
+    fixture.shutdown_node(0).await?;
+    let tx = fixture.dbs[0].tx_mut()?;
+    let saved = (
+        tx.get::<tables::ChainState>(tables::ChainStateKey::LastSafeBlock)?,
+        tx.get::<tables::ChainState>(tables::ChainStateKey::LastFinalizedBlock)?,
+    );
+    tx.put::<tables::ChainState>(tables::ChainStateKey::LastSafeBlock, 4)?;
+    tx.commit()?;
+    tracing::info!(?saved, "RG-216 reth's saved safe/finalized at shutdown, before the edit");
+
+    fixture.start_node(0).await?;
+    fixture.l1().sync().await?;
+    time::sleep(Duration::from_secs(2)).await;
+    let restart_safe = engine_block(&fixture, BlockNumberOrTag::Safe).await?;
+    let mirror_safe = fixture.get_status(0).await?.l2.fcs.safe_block_info().number;
+    tracing::info!(restart_safe, mirror_safe, "RG-216 safe after restart");
+
+    finalize(&mut fixture, 1, &batches[0]).await?;
+    finalize(&mut fixture, 2, &batches[1]).await?;
+    let finalized_after_restart = finalized_after_wait(&fixture, 57).await?;
+    let safe_after_restart = engine_block(&fixture, BlockNumberOrTag::Safe).await?;
+    tracing::info!(finalized_after_restart, safe_after_restart, "RG-216 after batch 2 finalized");
+
+    let next = commit(&mut fixture, 3, &batches[2]).await;
+    let finalized_after_next = match &next {
+        Ok(()) => {
+            finalize(&mut fixture, 3, &batches[2]).await?;
+            finalized_after_wait(&fixture, 60).await?
+        }
+        Err(_) => 0,
+    };
+    tracing::info!(?next, finalized_after_next, "RG-216 after batch 3");
+
+    assert!(
+        finalized_after_restart == 57 && next.is_ok() && finalized_after_next == 60,
+        "after the restart: safe {restart_safe}, finalized {finalized_after_restart} once batch 2 \
+         (ending at 57) was finalized; next batch consolidated: {next:?}, finalized after it: \
+         {finalized_after_next} (want 60)"
+    );
+    Ok(())
+}
+
 /// Read the file provided at `path` as a [`Bytes`].
 pub fn read_to_bytes<P: AsRef<std::path::Path>>(path: P) -> eyre::Result<Bytes> {
     use std::str::FromStr;

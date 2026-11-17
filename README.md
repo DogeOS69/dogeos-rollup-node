@@ -63,6 +63,15 @@ This repository is a modular Rust workspace for the Scroll rollup node. It is de
 
 Ensure you have [Rust](https://www.rust-lang.org/tools/install) installed.
 
+The direct Reth dependencies use the DogeOS `reth` tag `tsuki-v0.14`
+(`005acc083ccad7c6d76b28e2da8cbe7593cc3a14`). The `dogeos-reth` component
+revision is `b95b7b0c58a2c4fecc25d09ee9412369f52361c8` (PR #59);
+`Cargo.lock` records the resolved graph.
+DogeOS REVM remains on `tsuki-v0.13`
+(`516ff663b2fb2503dba8ef6b0d667f16334ac05a`). Verify the locked sources with
+`.github/assets/verify_reth_sources.sh` and its regression fixtures with
+`.github/assets/verify_reth_sources_test.sh` after fetching dependencies.
+
 To build the main binary:
 
 ```sh

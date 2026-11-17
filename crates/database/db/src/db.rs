@@ -2633,6 +2633,87 @@ mod test {
         }
     }
 
+    /// An old partial upgrade can leave an empty legacy column beside a trusted marker.
+    #[tokio::test]
+    async fn queue_hash_migration_partial_up_invalidates_stale_marker() {
+        use scroll_migration::{Migrator, MigratorTrait, ScrollDevMigrationInfo};
+
+        for index_exists in [false, true] {
+            let (db, messages, full, legacy) = old_queue_hash_database().await;
+            let inner = db.inner();
+            let conn = inner.get_connection();
+            Migrator::<ScrollDevMigrationInfo>::up(conn, None).await.unwrap();
+            assert_eq!(db.recompute_l1_message_queue_hashes(0, true).await.unwrap(), Some(4));
+            let marker = queue_hash_rule_marker(&db).await.unwrap();
+            assert_eq!(marker, "v1;start=0;legacy=true");
+            Migrator::<ScrollDevMigrationInfo>::down(conn, Some(1)).await.unwrap();
+            // Old down dropped the column but retained the matching completion marker.
+            conn.execute(Statement::from_sql_and_values(
+                conn.get_database_backend(),
+                "INSERT INTO metadata (key, value) VALUES ('l1_message_queue_hash_rule', ?)",
+                [marker.clone().into()],
+            ))
+            .await
+            .unwrap();
+            // Old up committed DDL without invalidating the marker or recording success.
+            conn.execute_unprepared(
+                "ALTER TABLE l1_message ADD COLUMN legacy_queue_hash BLOB NULL",
+            )
+            .await
+            .unwrap();
+            if index_exists {
+                conn.execute_unprepared("CREATE UNIQUE INDEX idx_l1_message_legacy_queue_hash ON l1_message (legacy_queue_hash)").await.unwrap();
+            }
+            assert_eq!(
+                Migrator::<ScrollDevMigrationInfo>::get_pending_migrations(conn)
+                    .await
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert_eq!(queue_hash_rule_marker(&db).await, Some(marker.clone()));
+            assert_eq!(legacy_queue_hash_null_count(&db).await, 4);
+            let before =
+                db.get_n_l1_messages(Some(L1MessageKey::from_queue_index(0)), 10).await.unwrap();
+            assert_eq!(before.iter().map(|m| m.transaction.clone()).collect::<Vec<_>>(), messages);
+            assert_eq!(before.iter().map(|m| m.queue_hash.unwrap()).collect::<Vec<_>>(), full);
+
+            Migrator::<ScrollDevMigrationInfo>::up(conn, None).await.unwrap();
+            assert!(queue_hash_rule_marker(&db).await.is_none());
+            assert!(Migrator::<ScrollDevMigrationInfo>::get_pending_migrations(conn)
+                .await
+                .unwrap()
+                .is_empty());
+            assert_eq!(
+                db.get_n_l1_messages(Some(L1MessageKey::from_queue_index(0)), 10).await.unwrap(),
+                before
+            );
+            assert_eq!(legacy_queue_hash_null_count(&db).await, 4);
+            assert_eq!(db.recompute_l1_message_queue_hashes(0, true).await.unwrap(), Some(4));
+            let stored =
+                db.get_n_l1_messages(Some(L1MessageKey::from_queue_index(0)), 10).await.unwrap();
+            assert_eq!(stored.iter().map(|m| m.transaction.clone()).collect::<Vec<_>>(), messages);
+            assert_eq!(stored.iter().map(|m| m.queue_hash.unwrap()).collect::<Vec<_>>(), full);
+            assert_eq!(
+                stored.iter().map(|m| m.legacy_queue_hash.unwrap()).collect::<Vec<_>>(),
+                legacy
+            );
+            for (hash, codec) in [(legacy[1], 11), (full[1], 12)] {
+                assert_eq!(
+                    db.get_n_l1_messages(Some(L1MessageKey::from_batch_queue_hash(hash, codec)), 2)
+                        .await
+                        .unwrap(),
+                    stored[1..3]
+                );
+            }
+            assert_eq!(db.recompute_l1_message_queue_hashes(0, true).await.unwrap(), None);
+            // Once applied, ordinary startup migration checks must preserve the trusted marker.
+            Migrator::<ScrollDevMigrationInfo>::up(conn, None).await.unwrap();
+            assert_eq!(queue_hash_rule_marker(&db).await, Some(marker));
+            assert_eq!(db.recompute_l1_message_queue_hashes(0, true).await.unwrap(), None);
+        }
+    }
+
     /// A downgrade destroys the legacy chain, so its completion marker cannot survive it.
     #[tokio::test]
     async fn queue_hash_migration_down_up_recomputes() {

@@ -16,14 +16,14 @@ pub struct Migration;
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        // An old-version partial upgrade can leave an existing column and a stale trusted
+        // marker after an old downgrade. Invalidate every pending attempt before any DDL:
         // SQLite DDL can persist before SeaORM records this migration as applied.
+        invalidate_queue_hash_rule(manager).await?;
         if !manager
             .has_column(L1Message::Table.to_string(), LegacyQueueHash::LegacyQueueHash.to_string())
             .await?
         {
-            // An old/interrupted downgrade may have left a marker for the dropped chain.
-            // Invalidate before ADD: a crash must never pair it with a newly empty column.
-            invalidate_queue_hash_rule(manager).await?;
             manager
                 .alter_table(
                     Table::alter()

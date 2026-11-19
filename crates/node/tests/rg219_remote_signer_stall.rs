@@ -33,7 +33,7 @@ use tokio::{
 /// The `Sign` request (1-based) that is never answered.
 const UNANSWERED_SIGN_REQUEST: usize = 3;
 
-/// How long the follower gets to catch up after the unanswered call.
+/// How long the follower gets to catch up, counted from 5 s after the unanswered call.
 const CATCH_UP_BUDGET: Duration = Duration::from_secs(60);
 
 /// DER prefix of a secp256k1 `SubjectPublicKeyInfo` with an uncompressed point.
@@ -228,7 +228,11 @@ async fn rg219_follower_catches_up_after_one_signing_call_never_returns() -> eyr
     // Wait for the unanswered call.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     while kms.sign_requests() < UNANSWERED_SIGN_REQUEST {
-        assert!(tokio::time::Instant::now() < deadline, "the sequencer never asked to sign");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "only {} of {UNANSWERED_SIGN_REQUEST} Sign requests arrived within 60 s",
+            kms.sign_requests()
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     let follower_before = fixture.get_block(1).await?.header.number;
@@ -246,8 +250,13 @@ async fn rg219_follower_catches_up_after_one_signing_call_never_returns() -> eyr
         sequencer_head >= UNANSWERED_SIGN_REQUEST as u64 + 5,
         "the sequencer stopped building at {sequencer_head}"
     );
+    // The unanswered call holds back every later block, so the follower has not moved past it.
+    assert!(
+        follower_head <= UNANSWERED_SIGN_REQUEST as u64,
+        "follower at {follower_head} was not held back by the unanswered call"
+    );
 
-    // Intended: the follower reaches the sequencer's head soon after.
+    // The follower reaches the head the sequencer had at that point.
     let start = tokio::time::Instant::now();
     loop {
         let follower = fixture.get_block(1).await?.header.number;

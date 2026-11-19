@@ -2621,6 +2621,8 @@ async fn rg216_finalization_after_restart_with_saved_safe_one_batch_behind() -> 
     let restart_safe = engine_block(&fixture, BlockNumberOrTag::Safe).await?;
     let mirror_safe = fixture.get_status(0).await?.l2.fcs.safe_block_info().number;
     tracing::info!(restart_safe, mirror_safe, "RG-216 safe after restart");
+    // Startup brings the engine's safe block back to the database's, before any finalization.
+    assert_eq!((restart_safe, mirror_safe), (57, 57), "safe block after the restart");
 
     finalize(&mut fixture, 1, &batches[0]).await?;
     finalize(&mut fixture, 2, &batches[1]).await?;

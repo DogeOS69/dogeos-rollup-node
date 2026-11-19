@@ -238,6 +238,7 @@ async fn rg219_follower_catches_up_after_one_signing_call_never_returns() -> eyr
     let follower_before = fixture.get_block(1).await?.header.number;
 
     // The sequencer keeps building while the call is outstanding.
+    // Must stay below the signer's per-attempt timeout (10 s today), or the hold check fails.
     tokio::time::sleep(Duration::from_secs(5)).await;
     let sequencer_head = fixture.get_sequencer_block().await?.header.number;
     let follower_head = fixture.get_block(1).await?.header.number;

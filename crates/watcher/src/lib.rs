@@ -323,7 +323,7 @@ where
 
             // Check L1 liveness if due.
             if self.liveness_probe.is_due() {
-                self.liveness_probe.check(self.unfinalized_blocks.last());
+                self.liveness_probe.check();
             }
 
             // step the watcher.
@@ -504,6 +504,8 @@ where
         finalized: &Header,
         latest: &Header,
     ) -> L1WatcherResult<()> {
+        self.liveness_probe.on_head(latest);
+
         let tail = self.unfinalized_blocks.last();
 
         if tail.is_some_and(|h| h.hash == latest.hash) {
@@ -1089,6 +1091,22 @@ mod tests {
         // Then
         assert_eq!(watcher.unfinalized_blocks.len(), 10);
         assert_eq!(watcher.unfinalized_blocks.pop().unwrap(), latest);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_handle_latest_block_records_the_head_on_the_liveness_probe() -> eyre::Result<()> {
+        // Given: the latest block is already the unfinalized tail, so handling it returns early.
+        let (finalized, latest, chain) = chain(10);
+        let (mut watcher, _) = l1_watcher(chain, vec![], vec![], finalized.clone(), latest.clone());
+        assert_eq!(watcher.liveness_probe.last_head_hash(), None);
+
+        // When
+        watcher.handle_latest_block(&finalized, &latest).await?;
+
+        // Then
+        assert_eq!(watcher.liveness_probe.last_head_hash(), Some(latest.hash));
 
         Ok(())
     }
